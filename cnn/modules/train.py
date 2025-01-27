@@ -10,18 +10,80 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from .networks import ForkCNN, CaliNN
-
-import sys,time,os
-# sys.path.append(os.path.abspath("../configs"))
-# from configs import config
+from .dataset import TrainDataset
 import config
 
+import sys,time,os
+import config
+
+class Trainer:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        train_data: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        gpu_id: int,
+        save_every: int,
+    ) -> None:
+        self.gpu_id = gpu_id
+        self.model = model.to(gpu_id)
+        self.train_data = train_data
+        self.optimizer = optimizer
+        self.save_every = save_every
+        self.model = DDP(model, device_ids=[gpu_id])
+        self.criterion = nn.MSELoss()
+
+    def _run_batch(self, img, spec, fid):
+        self.optimizer.zero_grad()
+        outputs = self.model.forward(img, spec)
+        loss = self.criterion(output, fid)        
+        loss = torch.sqrt(loss)           
+        loss.backward()                   
+        self.optimizer.step()
+        return loss
+
+    def _run_epoch(self, epoch, show_log=True):
+        b_sz = len(next(iter(self.train_data))[0])
+        losses = []
+        epoch_start = time.time()
+        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+        self.train_data.sampler.set_epoch(epoch)
+        for i, batch in enumerate(self.train_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().to(self.gpu_id)
+            loss = self._run_batch(source, targets)
+            losses.append(loss.item())
+            
+        epoch_loss = np.sqrt(sum(losses) / len(losses))
+        epoch_time = time.time() - epoch_start
+        if show_log:
+            print("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                          epoch_time // 60, 
+                                                                          epoch_time % 60))
     
-def train_nn(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int):
+    def _save_checkpoint(self, epoch):
+        ckp = self.model.module.state_dict()
+        PATH = join(config.train['model_path'], config.train['model_name'], str(epoch))
+        torch.save(ckp, PATH)
+        print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
+
+    def train(self, max_epochs: int):
+        for epoch in range(max_epochs):
+            self._run_epoch(epoch)
+            if self.gpu_id == 0 and epoch % self.save_every == 0:
+                self._save_checkpoint(epoch)
+                
+    
+def train_nn(rank: int, world_size: int, save_every=1, 
+             total_epochs=config.train['epoch_number'], 
+             batch_size=config.train['batch_size'], 
+             nfeatures=config.train['feature_number'], f_valid=0.1):
+    
     ddp_setup(rank, world_size)
-    model, optimizer = load_train_objs()
+    dataset, model, optimizer = load_train_objs(nfeatures)
     train_data = prepare_dataloader(dataset, batch_size)
-    trainer = Trainer(model, train_data, rank, save_every)
+    trainer = Trainer(model, train_data, optimizer, rank, save_every)
     trainer.train(total_epochs)
     destroy_process_group()
     
@@ -36,14 +98,27 @@ def ddp_setup(rank, world_size):
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-def load_train_objs():
-    model = ForkCNN(self.features, self.batch_size, GPUs=1)  # load your model
+def load_train_objs(nfeatures):
+    data_args = list(config.data.values())
+    dataset = TrainDataset(*data_args)
+    model = ForkCNN(nfeatures, self.batch_size, GPUs=1)  # load your model
     optimizer = optim.SGD(self.model.parameters(), 
                           lr=config.train['initial_learning_rate'], 
                           momentum=config.train['momentum'])
-    return model, optimizer
+    return dataset, model, optimizer
 
-class Trainer:
+def prepare_dataloader(dataset: Dataset, batch_size: int):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        pin_memory=True,
+        shuffle=False,
+        sampler=DistributedSampler(dataset)
+    )
+
+#################################################################################
+
+class TrainerNN:
     
     def __init__(
         self,

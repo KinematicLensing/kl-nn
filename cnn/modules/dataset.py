@@ -1,29 +1,53 @@
+from os.path import join
 import numpy as np
-#from astropy.io import fits
+import pandas as pd
+from astropy.io import fits
+import torch
 from torch.utils.data import Dataset
 
 from .simulation import get_sim
 
 import sys,time,os
-# sys.path.append(os.path.abspath("../configs"))
-# from configs import config
 import config
-
 
 def compute_noise(noisy_im,clean_im):
 
     noise = noisy_im - clean_im
 
-    # noise = noisy_im[0:2,:]
-    # noise = np.vstack((noise, noisy_im[-2:,:]))
-
     sig_sky = np.std(noise)
     mean_sky = np.mean(noise)
-    #snr = np.sqrt(np.sum(np.power(clean_im,2))/sig_sky**2)
     return sig_sky, mean_sky
 
 
 #### Dataset for CNN training. You need to customize it
+
+class TrainDataset(Dataset):
+    
+    def __init__(self, size, nspec, img_index, pars_file, data_stem):
+        
+        self.size = size
+        self.indices = np.linspace(0, size, size, dtype=int)
+        self.pars = pd.read_csv(join(config.data['pars_dir'], pars_file))
+        self.data_stem = data_stem
+        self.img_index = img_index
+        self.nspec = nspec
+
+    def __len__(self):
+        return self.size
+    
+    def __getitem__(self, index):
+        
+        hdu = fits.open(join(config.data['data_dir'], data_stem, f'{index}.fits'))
+        img = hdu[img_index].data
+        spec_stack = [hdu[2*i+1].data for i in range(nspec)]
+        spec_stack = np.vstack(spec_stack)
+        fid_pars = np.array(self.pars.iloc[index])[1:]
+        
+        return {'img': img,
+                'spec': spec_stack,
+                'fid_pars': fid_pars,
+                'id': index}
+
 class ShapeDataset(Dataset):
     
     def __init__(self, gal_pars, psf_pars):

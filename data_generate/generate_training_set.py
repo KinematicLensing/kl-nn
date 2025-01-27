@@ -74,7 +74,7 @@ exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
-FITS_DIR = '/xdisk/timeifler/wxs0703/desi_nn_mcmc/fits/'
+FITS_DIR = '/xdisk/timeifler/wxs0703/kl_nn/fits/'
 
 ##################### Setting up observation configurations ####################
 

@@ -86,19 +86,19 @@ class ForkCNN(nn.Module):
         
         
         self.cnn_layers = nn.Sequential(
-            nn.Conv2d(1,32,kernel_size=3,stride=2,padding=3,bias=False),
+            nn.Conv2d(1,32,kernel_size=(1, 3),stride=(1, 2),padding=(1, 3),bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
             
-            nn.Conv2d(32,64,kernel_size=3,stride=2,padding=3,bias=False),
+            nn.Conv2d(32,64,kernel_size=(1, 3),stride=(1, 2),padding=(1, 3),bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
             
-            nn.Conv2d(64,32,kernel_size=3,stride=2,padding=3,bias=False),
+            nn.Conv2d(64,32,kernel_size=(1, 3),stride=(1, 2),padding=(1, 3),bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
             
-            nn.Conv2d(32,16,kernel_size=3,stride=2,padding=3,bias=False),
+            nn.Conv2d(32,16,kernel_size=(1, 3),stride=(1, 2),padding=(1, 3),bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(True),
         )
@@ -116,20 +116,14 @@ class ForkCNN(nn.Module):
         x = self.resnet34(x)
         x = self.avgpool(x)
         
-        #y = self.resnet18(y)
         y = self.cnn_layers(y)
-        #y = self.avgpool(y)
         
         # Flatten
         x = x.view(int(self.batch/self.GPUs),-1)
         y = y.view(int(self.batch/self.GPUs),-1)
-        # print(x.size())
-        # print(y.size())
         
         # Concatenation
         z = torch.cat((x, y), -1)
-        #z = z.view(-1)
-        #print(z.size())
         z = self.fully_connected_layer(z)
         
         return z

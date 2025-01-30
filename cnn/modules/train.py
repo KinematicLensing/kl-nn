@@ -1,3 +1,4 @@
+from os.path import join
 import numpy as np
 from astropy.io import fits
 
@@ -9,8 +10,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from .networks import ForkCNN, CaliNN
-from .dataset import TrainDataset
+from networks import ForkCNN, CaliNN
+from dataset import TrainDataset
 import config
 
 import sys,time,os
@@ -24,6 +25,7 @@ class Trainer:
         optimizer: torch.optim.Optimizer,
         gpu_id: int,
         save_every: int,
+        batch_size: int,
     ) -> None:
         self.gpu_id = gpu_id
         self.model = model.to(gpu_id)
@@ -32,27 +34,27 @@ class Trainer:
         self.save_every = save_every
         self.model = DDP(model, device_ids=[gpu_id])
         self.criterion = nn.MSELoss()
+        self.batch_size = batch_size
 
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
         outputs = self.model.forward(img, spec)
-        loss = self.criterion(output, fid)        
+        loss = self.criterion(outputs, fid)        
         loss = torch.sqrt(loss)           
         loss.backward()                   
         self.optimizer.step()
         return loss
 
     def _run_epoch(self, epoch, show_log=True):
-        b_sz = len(next(iter(self.train_data))[0])
         losses = []
         epoch_start = time.time()
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {self.batch_size} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
         for i, batch in enumerate(self.train_data):
             img = batch['img'].float().to(self.gpu_id)
             spec = batch['spec'].float().to(self.gpu_id)
             fid = batch['fid_pars'].float().to(self.gpu_id)
-            loss = self._run_batch(source, targets)
+            loss = self._run_batch(img, spec, fid)
             losses.append(loss.item())
             
         epoch_loss = np.sqrt(sum(losses) / len(losses))
@@ -64,7 +66,7 @@ class Trainer:
     
     def _save_checkpoint(self, epoch):
         ckp = self.model.module.state_dict()
-        PATH = join(config.train['model_path'], config.train['model_name'], str(epoch))
+        PATH = join(config.train['model_path'], config.train['model_name']+str(epoch))
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
 
@@ -81,9 +83,9 @@ def train_nn(rank: int, world_size: int, save_every=1,
              nfeatures=config.train['feature_number'], f_valid=0.1):
     
     ddp_setup(rank, world_size)
-    dataset, model, optimizer = load_train_objs(nfeatures)
+    dataset, model, optimizer = load_train_objs(nfeatures, batch_size, world_size)
     train_data = prepare_dataloader(dataset, batch_size)
-    trainer = Trainer(model, train_data, optimizer, rank, save_every)
+    trainer = Trainer(model, train_data, optimizer, rank, save_every, batch_size)
     trainer.train(total_epochs)
     destroy_process_group()
     
@@ -98,16 +100,16 @@ def ddp_setup(rank, world_size):
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-def load_train_objs(nfeatures):
+def load_train_objs(nfeatures, batch_size, GPUs):
     data_args = list(config.data.values())
     dataset = TrainDataset(*data_args)
-    model = ForkCNN(nfeatures, self.batch_size, GPUs=1)  # load your model
-    optimizer = optim.SGD(self.model.parameters(), 
+    model = ForkCNN(nfeatures, batch_size, GPUs=GPUs)  # load your model
+    optimizer = optim.SGD(model.parameters(), 
                           lr=config.train['initial_learning_rate'], 
                           momentum=config.train['momentum'])
     return dataset, model, optimizer
 
-def prepare_dataloader(dataset: Dataset, batch_size: int):
+def prepare_dataloader(dataset, batch_size):
     return DataLoader(
         dataset,
         batch_size=batch_size,

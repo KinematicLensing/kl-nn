@@ -5,8 +5,6 @@ from astropy.io import fits
 import torch
 from torch.utils.data import Dataset
 
-from .simulation import get_sim
-
 import sys,time,os
 import config
 
@@ -23,11 +21,12 @@ def compute_noise(noisy_im,clean_im):
 
 class TrainDataset(Dataset):
     
-    def __init__(self, size, nspec, img_index, pars_file, data_stem):
+    def __init__(self, size, nspec, img_index, pars_dir, data_dir, data_stem):
         
         self.size = size
         self.indices = np.linspace(0, size, size, dtype=int)
-        self.pars = pd.read_csv(join(config.data['pars_dir'], pars_file))
+        self.pars = pd.read_csv(join(pars_dir, 'samples.csv'))
+        self.data_dir = data_dir
         self.data_stem = data_stem
         self.img_index = img_index
         self.nspec = nspec
@@ -37,14 +36,14 @@ class TrainDataset(Dataset):
     
     def __getitem__(self, index):
         
-        hdu = fits.open(join(config.data['data_dir'], data_stem, f'{index}.fits'))
-        img = hdu[img_index].data
-        spec_stack = [hdu[2*i+1].data for i in range(nspec)]
-        spec_stack = np.vstack(spec_stack)
-        fid_pars = np.array(self.pars.iloc[index])[1:]
+        with fits.open(join(self.data_dir, self.data_stem + f'{index}.fits')) as hdu:
+            img = hdu[self.img_index].data.astype(np.float32)
+            spec_stack = [hdu[2*i+1].data for i in range(self.nspec)]
+            spec_stack = np.vstack(spec_stack)
+            fid_pars = np.array(self.pars.iloc[index])[1:]
         
-        return {'img': img,
-                'spec': spec_stack,
+        return {'img': img[None],
+                'spec': spec_stack[None],
                 'fid_pars': fid_pars,
                 'id': index}
 

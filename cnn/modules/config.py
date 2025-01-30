@@ -2,12 +2,13 @@ nGPUs = 2
 
 data = \
 {
-    size: 10000,
-    nspec: 5,
-    img_index: 11,
+    'size': 10000,
+    'nspec': 5,
+    'img_index': 11,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/',
     'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/fits/',
+    'data_stem': 'training_'
 }
 
 train = \
@@ -17,13 +18,12 @@ train = \
     'initial_learning_rate': 0.01,
     'momentum': 0.9,
     
-    'batch_size': 256,
+    'batch_size': 100,
     'validation_split': 0.1,
     'feature_number': 8,
     
     'device': ['cuda:0', 'cuda:1'],
     'gpu_number': nGPUs,
-    'workers': 4*nGPUs,
     
     'save_model': True,
     'model_path': '/xdisk/timeifler/wxs0703/kl_nn/model/',

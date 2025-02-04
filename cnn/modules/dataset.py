@@ -19,20 +19,31 @@ def compute_noise(noisy_im,clean_im):
 
 #### Dataset for CNN training. You need to customize it
 
-class TrainDataset(Dataset):
+class FiberDataset(Dataset):
     
-    def __init__(self, size, nspec, img_index, pars_dir, data_dir, data_stem):
+    def __init__(self, f_valid, isValid, size, nspec, img_index, pars_dir, data_dir, data_stem):
         
+        split_id = int(size*(1-f_valid))
+        self.isValid = isValid
         self.size = size
-        self.indices = np.linspace(0, size, size, dtype=int)
-        self.pars = pd.read_csv(join(pars_dir, 'samples.csv'))
+        
+        if isValid:
+            self.nsamples = int(size*f_valid)
+            self.indices = np.linspace(split_id, size, self.nsamples, dtype=int)
+            self.pars = pd.read_csv(join(pars_dir, 'samples.csv')).iloc[split_id:]
+        else:
+            self.nsamples = int(size*(1-f_valid))
+            self.indices = np.linspace(0, split_id, self.nsamples, dtype=int)
+            self.pars = pd.read_csv(join(pars_dir, 'samples.csv')).iloc[:split_id]
+            
         self.data_dir = data_dir
         self.data_stem = data_stem
         self.img_index = img_index
         self.nspec = nspec
+        self.normalize(self.pars)
 
     def __len__(self):
-        return self.size
+        return self.nsamples
     
     def __getitem__(self, index):
         
@@ -46,6 +57,15 @@ class TrainDataset(Dataset):
                 'spec': spec_stack[None],
                 'fid_pars': fid_pars,
                 'id': index}
+    
+    def normalize(self, pars):
+        ranges = config.par_ranges
+        for par, values in self.pars.items():
+            if par != 'ID':
+                low, high = ranges[par]
+                values -= low
+                values /= high-low
+                
 
 class ShapeDataset(Dataset):
     

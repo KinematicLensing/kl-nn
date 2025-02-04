@@ -1,3 +1,5 @@
+import numpy as np
+
 nGPUs = 2
 
 data = \
@@ -9,6 +11,18 @@ data = \
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/',
     'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/fits/',
     'data_stem': 'training_'
+}
+
+par_ranges = \
+{
+    'g1': [-1, 1],
+    'g2': [-1, 1],
+    'theta_int': [-np.pi, np.pi],
+    'sini': [0, 1],
+    'v0': [-30, 30],
+    'vcirc': [60, 540],
+    'rscale': [0.1, 10],
+    'hlr': [0.1, 5],
 }
 
 train = \

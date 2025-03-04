@@ -9,7 +9,7 @@ data = \
     'img_index': 11,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/',
-    'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/fits/',
+    'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/train_data/',
     'data_stem': 'training_'
 }
 

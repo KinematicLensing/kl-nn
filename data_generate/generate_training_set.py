@@ -8,31 +8,16 @@ os.environ['OMP_NUM_THREADS'] = '1'
 
 import numpy as np
 import sys, copy, os
-sys.path.insert(0, './grism_modules')
-import mpi4py
-from mpi4py import MPI
-try:
-    comm = MPI.COMM_WORLD
-    size = comm.Get_size()
-    rank = comm.Get_rank()
-except:
-    rank = 0
-    size = 1
 from argparse import ArgumentParser
 from astropy.units import Unit
 import galsim as gs
-import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
-from matplotlib.patches import Circle
 
 # From KL-tools
-import priors
+import priors, likelihood
 from cube import FiberModelCube
-import likelihood
 from parameters import Pars, MetaPars
 from likelihood import LogPosterior, GrismLikelihood, get_GlobalDataVector, FiberLikelihood
 from velocity import VelocityMap
-from grism import GrismDataVector
 from datavector import FiberDataVector
 from emission import LINE_LAMBDAS
 
@@ -74,12 +59,12 @@ exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
-FITS_DIR = '/xdisk/timeifler/wxs0703/kl_nn/fits/'
+FITS_DIR = '/xdisk/timeifler/wxs0703/kl_nn/train_data_massive/'
 
 ##################### Setting up observation configurations ####################
 
 default_photo_conf = {'INSTNAME': "CTIO/DECam", 'OBSTYPE': 0, 'NAXIS': 2,
-    'NAXIS1': 32, 'NAXIS2': 30, 'PIXSCALE': 0.2637, 'PSFTYPE': "airy_fwhm",
+    'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': "airy_fwhm",
     'PSFFWHM': 1.0, 'DIAMETER': 378.2856, 'GAIN': 4.0,
     'NOISETYP': 'ccd', 'RDNOISE': 2.6, 'ADDNOISE': ADD_NOISE
 }
@@ -110,10 +95,16 @@ Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
 ### Choose fiber configurations
-offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
-           (fiber_offset*np.cos(np.pi/2),   fiber_offset*np.sin(np.pi/2)),
-           (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
-           (fiber_offset*np.cos(3*np.pi/2), fiber_offset*np.sin(3*np.pi/2)),
+g = np.array([g1, g2])
+R = np.array([[np.cos(2*theta_int), np.sin(2*theta_int)],
+              [-np.sin(2*theta_int), np.cos(2*theta_int)]])
+g = np.matmul(R, g)
+gt = float(g[0])
+gx = float(g[1])
+tan_theta = np.tan(theta_int)
+theta_obs = np.arctan2(g2+(1.-g1)*tan_theta, (1.+g1)+g2*tan_theta)
+offsets = [(fiber_offset*np.cos(theta_obs),         fiber_offset*np.sin(theta_obs)),
+           (fiber_offset*np.cos(np.pi+theta_obs),   fiber_offset*np.sin(np.pi+theta_obs)),
            (0,0)]
 OFFSETX = 1
 
@@ -249,7 +240,7 @@ def main():
         ### 3D underlying model dimension
         'model_dimension':{
             'Nx': 64,
-            'Ny': 62,
+            'Ny': 64,
             'lblue': 300,
             'lred': 1200,
             'resolution': 500000,

@@ -2,6 +2,7 @@ import sys,time,os
 from os.path import join
 import logging
 import numpy as np
+import pandas as pd
 from astropy.io import fits
 
 import torch
@@ -20,6 +21,7 @@ class Trainer:
     def __init__(
         self,
         model: torch.nn.Module,
+        nfeatures: int,
         train_dl: DataLoader,
         valid_dl: DataLoader,
         optimizer: torch.optim.Optimizer,
@@ -29,6 +31,7 @@ class Trainer:
     ) -> None:
         self.gpu_id = gpu_id
         self.model = model.to(gpu_id)
+        self.nfeatures = nfeatures
         self.train_data = train_dl
         self.valid_data = valid_dl
         self.optimizer = optimizer
@@ -63,7 +66,7 @@ class Trainer:
         for i, batch in enumerate(self.train_data):
             img = batch['img'].float().to(self.gpu_id)
             spec = batch['spec'].float().to(self.gpu_id)
-            fid = batch['fid_pars'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
             loss = self._run_batch(img, spec, fid)
             losses.append(loss.item())          
 
@@ -82,7 +85,7 @@ class Trainer:
         for i, batch in enumerate(self.valid_data):
             img = batch['img'].float().to(self.gpu_id)
             spec = batch['spec'].float().to(self.gpu_id)
-            fid = batch['fid_pars'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
             outputs = self.model.forward(img, spec)
             loss = self.criterion(outputs, fid)        
             loss = torch.sqrt(loss)
@@ -102,21 +105,28 @@ class Trainer:
         torch.save(ckp, PATH)
 
     def train(self, max_epochs: int):
+        train_losses = []
+        valid_losses = []
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
+            train_losses.append(train_loss)
+            valid_losses.append(valid_loss)
             if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
+        losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
+        losses.to_csv(join(config.train['model_path'], 'losses.csv'), index=False)
                 
     
 def train_nn(rank: int, world_size: int, save_every=1, 
              total_epochs=config.train['epoch_number'], 
              batch_size=config.train['batch_size'], 
              nfeatures=config.train['feature_number'], f_valid=0.1):
+    
     logging.basicConfig(level=logging.INFO)
     ddp_setup(rank, world_size)
     train_ds, valid_ds, model, optimizer = load_train_objs(nfeatures, batch_size, world_size, f_valid)
     train_dl, valid_dl = prepare_dataloader(train_ds, valid_ds, batch_size)
-    trainer = Trainer(model, train_dl, valid_dl, optimizer, rank, save_every, batch_size)
+    trainer = Trainer(model, nfeatures, train_dl, valid_dl, optimizer, rank, save_every, batch_size)
     trainer.train(total_epochs)
     destroy_process_group()
     
@@ -138,7 +148,8 @@ def load_train_objs(nfeatures, batch_size, GPUs, f_valid):
     model = ForkCNN(nfeatures, batch_size, GPUs=GPUs)  # load your model
     optimizer = optim.SGD(model.parameters(), 
                           lr=config.train['initial_learning_rate'], 
-                          momentum=config.train['momentum'])
+                          momentum=config.train['momentum'],
+                          nesterov=True)
     return train_ds, valid_ds, model, optimizer
 
 def prepare_dataloader(train_ds, valid_ds, batch_size):
@@ -157,6 +168,171 @@ def prepare_dataloader(train_ds, valid_ds, batch_size):
         sampler=DistributedSampler(valid_ds)
     )
     return train_dl, valid_dl
+
+def load_model(path=None, strict=True, assign=False, GPUs=1):
+
+    model = ForkCNN(config.train['feature_number'], config.train['batch_size'], GPUs=GPUs)
+    model.to(0)
+    if GPUs > 1:
+        model = DDP(model, device_ids=None)
+
+    if path != None:
+        model.load_state_dict(torch.load(path), strict=strict, assign=assign)
+
+    return model
+
+def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
+
+    model.eval()
+    losses=[]
+    for i, batch in enumerate(test_data):
+        img = batch['img'].float().to(gpu_id)
+        spec = batch['spec'].float().to(gpu_id)
+        fid = batch['fid_pars'].float().view(-1, nfeatures).to(gpu_id)
+        outputs = model.forward(img, spec)
+        loss = criterion(outputs, fid)
+        losses.append(loss.item())
+        if i == 0:
+            ids = batch['id'].numpy()
+            preds = outputs.detach().cpu().numpy()
+            fids = fid.cpu().numpy()
+        else:
+            ids = np.concatenate((ids, batch['id'].numpy()))
+            preds = np.vstack((preds, outputs.detach().cpu().numpy()))
+            fids = np.vstack((fids, fid.cpu().numpy()))
+
+    combined_pred = np.column_stack((ids, preds))
+    combined_fid = np.column_stack((ids, fids))
+
+    epoch_loss = sum(losses) / len(losses)
+
+    return combined_pred, combined_fid, epoch_loss
+
+class Tester:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        nfeatures: int,
+        train_dl: DataLoader,
+        valid_dl: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        gpu_id: int,
+        save_every: int,
+        batch_size: int,
+    ) -> None:
+        self.gpu_id = gpu_id
+        self.model = model.to(gpu_id)
+        self.nfeatures = nfeatures
+        self.train_data = train_dl
+        self.valid_data = valid_dl
+        self.optimizer = optimizer
+        self.save_every = save_every
+        self.model = DDP(model, device_ids=[gpu_id])
+        self.criterion = nn.MSELoss()
+        self.batch_size = batch_size
+        self.logger = logging.getLogger('Trainer')
+
+    def _run_batch(self, img, spec, fid):
+        self.optimizer.zero_grad()
+        outputs = self.model.forward(img, spec)
+        loss = self.criterion(outputs, fid)        
+        loss = torch.sqrt(loss)           
+        loss.backward()                   
+        self.optimizer.step()
+        return loss
+
+    def _run_epoch(self, epoch, show_log=True):
+        
+        self.train_data.sampler.set_epoch(epoch)
+        self.valid_data.sampler.set_epoch(epoch)
+        train_loss = self._trainFunc(epoch)
+        valid_loss = self._validFunc(epoch)
+        
+        return train_loss, valid_loss
+    
+    def _trainFunc(self,epoch,show_log=True):
+        self.model.train()
+        losses = []
+        epoch_start = time.time()
+        for i, batch in enumerate(self.train_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
+            loss = self._run_batch(img, spec, fid)
+            losses.append(loss.item())          
+
+        epoch_loss = np.sqrt(sum(losses) / len(losses))
+        epoch_time = time.time() - epoch_start
+        if show_log and self.gpu_id == 0:
+            self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                     epoch_time // 60, 
+                                                                                     epoch_time % 60))
+        return epoch_loss
+
+    def _validFunc(self,epoch,show_log=True):
+        self.model.eval()
+        losses = []
+        epoch_start = time.time()
+        for i, batch in enumerate(self.valid_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
+            outputs = self.model.forward(img, spec)
+            loss = self.criterion(outputs, fid)        
+            loss = torch.sqrt(loss)
+            losses.append(loss.item())
+
+        epoch_loss = np.sqrt(sum(losses) / len(losses))
+        epoch_time = time.time() - epoch_start
+        if show_log and self.gpu_id == 0:
+            self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                     epoch_time // 60, 
+                                                                                     epoch_time % 60))
+        return epoch_loss
+    
+    def _predictFunc(self, test_dl, model, criterion=nn.MSELoss()):
+
+        model.eval()
+        losses=[]
+        for i, batch in enumerate(self.valid_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
+            outputs = model.forward(img, spec)
+            loss = criterion(outputs, fid)
+            losses.append(loss.item())
+            if i == 0:
+                ids = batch['id'].numpy()
+                preds = outputs.detach().cpu().numpy()
+                fids = fid.cpu().numpy()
+            else:
+                ids = np.concatenate((ids, batch['id'].numpy()))
+                preds = np.vstack((preds, outputs.detach().cpu().numpy()))
+                fids = np.vstack((fids, fid.cpu().numpy()))
+
+        combined_pred = np.column_stack((ids, preds))
+        combined_fid = np.column_stack((ids, fids))
+
+        epoch_loss = np.sqrt(sum(losses) / len(losses))
+        
+        return combined_pred, combined_true, epoch_loss
+    
+    def _save_checkpoint(self, epoch):
+        ckp = self.model.module.state_dict()
+        PATH = join(config.train['model_path'], config.train['model_name']+str(epoch))
+        torch.save(ckp, PATH)
+
+    def train(self, max_epochs: int):
+        train_losses = []
+        valid_losses = []
+        for epoch in range(max_epochs):
+            train_loss, valid_loss = self._run_epoch(epoch)
+            train_losses.append(train_loss)
+            valid_losses.append(valid_loss)
+            if self.gpu_id == 0 and epoch % self.save_every == 0:
+                self._save_checkpoint(epoch)
+        losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
+        losses.to_csv(join(config.train['model_path'], 'losses.csv'), index=False)
 
 #################################################################################
 

@@ -19,7 +19,7 @@ def main():
                      [0.1, 10],       # rscale
                      [0.1, 5]]        # hlr
     ndim = len(sample_limits)
-    nsamples = 1000000
+    nsamples = 1e5
 
     sample_centers = []
     sample_scale = []
@@ -58,11 +58,11 @@ def main():
         ax.set_aspect(1.0/ax.get_data_ratio(), adjustable='box')
     
     plt.tight_layout()
-    plt.savefig(join(FIGDIR, 'sample_dist_massive.jpg'), dpi=300)
+    plt.savefig(join(FIGDIR, 'sample_dist_test.jpg'), dpi=300)
     plt.close(fig)
     
     # Save parameter samples
-    df.to_csv(join(SAMPDIR, 'samples_massive.csv'))
+    df.to_csv(join(SAMPDIR, 'samples_test_static_fibers.csv'))
 
 
 if __name__ == '__main__':

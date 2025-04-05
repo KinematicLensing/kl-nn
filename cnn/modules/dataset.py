@@ -8,52 +8,42 @@ from torch.utils.data import Dataset
 import sys,time,os
 import config
 
-def compute_noise(noisy_im,clean_im):
-
-    noise = noisy_im - clean_im
-
-    sig_sky = np.std(noise)
-    mean_sky = np.mean(noise)
-    return sig_sky, mean_sky
-
-
-#### Dataset for CNN training. You need to customize it
-
 class FiberDataset(Dataset):
     
-    def __init__(self, f_valid, isValid, size, nspec, img_index, pars_dir, data_dir, data_stem):
+    def __init__(self, size, nimgs, nspec, pars_dir, data_dir, data_stem):
         
-        split_id = int(size*(1-f_valid))
-        self.isValid = isValid
         self.size = size
-        
-        if isValid:
-            self.nsamples = int(size*f_valid)
-            self.indices = np.linspace(split_id, size, self.nsamples, dtype=int)
-            self.pars = pd.read_csv(join(pars_dir, 'samples.csv')).iloc[split_id:]
-        else:
-            self.nsamples = int(size*(1-f_valid))
-            self.indices = np.linspace(0, split_id, self.nsamples, dtype=int)
-            self.pars = pd.read_csv(join(pars_dir, 'samples.csv')).iloc[:split_id]
-            
+        self.pars = pd.read_csv(pars_dir)
         self.data_dir = data_dir
         self.data_stem = data_stem
-        self.img_index = img_index
+        self.nimgs = nimgs
         self.nspec = nspec
+        self.img_index = nspec*2+1
         self.normalize(self.pars)
 
     def __len__(self):
-        return self.nsamples
+        return self.size
     
     def __getitem__(self, index):
         
-        with fits.open(join(self.data_dir, self.data_stem + f'{index}.fits')) as hdu:
-            img = hdu[self.img_index].data.astype(np.float32)
-            spec_stack = [hdu[2*i+1].data for i in range(self.nspec)]
-            spec_stack = np.vstack(spec_stack)
+        folder = index // 4000 + 1
+        
+        with fits.open(join(self.data_dir, f'temp_{folder}/', self.data_stem + f'{index}.fits')) as hdu:
+            
+            img_stack = np.full((self.nimgs, 48, 48), 0, dtype=np.float32)
+            for i in range(self.nimgs):
+                img_stack[i] = hdu[self.img_index + i*2].data
+            img_stack /= np.max(img_stack)
+                
+            spec_stack = np.full((self.nspec, 64), 0, dtype=np.float32)
+            for i in range(self.nspec):
+                spec = hdu[2*i+1].data
+                spec_stack[i, :spec.shape[0]] = spec
+            spec_stack /= np.max(spec_stack)
+                
             fid_pars = np.array(self.pars.iloc[index])[1:]
         
-        return {'img': img[None],
+        return {'img': img_stack[None],
                 'spec': spec_stack[None],
                 'fid_pars': fid_pars,
                 'id': index}
@@ -61,7 +51,7 @@ class FiberDataset(Dataset):
     def normalize(self, pars):
         ranges = config.par_ranges
         for par, values in self.pars.items():
-            if par != 'ID':
+            if par in ranges.keys():
                 low, high = ranges[par]
                 values -= low
                 values /= high-low

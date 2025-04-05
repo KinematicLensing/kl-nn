@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+import config
 
 ## CNN
 class ResidualBlock(nn.Module):
@@ -45,107 +46,145 @@ class ResidualBlock(nn.Module):
     
 class ForkCNN(nn.Module):
     
-    def __init__(self, nFeatures, BatchSize, GPUs=1):
+    def __init__(self, batch_size, GPUs=1, 
+                 nspec=config.data['nspec'], 
+                 nfeatures=config.train['feature_number']):
         
-        self.features = nFeatures
-        self.batch = BatchSize
+        self.nfeatures = nfeatures
+        self.batch = batch_size
         self.GPUs = GPUs
         
         super(ForkCNN, self).__init__()
         '''
-        ### ResNet34
-        self.resnet34 = nn.Sequential(
-            nn.Conv2d(1,64,kernel_size=3,stride=2,padding=3,bias=False),
+        self.cnn_img = nn.Sequential(
+            
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
             
-            nn.MaxPool2d(3,2),
-            ResidualBlock(64,64),
-            ResidualBlock(64,64),
-            ResidualBlock(64,64,2),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
             
-            ResidualBlock(64,128),
-            ResidualBlock(128,128),
-            ResidualBlock(128,128),
-            ResidualBlock(128,128,2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             
-            ResidualBlock(128,256),
-            ResidualBlock(256,256),
-            ResidualBlock(256,256),
-            ResidualBlock(256,256),
-            ResidualBlock(256,256),
-            ResidualBlock(256,256,2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
             
-            ResidualBlock(256,512),
-            ResidualBlock(512,512),
-            ResidualBlock(512,512,2)
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(128, 512, kernel_size=(6, 6), stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            
         )
         '''
-        
-        self.resnet16 = nn.Sequential(
-            nn.Conv2d(1,64,kernel_size=3,stride=2,padding=3,bias=False),
-            nn.BatchNorm2d(64),
+        self.cnn_img = nn.Sequential(
+            
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(True),
             
-            nn.MaxPool2d(3,2),
-            ResidualBlock(64,64),
-            ResidualBlock(64,64),
-            ResidualBlock(64,64,2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             
-            ResidualBlock(64,128),
-            ResidualBlock(128,128),
-            ResidualBlock(128,128),
-            ResidualBlock(128,128,2)
+            ResidualBlock(32, 32),
+            ResidualBlock(32, 32),
+            ResidualBlock(32, 32, 2),
+            
+            ResidualBlock(32, 64),
+            ResidualBlock(64, 64),
+            ResidualBlock(64, 64),
+            ResidualBlock(64, 64, 2),
+            
+            ResidualBlock(64, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128, 2),
+            
+            nn.Conv2d(128, 512, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            
         )
-
         
-        self.avgpool = nn.AvgPool2d(2)
-        
-        
-        self.cnn_layers = nn.Sequential(
-            nn.Conv2d(1,32,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
+        self.cnn_spec = nn.Sequential(
+            
+            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(True),
+            
+            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
             
-            nn.Conv2d(32,64,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.Conv2d(64,64,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.Conv2d(64,128,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.Conv2d(128,128,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.Conv2d(128,64,kernel_size=(1, 3),stride=(1, 2),padding=(0, 2),bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.Conv2d(64,32,kernel_size=(1, 3),stride=(1, 2),padding=0,bias=False),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(128, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            
         )
         
         ### Fully-connected layers
         self.fully_connected_layer = nn.Sequential(
-            nn.Linear(288, 144), # 1296 may vary with different image size
-            nn.Linear(144, 48),
-            nn.Linear(48, self.features),
+            nn.Linear(1024, 256),
+            nn.Linear(256, 64),
+            nn.Linear(64, 32),
+            nn.Linear(32, self.nfeatures),
+            nn.Sigmoid()
         )
 
     
     def forward(self, x, y):
         
-        x = self.resnet16(x)
-        x = self.avgpool(x)
+        x = self.cnn_img(x)
         
-        y = self.cnn_layers(y)
+        y = self.cnn_spec(y)
         
         # Flatten
         x = x.view(int(self.batch),-1)

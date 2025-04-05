@@ -14,7 +14,7 @@
 
 #SBATCH --account=timeifler
 
-#SBATCH --time=120:00:00
+#SBATCH --time=60:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wxs0703@arizona.edu
 
@@ -27,7 +27,6 @@ source ~/.bashrc
 
 conda activate kl-nn
 
-SAMPDIR=/xdisk/timeifler/wxs0703/kl_nn/samples/samples.csv
 SCRIPT=generate_training_wrapper.py
 NCPUS=${SLURM_NTASKS}
 NSAMPS=4000

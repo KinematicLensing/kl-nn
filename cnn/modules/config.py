@@ -28,7 +28,8 @@ par_ranges = \
 {
     'g1': [-0.5, 0.5],
     'g2': [-0.5, 0.5],
-    'theta_int': [-np.pi, np.pi],
+    'sin_theta': [-1, 1],
+    'cos_theta': [-1, 1],
     'sini': [0, 1],
     'v0': [-30, 30],
     'vcirc': [60, 540],
@@ -39,7 +40,7 @@ par_ranges = \
 train = \
 {
 
-    'epoch_number': 50,
+    'epoch_number': 60,
     'initial_learning_rate': 0.001,
     'momentum': 0.9,
     
@@ -51,6 +52,6 @@ train = \
     
     'save_model': True,
     'model_path': '/xdisk/timeifler/wxs0703/kl_nn/model/',
-    'model_name': 'ResNet',
+    'model_name': 'Deconv',
     
 }

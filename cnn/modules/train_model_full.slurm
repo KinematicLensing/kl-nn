@@ -12,7 +12,7 @@
 
 #SBATCH --account=timeifler
 
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wxs0703@arizona.edu
 

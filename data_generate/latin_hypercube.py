@@ -9,6 +9,7 @@ SAMPDIR = '/xdisk/timeifler/wxs0703/kl_nn/samples/'
 
 def main():
     # Define sample limits
+    # Do this for all 8 parameters even if only fitting for shear, necessary for simulation
     param_list = ['g1+g2', 'phi', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr']
     sample_limits = [[0, 0.01],      # g1+g2
                      [0, 2*np.pi],    # phi, where g1 = (g1+g2)cos(phi)

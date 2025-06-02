@@ -11,6 +11,9 @@ import sys, copy, os
 from argparse import ArgumentParser
 from astropy.units import Unit
 import galsim as gs
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
+from matplotlib.patches import Circle
 
 # From KL-tools
 import priors, likelihood
@@ -26,6 +29,8 @@ import time
 
 ########################### Parsing arguments ##################################
 parser = ArgumentParser()
+parser.add_argument('-n', type=int, default=1, help='folder id')
+parser.add_argument('-isTrain', type=int, default=1, help='folder id')
 parser.add_argument('-ID', type=int, default=0, help='sample id')
 parser.add_argument('-g1', type=float, default=0, help='shear component 1')
 parser.add_argument('-g2', type=float, default=0, help='shear component 2')
@@ -41,6 +46,8 @@ group.add_argument('--mpi', dest='mpi', default=False, action='store_true',
 group.add_argument('-ncores', default=1, type=int,
                     help='Number of processes (uses `multiprocessing` sequencial pool).')
 args = parser.parse_args()
+isTrain = bool(args.isTrain)
+n = args.n
 ID = args.ID
 g1 = args.g1
 g2 = args.g2
@@ -59,7 +66,8 @@ exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
-FITS_DIR = '/xdisk/timeifler/wxs0703/kl_nn/train_data_massive/'
+TRAIN_DIR = f'/xdisk/timeifler/wxs0703/kl_nn/train_data/temp_{n}/'
+TEST_DIR = f'/xdisk/timeifler/wxs0703/kl_nn/test_data/temp_{n}/'
 
 ##################### Setting up observation configurations ####################
 
@@ -95,17 +103,19 @@ Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
 ### Choose fiber configurations
-g = np.array([g1, g2])
-R = np.array([[np.cos(2*theta_int), np.sin(2*theta_int)],
-              [-np.sin(2*theta_int), np.cos(2*theta_int)]])
-g = np.matmul(R, g)
-gt = float(g[0])
-gx = float(g[1])
-tan_theta = np.tan(theta_int)
-theta_obs = np.arctan2(g2+(1.-g1)*tan_theta, (1.+g1)+g2*tan_theta)
-offsets = [(fiber_offset*np.cos(theta_obs),         fiber_offset*np.sin(theta_obs)),
-           (fiber_offset*np.cos(np.pi+theta_obs),   fiber_offset*np.sin(np.pi+theta_obs)),
+cosi = np.sqrt(1-sini**2)
+A = np.array([[1+g1, g2],
+              [g2, 1-g1]])
+R = np.array([[np.cos(theta_int), -np.sin(theta_int)],
+              [np.sin(theta_int), np.cos(theta_int)]])
+P = np.array([[1, 0],
+              [0, cosi]])
+T = np.matmul(A, np.matmul(R, P))
+U, S, Vh = np.linalg.svd(T)
+offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
+           (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
            (0,0)]
+offsets = np.matmul(offsets, U)
 OFFSETX = 1
 
 for i in range(len(emlines)):
@@ -279,9 +289,13 @@ def main():
     pars = Pars(sampled_pars, meta_pars)
      
     fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value)
-    print('fiberlike created')
     datavector = get_GlobalDataVector(0)
-    datavector.to_fits(os.path.join(FITS_DIR, f'training_{ID}.fits'), overwrite=True)
+    if isTrain:
+        print(f'Train #{ID} generated')
+        datavector.to_fits(os.path.join(TRAIN_DIR, f'training_{ID}.fits'), overwrite=True)
+    else:
+        print(f'Train #{ID} generated')
+        datavector.to_fits(os.path.join(TEST_DIR, f'testing_{ID}.fits'), overwrite=True)
     
     return 0
 
@@ -289,7 +303,5 @@ if __name__ == '__main__':
 
     rc = main()
 
-    if rc == 0:
-        print('Samples generated successfully')
-    else:
+    if rc != 0:
         print(f'Tests failed with return code of {rc}')

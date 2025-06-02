@@ -55,22 +55,6 @@ class ForkCNN(nn.Module):
         self.GPUs = GPUs
         
         super(ForkCNN, self).__init__()
-
-        self.skip_connection = nn.Sequential(
-            
-            nn.Conv2d(1, 32, kernel_size=4, stride=4, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            nn.Conv2d(32, 64, kernel_size=4, stride=4, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=3, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-        )
         
         self.cnn_img = nn.Sequential(
             
@@ -92,14 +76,19 @@ class ForkCNN(nn.Module):
             ResidualBlock(64, 128),
             ResidualBlock(128, 128),
             ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
             ResidualBlock(128, 128, 2),
             
             ResidualBlock(128, 256),
             ResidualBlock(256, 256),
             ResidualBlock(256, 256),
+            ResidualBlock(256, 256),
             ResidualBlock(256, 256, 2),
             
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=0, bias=False),
+            ResidualBlock(256, 512),
+            ResidualBlock(512, 512),
+            
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=0, bias=False),
             nn.BatchNorm2d(512),
             nn.ReLU(True),
             
@@ -147,7 +136,15 @@ class ForkCNN(nn.Module):
             
             nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
             
-            nn.Conv2d(128, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            
+            nn.Conv2d(256, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
             nn.BatchNorm2d(512),
             nn.ReLU(True),
             
@@ -155,7 +152,7 @@ class ForkCNN(nn.Module):
         
         ### Fully-connected layers
         self.fully_connected_layer = nn.Sequential(
-            nn.Linear(1152, 512),
+            nn.Linear(1024, 512),
             nn.Linear(512, 256),
             nn.Linear(256, 128),
             nn.Linear(128, 32),
@@ -166,18 +163,16 @@ class ForkCNN(nn.Module):
     
     def forward(self, x, y):
         
-        x1 = self.cnn_img(x)
-        x2 = self.skip_connection(x)
+        x = self.cnn_img(x)
         
         y = self.cnn_spec(y)
         
         # Flatten
-        x1 = x1.view(int(self.batch),-1)
-        x2 = x2.view(int(self.batch),-1)
+        x = x.view(int(self.batch),-1)
         y = y.view(int(self.batch),-1)
         
         # Concatenation
-        z = torch.cat((x1, x2, y), -1)
+        z = torch.cat((x, y), -1)
         z = self.fully_connected_layer(z)
         
         return z

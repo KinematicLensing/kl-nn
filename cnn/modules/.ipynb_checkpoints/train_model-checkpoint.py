@@ -20,4 +20,4 @@ if __name__ == "__main__":
     
     world_size = torch.cuda.device_count()
 
-    mp.spawn(train_nn, args=(world_size, DeconvNN, DeconvTrainer), nprocs=world_size)
+    mp.spawn(train_nn, args=(world_size, ForkCNN, CNNTrainer), nprocs=world_size)

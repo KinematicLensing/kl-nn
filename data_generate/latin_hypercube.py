@@ -10,7 +10,7 @@ SAMPDIR = '/xdisk/timeifler/wxs0703/kl_nn/samples/'
 def main():
     # Define sample limits
     param_list = ['g1+g2', 'phi', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr']
-    sample_limits = [[0, 0.25],      # g1+g2
+    sample_limits = [[0, 0.01],      # g1+g2
                      [0, 2*np.pi],    # phi, where g1 = (g1+g2)cos(phi)
                      [-np.pi, np.pi], # theta_int
                      [0, 1],          # sini
@@ -58,11 +58,11 @@ def main():
         ax.set_aspect(1.0/ax.get_data_ratio(), adjustable='box')
     
     plt.tight_layout()
-    plt.savefig(join(FIGDIR, 'sample_dist_test.jpg'), dpi=300)
+    #plt.savefig(join(FIGDIR, 'sample_dist_low_g.jpg'), dpi=300)
     plt.close(fig)
     
     # Save parameter samples
-    df.to_csv(join(SAMPDIR, 'samples_test_static_fibers.csv'))
+    df.to_csv(join(SAMPDIR, 'samples_test_low_g_1m.csv'))
 
 
 if __name__ == '__main__':

@@ -4,9 +4,9 @@ Neural network tools for accelerating KL analyses
 Requires [kl-tools](https://github.com/sweverett/kl-tools) and all its dependent packages
 
 Versions:
-Python = 3.9+
-numpy = 1.26+
-pytorch = 2.5.1+
+Python = 3.9+;
+numpy = 1.26+;
+pytorch = 2.5.1+;
 also requires [ml-pyxis](https://github.com/vicolab/ml-pyxis) for database generation
 
 ### Data Generation

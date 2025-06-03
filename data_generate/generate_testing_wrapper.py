@@ -31,4 +31,4 @@ chunk = np.array(df.iloc[i:j]) if j < nsamps else np.array(df.iloc[i:])
 for row in chunk:
     ID, g1, g2, theta_int, sini, v0, vcirc, rscale, hlr = row
     ID = int(ID)
-    os.system(f"python generate_training_set.py -n={n} -isTrain={0} -ID={ID} -g1={g1} -g2={g2} -theta_int={theta_int} -sini={sini} -v0={v0} -vcirc={vcirc} -rscale={rscale} -hlr={hlr}")
+    os.system(f"python generate_fits.py -n={n} -isTrain={0} -ID={ID} -g1={g1} -g2={g2} -theta_int={theta_int} -sini={sini} -v0={v0} -vcirc={vcirc} -rscale={rscale} -hlr={hlr}")

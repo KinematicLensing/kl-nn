@@ -107,7 +107,7 @@ class CNNTrainer:
     
     def _save_checkpoint(self, epoch):
         ckp = self.model.module.state_dict()
-        PATH = join(config.train['model_path'], config.train['model_name']+str(epoch))
+        PATH = join(config.train['model_path'], config.train['model_name'], config.train['model_name']+str(epoch))
         torch.save(ckp, PATH)
 
     def train(self, max_epochs: int):
@@ -121,7 +121,7 @@ class CNNTrainer:
                 self._save_checkpoint(epoch)
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
         model_name = config.train['model_name']
-        losses.to_csv(join(config.train['model_path'], f'losses_{model_name}.csv'), index=False)
+        losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
                 
 #----------------#
 # Deconv Trainer #

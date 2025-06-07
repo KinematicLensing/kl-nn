@@ -17,6 +17,11 @@ import pyxis.torch as pxt
 from networks import *
 import config
 
+"""
+Module that manages all the trainer classes and testing functions. 
+Need to create a wrapper trainer class eventually
+"""
+
 #-------------#
 # CNN Trainer #
 #-------------#
@@ -107,7 +112,7 @@ class CNNTrainer:
     
     def _save_checkpoint(self, epoch):
         ckp = self.model.module.state_dict()
-        PATH = join(config.train['model_path'], config.train['model_name']+str(epoch))
+        PATH = join(config.train['model_path'], config.train['model_name'], config.train['model_name']+str(epoch))
         torch.save(ckp, PATH)
 
     def train(self, max_epochs: int):
@@ -121,7 +126,7 @@ class CNNTrainer:
                 self._save_checkpoint(epoch)
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
         model_name = config.train['model_name']
-        losses.to_csv(join(config.train['model_path'], f'losses_{model_name}.csv'), index=False)
+        losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
                 
 #----------------#
 # Deconv Trainer #
@@ -337,186 +342,9 @@ def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
 
     return combined_pred, combined_fid, epoch_loss
 
-#################################################################################
-
-class TrainerNN:
-    
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        train_data: DataLoader,
-        gpu_id: int,
-        save_every: int,
-        f_valid: float,
-    ) -> None:
-        self.gpu_id = gpu_id
-        self.model = model.to(gpu_id)
-        self.train_data = train_data
-        self.save_every = save_every
-        self.model = DDP(model, device_ids=[gpu_id])
-        self.f_valid = f_valid
-        
-    def _set_data(self, train_ds):
-        '''
-        Spilt the dataset into training and validation, and build dataloader.
-        '''
-
-        size = len(train_ds)
-        indices = list(range(size))
-        split = int(np.floor(self.f_valid * size))
-
-        train_indices, valid_indices = indices[split:], indices[:split]
-        train_sampler = DistributedSampler(train_indices)
-        valid_sampler = DistributedSampler(valid_indices)
-
-        self.train_dl = DataLoader(train_ds, 
-                              batch_size=self.batch_size, 
-                              num_workers=self.workers,
-                              sampler=train_sampler)
-        self.valid_dl = DataLoader(train_ds, 
-                              batch_size=self.batch_size, 
-                              num_workers=self.workers,
-                              sampler=valid_sampler)
-        print("Train_dl: {} Validation_dl: {}".format(len(self.train_dl), len(self.valid_dl)))
-        
-    def load_model(self,path=None,strict=True, assign=False):
-        
-        model = ForkCNN(self.features, self.batch_size, GPUs=1)
-        model.to(self.device)
-        if self.nGPUs > 1:
-            model = DDP(model, device_ids=None)
-        
-        if path != None:
-            model.load_state_dict(torch.load(path), strict=strict, assign=assign)
-        
-        return model
-    
-    def run(self, dataset, show_log=True):
-        
-        # set data loader here
-        print("Setting up DDP...")
-        self.ddp_setup(rank=0, world_size=1)
-        
-        print("Preparing Data Loader...")
-        self._set_data(dataset)
-        
-        self.model = self.load_model()
-        
-        self.criterion = nn.MSELoss()
-        self.optimizer = optim.SGD(self.model.parameters(), 
-                                   lr=config.train['initial_learning_rate'], 
-                                   momentum=config.train['momentum'])
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min')
-        
-        print('Begin training ...')
-        
-        # Loop the training and validation processes
-        train_losses = []
-        valid_losses = []
-        for epoch in range(config.train['epoch_number']):
-            self.train_dl.sampler.set_epoch(epoch)
-            self.valid_dl.sampler.set_epoch(epoch)
-            train_loss = self._trainFunc(epoch,show_log=show_log)
-            valid_loss = self._validFunc(epoch,show_log=show_log)
-            scheduler.step(train_loss)
-            scheduler.get_last_lr()
-            train_losses.append(train_loss)
-            valid_losses.append(valid_loss)
-            
-            if config.train['save_model']:
-                if not os.path.exists(config.train['model_path']):
-                    os.makedirs(config.train['model_path'])
-                torch.save(self.model.state_dict(), 
-                           config.train['model_path']+config.train['model_name']+str(epoch))
-                
-        if config.train['save_model']:
-            hdu0 = fits.PrimaryHDU(train_losses)
-            hdu1 = fits.ImageHDU(valid_losses)
-            hdul = fits.HDUList([hdu0, hdu1])
-            hdul.writeto(config.train['model_path']+'/training_loss.fits',overwrite=True)
-                
-        print('Finish training !')
-        destroy_process_group()
-        return train_losses, valid_losses
-
-    def _trainFunc(self,epoch,show_log=True):
-        self.model.train()
-        losses = []
-        epoch_start = time.time()
-        for i, batch in enumerate(self.train_dl):
-            inputs1, inputs2, labels = batch['gal_image'].float().to(self.device), \
-                                       batch['psf_image'].float().to(self.device), \
-                                       batch['label'].float().view(-1,self.features).to(self.device)
-
-            self.optimizer.zero_grad()             
-            outputs = self.model.forward(inputs1, inputs2)
-            loss = self.criterion(outputs, labels) 
-            losses.append(loss.item())        
-            loss = torch.sqrt(loss)           
-            loss.backward()                   
-            self.optimizer.step()                  
-
-        epoch_loss = np.sqrt(sum(losses) / len(losses))
-        epoch_time = time.time() - epoch_start
-        if show_log:
-            print("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                          epoch_time // 60, 
-                                                                          epoch_time % 60))
-        return epoch_loss
-
-    def _validFunc(self,epoch,show_log=True):
-        self.model.eval()
-        losses = []
-        epoch_start = time.time()
-        for i, batch in enumerate(self.valid_dl):
-            inputs1, inputs2, labels = batch['gal_image'].float().to(self.device), \
-                                       batch['psf_image'].float().to(self.device), \
-                                       batch['label'].float().view(-1,self.features).to(self.device)
-
-            outputs = self.model.forward(inputs1, inputs2)
-            loss = self.criterion(outputs, labels)
-            losses.append(loss.item())
-
-        epoch_loss = np.sqrt(sum(losses) / len(losses))
-        epoch_time = time.time() - epoch_start
-        if show_log:
-            print("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                        epoch_time // 60, 
-                                                                        epoch_time % 60))
-        return epoch_loss
-    
-    def _predictFunc(self,test_dl,MODEL,criterion=nn.MSELoss()):
-
-        MODEL.eval()
-        losses=[]
-        for i, batch in enumerate(test_dl):
-            inputs1, inputs2 = batch['gal_image'].float().to(self.device), \
-                                       batch['psf_image'].float().to(self.device)
-            outputs = MODEL.forward(inputs1, inputs2)
-            labels_true_batch = batch['label'].float().view(-1,self.features).to(self.device)
-            loss = criterion(outputs, labels_true_batch)
-            losses.append(loss.item())
-            if i == 0:
-                ids = batch['id'].numpy()
-                labels = outputs.detach().cpu().numpy()
-                labels_true = labels_true_batch.cpu()
-                snr = batch['snr'].numpy()
-            else:
-                ids = np.concatenate((ids, batch['id'].numpy()))
-                labels = np.vstack((labels, outputs.detach().cpu().numpy()))
-                labels_true = np.vstack((labels_true, labels_true_batch.cpu()))  
-                snr = np.concatenate((snr, batch['snr'].numpy()))
-
-        combined_pred = np.column_stack((ids, labels))
-        combined_true = np.column_stack((ids, labels_true))
-        combined_snr = np.column_stack((ids, snr))
-
-        epoch_loss = np.sqrt(sum(losses) / len(losses))
-        return combined_pred, combined_true, combined_snr, epoch_loss
-    
-    
 ##################################################
-    
+
+# Old/defective functions, not in use
     
 class MSBLoss(nn.Module):
     def __init__(self):

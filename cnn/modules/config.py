@@ -1,7 +1,5 @@
 import numpy as np
 
-nGPUs = 2
-
 data = \
 {
     'size': 1000000,
@@ -46,11 +44,21 @@ train = \
     'batch_size': 100,
     'feature_number': 6,
     
-    'device': ['cuda:0', 'cuda:1'],
-    'gpu_number': nGPUs,
-    
     'save_model': True,
     'model_path': '/xdisk/timeifler/wxs0703/kl_nn/model/',
     'model_name': 'random_SNR',
     
+}
+
+cali = \
+{
+    'train_size': 200000,
+    'test_size': 100000,
+    
+    'epoch_number': 60,
+    'batch_size': 100,
+    'feature_number': 7,
+    
+    'train_dir': '/xdisk/timeifler/wxs0703/kl_nn/train_data_200k/train_database_random_SNR',
+    'test_dir': '/xdisk/timeifler/wxs0703/kl_nn/test_data/test_database_random_SNR',
 }

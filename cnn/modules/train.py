@@ -232,156 +232,12 @@ class DeconvTrainer:
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
         model_name = config.train['model_name']
         losses.to_csv(join(config.train['model_path'], f'losses_{model_name}.csv'), index=False)
-                
 
-#------------------#
-# Global functions #
-#------------------#
-
-def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer, save_every=1, 
-             total_epochs=config.train['epoch_number'], 
-             batch_size=config.train['batch_size'], 
-             nfeatures=config.train['feature_number']):
-    
-    logging.basicConfig(level=logging.INFO)
-    log = logging.getLogger('Setup')
-    if rank == 0:
-        log.info('Initializing')
-    
-    ddp_setup(rank, world_size)
-    log.info(f'[rank: {rank}] Successfully set up device')
-    
-    train_ds, valid_ds, model, optimizer = load_train_objs(nfeatures, batch_size, world_size, Model)
-    model = model.to(rank)
-    model = DDP(model, device_ids=[rank])
-    log.info(f'[rank: {rank}] Successfully loaded training objects')
-    
-    train_dl, valid_dl = prepare_dataloader(train_ds, valid_ds, batch_size, world_size)
-    log.info(f'[rank: {rank}] Successfully prepared dataloader')
-    #torch.distributed.barrier()
-    
-    trainer = Trainer(model, nfeatures, train_dl, valid_dl, optimizer, rank, save_every, batch_size)
-    log.info(f'[rank: {rank}] Successfully initialized Trainer')
-    #torch.distributed.barrier()
-    trainer.train(total_epochs)
-    destroy_process_group()
-    
-def train_cali(rank: int, world_size: int, Model=CaliNN, Trainer=CaliTrainer, save_every=1, 
-             total_epochs=config.cali['epoch_number'], 
-             batch_size=config.cali['batch_size'], 
-             nfeatures=config.cali['feature_number']):
-    
-    logging.basicConfig(level=logging.INFO)
-    log = logging.getLogger('Setup')
-    if rank == 0:
-        log.info('Initializing')
-    
-    ddp_setup(rank, world_size)
-    log.info(f'[rank: {rank}] Successfully set up device')
-    
-    train_ds, valid_ds, model, optimizer = load_train_objs(nfeatures, batch_size, world_size, Model)
-    model = model.to(rank)
-    model = DDP(model, device_ids=[rank])
-    log.info(f'[rank: {rank}] Successfully loaded training objects')
-    
-    train_dl, valid_dl = prepare_dataloader(train_ds, valid_ds, batch_size, world_size)
-    log.info(f'[rank: {rank}] Successfully prepared dataloader')
-    #torch.distributed.barrier()
-    
-    trainer = Trainer(model, nfeatures, train_dl, valid_dl, optimizer, rank, save_every, batch_size)
-    log.info(f'[rank: {rank}] Successfully initialized Trainer')
-    #torch.distributed.barrier()
-    trainer.train(total_epochs)
-    destroy_process_group()
-    
-def ddp_setup(rank, world_size):
-    """
-    Args:
-        rank: Unique identifier of each process
-        world_size: Total number of processes
-    """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
-    torch.cuda.set_device(rank)
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.synchronize()
-
-def load_train_objs(nfeatures, batch_size, GPUs, Model):
-    train_ds = pxt.TorchDataset(config.data['data_dir'])
-    valid_ds = pxt.TorchDataset(config.test['data_dir'])
-    model = Model(batch_size, GPUs=GPUs)  # load your model
-    optimizer = optim.SGD(model.parameters(), 
-                          lr=config.train['initial_learning_rate'],
-                          momentum=config.train['momentum'])
-    return train_ds, valid_ds, model, optimizer
-
-def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        pin_memory=True,
-        sampler=DistributedSampler(train_ds),
-    )
-    valid_dl = DataLoader(
-        valid_ds,
-        batch_size=batch_size,
-        pin_memory=True,
-        sampler=DistributedSampler(valid_ds),
-    )
-    return train_dl, valid_dl
-
-def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
-
-    model = Model(config.train['batch_size'], GPUs=GPUs)
-    model.to(0)
-    if GPUs > 1:
-        model = DDP(model, device_ids=None)
-
-    if path != None:
-        model.load_state_dict(torch.load(path), strict=strict, assign=assign)
-
-    return model
-
-def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
-
-    model.eval()
-    losses=[]
-    for i, batch in enumerate(test_data):
-        img = batch['img'].float().to(gpu_id)
-        spec = batch['spec'].float().to(gpu_id)
-        fid = batch['fid_pars'].float().view(-1, nfeatures).to(gpu_id)
-        outputs = model(img, spec)
-        loss = criterion(outputs, fid)
-        losses.append(loss.item())
-        if i == 0:
-            ids = batch['id'].numpy()
-            preds = outputs.detach().cpu().numpy()
-            fids = fid.cpu().numpy()
-        else:
-            ids = np.concatenate((ids, batch['id'].numpy()))
-            preds = np.vstack((preds, outputs.detach().cpu().numpy()))
-            fids = np.vstack((fids, fid.cpu().numpy()))
-
-    combined_pred = np.column_stack((ids, preds))
-    combined_fid = np.column_stack((ids, fids))
-
-    epoch_loss = sum(losses) / len(losses)
-    epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
-
-    return combined_pred, combined_fid, epoch_loss
-                
 #-----------------------------#
 # Calibration Network Trainer #
 #-----------------------------#
 
-# Function necessary for L-BFGS training to work per the docs
-def closure():
-    lbfgs.zero_grad()
-    loss = loss_func(x_lbfgs)
-    loss.backward()
-    return loss
-
-class CNNTrainer:
+class CaliTrainer:
     def __init__(
         self,
         model: torch.nn.Module,
@@ -399,10 +255,10 @@ class CNNTrainer:
         self.valid_data = valid_dl
         self.optimizer = optimizer
         self.save_every = save_every
-        #self.model = DDP(model, device_ids=[gpu_id])
         self.model = model
-        self.criterion = nn.MSELoss()
+        self.criterion = MSBLoss()
         self.batch_size = batch_size
+        self.history = dict(train=[], valid=[])
         self.logger = logging.getLogger('Trainer')
 
     def _run_batch(self, img, spec, fid):
@@ -483,6 +339,144 @@ class CNNTrainer:
         model_name = config.train['model_name']
         losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
                 
+    # Function necessary for L-BFGS training to work per the docs
+    def closure():
+        lbfgs.zero_grad()
+        loss = self.criterion(x_lbfgs)
+        loss.backward()
+        return loss
+
+
+#------------------#
+# Global functions #
+#------------------#
+
+def train_nn(rank: int, world_size: int, stage='train', Model=ForkCNN, Trainer=CNNTrainer, 
+             save_every=1, total_epochs=50, batch_size=100, nfeatures=2):
+    '''
+    Main function to train any network. stage, Model, and Trainer should be specified.
+    stages can be 'train', 'cali' or 'weights (WIP)'
+    '''
+    # Set parameters based on stage
+    eval(f"total_epochs=config.{stage}['epoch_number']")
+    eval(f"batch_size=config.{stage}['batch_size']")
+    eval(f"nfeatures=config.{stage}['feature_number']")
+    
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger('Setup')
+    if rank == 0:
+        log.info('Initializing')
+    
+    ddp_setup(rank, world_size)
+    log.info(f'[rank: {rank}] Successfully set up device')
+    
+    eval(f"train_ds, valid_ds, model, optimizer = load_{stage}_objs(nfeatures, batch_size, world_size, Model)")
+    model = model.to(rank)
+    model = DDP(model, device_ids=[rank])
+    log.info(f'[rank: {rank}] Successfully loaded training objects')
+    
+    train_dl, valid_dl = prepare_dataloader(train_ds, valid_ds, batch_size, world_size)
+    log.info(f'[rank: {rank}] Successfully prepared dataloader')
+    #torch.distributed.barrier()
+    
+    trainer = Trainer(model, nfeatures, train_dl, valid_dl, optimizer, rank, save_every, batch_size)
+    log.info(f'[rank: {rank}] Successfully initialized Trainer')
+    #torch.distributed.barrier()
+    trainer.train(total_epochs)
+    destroy_process_group()
+    
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    torch.cuda.set_device(rank)
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.synchronize()
+
+def load_train_objs(nfeatures, batch_size, GPUs, Model):
+    # Create dataset objects
+    train_ds = pxt.TorchDataset(config.data['data_dir'])
+    valid_ds = pxt.TorchDataset(config.test['data_dir'])
+    # Initialize model and optimizer
+    model = Model(batch_size, GPUs=GPUs)  # load your model
+    optimizer = optim.SGD(model.parameters(), 
+                          lr=config.train['initial_learning_rate'],
+                          momentum=config.train['momentum'])
+    return train_ds, valid_ds, model, optimizer
+
+def load_cali_objs(nfeatures, batch_size, GPUs, Model):
+    # Create dataset objects
+    train_ds = pxt.TorchDataset(config.cali['train_dir'])
+    valid_ds = pxt.TorchDataset(config.cali['test_dir'])
+    # Initialize model and optimizer
+    model = Model(batch_size, GPUs=GPUs)
+    optimizer = optim.LBFGS(model.parameters(),
+                            lr=config.cali['learning_rate'],
+                            history_size=10,
+                            max_iter=4, 
+                            line_search_fn="strong_wolfe")
+    return train_ds, valid_ds, model, optimizer
+
+def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        pin_memory=True,
+        sampler=DistributedSampler(train_ds),
+    )
+    valid_dl = DataLoader(
+        valid_ds,
+        batch_size=batch_size,
+        pin_memory=True,
+        sampler=DistributedSampler(valid_ds),
+    )
+    return train_dl, valid_dl
+
+def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
+
+    model = Model(config.train['batch_size'], GPUs=GPUs)
+    model.to(0)
+    if GPUs > 1:
+        model = DDP(model, device_ids=None)
+
+    if path != None:
+        model.load_state_dict(torch.load(path), strict=strict, assign=assign)
+
+    return model
+
+def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
+    '''
+    Run this function to test performance of trained models
+    '''
+    model.eval()
+    losses=[]
+    for i, batch in enumerate(test_data):
+        img = batch['img'].float().to(gpu_id)
+        spec = batch['spec'].float().to(gpu_id)
+        fid = batch['fid_pars'].float().view(-1, nfeatures).to(gpu_id)
+        outputs = model(img, spec)
+        loss = criterion(outputs, fid)
+        losses.append(loss.item())
+        if i == 0:
+            ids = batch['id'].numpy()
+            preds = outputs.detach().cpu().numpy()
+            fids = fid.cpu().numpy()
+        else:
+            ids = np.concatenate((ids, batch['id'].numpy()))
+            preds = np.vstack((preds, outputs.detach().cpu().numpy()))
+            fids = np.vstack((fids, fid.cpu().numpy()))
+
+    combined_pred = np.column_stack((ids, preds))
+    combined_fid = np.column_stack((ids, fids))
+
+    epoch_loss = sum(losses) / len(losses)
+    epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
+
+    return combined_pred, combined_fid, epoch_loss
 
 ##################################################
 

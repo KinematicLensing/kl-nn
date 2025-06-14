@@ -1,5 +1,6 @@
 import numpy as np
 
+# Training data info and locations
 data = \
 {
     'size': 1000000,
@@ -11,6 +12,7 @@ data = \
     'data_stem': 'training_'
 }
 
+# Validation data info and locations
 test = \
 {
     'size': 100000,
@@ -22,6 +24,7 @@ test = \
     'data_stem': 'testing_'
 }
 
+# Which parameters should the CNN predict and what are their prior ranges?
 par_ranges = \
 {
     'g1': [-0.1, 0.1],
@@ -34,6 +37,7 @@ par_ranges = \
     #'hlr': [0.1, 5],
 }
 
+# CNN model training metaparameters
 train = \
 {
 
@@ -50,15 +54,17 @@ train = \
     
 }
 
+# Calibration network training metaparameters
 cali = \
 {
     'train_size': 200000,
-    'test_size': 100000,
+    'valid_size': 100000,
     
     'epoch_number': 60,
+    'learning_rate': 0.001,
     'batch_size': 100,
     'feature_number': 7,
     
     'train_dir': '/xdisk/timeifler/wxs0703/kl_nn/train_data_200k/train_database_random_SNR',
-    'test_dir': '/xdisk/timeifler/wxs0703/kl_nn/test_data/test_database_random_SNR',
+    'valid_dir': '/xdisk/timeifler/wxs0703/kl_nn/test_data/test_database_random_SNR',
 }

@@ -232,16 +232,135 @@ class DeconvTrainer:
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
         model_name = config.train['model_name']
         losses.to_csv(join(config.train['model_path'], f'losses_{model_name}.csv'), index=False)
+
+#-----------------------------#
+# Calibration Network Trainer #
+#-----------------------------#
+
+class CaliTrainer:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        nfeatures: int,
+        train_dl: DataLoader,
+        valid_dl: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        gpu_id: int,
+        save_every: int,
+        batch_size: int,
+    ) -> None:
+        self.gpu_id = gpu_id
+        self.nfeatures = nfeatures
+        self.train_data = train_dl
+        self.valid_data = valid_dl
+        self.optimizer = optimizer
+        self.save_every = save_every
+        self.model = model
+        self.criterion = MSBLoss()
+        self.batch_size = batch_size
+        self.history = dict(train=[], valid=[])
+        self.logger = logging.getLogger('Trainer')
+
+    def _run_batch(self, img, spec, fid):
+        self.optimizer.zero_grad()
+        outputs = self.model(img, spec)
+        loss = self.criterion(outputs, fid)      
+        loss.backward()                   
+        self.optimizer.step()
+        return loss
+
+    def _run_epoch(self, epoch, show_log=True):
+        
+        self.train_data.sampler.set_epoch(epoch)
+        self.valid_data.sampler.set_epoch(epoch)
+        train_loss = self._trainFunc(epoch)
+        valid_loss = self._validFunc(epoch)
+        
+        return train_loss, valid_loss
+    
+    def _trainFunc(self,epoch,show_log=True):
+        self.model.train()
+        losses = []
+        epoch_start = time.time()
+        for i, batch in enumerate(self.train_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
+            loss = self._run_batch(img, spec, fid)
+            losses.append(loss.item())
+            if show_log and self.gpu_id == 0 and i%100 == 0:
+                self.logger.info(f"Batch {i} complete")
+
+        epoch_loss = sum(losses) / len(losses)
+        epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
+        epoch_time = time.time() - epoch_start
+        if show_log and self.gpu_id == 0:
+            self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                     epoch_time // 60, 
+                                                                                     epoch_time % 60))
+        return epoch_loss
+
+    def _validFunc(self,epoch,show_log=True):
+        self.model.eval()
+        losses = []
+        epoch_start = time.time()
+        for i, batch in enumerate(self.valid_data):
+            img = batch['img'].float().to(self.gpu_id)
+            spec = batch['spec'].float().to(self.gpu_id)
+            fid = batch['fid_pars'].float().view(-1,self.nfeatures).to(self.gpu_id)
+            outputs = self.model(img, spec)
+            loss = self.criterion(outputs, fid)
+            losses.append(loss.item())
+
+        epoch_loss = sum(losses) / len(losses)
+        epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
+        epoch_time = time.time() - epoch_start
+        if show_log and self.gpu_id == 0:
+            self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                     epoch_time // 60, 
+                                                                                     epoch_time % 60))
+        return epoch_loss
+    
+    def _save_checkpoint(self, epoch):
+        ckp = self.model.module.state_dict()
+        PATH = join(config.train['model_path'], config.train['model_name'], config.train['model_name']+str(epoch))
+        torch.save(ckp, PATH)
+
+    def train(self, max_epochs: int):
+        train_losses = []
+        valid_losses = []
+        for epoch in range(max_epochs):
+            train_loss, valid_loss = self._run_epoch(epoch)
+            train_losses.append(train_loss)
+            valid_losses.append(valid_loss)
+            if self.gpu_id == 0 and epoch % self.save_every == 0:
+                self._save_checkpoint(epoch)
+        losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
+        model_name = config.train['model_name']
+        losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
                 
+    # Function necessary for L-BFGS training to work per the docs
+    def closure():
+        lbfgs.zero_grad()
+        loss = self.criterion(x_lbfgs)
+        loss.backward()
+        return loss
+
 
 #------------------#
 # Global functions #
 #------------------#
 
-def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer, save_every=1, 
-             total_epochs=config.train['epoch_number'], 
-             batch_size=config.train['batch_size'], 
-             nfeatures=config.train['feature_number']):
+def train_nn(rank: int, world_size: int, stage='train', Model=ForkCNN, Trainer=CNNTrainer, 
+             save_every=1, total_epochs=50, batch_size=100, nfeatures=2):
+    '''
+    Main function to train any network. stage, Model, and Trainer should be specified.
+    stages can be 'train', 'cali' or 'weights (WIP)'
+    '''
+    # Set parameters based on stage
+    eval(f"total_epochs=config.{stage}['epoch_number']")
+    eval(f"batch_size=config.{stage}['batch_size']")
+    eval(f"nfeatures=config.{stage}['feature_number']")
     
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger('Setup')
@@ -251,7 +370,7 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer, save
     ddp_setup(rank, world_size)
     log.info(f'[rank: {rank}] Successfully set up device')
     
-    train_ds, valid_ds, model, optimizer = load_train_objs(nfeatures, batch_size, world_size, Model)
+    eval(f"train_ds, valid_ds, model, optimizer = load_{stage}_objs(nfeatures, batch_size, world_size, Model)")
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     log.info(f'[rank: {rank}] Successfully loaded training objects')
@@ -279,12 +398,27 @@ def ddp_setup(rank, world_size):
     torch.cuda.synchronize()
 
 def load_train_objs(nfeatures, batch_size, GPUs, Model):
+    # Create dataset objects
     train_ds = pxt.TorchDataset(config.data['data_dir'])
     valid_ds = pxt.TorchDataset(config.test['data_dir'])
+    # Initialize model and optimizer
     model = Model(batch_size, GPUs=GPUs)  # load your model
     optimizer = optim.SGD(model.parameters(), 
                           lr=config.train['initial_learning_rate'],
                           momentum=config.train['momentum'])
+    return train_ds, valid_ds, model, optimizer
+
+def load_cali_objs(nfeatures, batch_size, GPUs, Model):
+    # Create dataset objects
+    train_ds = pxt.TorchDataset(config.cali['train_dir'])
+    valid_ds = pxt.TorchDataset(config.cali['test_dir'])
+    # Initialize model and optimizer
+    model = Model(batch_size, GPUs=GPUs)
+    optimizer = optim.LBFGS(model.parameters(),
+                            lr=config.cali['learning_rate'],
+                            history_size=10,
+                            max_iter=4, 
+                            line_search_fn="strong_wolfe")
     return train_ds, valid_ds, model, optimizer
 
 def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
@@ -315,7 +449,9 @@ def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
     return model
 
 def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
-
+    '''
+    Run this function to test performance of trained models
+    '''
     model.eval()
     losses=[]
     for i, batch in enumerate(test_data):
@@ -341,17 +477,6 @@ def predict(nfeatures, test_data, model, criterion=nn.MSELoss(), gpu_id=0):
     epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
 
     return combined_pred, combined_fid, epoch_loss
-                
-#-----------------------------#
-# Calibration Network Trainer #
-#-----------------------------#
-
-# Function necessary for L-BFGS training to work per the docs
-def closure():
-    lbfgs.zero_grad()
-    loss = loss_func(x_lbfgs)
-    loss.backward()
-    return loss
 
 ##################################################
 

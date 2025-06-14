@@ -5,7 +5,9 @@ import config
 
 ## CNN
 class ResidualBlock(nn.Module):
-    
+    '''
+    A residual block object that skips layers until stride > 1, i.e. the size of data shrinks
+    '''
     
     def __init__(self,in_channels,out_channels,stride=1,kernel_size=3,padding=1,bias=False):
         
@@ -45,7 +47,9 @@ class ResidualBlock(nn.Module):
 
     
 class ForkCNN(nn.Module):
-    
+    '''
+    CNN used for direct prediction of parameters.
+    '''
     def __init__(self, batch_size, GPUs=1, 
                  nspec=config.data['nspec'], 
                  nfeatures=config.train['feature_number']):
@@ -152,6 +156,7 @@ class ForkCNN(nn.Module):
         
         ### Fully-connected layers
         self.fully_connected_layer = nn.Sequential(
+            # make sure the first number is equal to the sum of final # of channels in both img and spec branches
             nn.Linear(1024, 512),
             nn.Linear(512, 256),
             nn.Linear(256, 128),
@@ -178,6 +183,9 @@ class ForkCNN(nn.Module):
         return z
 
 class DeconvNN(nn.Module):
+    '''
+    A deconv model in testing
+    '''
     def __init__(self, batch_size, GPUs=1, 
                  nspec=config.data['nspec'], 
                  nfeatures=config.train['feature_number']):
@@ -258,18 +266,18 @@ class DeconvNN(nn.Module):
 ## NN calibration
 class CaliNN(nn.Module):
     
-    def __init__(self):
+    def __init__(self, nfeatures=config.cali['feature_number']):
         super(CaliNN, self).__init__()
         
         self.main_net = nn.Sequential(
             #nn.ReLU(),
-            nn.Linear(4,5),
+            nn.Linear(nfeatures,8),
             #nn.ReLU(),
-            nn.Linear(5,5),
+            nn.Linear(8,8),
             #nn.ReLU(),
-            nn.Linear(5,5),
+            nn.Linear(8,8),
             #nn.ReLU(),
-            nn.Linear(5,1),
+            nn.Linear(8,2),
         )
 
     

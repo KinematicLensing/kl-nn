@@ -10,20 +10,20 @@ import config
 
 ### Dataset for NN calibration
 class CaliDataset(Dataset):
-    def __init__(self, ids, inputs, true):
+    def __init__(self, case, inputs, true, ids):
         
-        self.inputs = inputs
-        self.true = true
-        self.ids = ids
+        self.inputs = np.load(inputs)[case]
+        self.true = np.load(true)[case]
+        self.ids = np.load(ids)[case]
 
     def __len__(self):
-        return self.ids.shape[1]
+        return self.ids.shape[0]
 
-    def __getitem__(self, case, ID):
+    def __getitem__(self, ID):
         
-        return {'inputs': self.inputs[case, ID],
-                'target': self.true[case, ID],
-                'id': self.ids[case, ID]}
+        return {'inputs': self.inputs[ID].astype(np.float32),
+                'target': self.true[ID, :2].astype(np.float32),
+                'id': int(self.ids[ID])}
     
 
 ### Dataset for NN calibration training

@@ -61,7 +61,7 @@ cali = \
     'valid_size': 100000,
     
     'epoch_number': 60,
-    'learning_rate': 0.001,
+    'learning_rate': 0.0001,
     'batch_size': 100,
     'feature_number': 7,
     

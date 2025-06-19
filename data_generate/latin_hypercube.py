@@ -20,7 +20,7 @@ def main():
                      [0.1, 10],       # rscale
                      [0.1, 5]]        # hlr
     ndim = len(sample_limits)
-    nsamples = 1e5
+    nsamples = int(5e5)
 
     sample_centers = []
     sample_scale = []
@@ -63,7 +63,7 @@ def main():
     plt.close(fig)
     
     # Save parameter samples
-    df.to_csv(join(SAMPDIR, 'samples_test_low_g_1m.csv'))
+    df.to_csv(join(SAMPDIR, 'samples_test_5m.csv'))
 
 
 if __name__ == '__main__':

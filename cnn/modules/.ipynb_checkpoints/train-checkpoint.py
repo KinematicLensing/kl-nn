@@ -116,10 +116,12 @@ class CNNTrainer:
         torch.save(ckp, PATH)
 
     def train(self, max_epochs: int):
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', verbose=True)
         train_losses = []
         valid_losses = []
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
+            scheduler.step(train_loss)
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == 0 and epoch % self.save_every == 0:

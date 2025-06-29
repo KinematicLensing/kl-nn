@@ -8,7 +8,7 @@ data = \
     'nspec': 3,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_train_5m.csv',
-    'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/databases/train_database_5m',
+    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_5m',
     'data_stem': 'training_'
 }
 
@@ -20,7 +20,7 @@ test = \
     'nspec': 3,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_test_5m.csv',
-    'data_dir': '/xdisk/timeifler/wxs0703/kl_nn/databases/test_database_5m',
+    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_5m',
     'data_stem': 'testing_'
 }
 
@@ -29,7 +29,9 @@ par_ranges = \
 {
     'g1': [-0.1, 0.1],
     'g2': [-0.1, 0.1],
-    'theta_int': [-np.pi, np.pi],
+    'theta_int': [0, np.pi],
+    #'sin_theta': [-1, 1],
+    #'cos_theta': [-1, 1],
     'sini': [0, 1],
     'v0': [-30, 30],
     'vcirc': [60, 540],
@@ -41,7 +43,7 @@ par_ranges = \
 train = \
 {
 
-    'epoch_number': 100,
+    'epoch_number': 60,
     'initial_learning_rate': 0.01,
     'momentum': 0.9,
     
@@ -49,8 +51,8 @@ train = \
     'feature_number': 8,
     
     'save_model': True,
-    'model_path': '/xdisk/timeifler/wxs0703/kl_nn/model/',
-    'model_name': 'randSNR_5m',
+    'model_path': '/data/wxs0703/kl-nn/models/',
+    'model_name': 'randSNR_5m_scheduler',
     
 }
 

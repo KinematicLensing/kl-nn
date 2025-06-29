@@ -158,11 +158,14 @@ class ForkCNN(nn.Module):
         self.fully_connected_layer = nn.Sequential(
             # make sure the first number is equal to the sum of final # of channels in both img and spec branches
             nn.Linear(1024, 512),
+            #nn.Dropout(),
             nn.Linear(512, 256),
+            #nn.Dropout(),
             nn.Linear(256, 128),
+            #nn.Dropout(),
             nn.Linear(128, 32),
-            nn.Linear(32, self.nfeatures),
-            nn.Sigmoid()
+            #nn.Dropout(),
+            nn.Linear(32, self.nfeatures)
         )
 
     

@@ -53,7 +53,7 @@ class CNNTrainer:
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
         outputs = self.model(img, spec)
-        loss = self.criterion(outputs, fid)      
+        loss = self.criterion(outputs, fid)
         loss.backward()                   
         self.optimizer.step()
         return loss
@@ -63,7 +63,9 @@ class CNNTrainer:
         self.train_data.sampler.set_epoch(epoch)
         self.valid_data.sampler.set_epoch(epoch)
         train_loss = self._trainFunc(epoch)
+        torch.distributed.barrier()
         valid_loss = self._validFunc(epoch)
+        torch.distributed.barrier()
         
         return train_loss, valid_loss
     
@@ -78,15 +80,19 @@ class CNNTrainer:
             loss = self._run_batch(img, spec, fid)
             losses.append(loss.item())
             if show_log and self.gpu_id == 0 and i%100 == 0:
-                self.logger.info(f"Batch {i} complete")
+                #self.logger.info(f"Batch {i} complete")
+                print(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
         epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == 0:
-            self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                                     epoch_time // 60, 
-                                                                                     epoch_time % 60))
+            #self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+            #                                                                         epoch_time // 60, 
+            #                                                                         epoch_time % 60))
+            print("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                          epoch_time // 60, 
+                                                                          epoch_time % 60))
         return epoch_loss
 
     def _validFunc(self,epoch,show_log=True):
@@ -104,10 +110,13 @@ class CNNTrainer:
         epoch_loss = sum(losses) / len(losses)
         epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
-        if show_log and self.gpu_id == 0:
-            self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                                     epoch_time // 60, 
-                                                                                     epoch_time % 60))
+        if show_log and self.gpu_id == 0 and i%100 == 0:
+            #self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+            #                                                                         epoch_time // 60, 
+            #                                                                         epoch_time % 60))
+            print("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                          epoch_time // 60, 
+                                                                          epoch_time % 60))
         return epoch_loss
     
     def _save_checkpoint(self, epoch):
@@ -116,12 +125,12 @@ class CNNTrainer:
         torch.save(ckp, PATH)
 
     def train(self, max_epochs: int):
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', verbose=True)
+        #scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min')
         train_losses = []
         valid_losses = []
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
-            scheduler.step(train_loss)
+            #scheduler.step(train_loss)
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == 0 and epoch % self.save_every == 0:
@@ -360,9 +369,9 @@ def train_nn(rank: int, world_size: int, stage='train', Model=ForkCNN, Trainer=C
     stages can be 'train', 'cali' or 'weights (WIP)'
     '''
     # Set parameters based on stage
-    eval(f"total_epochs=config.{stage}['epoch_number']")
-    eval(f"batch_size=config.{stage}['batch_size']")
-    eval(f"nfeatures=config.{stage}['feature_number']")
+    total_epochs = config.train['epoch_number']
+    batch_size = config.train['batch_size']
+    nfeatures = config.train['feature_number']
     
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger('Setup')
@@ -372,7 +381,12 @@ def train_nn(rank: int, world_size: int, stage='train', Model=ForkCNN, Trainer=C
     ddp_setup(rank, world_size)
     log.info(f'[rank: {rank}] Successfully set up device')
     
-    eval(f"train_ds, valid_ds, model, optimizer = load_{stage}_objs(nfeatures, batch_size, world_size, Model)")
+    if stage == 'train':
+        train_ds, valid_ds, model, optimizer = load_train_objs(nfeatures, batch_size, world_size, Model)
+    elif stage == 'cali':
+        train_ds, valid_ds, model, optimizer = load_cali_objs(nfeatures, batch_size, world_size, Model)
+    else:
+        raise('Invalid stage, must be train or cali')
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     log.info(f'[rank: {rank}] Successfully loaded training objects')
@@ -394,7 +408,7 @@ def ddp_setup(rank, world_size):
         world_size: Total number of processes
     """
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = "12356"
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
@@ -427,13 +441,11 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
-        pin_memory=True,
         sampler=DistributedSampler(train_ds),
     )
     valid_dl = DataLoader(
         valid_ds,
         batch_size=batch_size,
-        pin_memory=True,
         sampler=DistributedSampler(valid_ds),
     )
     return train_dl, valid_dl

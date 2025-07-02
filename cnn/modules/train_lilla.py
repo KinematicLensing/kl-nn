@@ -121,6 +121,7 @@ class CNNTrainer:
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
         outputs = self.model(img, spec)
+        #loss = (2*self.criterion(outputs[:, :2]**2, fid[:, :2]**2) + 3*self.criterion(outputs[:, 2:], fid[:, 2:]))
         loss = self.criterion(outputs, fid)
         loss.backward()                   
         self.optimizer.step()
@@ -209,7 +210,7 @@ class CNNTrainer:
 
     def train(self, max_epochs: int):
         self._set_tensors()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=5)
         train_losses = []
         valid_losses = []
         self.train_order = np.linspace(0, self.ntrain-1, self.ntrain, dtype=int)
@@ -218,7 +219,8 @@ class CNNTrainer:
             print("Training start")
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
-            scheduler.step(train_loss)
+            scheduler.step(valid_loss)
+            print(f"Current LR is {scheduler.get_last_lr()}")
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == 0 and epoch % self.save_every == 0:

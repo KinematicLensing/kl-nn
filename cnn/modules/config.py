@@ -8,7 +8,7 @@ data = \
     'nspec': 3,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_train_5m.csv',
-    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_5m',
+    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_box_noiseless',
     'data_stem': 'training_'
 }
 
@@ -20,7 +20,7 @@ test = \
     'nspec': 3,
     
     'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_test_5m.csv',
-    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_5m',
+    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_box_noiseless',
     'data_stem': 'testing_'
 }
 
@@ -43,16 +43,16 @@ par_ranges = \
 train = \
 {
 
-    'epoch_number': 60,
+    'epoch_number': 30,
     'initial_learning_rate': 0.01,
     'momentum': 0.9,
     
-    'batch_size': 100,
+    'batch_size': 200,
     'feature_number': 8,
     
     'save_model': True,
     'model_path': '/data/wxs0703/kl-nn/models/',
-    'model_name': 'randSNR_5m_scheduler',
+    'model_name': 'randSNR_box_noiseless',
     
 }
 

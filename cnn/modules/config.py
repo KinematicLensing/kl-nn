@@ -7,8 +7,7 @@ data = \
     'nimgs': 3,
     'nspec': 3,
     
-    'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_train_5m.csv',
-    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_box_noiseless',
+    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_1m',
     'data_stem': 'training_'
 }
 
@@ -19,8 +18,7 @@ test = \
     'nimgs': 3,
     'nspec': 3,
     
-    'pars_dir': '/xdisk/timeifler/wxs0703/kl_nn/samples/samples_test_5m.csv',
-    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_box_noiseless',
+    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_1m',
     'data_stem': 'testing_'
 }
 
@@ -43,30 +41,32 @@ par_ranges = \
 train = \
 {
 
-    'epoch_number': 30,
-    'initial_learning_rate': 0.01,
+    'epoch_number': 100,
+    'initial_learning_rate': 0.1,
     'momentum': 0.9,
     
-    'batch_size': 200,
+    'batch_size': 100,
     'feature_number': 8,
     
     'save_model': True,
     'model_path': '/data/wxs0703/kl-nn/models/',
-    'model_name': 'randSNR_box_noiseless',
+    'model_name': 'test_1m_noise_nonorm',
+    'use_pretrain': False,
+    'pretrained_name': 'randSNR_noiseless',
+    'pretrain_from': 46
     
 }
 
 # Calibration network training metaparameters
 cali = \
 {
-    'train_size': 200000,
-    'valid_size': 100000,
-    
-    'epoch_number': 60,
+    'epoch_number': 30,
     'learning_rate': 0.0001,
     'batch_size': 100,
-    'feature_number': 7,
+    'feature_number': 8,
     
-    'train_dir': '/xdisk/timeifler/wxs0703/kl_nn/train_data_200k/train_database_random_SNR',
-    'valid_dir': '/xdisk/timeifler/wxs0703/kl_nn/test_data/test_database_random_SNR',
+    'model_path': '/data/wxs0703/kl-nn/models/',
+    'model_name': 'test_1m_noise_nonorm',
+    'data_dir': '/data/wxs0703/kl-nn/databases/cali_database_5m',
+    'res_dir': '/data/wxs0703/kl-nn/cali/'
 }

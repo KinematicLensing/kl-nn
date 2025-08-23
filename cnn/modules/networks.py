@@ -62,23 +62,17 @@ class ForkCNN(nn.Module):
         
         self.cnn_img = nn.Sequential(
             
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(True),
             
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(True),
             
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            ResidualBlock(32, 64),
-            ResidualBlock(64, 64),
-            ResidualBlock(64, 64),
-            ResidualBlock(64, 64, 2),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             
             ResidualBlock(64, 128),
-            ResidualBlock(128, 128),
             ResidualBlock(128, 128),
             ResidualBlock(128, 128),
             ResidualBlock(128, 128, 2),
@@ -91,10 +85,11 @@ class ForkCNN(nn.Module):
             
             ResidualBlock(256, 512),
             ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512, 2),
             
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
+            nn.AvgPool2d(3),
             
         )
         
@@ -163,9 +158,9 @@ class ForkCNN(nn.Module):
             #nn.Dropout(),
             nn.Linear(256, 128),
             #nn.Dropout(),
-            nn.Linear(128, 32),
+            nn.Linear(128, 64),
             #nn.Dropout(),
-            nn.Linear(32, self.nfeatures)
+            nn.Linear(64, self.nfeatures)
         )
 
     

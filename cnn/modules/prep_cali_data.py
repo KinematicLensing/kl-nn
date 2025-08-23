@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 import pyxis.torch as pxt
 
 from networks import *
-from train_lilla import *
+from train_cali import *
 import config
 
 if __name__ == "__main__":
@@ -18,4 +18,4 @@ if __name__ == "__main__":
     
     world_size = torch.cuda.device_count() # 1
 
-    mp.spawn(train_nn, args=(world_size, ForkCNN, CNNTrainer), nprocs=world_size)
+    mp.spawn(predict, args=(world_size, ForkCNN), nprocs=world_size)

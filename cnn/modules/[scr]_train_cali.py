@@ -12,10 +12,10 @@ from train_cali import *
 import config
 
 if __name__ == "__main__":
-
-    os.system(f"mkdir {join(config.train['model_path'], config.train['model_name'])}")
+    
+    os.system(f"mkdir {join(config.cali['model_path'], config.cali['model_name'])}")
     os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,5,6,7" #(Put the number(s) you want for the GPUs)
     
     world_size = torch.cuda.device_count() # 1
 
-    mp.spawn(predict, args=(world_size, ForkCNN), nprocs=world_size)
+    mp.spawn(train_cali, args=(world_size, CaliNN), nprocs=world_size)

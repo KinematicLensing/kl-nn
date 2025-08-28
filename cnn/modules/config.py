@@ -64,9 +64,11 @@ cali = \
     'learning_rate': 0.0001,
     'batch_size': 100,
     'feature_number': 8,
+    'n_cases': 5000,
+    'n_realizations': 1000,
     
     'model_path': '/data/wxs0703/kl-nn/models/',
-    'model_name': 'test_1m_noise_nonorm',
+    'model_name': 'cali_1m_noise_nonorm',
     'data_dir': '/data/wxs0703/kl-nn/databases/cali_database_5m',
     'res_dir': '/data/wxs0703/kl-nn/cali/'
 }

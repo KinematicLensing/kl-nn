@@ -50,13 +50,11 @@ class ForkCNN(nn.Module):
     '''
     CNN used for direct prediction of parameters.
     '''
-    def __init__(self, batch_size, GPUs=1, 
-                 nspec=config.data['nspec'], 
+    def __init__(self, batch_size, nspec=config.data['nspec'], 
                  nfeatures=config.train['feature_number']):
         
         self.nfeatures = nfeatures
         self.batch = batch_size
-        self.GPUs = GPUs
         
         super(ForkCNN, self).__init__()
         
@@ -268,13 +266,11 @@ class CaliNN(nn.Module):
         super(CaliNN, self).__init__()
         
         self.main_net = nn.Sequential(
-            #nn.ReLU(),
-            nn.Linear(nfeatures,8),
-            #nn.ReLU(),
-            nn.Linear(8,8),
-            #nn.ReLU(),
-            nn.Linear(8,8),
-            #nn.ReLU(),
+            nn.Tanh(),
+            nn.Linear(nfeatures,10),
+            nn.Tanh(),
+            nn.Linear(10,10),
+            nn.Tanh(),
             nn.Linear(8,2),
         )
 

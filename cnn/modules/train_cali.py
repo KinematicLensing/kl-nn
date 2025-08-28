@@ -39,7 +39,6 @@ class Predictor:
         nfeatures: int,
         cali_ds: FiberDataset,
         gpu_id: int,
-        save_every: int,
         batch_size: int,
     ) -> None:
         self.world_size = world_size
@@ -47,9 +46,8 @@ class Predictor:
         self.device = torch.device(f"cuda:{gpu_id}")
         self.nfeatures = nfeatures
         self.cali_data = cali_ds
-        self.optimizer = optimizer
-        self.save_every = save_every
         self.model = model
+        self.criterion = nn.MSELoss()
         self.batch_size = batch_size
         self.ncali = len(cali_ds)//world_size
         self.nbatch_cali = self.ncali//self.batch_size
@@ -63,12 +61,12 @@ class Predictor:
         if self.gpu_id == 0:
             print("Initializing datasets on GPU...")
         self.img_cali = torch.empty((self.ncali, 1, 48, 48), dtype=torch.float, device=self.device)
-        self.spec_vali = torch.empty((self.ncali, 1, 3, 64), dtype=torch.float, device=self.device)
+        self.spec_cali = torch.empty((self.ncali, 1, 3, 64), dtype=torch.float, device=self.device)
         self.fid_cali = torch.empty((self.ncali, self.nfeatures), dtype=torch.float, device=self.device)
         self.SNR_cali = torch.rand((self.ncali,), device=self.device)*190+10
         
         # Fill arrays with values
-        start = self.gpu_id*self.cali
+        start = self.gpu_id*self.ncali
         if self.gpu_id == 0:
             print("Uploading training set to GPU...")
         prev_prog = 0
@@ -100,37 +98,34 @@ class Predictor:
         #return (data-mean)/std
         return data
 
-    def _run_batch(self, img, spec, fid):
-        self.optimizer.zero_grad()
-        outputs = self.model(img, spec)
-        loss = self.criterion(outputs, fid)
-        loss.backward()                   
-        self.optimizer.step()
-        return loss
-        return epoch_loss
-
     def _predFunc(self, show_log=True):
         self.model.eval()
         results = torch.empty((self.ncali, self.nfeatures), dtype=torch.float, device=self.device)
-        for i in range(self.nbatch_cali):
-            start = i*self.batch_size
-            end = start+self.batch_size
-            batch_ids = self.valid_order[start:end]
-            snr = self.SNR_cali[start:end]
-            img = self._apply_noise(self.img_valid[start:end], snr)
-            spec = self._apply_noise(self.spec_valid[start:end], snr)
-            fid = self.fid_valid[start:end]
-            
-            outputs = self.model(img, spec)
-            loss = self.criterion(outputs, fid)
-            results[start:end] = outputs
-            
-            if show_log and self.gpu_id == 0 and i%100 == 0:
-                #self.logger.info(f"Batch {i} complete")
-                print(f"Batch {i} complete")
-              
+        shear = torch.empty((self.ncali, 2), dtype=torch.float, device=self.device)
+        losses = []
+        with torch.no_grad():
+            for i in range(self.nbatch_cali):
+                start = i*self.batch_size
+                end = start+self.batch_size
+                snr = self.SNR_cali[start:end]
+                img = self._apply_noise(self.img_cali[start:end], snr)
+                spec = self._apply_noise(self.spec_cali[start:end], snr)
+                fid = self.fid_cali[start:end]
+
+                outputs = self.model(img, spec)
+                losses.append(self.criterion(outputs, fid).item())
+                results[start:end] = outputs
+                shear[start:end] = fid[:, :2]
+
+                if show_log and self.gpu_id == 0 and i%100 == 0:
+                    #self.logger.info(f"Batch {i} complete")
+                    print(f"Batch {i} complete")
+        
+        loss = np.mean(np.array(losses))**0.5
         results = results.cpu().numpy()
-        np.save(join(config.cali['res_dir'], config.cali['model_name']+str(rank)), results)
+        shear = shear.cpu().numpy()
+        np.save(join(config.cali['res_dir'], config.cali['model_name']+str(self.gpu_id)), results)
+        np.save(join(config.cali['res_dir'], f'shear{self.gpu_id}'), shear)
 
         if show_log and self.gpu_id == 0:
             print(f"Loss: {loss}")
@@ -142,20 +137,120 @@ class Predictor:
         if self.gpu_id == 0:
             print("Running data through CNN...")
         cali_loss = self._predFunc()
+
         
+#------------------------#
+# Calibration NN Trainer #
+#------------------------#
+
+class CaliTrainer:
+    '''
+    Trainer class for calibration network
+    '''
+    def __init__(
+        self,
+        world_size: int,
+        model: torch.nn.Module,
+        nfeatures: int,
+        cali_ds: torch.Tensor,
+        shear: torch.Tensor,
+        gpu_id: int,
+        batch_size: int,
+    ) -> None:
+        self.world_size = world_size
+        self.gpu_id = gpu_id
+        self.device = torch.device(f"cuda:{gpu_id}")
+        self.nfeatures = nfeatures
+        self.model = model
+        self.optimizer = optim.LBFGS(model.parameters(),
+                         lr=config.cali['learning_rate'],
+                         history_size=100,
+                         max_iter=20)
+        self.batch_size = batch_size
+        self.ncali = len(cali_ds)//world_size
+        self.nbatch_cali = self.ncali//self.batch_size
+        self.logger = logging.getLogger('Trainer')
+        
+        self.cali_data = cali_ds
+        self.shear = shear
+        self.ncases = config.cali['n_cases']/world_size
+        self.nreals = config.cali['n_realizations']
+        self.nbatch_case = self.nreal/self.batch_size
+
+    def predict(self):
+        self._set_tensors()
+        if self.gpu_id == 0:
+            print("Running data through CNN...")
+        cali_loss = self._predFunc()
+    
+    def run_iter(self):
+    
+        losses = torch.full((self.ncases, 2), 0.).to(self.device)
+
+        for case in range(self.ncases):
+
+            case_loss = torch.tensor([0., 0.]).to(self.device)
+
+            for batch in range(self.nbatch_case):
+                
+                start = case*self.nreals + batch*self.batch_size
+                end = start + self.batch_size
+                inputs = self.cali_data[start:end]
+                target = self.shear[start:end]
+                outputs = model(inputs)
+                loss = torch.sum(torch.abs(outputs-target), dim=0)
+                case_loss += torch.sum(loss, dim=0)
+
+            losses[case] = (case_loss / nreal)**2
+
+        loss = torch.sum(losses)/(2*ncases)
+
+        return loss
+    
+    def closure(self):
+        optimizer.zero_grad()
+        loss = self.run_iter()
+        loss.backward()
+        return loss
+    
+    def train(self, nepochs):
+        
+        train_history = []
+        valid_history = []
+        
+        for i in range(nepochs):
+    
+            model.train()
+            train_loss = self.run_iter().cpu().item()
+            train_history.append(train_loss)
+            self.optimizer.step(self.closure)
+            print(f"[TRAIN] epoch {i+1} loss: {train_loss}")
+
+            model.eval()
+            valid_loss = self.run_iter().cpu().item()
+            valid_history.append(valid_loss)
+            print(f"[VALID] epoch {i+1} loss: {valid_loss}")
+
+            ckp = model.module.state_dict()
+            PATH = join(config.cali['model_path'], config.cali['model_name'], config.cali['model_name']+str(i+1))
+            torch.save(ckp, PATH)
+        
+        losses = pd.DataFrame(np.vstack([train_history, valid_history]))
+        model_name = config.cali['model_name']
+        losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
+    
 
 #------------------#
 # Global functions #
 #------------------#
 
-def predict(rank: int, world_size: int, Model=ForkCNN, 
-            save_every=1, batch_size=100, nfeatures=2):
+def predict(rank: int, world_size: int, Model=ForkCNN, batch_size=100, nfeatures=2):
     '''
     Main function to train any network.
     '''
     # Set parameters based on stage
-    batch_size = config.train['batch_size']
-    nfeatures = config.train['feature_number']
+    batch_size = config.cali['batch_size']
+    nfeatures = config.cali['feature_number']
     epoch = config.cali['epoch_number']
     
     logging.basicConfig(level=logging.INFO)
@@ -170,7 +265,7 @@ def predict(rank: int, world_size: int, Model=ForkCNN,
     cali_ds = pxt.TorchDataset(config.cali['data_dir'])
     
     # Initialize model
-    model_dir = config.train['model_path'] + config.train['pretrained_name'] + '/' + config.train['pretrained_name'] + str(epoch)
+    model_dir = config.cali['model_path'] + config.cali['model_name'] + '/' + config.cali['model_name'] + str(epoch)
     model = load_model(path=model_dir,strict=True, assign=True)
     if rank == 0:
         print(f"Loaded model {config.train['pretrained_name']} at epoch {epoch}")
@@ -179,10 +274,44 @@ def predict(rank: int, world_size: int, Model=ForkCNN,
     
     log.info(f'[rank: {rank}] Successfully loaded training objects')
     
-    predictor = Predictor(world_size, model, nfeatures, train_ds, valid_ds, optimizer, rank, save_every, batch_size)
+    predictor = Predictor(world_size, model, nfeatures, cali_ds, rank, batch_size)
     log.info(f'[rank: {rank}] Successfully initialized Predictor')
     torch.distributed.barrier()
     predictor.predict()
+    destroy_process_group()
+    
+def train_cali(rank: int, world_size: int, Model=CaliNN, batch_size=100, nfeatures=2):
+    '''
+    Main function to train any network.
+    '''
+    # Set parameters based on stage
+    batch_size = config.cali['batch_size']
+    nfeatures = config.cali['feature_number']
+    epoch = config.cali['epoch_number']
+    
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger('Setup')
+    if rank == 0:
+        log.info('Initializing')
+    
+    ddp_setup(rank, world_size)
+    log.info(f'[rank: {rank}] Successfully set up device')
+    
+    # Create dataset object
+    cali_ds = np.load(join(config.cali['res_dir'], config.cali['model_name']+str(rank))).to(rank)
+    shear = np.load(join(config.cali['res_dir'], f'shear{rank}')).to(rank)
+    
+    # Initialize model
+    model = Model()
+    model = model.to(rank)
+    model = DDP(model, device_ids=[rank])
+    
+    log.info(f'[rank: {rank}] Successfully loaded training objects')
+    
+    Trainer = CaliTrainer(world_size, model, nfeatures, cali_ds, shear, rank, batch_size)
+    log.info(f'[rank: {rank}] Successfully initialized Predictor')
+    torch.distributed.barrier()
+    Trainer.
     destroy_process_group()
     
 def ddp_setup(rank, world_size):
@@ -199,7 +328,7 @@ def ddp_setup(rank, world_size):
 
 def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
 
-    model = Model(config.train['batch_size'], GPUs=GPUs)
+    model = Model(config.cali['batch_size'], 3, config.cali['feature_number'])
     model.to(0)
     if GPUs > 1:
         model = DDP(model, device_ids=None)

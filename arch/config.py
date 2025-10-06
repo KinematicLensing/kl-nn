@@ -4,22 +4,16 @@ import numpy as np
 data = \
 {
     'size': 5000000,
-    'nimgs': 3,
-    'nspec': 3,
-    
     'data_dir': '/data/wxs0703/kl-nn/databases/train_database_1m',
-    'data_stem': 'training_'
+    'data_stem': 'gal_'
 }
 
 # Validation data info and locations
 test = \
 {
     'size': 500000,
-    'nimgs': 3,
-    'nspec': 3,
-    
     'data_dir': '/data/wxs0703/kl-nn/databases/test_database_1m',
-    'data_stem': 'testing_'
+    'data_stem': 'gal_'
 }
 
 # Which parameters should the CNN predict and what are their prior ranges?
@@ -46,7 +40,7 @@ train = \
     'momentum': 0.9,
     
     'batch_size': 100,
-    'feature_number': 8,
+    'feature_number': 2,
     
     'save_model': True,
     'model_path': '/data/wxs0703/kl-nn/models/',

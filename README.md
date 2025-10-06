@@ -1,13 +1,11 @@
 # kl-nn
 Neural network tools for accelerating KL analyses
 
-Requires [kl-tools](https://github.com/sweverett/kl-tools) and all its dependent packages
-
-Versions:
-Python = 3.9+;
-numpy = 1.26+;
-pytorch = 2.5.1+;
-also requires [ml-pyxis](https://github.com/vicolab/ml-pyxis) for database generation
+### Setup
+1. Git clone [kl-tools](https://github.com/wxs0703/kl-tools), move to the `data_generate` branch
+2. Create a new conda environment, and install all packages specified in the `environments.yml` file in the kl-tools directory
+3. Do `pip install .` inside the kl-tools directory to install kl-tools in your environment
+4. Install [ml-pyxis](https://github.com/vicolab/ml-pyxis) for database generation
 
 ### Data Generation
 Code for generating training data is located in `kl-nn/data_generate`
@@ -21,10 +19,10 @@ Code for generating training data is located in `kl-nn/data_generate`
 3. Create training and testing databases using `make_database.ipynb`. Use the `_only_g` version of the notebook if you only want to train to predict shear. The database format is smaller and easier for the training algorithm to digest.
 
 ### Network Config, Training and Testing
-Code for configuring neural network, training and testing is located in `kl-nn/cnn/modules`
+Code for configuring neural network, training and testing is located in `kl-nn/arch`
 
-Network configuration is all done in `networks.py`. Loss function and training process can be edited in `train.py`. If creating new networks be sure to follow the same input-output format as the default ForkCNN (input img, spec; output pred).
+Network configuration is all done in `networks.py`. Loss function and training process can be edited in `train.py`.
 
 Training configuration is done in `config.py`. Important parameters are `'size', 'pars_dir', 'data_dir'` as well as all the parameters in the `train` dictionary. To train simply configure and run `train_model_full.slurm`. the notebook `train_model.ipynb` only exists for debug purposes.
 
-To test the network simply follow the steps in `test_model.ipynb`.
+To test the network simply follow the `test_model.ipynb` notebook.

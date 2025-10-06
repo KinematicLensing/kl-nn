@@ -1,36 +1,19 @@
-# This is to ensure that numpy doesn't have
-# OpenMP optimizations clobber our own multiprocessing
-_USER_RUNNER_CLASS_ = False
-import os
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
-
 import numpy as np
-import sys, copy, os
+import copy, os
+from os.path import join
 from argparse import ArgumentParser
 from astropy.units import Unit
-import galsim as gs
-import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
-from matplotlib.patches import Circle
+SCR_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # From KL-tools
-import priors, likelihood
-from cube import FiberModelCube
-from parameters import Pars, MetaPars
-from likelihood import LogPosterior, GrismLikelihood, get_GlobalDataVector, FiberLikelihood
-from velocity import VelocityMap
-from datavector import FiberDataVector
-from emission import LINE_LAMBDAS
-
-import ipdb
-import time
+import kl_tools.priors as priors
+from kl_tools.parameters import Pars
+from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
 
 ########################### Parsing arguments ##################################
 parser = ArgumentParser()
 parser.add_argument('-n', type=int, default=1, help='folder id')
-parser.add_argument('-isTrain', type=int, default=1, help='folder id')
+parser.add_argument('-d', type=str, default='small', help='dataset name')
 parser.add_argument('-ID', type=int, default=0, help='sample id')
 parser.add_argument('-g1', type=float, default=0, help='shear component 1')
 parser.add_argument('-g2', type=float, default=0, help='shear component 2')
@@ -40,14 +23,9 @@ parser.add_argument('-v0', type=float, default=0, help='systemic velocity')
 parser.add_argument('-vcirc', type=float, default=300, help='max rotation velocity')
 parser.add_argument('-rscale', type=float, default=1, help='velocity scale radius')
 parser.add_argument('-hlr', type=float, default=1, help='half-light radius')
-group = parser.add_mutually_exclusive_group()
-group.add_argument('--mpi', dest='mpi', default=False, action='store_true',
-                   help='Run with MPI.')
-group.add_argument('-ncores', default=1, type=int,
-                    help='Number of processes (uses `multiprocessing` sequencial pool).')
 args = parser.parse_args()
-isTrain = bool(args.isTrain)
 n = args.n
+d = args.d
 ID = args.ID
 g1 = args.g1
 g2 = args.g2
@@ -58,6 +36,7 @@ vcirc = args.vcirc
 rscale = args.rscale
 hlr = args.hlr
 
+# Some global observation variables
 fiber_blur = 3.4 # pixels
 atm_psf_fwhm = 1.0 # arcsec
 fiber_rad = 0.75 # arcsec
@@ -66,8 +45,7 @@ exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
-TRAIN_DIR = f'/xdisk/timeifler/wxs0703/kl_nn/train_data/temp_{n}/'
-TEST_DIR = f'/xdisk/timeifler/wxs0703/kl_nn/test_data/temp_{n}/'
+FITS_DIR = f'/ocean/projects/phy250048p/shared/fits/{d}/part_{n}/'
 
 ##################### Setting up observation configurations ####################
 
@@ -78,7 +56,7 @@ default_photo_conf = {'INSTNAME': "CTIO/DECam", 'OBSTYPE': 0, 'NAXIS': 2,
 }
 
 default_fiber_conf = {'INSTNAME': "DESI", 'OBSTYPE': 1,
-    'SKYMODEL': "../data/Skyspectra/spec-sky.dat", 'PSFTYPE': "airy_fwhm", 
+    'SKYMODEL': join(SCR_DIR, "../data/Skyspectra/spec-sky.dat"), 'PSFTYPE': "airy_fwhm", 
     'PSFFWHM': 1.0, 'DIAMETER': 332.42, 'EXPTIME': 180, 'GAIN': 1.0,
     'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': 0.75, 'FIBRBLUR': 3.4
 }
@@ -102,7 +80,7 @@ spec_mask = np.array([int(bit) for bit in spec_mask_str])
 Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
-### Choose fiber configurations
+### Calculate fiber offsets due to shear and inclination
 cosi = np.sqrt(1-sini**2)
 A = np.array([[1+g1, g2],
               [g2, 1-g1]])
@@ -118,10 +96,11 @@ offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
 offsets = np.matmul(offsets, U)
 OFFSETX = 1
 
+### Choose fiber configurations
 for i in range(len(emlines)):
     if spec_mask[i]==1:
         eml, bid, chn, rdn = emlines[i], blockids[i], channels[i], rdnoise[i]
-        _bp = "../data/Bandpass/DESI/%s.dat"%(chn)
+        _bp = join(SCR_DIR, "../data/Bandpass/DESI/%s.dat"%(chn))
         for (dx, dy) in offsets:
             _conf = copy.deepcopy(default_fiber_conf)
             _conf.update({'OBSINDEX': _index_, 'SEDBLKID': bid, 'BANDPASS': _bp,
@@ -142,7 +121,7 @@ Nphot_used = np.sum(phot_mask)
 
 for i in range(len(photometry_band)):
     if phot_mask[i]==1:
-        _bp = "../data/Bandpass/CTIO/DECam.%s.dat"%photometry_band[i]
+        _bp = join(SCR_DIR, "../data/Bandpass/CTIO/DECam.%s.dat"%photometry_band[i])
         _conf = copy.deepcopy(default_photo_conf)
         _conf.update({"OBSINDEX": _index_, 'BANDPASS': _bp, "SKYLEVEL": sky_levels[i],
             "EXPTIME": exptime_photo if exptime_photo>0 else LS_DR9_exptime[i]})
@@ -234,7 +213,7 @@ def main():
             ### Inclined Exp profile
             'type': 'inclined_exp',
             'flux': 1.0, # counts
-            'hlr': 1.0,
+            'hlr': hlr,
         },
         ### misc
         'units': {
@@ -265,7 +244,7 @@ def main():
         'sed':{
             'z': redshift,
             'continuum_type': 'temp',
-            'restframe_temp': '../data/Simulation/GSB2.spec',
+            'restframe_temp': join(SCR_DIR, '../data/Simulation/GSB2.spec'),
             'temp_wave_type': 'Ang',
             'temp_flux_type': 'flambda',
             'cont_norm_method': 'flux',
@@ -290,12 +269,8 @@ def main():
      
     fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value)
     datavector = get_GlobalDataVector(0)
-    if isTrain:
-        print(f'Train #{ID} generated')
-        datavector.to_fits(os.path.join(TRAIN_DIR, f'training_{ID}.fits'), overwrite=True)
-    else:
-        print(f'Train #{ID} generated')
-        datavector.to_fits(os.path.join(TEST_DIR, f'testing_{ID}.fits'), overwrite=True)
+    print(f'Dataset {d} #{ID} generated')
+    datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)
     
     return 0
 

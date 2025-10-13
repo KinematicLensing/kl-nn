@@ -3,16 +3,20 @@ import numpy as np
 # Training data info and locations
 data = \
 {
-    'size': 5000000,
-    'data_dir': '/data/wxs0703/kl-nn/databases/train_database_1m',
+    'size': 10000,
+    'nimg': 1,
+    'nspec': 3,
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/small/',
     'data_stem': 'gal_'
 }
 
 # Validation data info and locations
 test = \
 {
-    'size': 500000,
-    'data_dir': '/data/wxs0703/kl-nn/databases/test_database_1m',
+    'size': 10000,
+    'nimg': 1,
+    'nspec': 3,
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/small/',
     'data_stem': 'gal_'
 }
 
@@ -35,7 +39,7 @@ par_ranges = \
 train = \
 {
 
-    'epoch_number': 100,
+    'epoch_number': 50,
     'initial_learning_rate': 0.1,
     'momentum': 0.9,
     
@@ -43,8 +47,8 @@ train = \
     'feature_number': 2,
     
     'save_model': True,
-    'model_path': '/data/wxs0703/kl-nn/models/',
-    'model_name': 'test_1m_noise_nonorm',
+    'model_path': '/ocean/projects/phy250048p/shared/models/',
+    'model_name': 'small_test',
     'use_pretrain': False,
     'pretrained_name': 'randSNR_noiseless',
     'pretrain_from': 46

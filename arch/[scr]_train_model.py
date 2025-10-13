@@ -8,14 +8,19 @@ import torch.multiprocessing as mp
 import pyxis.torch as pxt
 
 from networks import *
-from train_lilla import *
+from train import *
 import config
 
 if __name__ == "__main__":
 
+    # os.environ['NCCL_DEBUG'] = 'INFO'
+    # os.environ['NCCL_DEBUG_SUBSYS'] = 'ALL'
+    # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'INFO'
+
     os.system(f"mkdir {join(config.train['model_path'], config.train['model_name'])}")
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,5,6,7" #(Put the number(s) you want for the GPUs)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,5,6,7" #(Put the number(s) you want for the GPUs)
     
     world_size = torch.cuda.device_count() # 1
+    print("Training with {} GPUs".format(world_size))
 
     mp.spawn(train_nn, args=(world_size, ForkCNN, CNNTrainer), nprocs=world_size)

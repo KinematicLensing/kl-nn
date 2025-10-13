@@ -7,6 +7,8 @@ Neural network tools for accelerating KL analyses
 3. Do `pip install .` inside the kl-tools directory to install kl-tools in your environment
 4. Install [ml-pyxis](https://github.com/vicolab/ml-pyxis) for database generation
 
+### Note: Before running any slurm scripts, make sure to change any directories involved in the script itself as well as any scrips that it calls!
+
 ### Data Generation
 Code for generating training data is located in `kl-nn/data_generate`
 

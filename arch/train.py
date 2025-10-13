@@ -42,7 +42,7 @@ class CNNTrainer:
     ) -> None:
         self.world_size = world_size
         self.gpu_id = gpu_id
-        self.log_rank = 1
+        self.log_rank = 0
         self.device = torch.device(f"cuda:{gpu_id}")
         self.nfeatures = nfeatures
         self.train_data = train_ds
@@ -64,7 +64,7 @@ class CNNTrainer:
         '''
         # Initialize large arrays on GPU
         if self.gpu_id == self.log_rank:
-            print("Initializing datasets on GPU...")
+            self.logger.info("Setting up tensors on GPU")
         self.img_train = torch.empty((self.ntrain, 1, 48, 48), dtype=torch.float, device=self.device)
         self.img_valid = torch.empty((self.nvalid, 1, 48, 48), dtype=torch.float, device=self.device)
         self.spec_train = torch.empty((self.ntrain, 1, 3, 64), dtype=torch.float, device=self.device)
@@ -75,37 +75,47 @@ class CNNTrainer:
         # Fill arrays with values
         start = self.gpu_id*self.ntrain
         if self.gpu_id == self.log_rank:
-            print("Uploading training set to GPU...")
+            self.logger.info("Uploading training set to GPU...")
         prev_prog = 0
         for i in range(self.ntrain):
             i_db = start+i
             self.img_train[i] = self.train_data[i_db]['img']
             self.spec_train[i] = self.train_data[i_db]['spec']
             self.fid_train[i] = self.train_data[i_db]['fid_pars']
-            if self.fid_train[i, 2] < 0:
-                self.fid_train[i, 2] = self.fid_train[i, 2] + 1
+
+            if self.nfeatures > 2:
+                if self.fid_train[i, 2] < 0:
+                    self.fid_train[i, 2] = self.fid_train[i, 2] + 1
+
             prog = 100*i//self.ntrain
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
-                print(f"{prog}% complete")
-        self.fid_train[:, 2] = self.fid_train[:, 2]*2 - 1
+                self.logger.info(f"{prog}% complete")
+
+        if self.nfeatures > 2:        
+            self.fid_train[:, 2] = self.fid_train[:, 2]*2 - 1
         
         start = self.gpu_id*self.nvalid
         if self.gpu_id == self.log_rank:
-            print("Uploading validation set to GPU...")
+            self.logger.info("Uploading validation set to GPU...")
         prev_prog = 0
         for i in range(self.nvalid):
             i_db = start+i
             self.img_valid[i] = self.valid_data[i_db]['img']
             self.spec_valid[i] = self.valid_data[i_db]['spec']
             self.fid_valid[i] = self.valid_data[i_db]['fid_pars']
-            if self.fid_valid[i, 2] < 0:
-                self.fid_valid[i, 2] = self.fid_valid[i, 2] + 1
+
+            if self.nfeatures > 2:
+                if self.fid_valid[i, 2] < 0:
+                    self.fid_valid[i, 2] = self.fid_valid[i, 2] + 1
+
             prog = 100*i//self.nvalid
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
-                print(f"{prog}% complete")
-        self.fid_valid[:, 2] = self.fid_valid[:, 2]*2 - 1
+                self.logger.info(f"{prog}% complete")
+
+        if self.nfeatures > 2:
+            self.fid_valid[:, 2] = self.fid_valid[:, 2]*2 - 1
         
         torch.distributed.barrier()
         
@@ -133,13 +143,13 @@ class CNNTrainer:
     def _run_epoch(self, epoch, show_log=True):
         
         if self.gpu_id == self.log_rank:
-            print(f'Epoch {epoch} start')
+            self.logger.info(f'Starting epoch {epoch}')
             
         self.SNR_train = torch.rand((self.ntrain,), device=self.device)*190+10
         self.SNR_valid = torch.rand((self.nvalid,), device=self.device)*190+10
         
         if self.gpu_id == self.log_rank:
-            print('Generated randomized SNR and noise')
+            self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
             
         train_loss = self._trainFunc(epoch)
         torch.distributed.barrier()
@@ -168,19 +178,15 @@ class CNNTrainer:
             losses.append(loss.item())
             
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
-                #self.logger.info(f"Batch {i} complete")
-                print(f"Batch {i} complete")
+                self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
         epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
-            #self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-            #                                                                         epoch_time // 60, 
-            #                                                                         epoch_time % 60))
-            print("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                          epoch_time // 60, 
-                                                                          epoch_time % 60))
+            self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                    epoch_time // 60, 
+                                                                                    epoch_time % 60))
         return epoch_loss
 
     def _validFunc(self,epoch,show_log=True):
@@ -202,19 +208,15 @@ class CNNTrainer:
             losses.append(loss.item())
             
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
-                #self.logger.info(f"Batch {i} complete")
-                print(f"Batch {i} complete")
+                self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
         epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
-            #self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-            #                                                                         epoch_time // 60, 
-            #                                                                         epoch_time % 60))
-            print("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
-                                                                          epoch_time // 60, 
-                                                                          epoch_time % 60))
+            self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
+                                                                                    epoch_time // 60, 
+                                                                                    epoch_time % 60))
         return epoch_loss
     
     def _save_checkpoint(self, epoch):
@@ -230,11 +232,12 @@ class CNNTrainer:
         self.train_order = np.linspace(0, self.ntrain-1, self.ntrain, dtype=int)
         self.valid_order = np.linspace(0, self.nvalid-1, self.nvalid, dtype=int)
         if self.gpu_id == self.log_rank:
-            print("Training start")
+            self.logger.info("Training start")
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
             scheduler.step(valid_loss)
-            print(f"Current LR is {scheduler.get_last_lr()}")
+            if self.gpu_id == self.log_rank:
+                self.logger.info(f"Current LR is {scheduler.get_last_lr()}")
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == self.log_rank and epoch % self.save_every == 0:
@@ -310,7 +313,7 @@ def load_train_objs(nfeatures, batch_size, nGPUs, Model, rank, epoch=None):
         if rank == 0:
             print(f"Loaded model {config.train['pretrained_name']} at epoch {epoch}")
     else:
-        model = Model(batch_size, GPUs=nGPUs)  # initialize new model
+        model = Model(batch_size)  # initialize new model
         if rank == 0:
             print(f"Loaded new model")
     optimizer = optim.SGD(model.parameters(), 
@@ -333,7 +336,7 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
 
 def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
 
-    model = Model(config.train['batch_size'], GPUs=GPUs)
+    model = Model(config.train['batch_size'])
     model.to(0)
     if GPUs > 1:
         model = DDP(model, device_ids=None)

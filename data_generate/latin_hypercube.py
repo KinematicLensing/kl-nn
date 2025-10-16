@@ -3,9 +3,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats.qmc import LatinHypercube
+import os
 
 FIGDIR = '/ocean/projects/phy250048p/shared/figures/'
 SAMPDIR = '/ocean/projects/phy250048p/shared/samples/'
+
+os.makedirs(FIGDIR, exist_ok=True)
+os.makedirs(SAMPDIR, exist_ok=True)
 
 def main():
     # Define sample limits

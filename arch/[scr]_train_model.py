@@ -17,7 +17,7 @@ if __name__ == "__main__":
     # os.environ['NCCL_DEBUG_SUBSYS'] = 'ALL'
     # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'INFO'
 
-    os.system(f"mkdir {join(config.train['model_path'], config.train['model_name'])}")
+    os.makedirs(join(config.train['model_path'], config.train['model_name']), exist_ok=True)
     # os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,5,6,7" #(Put the number(s) you want for the GPUs)
     
     world_size = torch.cuda.device_count() # 1

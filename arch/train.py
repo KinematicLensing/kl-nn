@@ -244,7 +244,9 @@ class CNNTrainer:
                 self._save_checkpoint(epoch)
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
         model_name = config.train['model_name']
-        losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
+        losses_dir = join(config.train['model_path'], 'losses')
+        os.makedirs(losses_dir, exist_ok=True)
+        losses.to_csv(join(losses_dir, f'losses_{model_name}.csv'), index=False)
         
     
     def SNRWeightedLoss(self, output, target, snr):

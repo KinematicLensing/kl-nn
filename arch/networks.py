@@ -45,7 +45,69 @@ class ResidualBlock(nn.Module):
         x = nn.ReLU(True)(x)
         return x
 
+class PatchEmbedding(nn.Module):
+    def __init__(self, in_channels=1, patch_size=6, img_size=48, embed_dim=512, dropout=0.1):
+        super(PatchEmbedding, self).__init__()
+        self.patch_size = patch_size
+        self.img_size = img_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.num_patches, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.dropout = nn.Dropout(dropout)
     
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.proj(x) 
+        x = x.flatten(2).transpose(1, 2)  
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.dropout(x)
+        return x
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, embed_dim=512, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x2 = self.norm1(x)
+        attn_output, _ = self.attn(x2, x2, x2)
+        x = x + attn_output
+        x2 = self.norm2(x)
+        x = x + self.mlp(x2)
+        return x
+
+class VisionTransformer(nn.Module):
+    def __init__(self, in_channels=1, embed_dim=512, img_size=48, patch_size=6, num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super(VisionTransformer, self).__init__()
+        assert img_size % patch_size == 0, "Image size must be divisible by patch size."
+        self.patch_embed = PatchEmbedding(in_channels, patch_size, img_size, embed_dim, dropout)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, x):
+        x = self.patch_embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        cls_token = x[:, 0]
+        return cls_token
+
 class ForkCNN(nn.Module):
     '''
     CNN used for direct prediction of parameters.
@@ -58,38 +120,38 @@ class ForkCNN(nn.Module):
         
         super(ForkCNN, self).__init__()
         
-        self.cnn_img = nn.Sequential(
+        # self.cnn_img = nn.Sequential(
             
-            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
+        #     nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(True),
             
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
+        #     nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(True),
             
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        #     nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             
-            ResidualBlock(64, 128),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 128, 2),
+        #     ResidualBlock(64, 128),
+        #     ResidualBlock(128, 128),
+        #     ResidualBlock(128, 128),
+        #     ResidualBlock(128, 128, 2),
             
-            ResidualBlock(128, 256),
-            ResidualBlock(256, 256),
-            ResidualBlock(256, 256),
-            ResidualBlock(256, 256),
-            ResidualBlock(256, 256, 2),
+        #     ResidualBlock(128, 256),
+        #     ResidualBlock(256, 256),
+        #     ResidualBlock(256, 256),
+        #     ResidualBlock(256, 256),
+        #     ResidualBlock(256, 256, 2),
             
-            ResidualBlock(256, 512),
-            ResidualBlock(512, 512),
-            ResidualBlock(512, 512),
-            ResidualBlock(512, 512),
-            ResidualBlock(512, 512, 2),
+        #     ResidualBlock(256, 512),
+        #     ResidualBlock(512, 512),
+        #     ResidualBlock(512, 512),
+        #     ResidualBlock(512, 512),
+        #     ResidualBlock(512, 512, 2),
             
-            nn.AvgPool2d(3),
+        #     nn.AvgPool2d(3),
             
-        )
+        # )
         
         self.cnn_spec = nn.Sequential(
             
@@ -161,15 +223,17 @@ class ForkCNN(nn.Module):
             nn.Linear(64, self.nfeatures)
         )
 
+        self.vit = VisionTransformer(in_channels=1, embed_dim=512, img_size=48, patch_size=6, num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1)
+
     
     def forward(self, x, y):
         
-        x = self.cnn_img(x)
-        
+        # x = self.cnn_img(x)
+        x = self.vit(x)
         y = self.cnn_spec(y)
         
         # Flatten
-        x = x.view(int(self.batch),-1)
+        # x = x.view(int(self.batch),-1)
         y = y.view(int(self.batch),-1)
         
         # Concatenation

@@ -1,9 +1,9 @@
 import torch
 from torch import nn
+import normflows as nf
 
 import config
 
-## CNN
 class ResidualBlock(nn.Module):
     '''
     A residual block object that skips layers until stride > 1, i.e. the size of data shrinks
@@ -45,6 +45,7 @@ class ResidualBlock(nn.Module):
         x = nn.ReLU(True)(x)
         return x
 
+### ViT classes ###
 class PatchEmbedding(nn.Module):
     def __init__(self, in_channels=1, patch_size=6, img_size=48, embed_dim=512, dropout=0.1):
         super(PatchEmbedding, self).__init__()
@@ -108,16 +109,29 @@ class VisionTransformer(nn.Module):
         cls_token = x[:, 0]
         return cls_token
 
+### Main Network ###
 class ForkCNN(nn.Module):
     '''
     CNN used for direct prediction of parameters.
     '''
-    def __init__(self, batch_size, nspec=config.data['nspec'], 
-                 nfeatures=config.train['feature_number']):
-        
+    def __init__(self, 
+                 mode=0,    # 0 = point estimate, 1 = density estimate
+                 base=None,
+                 flows=None,
+                 batch_size=config.train['batch_size'],
+                 nfeatures=config.train['feature_number'],
+                 nspec=config.data['nspec']):
+
+        self.bs = batch_size
         self.nfeatures = nfeatures
-        self.batch = batch_size
-        
+        self.nspecs = nspec
+        if mode == 0 or mode == 1:
+            self.mode = mode
+        else:
+            raise ValueError('Mode can only be 0 (point estimate) or 1 (density estimate)!')
+        if mode == 1 and (base is None or flows is None):
+            raise Exception('Need to specify base and flows if doing density estimate!')
+
         super(ForkCNN, self).__init__()
         
         # self.cnn_img = nn.Sequential(
@@ -209,38 +223,54 @@ class ForkCNN(nn.Module):
             
         )
         
-        ### Fully-connected layers
-        self.fully_connected_layer = nn.Sequential(
-            # make sure the first number is equal to the sum of final # of channels in both img and spec branches
-            nn.Linear(1024, 512),
-            #nn.Dropout(),
-            nn.Linear(512, 256),
-            #nn.Dropout(),
-            nn.Linear(256, 128),
-            #nn.Dropout(),
-            nn.Linear(128, 64),
-            #nn.Dropout(),
-            nn.Linear(64, self.nfeatures)
-        )
+        if self.mode == 0:
+            ### Fully-connected layers
+            self.fully_connected_layer = nn.Sequential(
+                # make sure the first number is equal to the sum of final # of channels in both img and spec branches
+                nn.Linear(1024, 512),
+                nn.Linear(512, 256),
+                nn.Linear(256, 128),
+                nn.Linear(128, 64),
+                nn.Linear(64, self.nfeatures)
+            )
+        elif self.mode == 1:
+            # Normalizing flow for density estimation
+            self.flow = nf.ConditionalNormalizingFlow(base, flows)
 
-        self.vit = VisionTransformer(in_channels=1, embed_dim=512, img_size=48, patch_size=6, num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1)
+
+        # Vision Transformer for image feature extraction
+        self.vit = VisionTransformer(in_channels=1, 
+                                     embed_dim=512, 
+                                     img_size=48, 
+                                     patch_size=6, 
+                                     num_layers=6, 
+                                     num_heads=8, 
+                                     mlp_ratio=4.0, 
+                                     dropout=0.1)
 
     
-    def forward(self, x, y):
+    def forward(self, x, y, true=None):
         
+        # Feature extraction from img and spec
         # x = self.cnn_img(x)
         x = self.vit(x)
         y = self.cnn_spec(y)
         
-        # Flatten
-        # x = x.view(int(self.batch),-1)
-        y = y.view(int(self.batch),-1)
-        
-        # Concatenation
+        # Flatten and concatenate
+        # x = x.view(int(self.bs),-1)
+        y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
-        z = self.fully_connected_layer(z)
-        
-        return z
+
+        # Point/density estimate
+        if self.mode == 0:
+            z = self.fully_connected_layer(z)
+            return z
+        elif self.mode == 1:
+            # For normalizing flows, directly output loss
+            loss = self.flow.forward_kld(true, context=z)
+            return loss
+
+
 
 class DeconvNN(nn.Module):
     '''
@@ -251,7 +281,7 @@ class DeconvNN(nn.Module):
                  nfeatures=config.train['feature_number']):
         
         self.nfeatures = nfeatures
-        self.batch = batch_size
+        self.bs = batch_size
         self.GPUs = GPUs
         
         super(DeconvNN, self).__init__()
@@ -316,7 +346,7 @@ class DeconvNN(nn.Module):
         
         x = self.linear(x)
         
-        x = x.view(int(self.batch),-1, 1, 1)
+        x = x.view(int(self.bs),-1, 1, 1)
         
         x = self.dnn_img(x)
         

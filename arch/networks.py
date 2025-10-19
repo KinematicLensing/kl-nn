@@ -233,6 +233,7 @@ class ForkCNN(nn.Module):
                 nn.Linear(128, 64),
                 nn.Linear(64, self.nfeatures)
             )
+            self.loss = nn.MSELoss()
         elif self.mode == 1:
             # Normalizing flow for density estimation
             self.flow = nf.ConditionalNormalizingFlow(base, flows)
@@ -249,7 +250,7 @@ class ForkCNN(nn.Module):
                                      dropout=0.1)
 
     
-    def forward(self, x, y, true=None):
+    def forward(self, x, y, true):
         
         # Feature extraction from img and spec
         # x = self.cnn_img(x)
@@ -260,16 +261,17 @@ class ForkCNN(nn.Module):
         # x = x.view(int(self.bs),-1)
         y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
+        print(z.shape, z.min().item(), z.max().item())
 
         # Point/density estimate
         if self.mode == 0:
             z = self.fully_connected_layer(z)
-            return z
+            loss = self.loss(z, true)
         elif self.mode == 1:
             # For normalizing flows, directly output loss
             loss = self.flow.forward_kld(true, context=z)
-            return loss
 
+        return loss
 
 
 class DeconvNN(nn.Module):

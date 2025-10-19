@@ -39,9 +39,11 @@ par_ranges = \
 train = \
 {
 
+    'mode': 1,
     'epoch_number': 50,
     'initial_learning_rate': 0.1,
     'momentum': 0.9,
+    'weight_decay': 1e-5,
     
     'batch_size': 100,
     'feature_number': 2,
@@ -53,6 +55,12 @@ train = \
     'pretrained_name': 'randSNR_noiseless',
     'pretrain_from': 46
     
+}
+
+flow = \
+{
+    'num_layers': 32,
+    'mlp': [1, 64, 64, 2],
 }
 
 # Calibration network training metaparameters

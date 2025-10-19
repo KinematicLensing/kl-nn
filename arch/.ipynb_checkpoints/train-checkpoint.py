@@ -51,6 +51,7 @@ class CNNTrainer:
         self.optimizer = optimizer
         self.save_every = save_every
         self.model = model
+        self.criterion = nn.MSELoss()
         self.batch_size = batch_size
         self.ntrain = len(train_ds)//world_size
         self.nvalid = len(valid_ds)//world_size
@@ -134,7 +135,8 @@ class CNNTrainer:
 
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
-        loss = self.model(img, spec, fid)
+        outputs = self.model(img, spec)
+        loss = self.criterion(outputs, fid)
         loss.backward()                   
         self.optimizer.step()
         return loss
@@ -202,7 +204,8 @@ class CNNTrainer:
             spec = self._apply_noise(self.spec_valid[batch_ids], snr)
             fid = self.fid_valid[batch_ids]
             
-            loss = self.model(img, spec, fid)
+            outputs = self.model(img, spec)
+            loss = self.criterion(outputs, fid)
             losses.append(loss.item())
             
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
@@ -282,11 +285,10 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer,
         if rank == 0:
             log.info('Setting up for density estimation')
     elif mode == 0:
-        base, flows = None, None
         if rank == 0:
             log.info('Setting up for point estimation')
-
-    train_ds, valid_ds, model, optimizer = load_train_objs(mode, nfeatures, batch_size, world_size, Model, rank, epoch, base=base, flows=flows)
+            
+    train_ds, valid_ds, model, optimizer = load_train_objs(mode, nfeatures, batch_size, world_size, Model, rank, epoch)
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     log.info(f'[rank: {rank}] Successfully loaded training objects')
@@ -313,28 +315,25 @@ def ddp_setup(rank, world_size):
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
 
-def setup_flows():
-    # Define flows
-    K = 4
-
-    latent_size = 2
-    hidden_units = 64
-    num_blocks = 2
-    context_size = 1024
-
+def setup_flow():
+    # Define 2D Gaussian base distribution
+    base = nf.distributions.base.DiagGaussian(2)
+    
+    # Define list of flows
+    num_layers = config.flow['num_layers']
     flows = []
-    for i in range(K):
-        flows += [nf.flows.MaskedAffineAutoregressive(latent_size, hidden_units, 
-                                                    context_features=context_size, 
-                                                    num_blocks=num_blocks)]
-        flows += [nf.flows.LULinearPermute(latent_size)]
+    for i in range(num_layers):
+        # Neural network with two hidden layers having 64 units each
+        # Last layer is initialized by zeros making training more stable
+        param_map = nf.nets.MLP(config.flow['mlp'], init_zeros=True)
+        # Add flow layer
+        flows.append(nf.flows.AffineCouplingBlock(param_map))
+        # Swap dimensions
+        flows.append(nf.flows.Permute(2, mode='swap'))
 
-    # Set base distribution
-    q0 = nf.distributions.DiagGaussian(2, trainable=False)
-
-    return q0, flows
-
-def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None, **kwargs):
+    return base, flows
+    
+def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None):
     # Create dataset objects
     train_ds = pxt.TorchDataset(config.data['data_dir'])
     valid_ds = pxt.TorchDataset(config.test['data_dir'])
@@ -345,16 +344,12 @@ def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None,
         if rank == 0:
             print(f"Loaded model {config.train['pretrained_name']} at epoch {epoch}")
     else:
-        model = Model(mode, **kwargs)  # initialize new model
+        model = Model(mode)  # initialize new model
         if rank == 0:
             print(f"Loaded new model")
-    # optimizer = optim.SGD(model.parameters(), 
-    #                       lr=config.train['initial_learning_rate'],
-    #                       momentum=config.train['momentum'])
-    optimizer = optim.AdamW(model.parameters(), 
-                            lr=config.train['initial_learning_rate'], 
-                            weight_decay=config.train['weight_decay'])
-
+    optimizer = optim.SGD(model.parameters(), 
+                          lr=config.train['initial_learning_rate'],
+                          momentum=config.train['momentum'])
     return train_ds, valid_ds, model, optimizer
 
 def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):

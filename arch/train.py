@@ -325,8 +325,8 @@ def setup_flows():
     flows = []
     for i in range(K):
         flows += [nf.flows.MaskedAffineAutoregressive(latent_size, hidden_units, 
-                                                    context_features=context_size, 
-                                                    num_blocks=num_blocks)]
+                                                      context_features=context_size, 
+                                                      num_blocks=num_blocks)]
         flows += [nf.flows.LULinearPermute(latent_size)]
 
     # Set base distribution
@@ -370,10 +370,16 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
     )
     return train_dl, valid_dl
 
-def load_model(Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
+def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
+    
+    if mode == 1:
+        base, flows = setup_flows()
+    elif mode == 0:
+        base, flows = None, None
 
-    model = Model(config.train['batch_size'])
+    model = Model(mode, base=base, flows=flows)
     model.to(0)
+
     if GPUs > 1:
         model = DDP(model, device_ids=None)
 
@@ -433,24 +439,23 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-        
-def predict(self, max_epochs: int):
-    self._set_tensors()
-    train_losses = []
-    valid_losses = []
-    if self.gpu_id == self.log_rank:
-        print("Predicting start")
-    for epoch in range(max_epochs):
-        train_loss, valid_loss = self._run_epoch(epoch)
-        scheduler.step(valid_loss)
-        print(f"Current LR is {scheduler.get_last_lr()}")
-        train_losses.append(train_loss)
-        valid_losses.append(valid_loss)
-        if self.gpu_id == self.log_rank and epoch % self.save_every == 0:
-            self._save_checkpoint(epoch)
-    losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
-    model_name = config.train['model_name']
-    losses.to_csv(join(config.train['model_path'], 'losses', f'losses_{model_name}.csv'), index=False)
+def estimate_density(zz, test_data, model, gpu_id=0):
+    '''
+    Run this function to test performance of trained density estimation models
+    '''
+    model.eval()
+    true = []
+    log_probs = []
+    for i in range(2):
+        snr = torch.rand((),device=0)*190 + 10
+        img = apply_noise(test_data[i]['img'].float().to(gpu_id), snr)
+        spec = apply_noise(test_data[i]['spec'].float().to(gpu_id), snr)
+        fid = test_data[i]['fid_pars'].float().to(gpu_id)
+        log_prob = model.estimate_log_prob(img, spec, zz)
+        log_probs.append(log_prob.detach().cpu().numpy())
+        true.append(fid.cpu().numpy())
+
+    return log_probs, true
 
 ##################################################
 

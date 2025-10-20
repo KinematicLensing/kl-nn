@@ -237,6 +237,9 @@ class ForkCNN(nn.Module):
         elif self.mode == 1:
             # Normalizing flow for density estimation
             self.flow = nf.ConditionalNormalizingFlow(base, flows)
+            with torch.no_grad():
+                for param in self.flow.parameters():
+                    param.zero_()  # Initialize flow to identity
 
 
         # Vision Transformer for image feature extraction
@@ -261,7 +264,6 @@ class ForkCNN(nn.Module):
         # x = x.view(int(self.bs),-1)
         y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
-        print(z.shape, z.min().item(), z.max().item())
 
         # Point/density estimate
         if self.mode == 0:
@@ -272,6 +274,19 @@ class ForkCNN(nn.Module):
             loss = self.flow.forward_kld(true, context=z)
 
         return loss
+
+    def estimate_log_prob(self, x, y, zz):
+        '''
+        Estimate log probability density for given inputs and parameters
+        '''
+        x = self.vit(x)
+        y = self.cnn_spec(y)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        z = z.repeat(zz.shape[0], 1)
+        log_prob = self.flow.log_prob(zz, context=z)
+
+        return log_prob
 
 
 class DeconvNN(nn.Module):

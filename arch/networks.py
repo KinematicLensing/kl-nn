@@ -69,6 +69,54 @@ class PatchEmbedding(nn.Module):
         x = self.dropout(x)
         return x
 
+class SpecRNN(nn.Module):
+    def __init__(self, nspec, hidden_size=256, num_layers=2, bidirectional=True):
+        super().__init__()
+
+        # Local feature extractor across time
+        self.cnn_spec = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+
+            nn.Conv2d(32, 64, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),  # Reduce temporal dim
+        )
+
+        # RNN across spectral dimension
+        self.rnn_spec = nn.GRU(
+            input_size=64,          # CNN feature dim per spectral bin
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+
+        # Output projection
+        rnn_out_dim = hidden_size * (2 if bidirectional else 1)
+        self.proj = nn.Sequential(
+            nn.Linear(rnn_out_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        feat = self.cnn_spec(x) 
+        
+        feat = feat.mean(dim=-1)
+        feat = feat.permute(0, 2, 1)
+
+        # RNN along the spectral dimension
+        rnn_out, _ = self.rnn_spec(feat)
+        rnn_feat = rnn_out[:, -1, :]
+
+        # Project to 512-dim feature
+        out = self.proj(rnn_feat)
+        return out
+    
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, embed_dim=512, num_heads=8, mlp_ratio=4.0, dropout=0.1):
         super(TransformerEncoderLayer, self).__init__()
@@ -167,61 +215,7 @@ class ForkCNN(nn.Module):
             
         # )
         
-        self.cnn_spec = nn.Sequential(
-            
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(True),
-            
-            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(True),
-            
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-            
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-            
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            nn.Conv2d(256, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            
-        )
+        self.cnn_spec = SpecRNN()
         
         if self.mode == 0:
             ### Fully-connected layers

@@ -40,8 +40,8 @@ train = \
 {
 
     'mode': 1,
-    'epoch_number': 50,
-    'initial_learning_rate': 0.1,
+    'epoch_number': 200,
+    'initial_learning_rate': 1,
     'momentum': 0.9,
     'weight_decay': 1e-5,
     

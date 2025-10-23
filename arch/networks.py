@@ -270,7 +270,6 @@ class ForkCNN(nn.Module):
             z = self.fully_connected_layer(z)
             loss = self.loss(z, true)
         elif self.mode == 1:
-            # For normalizing flows, directly output loss
             loss = self.flow.forward_kld(true, context=z)
 
         return loss
@@ -279,14 +278,25 @@ class ForkCNN(nn.Module):
         '''
         Estimate log probability density for given inputs and parameters
         '''
+        # x = self.cnn_img(x)
         x = self.vit(x)
         y = self.cnn_spec(y)
+        # x = x.view(1, -1)
         y = y.view(1, -1)
         z = torch.cat((x, y), -1)
         z = z.repeat(zz.shape[0], 1)
         log_prob = self.flow.log_prob(zz, context=z)
 
         return log_prob
+    
+    def context(self, x, y):
+        # x = self.cnn_img(x)
+        x = self.vit(x)
+        y = self.cnn_spec(y)
+        # x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        return z
 
 
 class DeconvNN(nn.Module):

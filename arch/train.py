@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import pyxis.torch as pxt
 import normflows as nf
+from normflows.nets.mlp import MLP
 
 from networks import *
 from dataset import *
@@ -135,8 +136,9 @@ class CNNTrainer:
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
         loss = self.model(img, spec, fid)
-        loss.backward()                   
-        self.optimizer.step()
+        if ~(torch.isnan(loss) | torch.isinf(loss)):
+            loss.backward()                   
+            self.optimizer.step()
         return loss
 
     def _run_epoch(self, epoch, show_log=True):
@@ -317,7 +319,7 @@ def setup_flows():
     # Define flows
     K = 4
 
-    latent_size = 2
+    latent_size = config.train['feature_number']
     hidden_units = 64
     num_blocks = 2
     context_size = 1024
@@ -330,7 +332,9 @@ def setup_flows():
         flows += [nf.flows.LULinearPermute(latent_size)]
 
     # Set base distribution
-    q0 = nf.distributions.DiagGaussian(2, trainable=False)
+    context_encoder = MLP([context_size, 128, 64, latent_size*2],)
+    q0 = nf.distributions.base.ConditionalDiagGaussian(latent_size, context_encoder)
+    # q0 = nf.distributions.base.Uniform(2, low=-1.5, high=1.5)
 
     return q0, flows
 
@@ -370,7 +374,7 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
     )
     return train_dl, valid_dl
 
-def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1):
+def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1, device='cpu'):
     
     if mode == 1:
         base, flows = setup_flows()
@@ -378,18 +382,18 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
         base, flows = None, None
 
     model = Model(mode, base=base, flows=flows)
-    model.to(0)
+    model.to(device)
 
     if GPUs > 1:
         model = DDP(model, device_ids=None)
 
     if path != None:
-        model.load_state_dict(torch.load(path, weights_only=False), strict=strict, assign=assign)
+        model.load_state_dict(torch.load(path, weights_only=False, map_location=torch.device(device)), strict=strict, assign=assign)
 
     return model
 
-def apply_noise(data, snr):
-    noise = torch.randn_like(data, device=0)
+def apply_noise(data, snr, device='cpu'):
+    noise = torch.randn_like(data, device=device)
     maxs = torch.amax(data, dim=(-1, -2, -3))
     seg = data > 0.1*maxs.view(-1, 1, 1, 1)
     npix = torch.sum(seg, dim=(-1, -2, -3))
@@ -439,18 +443,18 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-def estimate_density(zz, test_data, model, gpu_id=0):
+def estimate_density(zz, test_data, model, device='cpu'):
     '''
     Run this function to test performance of trained density estimation models
     '''
     model.eval()
     true = []
     log_probs = []
-    for i in range(2):
-        snr = torch.rand((),device=0)*190 + 10
-        img = apply_noise(test_data[i]['img'].float().to(gpu_id), snr)
-        spec = apply_noise(test_data[i]['spec'].float().to(gpu_id), snr)
-        fid = test_data[i]['fid_pars'].float().to(gpu_id)
+    for i in range(10):
+        snr = torch.rand((),device=device)*190 + 10
+        img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
+        spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
+        fid = test_data[i]['fid_pars'].float().to(device)
         log_prob = model.estimate_log_prob(img, spec, zz)
         log_probs.append(log_prob.detach().cpu().numpy())
         true.append(fid.cpu().numpy())

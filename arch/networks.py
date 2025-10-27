@@ -214,8 +214,64 @@ class ForkCNN(nn.Module):
         #     nn.AvgPool2d(3),
             
         # )
+
+        # self.cnn_spec = nn.Sequential(
+            
+        #     nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(16),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(16),
+        #     nn.ReLU(True),
+            
+        #     nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+        #     nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(True),
+            
+        #     nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+        #     nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(True),
+            
+        #     nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+        #     nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(128),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(128),
+        #     nn.ReLU(True),
+            
+        #     nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+        #     nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(256),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+        #     nn.BatchNorm2d(256),
+        #     nn.ReLU(True),
+            
+        #     nn.Conv2d(256, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
+        #     nn.BatchNorm2d(512),
+        #     nn.ReLU(True),
+            
+        # )
         
-        self.cnn_spec = SpecRNN()
+        self.cnn_spec = SpecRNN(nspec)
         
         if self.mode == 0:
             ### Fully-connected layers

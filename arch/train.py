@@ -15,6 +15,12 @@ from torch.distributed import init_process_group, destroy_process_group
 import pyxis.torch as pxt
 import normflows as nf
 from normflows.nets.mlp import MLP
+from nflows.flows.base import Flow
+from nflows.distributions.normal import ConditionalDiagonalNormal
+from nflows.transforms.base import CompositeTransform
+from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
+from nflows.transforms.permutations import ReversePermutation
+from nflows.nn.nets import ResidualNet
 
 from networks import *
 from dataset import *
@@ -315,28 +321,51 @@ def ddp_setup(rank, world_size):
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
 
+# def setup_flows():
+#     # Define flows
+#     K = 4
+
+#     latent_size = config.train['feature_number']
+#     hidden_units = 64
+#     num_blocks = 2
+#     context_size = 1024
+
+#     flows = []
+#     for i in range(K):
+#         flows += [nf.flows.MaskedAffineAutoregressive(latent_size, hidden_units, 
+#                                                       context_features=context_size, 
+#                                                       num_blocks=num_blocks)]
+#         flows += [nf.flows.LULinearPermute(latent_size)]
+
+#     # Set base distribution
+#     context_encoder = MLP([context_size, 128, 64, latent_size*2],)
+#     q0 = nf.distributions.base.ConditionalDiagGaussian(latent_size, context_encoder)
+#     # q0 = nf.distributions.base.Uniform(2, low=-1.5, high=1.5)
+
+#     return q0, flows
+    
 def setup_flows():
     # Define flows
-    K = 4
-
-    latent_size = config.train['feature_number']
+    num_layers = config.flow['num_layers']
+    n_features = config.train['feature_number']
     hidden_units = 64
     num_blocks = 2
     context_size = 1024
-
-    flows = []
-    for i in range(K):
-        flows += [nf.flows.MaskedAffineAutoregressive(latent_size, hidden_units, 
-                                                      context_features=context_size, 
-                                                      num_blocks=num_blocks)]
-        flows += [nf.flows.LULinearPermute(latent_size)]
-
+    
     # Set base distribution
-    context_encoder = MLP([context_size, 128, 64, latent_size*2],)
-    q0 = nf.distributions.base.ConditionalDiagGaussian(latent_size, context_encoder)
-    # q0 = nf.distributions.base.Uniform(2, low=-1.5, high=1.5)
+    base = ConditionalDiagonalNormal(shape=[n_features], 
+                                     context_encoder=MLP([context_size, 128, 64, n_features*2],))
 
-    return q0, flows
+    transforms = []
+    for i in range(num_layers):
+        transforms.append(ReversePermutation(features=n_features))
+        transforms.append(MaskedAffineAutoregressiveTransform(features=n_features, 
+                                                              hidden_features=hidden_units, 
+                                                              context_features=context_size))
+
+    transform = CompositeTransform(transforms)
+
+    return base, transform
 
 def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None, **kwargs):
     # Create dataset objects
@@ -450,7 +479,7 @@ def estimate_density(zz, test_data, model, device='cpu'):
     model.eval()
     true = []
     log_probs = []
-    for i in range(10):
+    for i in range(5):
         snr = torch.rand((),device=device)*190 + 10
         img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
         spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)

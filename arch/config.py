@@ -40,8 +40,8 @@ train = \
 {
 
     'mode': 1,
-    'epoch_number': 50,
-    'initial_learning_rate': 0.1,
+    'epoch_number': 200,
+    'initial_learning_rate': 1,
     'momentum': 0.9,
     'weight_decay': 1e-5,
     
@@ -50,7 +50,8 @@ train = \
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'small_test',
+    'model_name': 'small_test_ViT_RNN_flow',
+
     'use_pretrain': False,
     'pretrained_name': 'randSNR_noiseless',
     'pretrain_from': 46
@@ -59,7 +60,7 @@ train = \
 
 flow = \
 {
-    'num_layers': 32,
+    'num_layers': 5,
     'mlp': [1, 64, 64, 2],
 }
 

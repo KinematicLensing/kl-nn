@@ -1,8 +1,11 @@
 import torch
 from torch import nn
 import normflows as nf
+from nflows.flows.base import Flow
 
 import config
+
+nspec = config.data['nspec']
 
 class ResidualBlock(nn.Module):
     '''
@@ -68,7 +71,48 @@ class PatchEmbedding(nn.Module):
         x = x + self.pos_embed
         x = self.dropout(x)
         return x
+    
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, embed_dim=512, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
 
+    def forward(self, x):
+        x2 = self.norm1(x)
+        attn_output, _ = self.attn(x2, x2, x2)
+        x = x + attn_output
+        x2 = self.norm2(x)
+        x = x + self.mlp(x2)
+        return x
+
+class VisionTransformer(nn.Module):
+    def __init__(self, in_channels=1, embed_dim=512, img_size=48, patch_size=6, num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+        super(VisionTransformer, self).__init__()
+        assert img_size % patch_size == 0, "Image size must be divisible by patch size."
+        self.patch_embed = PatchEmbedding(in_channels, patch_size, img_size, embed_dim, dropout)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, x):
+        x = self.patch_embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        cls_token = x[:, 0]
+        return cls_token
+
+### Spectra RNN ###
 class SpecRNN(nn.Module):
     def __init__(self, nspec, hidden_size=256, num_layers=2, bidirectional=True):
         super().__init__()
@@ -116,46 +160,6 @@ class SpecRNN(nn.Module):
         # Project to 512-dim feature
         out = self.proj(rnn_feat)
         return out
-    
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim=512, num_heads=8, mlp_ratio=4.0, dropout=0.1):
-        super(TransformerEncoderLayer, self).__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        x2 = self.norm1(x)
-        attn_output, _ = self.attn(x2, x2, x2)
-        x = x + attn_output
-        x2 = self.norm2(x)
-        x = x + self.mlp(x2)
-        return x
-
-class VisionTransformer(nn.Module):
-    def __init__(self, in_channels=1, embed_dim=512, img_size=48, patch_size=6, num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1):
-        super(VisionTransformer, self).__init__()
-        assert img_size % patch_size == 0, "Image size must be divisible by patch size."
-        self.patch_embed = PatchEmbedding(in_channels, patch_size, img_size, embed_dim, dropout)
-        self.layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(embed_dim)
-    
-    def forward(self, x):
-        x = self.patch_embed(x)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        cls_token = x[:, 0]
-        return cls_token
 
 ### Main Network ###
 class ForkCNN(nn.Module):
@@ -272,6 +276,19 @@ class ForkCNN(nn.Module):
         # )
         
         self.cnn_spec = SpecRNN(nspec)
+
+        # Vision Transformer for image feature extraction
+        self.vit = VisionTransformer(in_channels=1, 
+                                     embed_dim=512, 
+                                     img_size=48, 
+                                     patch_size=6, 
+                                     num_layers=6, 
+                                     num_heads=8, 
+                                     mlp_ratio=4.0, 
+                                     dropout=0.1)
+                                     
+        # CNN + RNN for spectra feature extraction
+        self.cnn_spec = SpecRNN(self.nspecs)
         
         if self.mode == 0:
             ### Fully-connected layers
@@ -286,21 +303,11 @@ class ForkCNN(nn.Module):
             self.loss = nn.MSELoss()
         elif self.mode == 1:
             # Normalizing flow for density estimation
-            self.flow = nf.ConditionalNormalizingFlow(base, flows)
+            # self.flow = nf.ConditionalNormalizingFlow(base, flows)
+            self.flow = Flow(flows, base)
             with torch.no_grad():
                 for param in self.flow.parameters():
                     param.zero_()  # Initialize flow to identity
-
-
-        # Vision Transformer for image feature extraction
-        self.vit = VisionTransformer(in_channels=1, 
-                                     embed_dim=512, 
-                                     img_size=48, 
-                                     patch_size=6, 
-                                     num_layers=6, 
-                                     num_heads=8, 
-                                     mlp_ratio=4.0, 
-                                     dropout=0.1)
 
     
     def forward(self, x, y, true):
@@ -320,8 +327,8 @@ class ForkCNN(nn.Module):
             z = self.fully_connected_layer(z)
             loss = self.loss(z, true)
         elif self.mode == 1:
-            # For normalizing flows, directly output loss
-            loss = self.flow.forward_kld(true, context=z)
+            # loss = self.flow.forward_kld(true, context=z)
+            loss = -self.flow.log_prob(true, context=z).mean()
 
         return loss
 
@@ -329,14 +336,116 @@ class ForkCNN(nn.Module):
         '''
         Estimate log probability density for given inputs and parameters
         '''
+        # x = self.cnn_img(x)
         x = self.vit(x)
         y = self.cnn_spec(y)
+        # x = x.view(1, -1)
         y = y.view(1, -1)
         z = torch.cat((x, y), -1)
         z = z.repeat(zz.shape[0], 1)
         log_prob = self.flow.log_prob(zz, context=z)
 
         return log_prob
+    
+    def context(self, x, y):
+        # x = self.cnn_img(x)
+        x = self.vit(x)
+        y = self.cnn_spec(y)
+        # x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        return z
+
+### Spec CNN ###
+cnn_spec = nn.Sequential(
+            
+    nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(16),
+    nn.ReLU(True),
+    
+    nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(16),
+    nn.ReLU(True),
+    
+    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+    
+    nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(32),
+    nn.ReLU(True),
+    
+    nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(32),
+    nn.ReLU(True),
+    
+    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+    
+    nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(True),
+    
+    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(True),
+    
+    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+    
+    nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(128),
+    nn.ReLU(True),
+    
+    nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(128),
+    nn.ReLU(True),
+    
+    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+    
+    nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(256),
+    nn.ReLU(True),
+    
+    nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(256),
+    nn.ReLU(True),
+    
+    nn.Conv2d(256, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
+    nn.BatchNorm2d(512),
+    nn.ReLU(True),
+    
+)
+
+### Image CNN ###
+cnn_img = nn.Sequential(
+            
+    nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(True),
+    
+    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(True),
+    
+    nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+    
+    ResidualBlock(64, 128),
+    ResidualBlock(128, 128),
+    ResidualBlock(128, 128),
+    ResidualBlock(128, 128, 2),
+    
+    ResidualBlock(128, 256),
+    ResidualBlock(256, 256),
+    ResidualBlock(256, 256),
+    ResidualBlock(256, 256),
+    ResidualBlock(256, 256, 2),
+    
+    ResidualBlock(256, 512),
+    ResidualBlock(512, 512),
+    ResidualBlock(512, 512),
+    ResidualBlock(512, 512),
+    ResidualBlock(512, 512, 2),
+    
+    nn.AvgPool2d(3),
+    
+)
 
 
 class DeconvNN(nn.Module):

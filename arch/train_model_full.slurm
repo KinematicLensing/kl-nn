@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/test_train_model_small.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_small_ViT_RNN_Flow.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-16:1
 #SBATCH --time=2:00:00

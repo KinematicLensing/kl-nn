@@ -5,7 +5,125 @@ from nflows.flows.base import Flow
 
 import config
 
-nspec = config.data['nspec']
+### Main Network ###
+class ForkCNN(nn.Module):
+    '''
+    Main network consisting of feature extraction branches for images and spectra,
+    followed by either point estimate or density estimate layers.
+    '''
+    def __init__(self, 
+                 mode=0,    # 0 = point estimate, 1 = density estimate
+                 base=None,
+                 flows=None,
+                 batch_size=config.train['batch_size'],
+                 nfeatures=config.train['feature_number'],
+                 nspec=config.data['nspec']):
+
+        self.bs = batch_size
+        self.nfeatures = nfeatures
+        self.nspecs = nspec
+        if mode == 0 or mode == 1:
+            self.mode = mode
+        else:
+            raise ValueError('Mode can only be 0 (point estimate) or 1 (density estimate)!')
+        if mode == 1 and (base is None or flows is None):
+            raise Exception('Need to specify base and flows if doing density estimate!')
+
+        super(ForkCNN, self).__init__()
+        
+
+        # Vision Transformer for image feature extraction
+        # self.img_net = VisionTransformer(in_channels=1, 
+        #                              embed_dim=512, 
+        #                              img_size=48, 
+        #                              patch_size=6, 
+        #                              num_layers=6, 
+        #                              num_heads=8, 
+        #                              mlp_ratio=4.0, 
+        #                              dropout=0.1)
+        self.img_net = ImgCNN()
+                                     
+        # CNN + RNN for spectra feature extraction
+        # self.spec_net = SpecRNN(self.nspecs)
+        self.spec_net = SpecCNN(self.nspecs)
+
+
+        # Define point estimate or density estimate layers
+        if self.mode == 0:
+            ### Fully-connected layers
+            self.fully_connected_layer = nn.Sequential(
+                # make sure the first number is equal to the sum of final # of channels in both img and spec branches
+                nn.Linear(1024, 512),
+                nn.Linear(512, 256),
+                nn.Linear(256, 128),
+                nn.Linear(128, 64),
+                nn.Linear(64, self.nfeatures)
+            )
+            self.loss = nn.MSELoss()
+        elif self.mode == 1:
+            # Normalizing flow for density estimation
+            # self.flow = nf.ConditionalNormalizingFlow(base, flows)
+            self.flow = Flow(flows, base)
+            with torch.no_grad():
+                for param in self.flow.parameters():
+                    param.zero_()  # Initialize flow to identity
+
+    
+    def forward(self, x, y, true):
+        
+        # Feature extraction from img and spec
+        x = self.img_net(x)
+        y = self.spec_net(y)
+
+        # Flatten and concatenate
+        x = x.view(int(self.bs),-1)
+        y = y.view(int(self.bs),-1)
+        z = torch.cat((x, y), -1)
+
+        # Point/density estimate
+        if self.mode == 0:
+            z = self.fully_connected_layer(z)
+            loss = self.loss(z, true)
+        elif self.mode == 1:
+            # loss = self.flow.forward_kld(true, context=z)
+            loss = -self.flow.log_prob(true, context=z).mean()
+
+        return loss
+    
+    def point_estimate(self, x, y):
+        '''
+        Get point estimate for given inputs
+        '''
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(int(self.bs),-1)
+        y = y.view(int(self.bs),-1)
+        z = torch.cat((x, y), -1)
+        z = self.fully_connected_layer(z)
+        return z
+
+    def estimate_log_prob(self, x, y, zz):
+        '''
+        Estimate log probability density for given inputs and parameters
+        '''
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        z = z.repeat(zz.shape[0], 1)
+        log_prob = self.flow.log_prob(zz, context=z)
+
+        return log_prob
+    
+    def context(self, x, y):
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        return z
+
 
 class ResidualBlock(nn.Module):
     '''
@@ -161,201 +279,119 @@ class SpecRNN(nn.Module):
         out = self.proj(rnn_feat)
         return out
 
-### Main Network ###
-class ForkCNN(nn.Module):
-    '''
-    CNN used for direct prediction of parameters.
-    '''
-    def __init__(self, 
-                 mode=0,    # 0 = point estimate, 1 = density estimate
-                 base=None,
-                 flows=None,
-                 batch_size=config.train['batch_size'],
-                 nfeatures=config.train['feature_number'],
-                 nspec=config.data['nspec']):
-
-        self.bs = batch_size
-        self.nfeatures = nfeatures
-        self.nspecs = nspec
-        if mode == 0 or mode == 1:
-            self.mode = mode
-        else:
-            raise ValueError('Mode can only be 0 (point estimate) or 1 (density estimate)!')
-        if mode == 1 and (base is None or flows is None):
-            raise Exception('Need to specify base and flows if doing density estimate!')
-
-        super(ForkCNN, self).__init__()
-        
-
-        # Vision Transformer for image feature extraction
-        self.vit = VisionTransformer(in_channels=1, 
-                                     embed_dim=512, 
-                                     img_size=48, 
-                                     patch_size=6, 
-                                     num_layers=6, 
-                                     num_heads=8, 
-                                     mlp_ratio=4.0, 
-                                     dropout=0.1)
-                                     
-        # CNN + RNN for spectra feature extraction
-        self.cnn_spec = SpecRNN(self.nspecs)
-        
-        if self.mode == 0:
-            ### Fully-connected layers
-            self.fully_connected_layer = nn.Sequential(
-                # make sure the first number is equal to the sum of final # of channels in both img and spec branches
-                nn.Linear(1024, 512),
-                nn.Linear(512, 256),
-                nn.Linear(256, 128),
-                nn.Linear(128, 64),
-                nn.Linear(64, self.nfeatures)
-            )
-            self.loss = nn.MSELoss()
-        elif self.mode == 1:
-            # Normalizing flow for density estimation
-            # self.flow = nf.ConditionalNormalizingFlow(base, flows)
-            self.flow = Flow(flows, base)
-            with torch.no_grad():
-                for param in self.flow.parameters():
-                    param.zero_()  # Initialize flow to identity
-
-    
-    def forward(self, x, y, true):
-        
-        # Feature extraction from img and spec
-        # x = self.cnn_img(x)
-        x = self.vit(x)
-        y = self.cnn_spec(y)
-        
-        # Flatten and concatenate
-        # x = x.view(int(self.bs),-1)
-        y = y.view(int(self.bs),-1)
-        z = torch.cat((x, y), -1)
-
-        # Point/density estimate
-        if self.mode == 0:
-            z = self.fully_connected_layer(z)
-            loss = self.loss(z, true)
-        elif self.mode == 1:
-            # loss = self.flow.forward_kld(true, context=z)
-            loss = -self.flow.log_prob(true, context=z).mean()
-
-        return loss
-
-    def estimate_log_prob(self, x, y, zz):
-        '''
-        Estimate log probability density for given inputs and parameters
-        '''
-        # x = self.cnn_img(x)
-        x = self.vit(x)
-        y = self.cnn_spec(y)
-        # x = x.view(1, -1)
-        y = y.view(1, -1)
-        z = torch.cat((x, y), -1)
-        z = z.repeat(zz.shape[0], 1)
-        log_prob = self.flow.log_prob(zz, context=z)
-
-        return log_prob
-    
-    def context(self, x, y):
-        # x = self.cnn_img(x)
-        x = self.vit(x)
-        y = self.cnn_spec(y)
-        # x = x.view(1, -1)
-        y = y.view(1, -1)
-        z = torch.cat((x, y), -1)
-        return z
-
 ### Spec CNN ###
-cnn_spec = nn.Sequential(
+class SpecCNN(nn.Module):
+
+    def __init__(self, nspecs):
+        super(SpecCNN, self).__init__()
+
+        self.nspecs = nspecs
+
+        self.cnn_spec = nn.Sequential(
+
+            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(True),
             
-    nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(16),
-    nn.ReLU(True),
-    
-    nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(16),
-    nn.ReLU(True),
-    
-    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-    
-    nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(32),
-    nn.ReLU(True),
-    
-    nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(32),
-    nn.ReLU(True),
-    
-    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-    
-    nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(64),
-    nn.ReLU(True),
-    
-    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(64),
-    nn.ReLU(True),
-    
-    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-    
-    nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(True),
-    
-    nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(128),
-    nn.ReLU(True),
-    
-    nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
-    
-    nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(256),
-    nn.ReLU(True),
-    
-    nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(256),
-    nn.ReLU(True),
-    
-    nn.Conv2d(256, 512, kernel_size=(nspec, 4), stride=1, padding=0, bias=False),
-    nn.BatchNorm2d(512),
-    nn.ReLU(True),
-    
-)
+            nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+
+            nn.Conv2d(256, 512, kernel_size=(self.nspecs, 4), stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            
+        )
+
+    def forward(self, x):
+        
+        x = self.cnn_spec(x)
+        
+        return x
 
 ### Image CNN ###
-cnn_img = nn.Sequential(
+class ImgCNN(nn.Module):
+    def __init__(self):
+        super(ImgCNN, self).__init__()
+
+        self.cnn_img = nn.Sequential(
+
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
             
-    nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(64),
-    nn.ReLU(True),
-    
-    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-    nn.BatchNorm2d(64),
-    nn.ReLU(True),
-    
-    nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-    
-    ResidualBlock(64, 128),
-    ResidualBlock(128, 128),
-    ResidualBlock(128, 128),
-    ResidualBlock(128, 128, 2),
-    
-    ResidualBlock(128, 256),
-    ResidualBlock(256, 256),
-    ResidualBlock(256, 256),
-    ResidualBlock(256, 256),
-    ResidualBlock(256, 256, 2),
-    
-    ResidualBlock(256, 512),
-    ResidualBlock(512, 512),
-    ResidualBlock(512, 512),
-    ResidualBlock(512, 512),
-    ResidualBlock(512, 512, 2),
-    
-    nn.AvgPool2d(3),
-    
-)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            ResidualBlock(64, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128, 2),
+            
+            ResidualBlock(128, 256),
+            ResidualBlock(256, 256),
+            ResidualBlock(256, 256),
+            ResidualBlock(256, 256),
+            ResidualBlock(256, 256, 2),
+            
+            ResidualBlock(256, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512, 2),
+            
+            nn.AvgPool2d(3),
+            
+        )
+
+    def forward(self, x):
+        
+        x = self.cnn_img(x)
+        
+        return x
 
 
 class DeconvNN(nn.Module):

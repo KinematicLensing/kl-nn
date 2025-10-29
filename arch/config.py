@@ -3,20 +3,20 @@ import numpy as np
 # Training data info and locations
 data = \
 {
-    'size': 10000,
+    'size': 1000000,
     'nimg': 1,
     'nspec': 3,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/small/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m/',
     'data_stem': 'gal_'
 }
 
 # Validation data info and locations
 test = \
 {
-    'size': 10000,
+    'size': 100000,
     'nimg': 1,
     'nspec': 3,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/small/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_1m/',
     'data_stem': 'gal_'
 }
 
@@ -25,23 +25,23 @@ par_ranges = \
 {
     'g1': [-0.1, 0.1],
     'g2': [-0.1, 0.1],
-    'theta_int': [0, np.pi],
-    #'sin_theta': [-1, 1],
-    #'cos_theta': [-1, 1],
-    'sini': [0, 1],
-    'v0': [-30, 30],
-    'vcirc': [60, 540],
-    'rscale': [0.1, 10],
-    'hlr': [0.1, 5],
+    # 'theta_int': [0, np.pi],
+    # #'sin_theta': [-1, 1],
+    # #'cos_theta': [-1, 1],
+    # 'sini': [0, 1],
+    # 'v0': [-30, 30],
+    # 'vcirc': [60, 540],
+    # 'rscale': [0.1, 10],
+    # 'hlr': [0.1, 5],
 }
 
 # CNN model training metaparameters
 train = \
 {
 
-    'mode': 1,
-    'epoch_number': 200,
-    'initial_learning_rate': 1,
+    'mode': 1,  # 0: point estimate; 1: density estimate via normalizing flow
+    'epoch_number': 60,
+    'initial_learning_rate': 0.001,
     'momentum': 0.9,
     'weight_decay': 1e-5,
     
@@ -50,7 +50,7 @@ train = \
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'small_test_ViT_RNN_flow',
+    'model_name': 'CNN-CNN-flow_1m',
 
     'use_pretrain': False,
     'pretrained_name': 'randSNR_noiseless',

@@ -201,20 +201,20 @@ class CNNTrainer:
         np.random.shuffle(self.valid_order)
         losses = []
         epoch_start = time.time()
-        
-        for i in range(self.nbatch_valid):
-            start = i*self.batch_size
-            batch_ids = self.valid_order[start:start+self.batch_size]
-            snr = self.SNR_train[batch_ids]
-            img = self._apply_noise(self.img_valid[batch_ids], snr)
-            spec = self._apply_noise(self.spec_valid[batch_ids], snr)
-            fid = self.fid_valid[batch_ids]
-            
-            loss = self.model(img, spec, fid)
-            losses.append(loss.item())
-            
-            if show_log and self.gpu_id == self.log_rank and i%100 == 0:
-                self.logger.info(f"Batch {i} complete")
+        with torch.no_grad():
+            for i in range(self.nbatch_valid):
+                start = i*self.batch_size
+                batch_ids = self.valid_order[start:start+self.batch_size]
+                snr = self.SNR_train[batch_ids]
+                img = self._apply_noise(self.img_valid[batch_ids], snr)
+                spec = self._apply_noise(self.spec_valid[batch_ids], snr)
+                fid = self.fid_valid[batch_ids]
+                
+                loss = self.model(img, spec, fid)
+                losses.append(loss.item())
+                
+                if show_log and self.gpu_id == self.log_rank and i%100 == 0:
+                    self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
         epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
@@ -434,23 +434,26 @@ def apply_noise(data, snr, device='cpu'):
     #return (data-mean)/std
     return data
 
-def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(), gpu_id=0):
+def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(), device='cpu'):
     '''
     Run this function to test performance of trained models
     '''
     model.eval()
     losses=[]
     for i, batch in enumerate(test_data):
-        snr = torch.rand((batch_size,), device=0)*190 + 10
+        # if i > 2:
+        #     break
+        snr = torch.rand((batch_size,), device=device)*190 + 10
         #snr = torch.full((batch_size,), 150., device=0)
-        img = apply_noise(batch['img'].float().to(gpu_id), snr)
-        spec = apply_noise(batch['spec'].float().to(gpu_id), snr)
-        neg = batch['fid_pars'][:, 2] < 0
+        img = apply_noise(batch['img'].float().to(device), snr, device=device)
+        spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
         fid = batch['fid_pars']
-        fid[:, 2][neg] += 1
-        fid[:, 2] = fid[:, 2]*2 - 1
-        fid = fid.float().to(gpu_id)
-        outputs = model(img, spec)
+        if nfeatures > 2:
+            neg = batch['fid_pars'][:, 2] < 0
+            fid[:, 2][neg] += 1
+            fid[:, 2] = fid[:, 2]*2 - 1
+        fid = fid.float().to(device)
+        outputs = model.point_estimate(img, spec)
         loss = criterion(outputs, fid)
         losses.append(loss.item())
         if i == 0:

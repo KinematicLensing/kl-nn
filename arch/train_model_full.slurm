@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_small_ViT_RNN_Flow.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_small_CNN-CNN-flow.out
 #SBATCH --partition=GPU-shared
-#SBATCH --gpus=v100-16:1
-#SBATCH --time=2:00:00
+#SBATCH --gpus=v100-32:4
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu

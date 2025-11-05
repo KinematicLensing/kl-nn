@@ -2,6 +2,11 @@ import torch
 from torch import nn
 import normflows as nf
 from nflows.flows.base import Flow
+from nflows.distributions.normal import ConditionalDiagonalNormal
+from nflows.transforms.base import CompositeTransform
+from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
+from nflows.transforms.permutations import ReversePermutation
+from nflows.nn.nets import ResidualNet
 
 import config
 
@@ -13,8 +18,6 @@ class ForkCNN(nn.Module):
     '''
     def __init__(self, 
                  mode=0,    # 0 = point estimate, 1 = density estimate
-                 base=None,
-                 flows=None,
                  batch_size=config.train['batch_size'],
                  nfeatures=config.train['feature_number'],
                  nspec=config.data['nspec']):
@@ -22,12 +25,10 @@ class ForkCNN(nn.Module):
         self.bs = batch_size
         self.nfeatures = nfeatures
         self.nspecs = nspec
-        if mode == 0 or mode == 1:
+        if mode == 0 or mode == 1 or mode == 2:
             self.mode = mode
         else:
             raise ValueError('Mode can only be 0 (point estimate) or 1 (density estimate)!')
-        if mode == 1 and (base is None or flows is None):
-            raise Exception('Need to specify base and flows if doing density estimate!')
 
         super(ForkCNN, self).__init__()
         
@@ -53,20 +54,18 @@ class ForkCNN(nn.Module):
             ### Fully-connected layers
             self.fully_connected_layer = nn.Sequential(
                 # make sure the first number is equal to the sum of final # of channels in both img and spec branches
-                nn.Linear(1024, 512),
-                nn.Linear(512, 256),
-                nn.Linear(256, 128),
-                nn.Linear(128, 64),
-                nn.Linear(64, self.nfeatures)
+                nn.Linear(1024, self.nfeatures),
             )
             self.loss = nn.MSELoss()
-        elif self.mode == 1:
+        elif self.mode >= 1:
             # Normalizing flow for density estimation
+            self.layer_norm = nn.LayerNorm(1024)
+            self.setup_flows()
             # self.flow = nf.ConditionalNormalizingFlow(base, flows)
-            self.flow = Flow(flows, base)
-            with torch.no_grad():
-                for param in self.flow.parameters():
-                    param.zero_()  # Initialize flow to identity
+            self.flow = Flow(self.transform, self.base)
+            # with torch.no_grad():
+            #     for param in self.flow.parameters():
+            #         param.zero_()  # Initialize flow to identity
 
     
     def forward(self, x, y, true):
@@ -84,12 +83,37 @@ class ForkCNN(nn.Module):
         if self.mode == 0:
             z = self.fully_connected_layer(z)
             loss = self.loss(z, true)
-        elif self.mode == 1:
+        elif self.mode >= 1:
+            z = self.layer_norm(z)
             # loss = self.flow.forward_kld(true, context=z)
             loss = -self.flow.log_prob(true, context=z).mean()
 
         return loss
     
+    def setup_flows(self):
+        '''
+        Set up normalizing flows for density estimation
+        '''
+        # Define flows
+        num_layers = config.flow['num_layers']
+        n_features = config.train['feature_number']
+        hidden_units = 64
+        num_blocks = 2
+        context_size = 1024
+        
+        # Set base distribution
+        self.base = ConditionalDiagonalNormal(shape=[n_features], 
+                                              context_encoder=MLP([context_size, 128, 64, n_features*2]))
+
+        transforms = []
+        for i in range(num_layers):
+            transforms.append(ReversePermutation(features=n_features))
+            transforms.append(MaskedAffineAutoregressiveTransform(features=n_features, 
+                                                                hidden_features=hidden_units, 
+                                                                context_features=context_size))
+
+        self.transform = CompositeTransform(transforms)
+
     def point_estimate(self, x, y):
         '''
         Get point estimate for given inputs
@@ -111,12 +135,42 @@ class ForkCNN(nn.Module):
         x = x.view(1, -1)
         y = y.view(1, -1)
         z = torch.cat((x, y), -1)
+        z = self.layer_norm(z)
         z = z.repeat(zz.shape[0], 1)
         log_prob = self.flow.log_prob(zz, context=z)
 
         return log_prob
     
+    def mean(self, x, y):
+        '''
+        Return the mean of the distribution for given inputs
+        '''
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        z = self.layer_norm(z)
+        mean = self.flow.mean(context=z)
+        return mean
+
+    def sample(self, x, y, num_samples):
+        '''
+        Sample from the density estimate for given inputs
+        '''
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1, -1)
+        y = y.view(1, -1)
+        z = torch.cat((x, y), -1)
+        z = self.layer_norm(z)
+        samples = self.flow.sample(num_samples, context=z)
+        return samples
+    
     def context(self, x, y):
+        '''
+        Get context vector for given inputs, used for diagnostics
+        '''
         x = self.img_net(x)
         y = self.spec_net(y)
         x = x.view(1, -1)
@@ -124,6 +178,27 @@ class ForkCNN(nn.Module):
         z = torch.cat((x, y), -1)
         return z
 
+class MLP(nn.Module):
+    '''
+    A simple MLP with Linear and ReLU
+    '''
+    
+    def __init__(self, layers):
+        
+        super(MLP,self).__init__()
+
+        modules = nn.ModuleList([])
+        for i in range(len(layers)-1):
+            modules.append(nn.Linear(layers[i],layers[i+1]))
+            if i != len(layers)-2:
+                modules.append(nn.ReLU(True))
+
+        self.mlp = nn.Sequential(*modules)
+
+    def forward(self,x):
+
+        x = self.mlp(x)
+        return x
 
 class ResidualBlock(nn.Module):
     '''

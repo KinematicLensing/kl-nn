@@ -157,21 +157,23 @@ class CNNTrainer:
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
-            
-        train_loss = self._trainFunc(epoch)
+
+        train_loss, train_nans, train_infs = self._trainFunc(epoch)
         torch.distributed.barrier()
         torch.cuda.synchronize()
-        valid_loss = self._validFunc(epoch)
+        valid_loss, valid_nans, valid_infs = self._validFunc(epoch)
         torch.distributed.barrier()
         torch.cuda.synchronize()
-        
-        return train_loss, valid_loss
-    
+
+        return train_loss, train_nans, train_infs, valid_loss, valid_nans, valid_infs
+
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
         np.random.shuffle(self.train_order)
         losses = []
         epoch_start = time.time()
+        nans = 0
+        infs = 0
         
         for i in range(self.nbatch_train):
             start = i*self.batch_size
@@ -182,25 +184,32 @@ class CNNTrainer:
             fid = self.fid_train[batch_ids]
             
             loss = self._run_batch(img, spec, fid)
-            losses.append(loss.item())
-            
+            if ~(torch.isnan(loss) | torch.isinf(loss)):
+                losses.append(loss.item())
+            elif torch.isnan(loss):
+                nans += 1
+            elif torch.isinf(loss):
+                infs += 1
+
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                 self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
-        epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
+        # epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
-        return epoch_loss
+        return epoch_loss, nans, infs
 
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
         np.random.shuffle(self.valid_order)
         losses = []
         epoch_start = time.time()
+        nans = 0
+        infs = 0
         with torch.no_grad():
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
@@ -211,19 +220,24 @@ class CNNTrainer:
                 fid = self.fid_valid[batch_ids]
                 
                 loss = self.model(img, spec, fid)
-                losses.append(loss.item())
-                
+                if ~(torch.isnan(loss) | torch.isinf(loss)):
+                    losses.append(loss.item())
+                elif torch.isnan(loss):
+                    nans += 1
+                elif torch.isinf(loss):
+                    infs += 1
+
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
-        epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
+        # epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
-        return epoch_loss
+        return epoch_loss, nans, infs
     
     def _save_checkpoint(self, epoch):
         ckp = self.model.module.state_dict()
@@ -235,17 +249,25 @@ class CNNTrainer:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=5)
         train_losses = []
         valid_losses = []
+        train_nans_list = []
+        train_infs_list = []
+        valid_nans_list = []
+        valid_infs_list = []
         self.train_order = np.linspace(0, self.ntrain-1, self.ntrain, dtype=int)
         self.valid_order = np.linspace(0, self.nvalid-1, self.nvalid, dtype=int)
         if self.gpu_id == self.log_rank:
             self.logger.info("Training start")
         for epoch in range(max_epochs):
-            train_loss, valid_loss = self._run_epoch(epoch)
+            train_loss, train_nans, train_infs, valid_loss, valid_nans, valid_infs = self._run_epoch(epoch)
             scheduler.step(valid_loss)
             if self.gpu_id == self.log_rank:
                 self.logger.info(f"Current LR is {scheduler.get_last_lr()}")
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
+            train_nans_list.append(train_nans)
+            train_infs_list.append(train_infs)
+            valid_nans_list.append(valid_nans)
+            valid_infs_list.append(valid_infs)
             if self.gpu_id == self.log_rank and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
         losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
@@ -253,8 +275,9 @@ class CNNTrainer:
         losses_dir = join(config.train['model_path'], 'losses')
         os.makedirs(losses_dir, exist_ok=True)
         losses.to_csv(join(losses_dir, f'losses_{model_name}.csv'), index=False)
-        
-    
+        nans_infs = pd.DataFrame(np.hstack([train_nans, train_infs, valid_nans, valid_infs]))
+        nans_infs.to_csv(join(losses_dir, f'nans_infs_{model_name}.csv'), index=False)
+
     def SNRWeightedLoss(self, output, target, snr):
         MSE_case = torch.mean((output-target)**2, dim=1)
         return torch.mean(MSE_case*(snr/150)**2)
@@ -283,18 +306,8 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer,
     
     ddp_setup(rank, world_size)
     log.info(f'[rank: {rank}] Successfully set up device')
-    
-    # if density estimation, setup flow model
-    if mode == 1:
-        base, flows = setup_flows()
-        if rank == 0:
-            log.info('Setting up for density estimation')
-    elif mode == 0:
-        base, flows = None, None
-        if rank == 0:
-            log.info('Setting up for point estimation')
 
-    train_ds, valid_ds, model, optimizer = load_train_objs(mode, nfeatures, batch_size, world_size, Model, rank, epoch, base=base, flows=flows)
+    train_ds, valid_ds, model, optimizer = load_train_objs(mode, nfeatures, batch_size, world_size, Model, rank, epoch, log=log)
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     log.info(f'[rank: {rank}] Successfully loaded training objects')
@@ -367,20 +380,23 @@ def setup_flows():
 
     return base, transform
 
-def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None, **kwargs):
+def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None, log=None,**kwargs):
     # Create dataset objects
     train_ds = pxt.TorchDataset(config.data['data_dir'])
     valid_ds = pxt.TorchDataset(config.test['data_dir'])
     # Initialize model and optimizer
     if epoch is not None: # if epoch is specified, load pretrained model
+        strict = False if mode == 2 else True
         model_dir = config.train['model_path'] + config.train['pretrained_name'] + '/' + config.train['pretrained_name'] + str(epoch)
-        model = load_model(path=model_dir,strict=True, assign=True)
+        model = load_model(mode=mode, path=model_dir,strict=strict, assign=True)
         if rank == 0:
-            print(f"Loaded model {config.train['pretrained_name']} at epoch {epoch}")
+            if log is not None:
+                log.info(f"Loaded model {config.train['pretrained_name']} at epoch {epoch}")
     else:
         model = Model(mode, **kwargs)  # initialize new model
         if rank == 0:
-            print(f"Loaded new model")
+            if log is not None:
+                log.info(f"Loaded new model {config.train['model_name']}")
     # optimizer = optim.SGD(model.parameters(), 
     #                       lr=config.train['initial_learning_rate'],
     #                       momentum=config.train['momentum'])
@@ -404,13 +420,8 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
     return train_dl, valid_dl
 
 def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1, device='cpu'):
-    
-    if mode == 1:
-        base, flows = setup_flows()
-    elif mode == 0:
-        base, flows = None, None
 
-    model = Model(mode, base=base, flows=flows)
+    model = Model(mode)
     model.to(device)
 
     if GPUs > 1:
@@ -475,23 +486,49 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-def estimate_density(zz, test_data, model, device='cpu'):
+def estimate_density(zz, test_data, model, ngals, device='cpu'):
     '''
     Run this function to test performance of trained density estimation models
     '''
     model.eval()
     true = []
     log_probs = []
-    for i in range(5):
-        snr = torch.rand((),device=device)*190 + 10
-        img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
-        spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
-        fid = test_data[i]['fid_pars'].float().to(device)
-        log_prob = model.estimate_log_prob(img, spec, zz)
-        log_probs.append(log_prob.detach().cpu().numpy())
-        true.append(fid.cpu().numpy())
+    snrs = []
+    with torch.no_grad():
+        for i in range(ngals):
+            snr = torch.rand((),device=device)*190 + 10
+            img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
+            spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
+            fid = test_data[i]['fid_pars'][:2].float().to(device)
+            log_prob = model.estimate_log_prob(img, spec, zz)
+            log_probs.append(log_prob.detach().cpu().numpy())
+            true.append(fid.cpu().numpy())
+            snrs.append(snr.cpu().numpy())
+    true = np.array(true)
+    snrs = np.array(snrs)
 
-    return log_probs, true
+    return log_probs, true, snrs
+
+def estimate_expectation(test_data, model, ngals, nsamples, device='cpu'):
+    '''
+    Run this function to test performance of trained density estimation models
+    '''
+    model.eval()
+    expectations = []
+    snrs = []
+    with torch.no_grad():
+        for i in range(ngals):
+            snr = torch.rand((),device=device)*190 + 10
+            img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
+            spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
+            samples = model.sample(img, spec, nsamples)
+            expectation = torch.mean(samples, dim=(0, 1))
+            expectations.append(expectation.detach().cpu().numpy())
+            snrs.append(snr.cpu().numpy())
+    expectations = np.array(expectations)
+    snrs = np.array(snrs)
+
+    return expectations, snrs
 
 ##################################################
 

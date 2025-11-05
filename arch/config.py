@@ -39,9 +39,9 @@ par_ranges = \
 train = \
 {
 
-    'mode': 1,  # 0: point estimate; 1: density estimate via normalizing flow
-    'epoch_number': 60,
-    'initial_learning_rate': 0.001,
+    'mode': 2,  # 0: point estimate; 1: density estimate via normalizing flow
+    'epoch_number': 100,
+    'initial_learning_rate': 1e-4,
     'momentum': 0.9,
     'weight_decay': 1e-5,
     
@@ -50,18 +50,18 @@ train = \
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'CNN-CNN-flow_1m',
+    'model_name': 'CNN-CNN-flow_1m_LN_pretrained',
 
-    'use_pretrain': False,
-    'pretrained_name': 'randSNR_noiseless',
-    'pretrain_from': 46
+    'use_pretrain': True,
+    'pretrained_name': 'CNN-CNN-ffn_1m',
+    'pretrain_from': 79
     
 }
 
 flow = \
 {
     'num_layers': 5,
-    'mlp': [1, 64, 64, 2],
+    'mlp': [1, 128, 64, 2],
 }
 
 # Calibration network training metaparameters

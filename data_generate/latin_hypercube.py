@@ -14,7 +14,7 @@ os.makedirs(SAMPDIR, exist_ok=True)
 def main():
     # Define sample limits
     # Do this for all 8 parameters even if only fitting for shear, necessary for simulation
-    param_list = ['g1+g2', 'phi', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr']
+    param_list = ['g1', 'g2', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr']
     sample_limits = [[-0.1, 0.1],     # g1
                      [-0.1, 0.1],     # g2
                      [-np.pi, np.pi], # theta_int

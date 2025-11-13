@@ -9,6 +9,7 @@ SCR_DIR = os.path.dirname(os.path.abspath(__file__))
 import kl_tools.priors as priors
 from kl_tools.parameters import Pars
 from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
+from kl_tools.cube import FiberModelCube
 
 ########################### Parsing arguments ##################################
 parser = ArgumentParser()
@@ -267,16 +268,13 @@ def main():
     }
     pars = Pars(sampled_pars, meta_pars)
      
-    fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value)
-    datavector = get_GlobalDataVector(0)
-    print(f'Dataset {d} #{ID} generated')
-    datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)
+    fibercube = FiberModelCube(meta_pars)
+    noise = fibercube._get_noise(default_obs_conf)
+    sigma = np.sqrt(noise.getVariance())
     
-    return 0
+    return sigma
 
 if __name__ == '__main__':
 
-    rc = main()
-
-    if rc != 0:
-        print(f'Tests failed with return code of {rc}')
+    sigma = main()
+    print(f'sigma = {sigma}')

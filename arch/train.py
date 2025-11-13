@@ -110,7 +110,7 @@ class CNNTrainer:
             i_db = start+i
             self.img_valid[i] = self.valid_data[i_db]['img']
             self.spec_valid[i] = self.valid_data[i_db]['spec']
-            self.fid_valid[i] = self.valid_data[i_db]['fid_pars']
+            self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
 
             if self.nfeatures > 2:
                 if self.fid_valid[i, 2] < 0:
@@ -320,6 +320,7 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer,
     log.info(f'[rank: {rank}] Successfully initialized Trainer')
     torch.distributed.barrier()
     trainer.train(total_epochs)
+    torch.distributed.barrier()
     destroy_process_group()
     
 def ddp_setup(rank, world_size):

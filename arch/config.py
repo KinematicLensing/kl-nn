@@ -39,7 +39,7 @@ par_ranges = \
 train = \
 {
 
-    'mode': 2,  # 0: point estimate; 1: density estimate via normalizing flow
+    'mode': 1,  # 0: point estimate; 1: density estimate via normalizing flow
     'epoch_number': 100,
     'initial_learning_rate': 1e-4,
     'momentum': 0.9,
@@ -50,9 +50,9 @@ train = \
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'CNN-CNN-flow_1m_LN_pretrained',
+    'model_name': 'CNN-CNN-flow_1m_LN',
 
-    'use_pretrain': True,
+    'use_pretrain': False,
     'pretrained_name': 'CNN-CNN-ffn_1m',
     'pretrain_from': 79
     

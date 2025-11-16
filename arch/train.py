@@ -152,8 +152,8 @@ class CNNTrainer:
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Starting epoch {epoch}')
             
-        self.SNR_train = torch.rand((self.ntrain,), device=self.device)*190+10
-        self.SNR_valid = torch.rand((self.nvalid,), device=self.device)*190+10
+        self.SNR_train = torch.rand((self.ntrain,), device=self.device)*990+10
+        self.SNR_valid = torch.rand((self.nvalid,), device=self.device)*990+10
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
@@ -438,7 +438,7 @@ def apply_noise(data, snr, device='cpu'):
     maxs = torch.amax(data, dim=(-1, -2, -3))
     seg = data > 0.1*maxs.view(-1, 1, 1, 1)
     npix = torch.sum(seg, dim=(-1, -2, -3))
-    total = torch.sum(data, dim=(-1, -2, -3))/npix
+    total = torch.sum(data, dim=(-1, -2, -3))
     factor = total/(npix**0.5*snr)
     data = data + noise*factor.view(-1, 1, 1, 1)
     #mean = data.mean()
@@ -455,7 +455,7 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     for i, batch in enumerate(test_data):
         # if i > 2:
         #     break
-        snr = torch.rand((batch_size,), device=device)*190 + 10
+        snr = torch.rand((batch_size,), device=device)*990 + 10
         #snr = torch.full((batch_size,), 150., device=0)
         img = apply_noise(batch['img'].float().to(device), snr, device=device)
         spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
@@ -497,7 +497,7 @@ def estimate_density(zz, test_data, model, ngals, device='cpu'):
     snrs = []
     with torch.no_grad():
         for i in range(ngals):
-            snr = torch.rand((),device=device)*190 + 10
+            snr = torch.rand((),device=device)*990 + 10
             img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
             spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
             fid = test_data[i]['fid_pars'][:2].float().to(device)
@@ -508,7 +508,7 @@ def estimate_density(zz, test_data, model, ngals, device='cpu'):
     true = np.array(true)
     snrs = np.array(snrs)
 
-    return log_probs, true, snrs
+    return log_probs, true, snrs, img, spec
 
 def estimate_expectation(test_data, model, ngals, nsamples, device='cpu'):
     '''

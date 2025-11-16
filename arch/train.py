@@ -131,9 +131,9 @@ class CNNTrainer:
         maxs = torch.amax(data, dim=(-1, -2, -3))
         seg = data > 0.1*maxs.view(-1, 1, 1, 1)
         npix = torch.sum(seg, dim=(-1, -2, -3))
-        avg = torch.sum(data, dim=(-1, -2, -3))/npix
-        factor = avg/snr
-        data = data + noise*torch.sqrt(factor.view(-1, 1, 1, 1))
+        total = torch.sum(data, dim=(-1, -2, -3))
+        factor = total/(npix**0.5*snr)
+        data = data + noise*factor.view(-1, 1, 1, 1)
         #mean = data.mean()
         #std = data.std()
         #return (data-mean)/std
@@ -438,9 +438,9 @@ def apply_noise(data, snr, device='cpu'):
     maxs = torch.amax(data, dim=(-1, -2, -3))
     seg = data > 0.1*maxs.view(-1, 1, 1, 1)
     npix = torch.sum(seg, dim=(-1, -2, -3))
-    avg = torch.sum(data, dim=(-1, -2, -3))/npix
-    factor = avg/snr
-    data = data + noise*torch.sqrt(factor.view(-1, 1, 1, 1))
+    total = torch.sum(data, dim=(-1, -2, -3))/npix
+    factor = total/(npix**0.5*snr)
+    data = data + noise*factor.view(-1, 1, 1, 1)
     #mean = data.mean()
     #std = data.std()
     #return (data-mean)/std

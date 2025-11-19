@@ -246,7 +246,7 @@ class CNNTrainer:
 
     def train(self, max_epochs: int):
         self._set_tensors()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
         train_losses = []
         valid_losses = []
         train_nans_list = []
@@ -452,32 +452,31 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     '''
     model.eval()
     losses=[]
-    for i, batch in enumerate(test_data):
-        # if i > 2:
-        #     break
-        snr = torch.rand((batch_size,), device=device)*990 + 10
-        #snr = torch.full((batch_size,), 150., device=0)
-        img = apply_noise(batch['img'].float().to(device), snr, device=device)
-        spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
-        fid = batch['fid_pars']
-        if nfeatures > 2:
-            neg = batch['fid_pars'][:, 2] < 0
-            fid[:, 2][neg] += 1
-            fid[:, 2] = fid[:, 2]*2 - 1
-        fid = fid.float().to(device)
-        outputs = model.point_estimate(img, spec)
-        loss = criterion(outputs, fid)
-        losses.append(loss.item())
-        if i == 0:
-            ids = batch['id'].numpy()
-            preds = outputs.detach().cpu().numpy()
-            fids = fid.cpu().numpy()
-            snrs = snr.cpu().numpy()
-        else:
-            ids = np.concatenate((ids, batch['id'].numpy()))
-            preds = np.vstack((preds, outputs.detach().cpu().numpy()))
-            fids = np.vstack((fids, fid.cpu().numpy()))
-            snrs = np.concatenate((snrs, snr.cpu().numpy()))
+    with torch.no_grad():
+        for i, batch in enumerate(test_data):
+            snr = torch.rand((batch_size,), device=device)*990 + 10
+            #snr = torch.full((batch_size,), 150., device=0)
+            img = apply_noise(batch['img'].float().to(device), snr, device=device)
+            spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
+            fid = batch['fid_pars'][:, :nfeatures]
+            if nfeatures > 2:
+                neg = batch['fid_pars'][:, 2] < 0
+                fid[:, 2][neg] += 1
+                fid[:, 2] = fid[:, 2]*2 - 1
+            fid = fid.float().to(device)
+            outputs = model.point_estimate(img, spec)
+            loss = criterion(outputs, fid)
+            losses.append(loss.item())
+            if i == 0:
+                ids = batch['id'].numpy()
+                preds = outputs.detach().cpu().numpy()
+                fids = fid.cpu().numpy()
+                snrs = snr.cpu().numpy()
+            else:
+                ids = np.concatenate((ids, batch['id'].numpy()))
+                preds = np.vstack((preds, outputs.detach().cpu().numpy()))
+                fids = np.vstack((fids, fid.cpu().numpy()))
+                snrs = np.concatenate((snrs, snr.cpu().numpy()))
 
     combined_pred = np.column_stack((ids, preds))
     combined_fid = np.column_stack((ids, fids))
@@ -487,28 +486,28 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-def estimate_density(zz, test_data, model, ngals, device='cpu'):
+def estimate_density(zz, test_data, model, batch_size=100, snr=None, device='cpu'):
     '''
     Run this function to test performance of trained density estimation models
     '''
     model.eval()
     true = []
     log_probs = []
-    snrs = []
+    snrs = snr if snr is not None else torch.rand((batch_size*len(test_data),),device=device)*990 + 10
     with torch.no_grad():
-        for i in range(ngals):
-            snr = torch.rand((),device=device)*990 + 10
-            img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
-            spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
-            fid = test_data[i]['fid_pars'][:2].float().to(device)
-            log_prob = model.estimate_log_prob(img, spec, zz)
+        for i, batch in enumerate(test_data):
+            snr = snrs[i*batch_size:(i+1)*batch_size]
+            img = apply_noise(batch['img'].float().to(device), snr, device=device)
+            spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
+            fid = batch['fid_pars'][:, :2].float().to(device)
+            log_prob = model.estimate_log_prob(img, spec, zz, batch_size)
             log_probs.append(log_prob.detach().cpu().numpy())
             true.append(fid.cpu().numpy())
-            snrs.append(snr.cpu().numpy())
-    true = np.array(true)
-    snrs = np.array(snrs)
+    true = np.vstack(true)
+    log_probs = np.vstack(log_probs)
+    snrs = snrs.cpu().numpy()
 
-    return log_probs, true, snrs, img, spec
+    return log_probs, true, snrs
 
 def estimate_expectation(test_data, model, ngals, nsamples, device='cpu'):
     '''

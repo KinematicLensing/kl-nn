@@ -126,57 +126,21 @@ class ForkCNN(nn.Module):
         z = self.fully_connected_layer(z)
         return z
 
-    def estimate_log_prob(self, x, y, zz):
+    def estimate_log_prob(self, x, y, zz, batch_size):
         '''
         Estimate log probability density for given inputs and parameters
         '''
         x = self.img_net(x)
         y = self.spec_net(y)
-        x = x.view(1, -1)
-        y = y.view(1, -1)
+        x = x.view(batch_size, -1)
+        y = y.view(batch_size, -1)
         z = torch.cat((x, y), -1)
         z = self.layer_norm(z)
-        z = z.repeat(zz.shape[0], 1)
-        log_prob = self.flow.log_prob(zz, context=z)
+        z = torch.repeat_interleave(z, repeats=zz.shape[0], dim=0)
+        zz = zz.repeat(batch_size, 1)
+        log_prob = self.flow.log_prob(zz, context=z).view(batch_size, -1)
 
         return log_prob
-    
-    def mean(self, x, y):
-        '''
-        Return the mean of the distribution for given inputs
-        '''
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(1, -1)
-        y = y.view(1, -1)
-        z = torch.cat((x, y), -1)
-        z = self.layer_norm(z)
-        mean = self.flow.mean(context=z)
-        return mean
-
-    def sample(self, x, y, num_samples):
-        '''
-        Sample from the density estimate for given inputs
-        '''
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(1, -1)
-        y = y.view(1, -1)
-        z = torch.cat((x, y), -1)
-        z = self.layer_norm(z)
-        samples = self.flow.sample(num_samples, context=z)
-        return samples
-    
-    def context(self, x, y):
-        '''
-        Get context vector for given inputs, used for diagnostics
-        '''
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(1, -1)
-        y = y.view(1, -1)
-        z = torch.cat((x, y), -1)
-        return z
 
 class MLP(nn.Module):
     '''

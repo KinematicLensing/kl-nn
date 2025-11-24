@@ -45,8 +45,8 @@ class ForkCNN(nn.Module):
         self.img_net = ImgCNN()
                                      
         # CNN + RNN for spectra feature extraction
-        # self.spec_net = SpecRNN(self.nspecs)
-        self.spec_net = SpecCNN(self.nspecs)
+        self.spec_net = LargeSpecRNN(self.nspecs)
+        # self.spec_net = SpecCNN(self.nspecs)
 
 
         # Define point estimate or density estimate layers
@@ -317,6 +317,79 @@ class SpecRNN(nn.Module):
         # Project to 512-dim feature
         out = self.proj(rnn_feat)
         return out
+    
+class LargeSpecRNN(nn.Module):
+    def __init__(self, nspec, hidden_size=1024, num_layers=4, bidirectional=True):
+        super().__init__()
+
+        # Deeper local feature extractor across time
+        self.cnn_spec = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+
+            nn.Conv2d(64, 128, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+
+            nn.Conv2d(128, 256, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),  # Reduce temporal dim
+            
+            nn.Conv2d(256, 256, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+        )
+
+        # Larger RNN across spectral dimension
+        self.rnn_spec = nn.GRU(
+            input_size=256,          # CNN feature dim per spectral bin
+            hidden_size=hidden_size,  # Increased to 1024
+            num_layers=num_layers,    # Increased to 4 layers
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=0.2 if num_layers > 1 else 0  # Add dropout between layers
+        )
+
+        # Larger output projection
+        rnn_out_dim = hidden_size * (2 if bidirectional else 1)
+        self.proj = nn.Sequential(
+            nn.Linear(rnn_out_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        # x: (batch, 1, nspec, time)
+        batch_size = x.size(0)
+        
+        # CNN processing
+        x = self.cnn_spec(x)  # (batch, 256, nspec, time/2)
+        
+        # Reshape for RNN: merge batch and time, treat spectral bins as sequence
+        b, c, nspec, t = x.size()
+        x = x.permute(0, 3, 2, 1)  # (batch, time, nspec, channels)
+        x = x.reshape(b * t, nspec, c)  # (batch*time, nspec, channels)
+        
+        # RNN processing across spectral dimension
+        x, _ = self.rnn_spec(x)  # (batch*time, nspec, hidden*2)
+        
+        # Global pooling across spectral dimension
+        x = x.mean(dim=1)  # (batch*time, hidden*2)
+        
+        # Projection
+        x = self.proj(x)  # (batch*time, 512)
+        
+        # Reshape back
+        x = x.view(b, t, -1)  # (batch, time, 512)
+        
+        return x
 
 ### Spec CNN ###
 class SpecCNN(nn.Module):

@@ -49,8 +49,8 @@ train = \
     'feature_number': 2,
     
     'save_model': True,
-    'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'CNN-CNN-flow_1m_LN',
+    'model_path': '/ocean/projects/phy250048p/shared/models_rishav/',
+    'model_name': 'CNN-largeRNN-flow',
 
     'use_pretrain': False,
     'pretrained_name': 'CNN-CNN-ffn_1m',

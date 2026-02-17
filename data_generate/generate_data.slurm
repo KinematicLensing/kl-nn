@@ -4,7 +4,7 @@
 #SBATCH --time=2:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --array=1-100
+#SBATCH --array=1-250
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
@@ -16,14 +16,14 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=../scripts/generate_fits_wrapper.py
-SAMPFILE=samples_small.csv
-DATASET=small
-NSAMPS=100
+SAMPFILE=samples_train_1m.csv
+DATASET=train_1m_fib5
+NSAMPS=4000
 hit=0
 
 mkdir /ocean/projects/phy250048p/shared/fits/${DATASET}
 
-for (( c=0; c<101; c++ ))
+for (( c=0; c<251; c++ ))
 do
   hit=$((${hit}+1))
   if [ ${hit} -eq ${SLURM_ARRAY_TASK_ID} ]

@@ -24,6 +24,7 @@ from nflows.nn.nets import ResidualNet
 
 from networks import *
 from dataset import *
+from utils import *
 import config
 
 """
@@ -63,6 +64,7 @@ class CNNTrainer:
         self.nvalid = len(valid_ds)//world_size
         self.nbatch_train = self.ntrain//self.batch_size
         self.nbatch_valid = self.nvalid//self.batch_size
+        self.transform_to_gal = config.train.get('transform_to_gal', False)
         self.logger = logging.getLogger('Trainer')
         
     def _set_tensors(self):
@@ -87,8 +89,8 @@ class CNNTrainer:
         for i in range(self.ntrain):
             i_db = start+i
             self.img_train[i] = self.train_data[i_db]['img']
-            self.spec_train[i] = self.train_data[i_db]['spec']
-            self.fid_train[i] = self.train_data[i_db]['fid_pars']
+            self.spec_train[i] = self.train_data[i_db]['spec'][0, :3]
+            self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
 
             if self.nfeatures > 2:
                 if self.fid_train[i, 2] < 0:
@@ -101,6 +103,14 @@ class CNNTrainer:
 
         if self.nfeatures > 2:        
             self.fid_train[:, 2] = self.fid_train[:, 2]*2 - 1
+        if self.transform_to_gal:
+            g1 = self.fid_train[:, 0]
+            g2 = self.fid_train[:, 1]
+            samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_train_1m.csv')
+            theta = torch.tensor(samples['theta_int'].values[start:start+self.ntrain]).to(self.device)
+            g_plus, g_cross = img_to_gal_axis(g1, g2, theta)
+            self.fid_train[:, 0] = g_plus
+            self.fid_train[:, 1] = g_cross
         
         start = self.gpu_id*self.nvalid
         if self.gpu_id == self.log_rank:
@@ -109,7 +119,7 @@ class CNNTrainer:
         for i in range(self.nvalid):
             i_db = start+i
             self.img_valid[i] = self.valid_data[i_db]['img']
-            self.spec_valid[i] = self.valid_data[i_db]['spec']
+            self.spec_valid[i] = self.valid_data[i_db]['spec'][0, :3]
             self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
 
             if self.nfeatures > 2:
@@ -123,6 +133,14 @@ class CNNTrainer:
 
         if self.nfeatures > 2:
             self.fid_valid[:, 2] = self.fid_valid[:, 2]*2 - 1
+        if self.transform_to_gal:
+            g1 = self.fid_valid[:, 0]
+            g2 = self.fid_valid[:, 1]
+            samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_test_1m.csv')
+            theta = torch.tensor(samples['theta_int'].values[start:start+self.nvalid]).to(self.device)
+            g_plus, g_cross = img_to_gal_axis(g1, g2, theta)
+            self.fid_valid[:, 0] = g_plus
+            self.fid_valid[:, 1] = g_cross
         
         torch.distributed.barrier()
         
@@ -154,6 +172,8 @@ class CNNTrainer:
             
         self.SNR_train = torch.rand((self.ntrain,), device=self.device)*990+10
         self.SNR_valid = torch.rand((self.nvalid,), device=self.device)*990+10
+        # self.SNR_train = torch.full((self.ntrain,), 900., device=self.device)
+        # self.SNR_valid = torch.full((self.nvalid,), 900., device=self.device)
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
@@ -181,6 +201,8 @@ class CNNTrainer:
             snr = self.SNR_train[batch_ids]
             img = self._apply_noise(self.img_train[batch_ids], snr)
             spec = self._apply_noise(self.spec_train[batch_ids], snr)
+            # img = self.img_train[batch_ids]
+            # spec = self.spec_train[batch_ids]
             fid = self.fid_train[batch_ids]
             
             loss = self._run_batch(img, spec, fid)
@@ -217,6 +239,8 @@ class CNNTrainer:
                 snr = self.SNR_train[batch_ids]
                 img = self._apply_noise(self.img_valid[batch_ids], snr)
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr)
+                # img = self.img_valid[batch_ids]
+                # spec = self.spec_valid[batch_ids]
                 fid = self.fid_valid[batch_ids]
                 
                 loss = self.model(img, spec, fid)
@@ -231,7 +255,6 @@ class CNNTrainer:
                     self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
-        # epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
@@ -316,6 +339,7 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer,
     #log.info(f'[rank: {rank}] Successfully prepared dataloader')
     #torch.distributed.barrier()
     
+    os.makedirs(join(config.train['model_path'], config.train['model_name']), exist_ok=True)
     trainer = Trainer(world_size, model, nfeatures, train_ds, valid_ds, optimizer, rank, save_every, batch_size)
     log.info(f'[rank: {rank}] Successfully initialized Trainer')
     torch.distributed.barrier()
@@ -455,9 +479,11 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     with torch.no_grad():
         for i, batch in enumerate(test_data):
             snr = torch.rand((batch_size,), device=device)*990 + 10
-            #snr = torch.full((batch_size,), 150., device=0)
+            # snr = torch.full((batch_size,), 900., device=0)
             img = apply_noise(batch['img'].float().to(device), snr, device=device)
             spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
+            img = batch['img'].float().to(device)
+            spec = batch['spec'].float().to(device)
             fid = batch['fid_pars'][:, :nfeatures]
             if nfeatures > 2:
                 neg = batch['fid_pars'][:, 2] < 0
@@ -482,7 +508,6 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     combined_fid = np.column_stack((ids, fids))
 
     epoch_loss = sum(losses) / len(losses)
-    epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
@@ -498,8 +523,18 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, device='cpu
         for i, batch in enumerate(test_data):
             snr = snrs[i*batch_size:(i+1)*batch_size]
             img = apply_noise(batch['img'].float().to(device), snr, device=device)
-            spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
+            spec = apply_noise(batch['spec'][:, :, :3].float().to(device), snr, device=device)
+            # img = batch['img'].float().to(device)
+            # spec = batch['spec'].float().to(device)
             fid = batch['fid_pars'][:, :2].float().to(device)
+            g1 = fid[:, 0]
+            g2 = fid[:, 1]
+            if config.train.get('transform_to_gal', False):
+                samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_test_1m.csv')
+                theta = torch.tensor(samples['theta_int'].values[i*batch_size:(i+1)*batch_size]).to(device)
+                gp, gc = img_to_gal_axis(g1, g2, theta)
+                fid[:, 0] = gp
+                fid[:, 1] = gc
             log_prob = model.estimate_log_prob(img, spec, zz, batch_size)
             log_probs.append(log_prob.detach().cpu().numpy())
             true.append(fid.cpu().numpy())

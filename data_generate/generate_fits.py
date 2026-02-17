@@ -92,7 +92,9 @@ T = np.matmul(A, np.matmul(R, P))
 U, S, Vh = np.linalg.svd(T)
 offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
            (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
-           (0,0)]
+           (0,0),
+           (fiber_offset*np.cos(np.pi/2), fiber_offset*np.sin(np.pi/2)),
+           (fiber_offset*np.cos(3*np.pi/2), fiber_offset*np.sin(3*np.pi/2))]
 offsets = np.matmul(offsets, U)
 OFFSETX = 1
 

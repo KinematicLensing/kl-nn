@@ -71,6 +71,8 @@ class ForkCNN(nn.Module):
     def forward(self, x, y, true):
         
         # Feature extraction from img and spec
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
         x = self.img_net(x)
         y = self.spec_net(y)
 
@@ -78,6 +80,7 @@ class ForkCNN(nn.Module):
         x = x.view(int(self.bs),-1)
         y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
+        # z = x
 
         # Point/density estimate
         if self.mode == 0:
@@ -130,11 +133,14 @@ class ForkCNN(nn.Module):
         '''
         Estimate log probability density for given inputs and parameters
         '''
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
         x = self.img_net(x)
         y = self.spec_net(y)
         x = x.view(batch_size, -1)
         y = y.view(batch_size, -1)
         z = torch.cat((x, y), -1)
+        # z = x
         z = self.layer_norm(z)
         z = torch.repeat_interleave(z, repeats=zz.shape[0], dim=0)
         zz = zz.repeat(batch_size, 1)

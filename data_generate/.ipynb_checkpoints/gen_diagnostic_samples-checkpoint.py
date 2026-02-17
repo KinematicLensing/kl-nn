@@ -17,18 +17,28 @@ def main():
     param_list = ['g1', 'g2', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr']
     sample_limits = [[-0.1, 0.1],     # g1
                      [-0.1, 0.1],     # g2
-                     [-np.pi, np.pi], # theta_int
-                     [0, 1],          # sini
-                     [-30, 30],       # v0
+                     0, # theta_int
+                     'dependent',          # sini
+                     0,       # v0
                      [60, 540],       # vcirc
-                     [0.1, 10],       # rscale
-                     [0.1, 5]]        # hlr
+                     5,       # rscale
+                     2.5]        # hlr
     ndim = len(sample_limits)
     nsamples = int(1e4)
+    e_obs = 0.2  # observed ellipticity
+    q_z = 0.2   # intrinsic axis ratio
 
     sample_centers = []
     sample_scale = []
     for limit in sample_limits:
+        if limit == 'dependent':
+            sample_centers.append(0)  # Placeholder, will be set later based on other params
+            sample_scale.append(1)    # Placeholder
+            continue
+        if isinstance(limit, (int, float)):
+            sample_centers.append(limit)
+            sample_scale.append(0)
+            continue
         sample_centers.append((limit[-1] + limit[0])/2)
         sample_scale.append(limit[-1] - limit[0])
 
@@ -39,6 +49,13 @@ def main():
 
     for i, param in enumerate(param_list):
         df[param] = df[param]*sample_scale[i] + sample_centers[i]
+    # Handle dependent parameter 'sini'
+    for idx, row in df.iterrows():
+        g1 = row['g1']
+        g2 = row['g2']
+        e_int = np.sqrt((2*g1-1)*e_obs**2/(2*e_obs**2*g1-1))
+        
+        df.at[idx, 'sini'] = sini
 
     # # Code for sampling a uniform circular distribution of shear values, but probably retired
     # df['g1+g2'] = np.sqrt(df['g1+g2'])

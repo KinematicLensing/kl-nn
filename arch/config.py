@@ -6,7 +6,7 @@ data = \
     'size': 1000000,
     'nimg': 1,
     'nspec': 3,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m_low_hlr/',
     'data_stem': 'gal_'
 }
 
@@ -16,7 +16,7 @@ test = \
     'size': 100000,
     'nimg': 1,
     'nspec': 3,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_1m/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_1m_low_hlr/',
     'data_stem': 'gal_'
 }
 
@@ -32,7 +32,7 @@ par_ranges = \
     # 'v0': [-30, 30],
     # 'vcirc': [60, 540],
     # 'rscale': [0.1, 10],
-    # 'hlr': [0.1, 5],
+    # 'hlr': [0.1, 1],
 }
 
 # CNN model training metaparameters
@@ -49,8 +49,9 @@ train = \
     'feature_number': 2,
     
     'save_model': True,
-    'model_path': '/ocean/projects/phy250048p/shared/models_rishav/',
-    'model_name': 'CNN-largeRNN-flow',
+    'model_path': '/ocean/projects/phy250048p/shared/models/',
+    'model_name': 'CNN-CNN-flow_1m_low_hlr',
+    'transform_to_gal': False,
 
     'use_pretrain': False,
     'pretrained_name': 'CNN-CNN-ffn_1m',

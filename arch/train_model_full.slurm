@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_CNN-CNN-flow_LN.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_CNN-CNN-flow_low_hlr.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
 #SBATCH --time=8:00:00
@@ -16,5 +16,7 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_train_model.py
+
+cp config.py /ocean/projects/phy250048p/shared/configs/cfg_train_model_CNN-CNN-flow_low_hlr.py
 
 python ${SCRIPT}

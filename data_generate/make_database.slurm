@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_test.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_sersic_var.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=4:00:00
+#SBATCH --time=2:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mail-type=ALL
@@ -15,10 +15,10 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=make_database.py
-SAMPLE=test_1m_low_hlr
-DATASET=test_1m_low_hlr
-NSAMPS=4000
-NPARTS=25
+SAMPLE=sersic_var
+DATASET=sersic_var
+NSAMPS=500
+NPARTS=10
 NSPEC=5
 hit=0
 

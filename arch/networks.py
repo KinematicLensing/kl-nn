@@ -45,8 +45,8 @@ class ForkCNN(nn.Module):
         self.img_net = ImgCNN()
                                      
         # CNN + RNN for spectra feature extraction
-        self.spec_net = LargeSpecRNN(self.nspecs)
-        # self.spec_net = SpecCNN(self.nspecs)
+        # self.spec_net = LargeSpecRNN(self.nspecs)
+        self.spec_net = SpecCNN(self.nspecs)
 
 
         # Define point estimate or density estimate layers

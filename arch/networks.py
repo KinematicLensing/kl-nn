@@ -17,18 +17,31 @@ class ForkCNN(nn.Module):
     followed by either point estimate or density estimate layers.
     '''
     def __init__(self, 
-                 mode=0,    # 0 = point estimate, 1 = density estimate
+                 mode=0,    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
                  batch_size=config.train['batch_size'],
                  nfeatures=config.train['feature_number'],
-                 nspec=config.data['nspec']):
+                 nspec=config.data['nspec'],
+                 # Lognormal TF prior parameters (only used when mode == 2)
+                 vcirc_dex=0.1,   # scatter in dex; fixed, represents TF relation scatter
+                 vcirc_min=config.par_ranges.get('vcirc', [60.0, 540.0])[0],
+                 vcirc_max=config.par_ranges.get('vcirc', [60.0, 540.0])[1],
+                 vcirc_idx=2):    # index of v_circ in target vector, e.g. 2 for [g1, g2, v_circ]
 
         self.bs = batch_size
         self.nfeatures = nfeatures
         self.nspecs = nspec
-        if mode == 0 or mode == 1 or mode == 2:
+        if mode in (0, 1, 2):
             self.mode = mode
         else:
-            raise ValueError('Mode can only be 0 (point estimate) or 1 (density estimate)!')
+            raise ValueError('Mode must be 0 (point estimate), 1 (density estimate), or 2 (density estimate with TF prior)!')
+
+        # Lognormal TF prior settings (only used when mode == 2)
+        # dex is fixed (TF scatter); mu is supplied per-galaxy at runtime from magnitude measurements
+        self.vcirc_log_scale = vcirc_dex * torch.log(torch.tensor(10.)).item()  # convert dex -> natural-log std
+        self.vcirc_min = float(vcirc_min)
+        self.vcirc_max = float(vcirc_max)
+        self.vcirc_jac = 0.5 * (self.vcirc_max - self.vcirc_min)  # |dv/dx| for x in [-1, 1]
+        self.vcirc_idx = vcirc_idx
 
         super(ForkCNN, self).__init__()
         
@@ -69,7 +82,13 @@ class ForkCNN(nn.Module):
 
     
     def forward(self, x, y, true):
-        
+        '''
+        x: image tensor
+        y: spectrum tensor
+        true: target tensor of shape (batch, nfeatures), e.g. [g1, g2, v_circ_norm]
+              in mode 2, true[:, vcirc_idx] is also used as per-galaxy v_circ_mu center
+              for the TF prior (after de-normalization to physical km/s).
+        '''
         # Feature extraction from img and spec
         x = nn.functional.normalize(x, dim=[2,3])
         y = nn.functional.normalize(y, dim=[2,3])
@@ -88,8 +107,27 @@ class ForkCNN(nn.Module):
             loss = self.loss(z, true)
         elif self.mode >= 1:
             z = self.layer_norm(z)
-            # loss = self.flow.forward_kld(true, context=z)
             loss = -self.flow.log_prob(true, context=z).mean()
+
+            # mode 2: per-galaxy lognormal TF prior on physical v_circ
+            # with change of variables from normalized v in [-1,1] to physical km/s
+            if self.mode == 2:
+                v_norm = true[:, self.vcirc_idx].clamp(min=-1.0, max=1.0)
+                v_circ = self.vcirc_min + 0.5 * (v_norm + 1.0) * (self.vcirc_max - self.vcirc_min)
+                v_circ = v_circ.clamp(min=1e-8)
+
+                # In mode 2, mu is supplied in true[:, vcirc_idx] as normalized coordinate.
+                mu_norm = true[:, self.vcirc_idx].clamp(min=-1.0, max=1.0)
+                vcirc_mu = self.vcirc_min + 0.5 * (mu_norm + 1.0) * (self.vcirc_max - self.vcirc_min)
+                vcirc_mu = vcirc_mu.clamp(min=1e-8)
+
+                prior = torch.distributions.LogNormal(
+                    loc=torch.log(vcirc_mu),
+                    scale=torch.full_like(v_circ, self.vcirc_log_scale)
+                )
+                # log p(v_norm) = log p(v_phys) + log |dv_phys/dv_norm|
+                tf_loss = (prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))).mean()
+                loss = loss - tf_loss
 
         return loss
     
@@ -129,9 +167,12 @@ class ForkCNN(nn.Module):
         z = self.fully_connected_layer(z)
         return z
 
-    def estimate_log_prob(self, x, y, zz, batch_size):
+    def estimate_log_prob(self, x, y, zz, batch_size, vcirc_mu=None):
         '''
-        Estimate log probability density for given inputs and parameters
+        Estimate log probability density for given inputs and parameters.
+        zz: candidate parameter vectors of shape (N, nfeatures), e.g. [g1, g2, v_circ_norm]
+        vcirc_mu: per-galaxy prior center, shape (batch_size,), units km/s (linear).
+                  Required when mode == 2. Each galaxy's N candidates share the same mu.
         '''
         x = nn.functional.normalize(x, dim=[2,3])
         y = nn.functional.normalize(y, dim=[2,3])
@@ -146,7 +187,69 @@ class ForkCNN(nn.Module):
         zz = zz.repeat(batch_size, 1)
         log_prob = self.flow.log_prob(zz, context=z).view(batch_size, -1)
 
+        # mode 2: per-galaxy lognormal TF prior on physical v_circ
+        # with change-of-variables from normalized v in [-1,1] to physical km/s
+        if self.mode == 2:
+            assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
+
+            # Candidate v_circ comes normalized from zz; map to physical units
+            v_norm = zz[:, self.vcirc_idx].clamp(min=-1.0, max=1.0)  # (batch_size * N,)
+            v_circ = self.vcirc_min + 0.5 * (v_norm + 1.0) * (self.vcirc_max - self.vcirc_min)
+            v_circ = v_circ.clamp(min=1e-8)
+
+            N = log_prob.shape[1]
+            # each galaxy's prior center repeated N times to match the candidate grid
+            mu = vcirc_mu.to(device=v_circ.device, dtype=v_circ.dtype).clamp(min=1e-8)
+            loc = torch.log(mu).repeat_interleave(N)
+            prior = torch.distributions.LogNormal(
+                loc=loc,
+                scale=torch.full_like(v_circ, self.vcirc_log_scale)
+            )
+            tf_log_prob = prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
+            log_prob = log_prob + tf_log_prob.view(batch_size, -1)
+
         return log_prob
+
+    def sample(self, x, y, num_samples, vcirc_mu=None):
+        '''
+        Sample from the conditional distribution p(params | x, y)
+        num_samples: number of samples to draw per galaxy
+        vcirc_mu: per-galaxy prior center, shape (1,), units km/s (linear).
+                  Required when mode == 2. Each galaxy's N samples share the same mu.
+        '''
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1,-1)
+        y = y.view(1,-1)
+        z = torch.cat((x, y), -1)
+        # z = x
+        z = self.layer_norm(z)
+
+        # Sample from flow
+        samples = self.flow.sample(num_samples, context=z)  # (1, num_samples, nfeatures)
+
+        # if self.mode == 2:
+        #     assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
+
+        #     # Candidate v_circ comes normalized from flow; map to physical units
+        #     v_norm = samples[0, :, self.vcirc_idx].clamp(min=-1.0, max=1.0)  # (num_samples,)
+        #     v_circ = self.vcirc_min + 0.5 * (v_norm + 1.0) * (self.vcirc_max - self.vcirc_min)
+        #     v_circ = v_circ.clamp(min=1e-8)
+
+        #     N = samples.shape[0]
+        #     mu = vcirc_mu.clamp(min=1e-8)
+        #     loc = torch.log(mu).repeat_interleave(num_samples)
+        #     prior = torch.distributions.LogNormal(
+        #         loc=loc,
+        #         scale=torch.full_like(loc, self.vcirc_log_scale)
+        #     )
+            # tf_log_prob = prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
+            # accept_mask = torch.rand_like(tf_log_prob) < tf_log_prob.exp()  # Accept/reject based on TF prior
+            # samples[:, ~accept_mask] = torch.nan
+
+        return samples.view(1, num_samples, -1)
 
 class MLP(nn.Module):
     '''

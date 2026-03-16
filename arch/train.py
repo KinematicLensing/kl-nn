@@ -49,6 +49,7 @@ class CNNTrainer:
         save_every: int,
         batch_size: int,
     ) -> None:
+        
         self.world_size = world_size
         self.gpu_id = gpu_id
         self.log_rank = 0
@@ -76,8 +77,8 @@ class CNNTrainer:
             self.logger.info("Setting up tensors on GPU")
         self.img_train = torch.empty((self.ntrain, 1, 48, 48), dtype=torch.float, device=self.device)
         self.img_valid = torch.empty((self.nvalid, 1, 48, 48), dtype=torch.float, device=self.device)
-        self.spec_train = torch.empty((self.ntrain, 1, 3, 64), dtype=torch.float, device=self.device)
-        self.spec_valid = torch.empty((self.nvalid, 1, 3, 64), dtype=torch.float, device=self.device)
+        self.spec_train = torch.empty((self.ntrain, 1, 5, 64), dtype=torch.float, device=self.device)
+        self.spec_valid = torch.empty((self.nvalid, 1, 5, 64), dtype=torch.float, device=self.device)
         self.fid_train = torch.empty((self.ntrain, self.nfeatures), dtype=torch.float, device=self.device)
         self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
         
@@ -89,28 +90,15 @@ class CNNTrainer:
         for i in range(self.ntrain):
             i_db = start+i
             self.img_train[i] = self.train_data[i_db]['img']
-            self.spec_train[i] = self.train_data[i_db]['spec'][0, :3]
+            self.spec_train[i] = self.train_data[i_db]['spec']
             self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
-
-            if self.nfeatures > 2:
-                if self.fid_train[i, 2] < 0:
-                    self.fid_train[i, 2] = self.fid_train[i, 2] + 1
+            if config.train.get('mode', 1) == 2:
+                self.fid_train[i, 2] = self.train_data[i_db]['fid_pars'][5]
 
             prog = 100*i//self.ntrain
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
                 self.logger.info(f"{prog}% complete")
-
-        if self.nfeatures > 2:        
-            self.fid_train[:, 2] = self.fid_train[:, 2]*2 - 1
-        if self.transform_to_gal:
-            g1 = self.fid_train[:, 0]
-            g2 = self.fid_train[:, 1]
-            samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_train_1m.csv')
-            theta = torch.tensor(samples['theta_int'].values[start:start+self.ntrain]).to(self.device)
-            g_plus, g_cross = img_to_gal_axis(g1, g2, theta)
-            self.fid_train[:, 0] = g_plus
-            self.fid_train[:, 1] = g_cross
         
         start = self.gpu_id*self.nvalid
         if self.gpu_id == self.log_rank:
@@ -119,28 +107,15 @@ class CNNTrainer:
         for i in range(self.nvalid):
             i_db = start+i
             self.img_valid[i] = self.valid_data[i_db]['img']
-            self.spec_valid[i] = self.valid_data[i_db]['spec'][0, :3]
+            self.spec_valid[i] = self.valid_data[i_db]['spec']
             self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
-
-            if self.nfeatures > 2:
-                if self.fid_valid[i, 2] < 0:
-                    self.fid_valid[i, 2] = self.fid_valid[i, 2] + 1
+            if config.train.get('mode', 1) == 2:
+                self.fid_valid[i, 2] = self.valid_data[i_db]['fid_pars'][5]
 
             prog = 100*i//self.nvalid
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
                 self.logger.info(f"{prog}% complete")
-
-        if self.nfeatures > 2:
-            self.fid_valid[:, 2] = self.fid_valid[:, 2]*2 - 1
-        if self.transform_to_gal:
-            g1 = self.fid_valid[:, 0]
-            g2 = self.fid_valid[:, 1]
-            samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_test_1m.csv')
-            theta = torch.tensor(samples['theta_int'].values[start:start+self.nvalid]).to(self.device)
-            g_plus, g_cross = img_to_gal_axis(g1, g2, theta)
-            self.fid_valid[:, 0] = g_plus
-            self.fid_valid[:, 1] = g_cross
         
         torch.distributed.barrier()
         
@@ -511,10 +486,12 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-def estimate_density(zz, test_data, model, batch_size=100, snr=None, device='cpu'):
+def estimate_density(zz, test_data, model, batch_size=100, snr=None, vcirc_mu=None,device='cpu'):
     '''
     Run this function to test performance of trained density estimation models
     '''
+    if model.mode == 2:
+        assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
     true = []
     log_probs = []
@@ -522,20 +499,13 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, device='cpu
     with torch.no_grad():
         for i, batch in enumerate(test_data):
             snr = snrs[i*batch_size:(i+1)*batch_size]
+            vcircs = vcirc_mu[i*batch_size:(i+1)*batch_size] if vcirc_mu is not None else None
             img = apply_noise(batch['img'].float().to(device), snr, device=device)
-            spec = apply_noise(batch['spec'][:, :, :3].float().to(device), snr, device=device)
+            spec = apply_noise(batch['spec'].float().to(device), snr, device=device)
             # img = batch['img'].float().to(device)
             # spec = batch['spec'].float().to(device)
             fid = batch['fid_pars'][:, :2].float().to(device)
-            g1 = fid[:, 0]
-            g2 = fid[:, 1]
-            if config.train.get('transform_to_gal', False):
-                samples = pd.read_csv('/ocean/projects/phy250048p/shared/samples/samples_test_1m.csv')
-                theta = torch.tensor(samples['theta_int'].values[i*batch_size:(i+1)*batch_size]).to(device)
-                gp, gc = img_to_gal_axis(g1, g2, theta)
-                fid[:, 0] = gp
-                fid[:, 1] = gc
-            log_prob = model.estimate_log_prob(img, spec, zz, batch_size)
+            log_prob = model.estimate_log_prob(img, spec, zz, batch_size, vcirc_mu=vcircs)
             log_probs.append(log_prob.detach().cpu().numpy())
             true.append(fid.cpu().numpy())
     true = np.vstack(true)
@@ -544,26 +514,27 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, device='cpu
 
     return log_probs, true, snrs
 
-def estimate_expectation(test_data, model, ngals, nsamples, device='cpu'):
+def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, device='cpu'):
     '''
-    Run this function to test performance of trained density estimation models
+    Run this function to sample from trained density estimation models
     '''
+    if model.mode == 2:
+        assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
-    expectations = []
-    snrs = []
+    samples = []
+    snrs = snr if snr is not None else torch.rand((len(test_ds),),device=device)*990 + 10
     with torch.no_grad():
-        for i in range(ngals):
-            snr = torch.rand((),device=device)*190 + 10
-            img = apply_noise(test_data[i]['img'].float().to(device), snr, device=device)
-            spec = apply_noise(test_data[i]['spec'].float().to(device), snr, device=device)
-            samples = model.sample(img, spec, nsamples)
-            expectation = torch.mean(samples, dim=(0, 1))
-            expectations.append(expectation.detach().cpu().numpy())
-            snrs.append(snr.cpu().numpy())
-    expectations = np.array(expectations)
-    snrs = np.array(snrs)
+        for i in range(len(test_ds)):
+            snr = snrs[i]
+            vcircs = vcirc_mu[i] if vcirc_mu is not None else None
+            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, device=device)
+            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, device=device)
+            sample = model.sample(img, spec, nsamples, vcirc_mu=vcircs)
+            samples.append(sample.detach().cpu().numpy())
+    samples = np.vstack(samples)
+    snrs = snrs.cpu().numpy()
 
-    return expectations, snrs
+    return samples, snrs
 
 ##################################################
 

@@ -5,7 +5,7 @@ data = \
 {
     'size': 1000000,
     'nimg': 1,
-    'nspec': 3,
+    'nspec': 5,
     'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m_low_hlr/',
     'data_stem': 'gal_'
 }
@@ -15,7 +15,7 @@ test = \
 {
     'size': 100000,
     'nimg': 1,
-    'nspec': 3,
+    'nspec': 5,
     'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_1m_low_hlr/',
     'data_stem': 'gal_'
 }
@@ -30,7 +30,7 @@ par_ranges = \
     # #'cos_theta': [-1, 1],
     # 'sini': [0, 1],
     # 'v0': [-30, 30],
-    # 'vcirc': [60, 540],
+    'vcirc': [60, 540],
     # 'rscale': [0.1, 10],
     # 'hlr': [0.1, 1],
 }
@@ -39,18 +39,18 @@ par_ranges = \
 train = \
 {
 
-    'mode': 1,  # 0: point estimate; 1: density estimate via normalizing flow
-    'epoch_number': 100,
+    'mode': 2,  # 0: point estimate; 1: density estimate via normalizing flow; 2: density estimate with TF prior
+    'epoch_number': 120,
     'initial_learning_rate': 1e-4,
     'momentum': 0.9,
     'weight_decay': 1e-5,
     
     'batch_size': 100,
-    'feature_number': 2,
+    'feature_number': 3,
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'CNN-CNN-flow_1m_low_hlr',
+    'model_name': 'CNN-CNN-flow_1m_tf',
     'transform_to_gal': False,
 
     'use_pretrain': False,

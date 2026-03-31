@@ -456,6 +456,7 @@ def make_corner_plot(
     smooth_scale_2d=0.5,
     contour_colors=None,
     sample_label=None,
+    sample_labels=None,
     truth_color="black",
     title_limit=1,
     subplot_size=2.2,
@@ -467,16 +468,23 @@ def make_corner_plot(
 
     Parameters
     ----------
-    samples : array-like, shape (nsamples, nfeatures)
-        Posterior samples.
+    samples : array-like or sequence of array-like
+        Posterior samples. Each sample set must have shape
+        ``(nsamples, nfeatures)``. If a sequence is passed, multiple sample
+        sets are overplotted for comparison.
     truth : array-like, optional, shape (nfeatures,)
         Truth values to overplot as getdist markers.
     labels : sequence of str, optional
         Parameter labels shown on the axes.
     names : sequence of str, optional
         Internal parameter names used by getdist.
-    weights : array-like, optional, shape (nsamples,)
-        Sample weights.
+    weights : array-like or sequence of array-like, optional
+        Sample weights. For multiple sample sets, pass one weight vector per
+        set.
+    sample_label : str, optional
+        Backward-compatible label for a single sample set.
+    sample_labels : sequence of str, optional
+        Labels for multiple sample sets, used in the legend.
     ranges : sequence of tuple or dict, optional
         Plot ranges for each parameter. If a sequence is given it must have
         length ``nfeatures``.
@@ -497,17 +505,44 @@ def make_corner_plot(
     except ImportError as exc:
         raise ImportError("make_corner_plot requires the 'getdist' package to be installed.") from exc
 
+    def _to_numpy_array(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    # Accept single-set input or multiple sets for overplotting.
     if torch.is_tensor(samples):
-        samples = samples.detach().cpu().numpy()
+        sample_sets = [samples.detach().cpu().numpy()]
+    elif isinstance(samples, (list, tuple)):
+        if len(samples) == 0:
+            raise ValueError("samples must contain at least one sample set.")
+        first = _to_numpy_array(samples[0])
+        if first.ndim == 1:
+            sample_sets = [np.asarray(samples)]
+        else:
+            sample_sets = [_to_numpy_array(s) for s in samples]
     else:
-        samples = np.asarray(samples)
+        samples_arr = np.asarray(samples)
+        if samples_arr.ndim == 3:
+            sample_sets = [np.asarray(s) for s in samples_arr]
+        else:
+            sample_sets = [samples_arr]
 
-    if samples.ndim != 2:
-        raise ValueError("samples must have shape (nsamples, nfeatures).")
+    if len(sample_sets) == 0:
+        raise ValueError("samples must contain at least one sample set.")
 
-    nsamples, nfeatures = samples.shape
-    if nsamples == 0:
-        raise ValueError("samples must contain at least one sample.")
+    for s in sample_sets:
+        if s.ndim != 2:
+            raise ValueError("each sample set must have shape (nsamples, nfeatures).")
+        if s.shape[0] == 0:
+            raise ValueError("each sample set must contain at least one sample.")
+
+    nfeatures = sample_sets[0].shape[1]
+    for s in sample_sets[1:]:
+        if s.shape[1] != nfeatures:
+            raise ValueError("all sample sets must have the same number of features.")
+
+    nsets = len(sample_sets)
 
     if truth is not None:
         if torch.is_tensor(truth):
@@ -518,14 +553,27 @@ def make_corner_plot(
         if truth.shape[0] != nfeatures:
             raise ValueError("truth must have shape (nfeatures,).")
 
+    weights_sets = [None for _ in range(nsets)]
     if weights is not None:
-        if torch.is_tensor(weights):
-            weights = weights.detach().cpu().numpy()
+        if nsets == 1:
+            w = _to_numpy_array(weights)
+            w = np.ravel(w)
+            if w.shape[0] != sample_sets[0].shape[0]:
+                raise ValueError("weights must have shape (nsamples,).")
+            weights_sets = [w]
         else:
-            weights = np.asarray(weights)
-        weights = np.ravel(weights)
-        if weights.shape[0] != nsamples:
-            raise ValueError("weights must have shape (nsamples,).")
+            if not isinstance(weights, (list, tuple)):
+                raise ValueError("for multiple sample sets, weights must be a sequence with one entry per set.")
+            if len(weights) != nsets:
+                raise ValueError("weights must have one entry per sample set.")
+            multi_weights = []
+            for i, (s, w) in enumerate(zip(sample_sets, weights)):
+                w_arr = _to_numpy_array(w)
+                w_arr = np.ravel(w_arr)
+                if w_arr.shape[0] != s.shape[0]:
+                    raise ValueError(f"weights[{i}] must have shape (nsamples,).")
+                multi_weights.append(w_arr)
+            weights_sets = multi_weights
 
     if names is None:
         names = [f"p{i}" for i in range(nfeatures)]
@@ -555,14 +603,29 @@ def make_corner_plot(
     if settings is not None:
         sample_settings.update(settings)
 
-    mc_samples = MCSamples(
-        samples=samples,
-        names=names,
-        labels=labels,
-        weights=weights,
-        ranges=getdist_ranges,
-        settings=sample_settings,
-    )
+    if sample_labels is None and sample_label is not None:
+        sample_labels = [sample_label]
+
+    if sample_labels is not None:
+        if isinstance(sample_labels, str):
+            sample_labels = [sample_labels]
+        else:
+            sample_labels = list(sample_labels)
+        if len(sample_labels) != nsets:
+            raise ValueError("sample_labels must have one label per sample set.")
+
+    mc_samples_list = []
+    for s, w in zip(sample_sets, weights_sets):
+        mc_samples_list.append(
+            MCSamples(
+                samples=s,
+                names=names,
+                labels=labels,
+                weights=w,
+                ranges=getdist_ranges,
+                settings=sample_settings,
+            )
+        )
 
     markers = None
     if truth is not None:
@@ -572,7 +635,7 @@ def make_corner_plot(
     plotter.settings.title_limit = title_limit
     plotter.settings.linewidth_contour = 1.2
     plotter.settings.legend_frame = False
-    plotter.settings.num_plot_contours = 3
+    plotter.settings.num_plot_contours = 2
 
     triangle_kwargs = {
         "filled": filled,
@@ -580,22 +643,24 @@ def make_corner_plot(
     }
     if contour_colors is not None:
         triangle_kwargs["contour_colors"] = contour_colors
-    if sample_label is not None:
-        triangle_kwargs["legend_labels"] = [sample_label]
+    if sample_labels is not None:
+        triangle_kwargs["legend_labels"] = sample_labels
+    if truth is not None:
+        triangle_kwargs["marker_args"] = {
+            "color": truth_color,
+            "lw": 1.2,
+        }
 
-    plotter.triangle_plot([mc_samples], params=list(names), **triangle_kwargs)
+    plotter.triangle_plot(mc_samples_list, params=list(names), **triangle_kwargs)
 
     fig = plotter.fig
-    if truth is not None:
-        for ax in fig.axes:
-            for line in ax.lines:
-                line.set_color(truth_color)
-                line.set_alpha(0.8)
 
     if suptitle is not None:
         fig.suptitle(suptitle)
 
-    return fig, plotter, mc_samples
+    if nsets == 1:
+        return fig, plotter, mc_samples_list[0]
+    return fig, plotter, mc_samples_list
 
 
 def truncate_colormap(cmap_name, minval=0.0, maxval=1.0, n=5):

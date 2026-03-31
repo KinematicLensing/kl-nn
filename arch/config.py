@@ -1,5 +1,7 @@
 import numpy as np
 
+sigma = 69.00924072265624 # spread of gaussian noise for a flux factor of 1, i.e. SNR=5 at rmag=23.4
+
 # Training data info and locations
 data = \
 {
@@ -7,7 +9,7 @@ data = \
     'nimg': 1,
     'nspec': 5,
     'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m_low_hlr/',
-    'data_stem': 'gal_'
+    'data_stem': 'gal_',
 }
 
 # Validation data info and locations
@@ -40,7 +42,7 @@ train = \
 {
 
     'mode': 2,  # 0: point estimate; 1: density estimate via normalizing flow; 2: density estimate with TF prior
-    'epoch_number': 120,
+    'epoch_number': 150,
     'initial_learning_rate': 1e-4,
     'momentum': 0.9,
     'weight_decay': 1e-5,
@@ -63,20 +65,4 @@ flow = \
 {
     'num_layers': 5,
     'mlp': [1, 128, 64, 2],
-}
-
-# Calibration network training metaparameters
-cali = \
-{
-    'epoch_number': 30,
-    'learning_rate': 0.0001,
-    'batch_size': 100,
-    'feature_number': 8,
-    'n_cases': 5000,
-    'n_realizations': 1000,
-    
-    'model_path': '/data/wxs0703/kl-nn/models/',
-    'model_name': 'cali_1m_noise_nonorm',
-    'data_dir': '/data/wxs0703/kl-nn/databases/cali_database_5m',
-    'res_dir': '/data/wxs0703/kl-nn/cali/'
 }

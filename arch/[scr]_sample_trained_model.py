@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
 		help="Number of test galaxies to process. Use -1 to process the full test dataset.",
 	)
 	parser.add_argument(
+		"--split-start",
+		type=int,
+		default=0,
+		help="Start index (inclusive) of the selected galaxy range after --n-galaxies truncation.",
+	)
+	parser.add_argument(
+		"--split-end",
+		type=int,
+		default=-1,
+		help="End index (exclusive) of the selected galaxy range after --n-galaxies truncation. -1 means end.",
+	)
+	parser.add_argument(
 		"--mode",
 		type=int,
 		default=config.train.get("mode", 2),
@@ -136,10 +148,26 @@ def resolve_checkpoint_path(args: argparse.Namespace) -> str:
 	return candidates[-1][1]
 
 
-def maybe_subset(test_ds, n_galaxies: int):
-	if n_galaxies < 0 or n_galaxies >= len(test_ds):
-		return test_ds
-	return Subset(test_ds, np.arange(0, n_galaxies))
+def build_subset(test_ds, n_galaxies: int, split_start: int, split_end: int):
+	total = len(test_ds)
+	limit = total if n_galaxies < 0 else min(n_galaxies, total)
+
+	if split_start < 0:
+		raise ValueError("--split-start must be >= 0")
+	if split_start > limit:
+		raise ValueError(f"--split-start ({split_start}) exceeds selected dataset size ({limit})")
+
+	effective_end = limit if split_end < 0 else min(split_end, limit)
+	if effective_end < split_start:
+		raise ValueError("--split-end must be >= --split-start")
+
+	indices = np.arange(split_start, effective_end, dtype=int)
+	if len(indices) == 0:
+		raise ValueError(
+			"Selected split is empty. Adjust --split-start/--split-end (or job array split settings)."
+		)
+
+	return Subset(test_ds, indices.tolist()), limit, split_start, effective_end
 
 
 def get_vcirc_mu(test_ds, device: torch.device) -> torch.Tensor:
@@ -169,11 +197,16 @@ def main() -> None:
 
 	checkpoint_path = resolve_checkpoint_path(args)
 	print(f"Loading checkpoint: {checkpoint_path}")
-	model = load_model(mode=args.mode, path=checkpoint_path, strict=True, assign=True, device=device)
+	model = load_model(mode=args.mode, path=checkpoint_path, strict=True, assign=True, device=str(device))
 
 	print(f"Loading test dataset: {data_dir}")
 	test_ds = pxt.TorchDataset(data_dir)
-	test_subset = maybe_subset(test_ds, args.n_galaxies)
+	test_subset, limited_size, split_start, split_end = build_subset(
+		test_ds,
+		args.n_galaxies,
+		args.split_start,
+		args.split_end,
+	)
 	ngals = len(test_subset)
 
 	vcirc_mu = get_vcirc_mu(test_subset, device=device) if args.mode == 2 else None
@@ -187,17 +220,20 @@ def main() -> None:
 		test_subset,
 		args.samples_per_galaxy,
 		vcirc_mu=vcirc_mu,
-		device=device,
+		device=str(device),
 	)
 
 	os.makedirs(args.cache_dir, exist_ok=True)
 	dataset_tag = basename(args.dataset_name.rstrip("/"))
-	default_stem = f"{args.model_name}_{dataset_tag}_ns{args.samples_per_galaxy}_n{ngals}"
+	split_tag = f"s{split_start}e{split_end}"
+	default_stem = (
+		f"{args.model_name}_{dataset_tag}_ns{args.samples_per_galaxy}_n{ngals}_{split_tag}"
+	)
 	out_stem = args.output_stem if args.output_stem else default_stem
 
 	sample_path = join(args.cache_dir, f"sample_{out_stem}.npy")
 	snr_path = join(args.cache_dir, f"snr_{out_stem}.npy")
-	meta_path = join(args.cache_dir, f"sample_meta_{out_stem}.json")
+	meta_path = join(args.cache_dir, f"meta_{out_stem}.json")
 
 	ensure_writable(sample_path, args.overwrite)
 	ensure_writable(snr_path, args.overwrite)
@@ -212,6 +248,9 @@ def main() -> None:
 		"dataset_name": args.dataset_name,
 		"dataset_dir": data_dir,
 		"mode": args.mode,
+		"limited_size": limited_size,
+		"split_start": split_start,
+		"split_end": split_end,
 		"n_galaxies": ngals,
 		"samples_per_galaxy": args.samples_per_galaxy,
 		"device": str(device),

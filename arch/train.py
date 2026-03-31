@@ -67,6 +67,7 @@ class CNNTrainer:
         self.nbatch_valid = self.nvalid//self.batch_size
         self.transform_to_gal = config.train.get('transform_to_gal', False)
         self.logger = logging.getLogger('Trainer')
+        self.sigma = config.sigma
         
     def _set_tensors(self):
         '''
@@ -145,10 +146,8 @@ class CNNTrainer:
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Starting epoch {epoch}')
             
-        self.SNR_train = torch.rand((self.ntrain,), device=self.device)*990+10
-        self.SNR_valid = torch.rand((self.nvalid,), device=self.device)*990+10
-        # self.SNR_train = torch.full((self.ntrain,), 900., device=self.device)
-        # self.SNR_valid = torch.full((self.nvalid,), 900., device=self.device)
+        self.SNR_train = self.generate_snr(size=self.ntrain, mode='rmag')
+        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='rmag')
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
@@ -276,10 +275,21 @@ class CNNTrainer:
         nans_infs = pd.DataFrame(np.hstack([train_nans, train_infs, valid_nans, valid_infs]))
         nans_infs.to_csv(join(losses_dir, f'nans_infs_{model_name}.csv'), index=False)
 
-    def SNRWeightedLoss(self, output, target, snr):
-        MSE_case = torch.mean((output-target)**2, dim=1)
-        return torch.mean(MSE_case*(snr/150)**2)
-        
+    def generate_snr(self, size, mode='uniform', **kwargs):
+        if mode == 'uniform':
+            min_snr = kwargs.get('min', 10)
+            max_snr = kwargs.get('max', 1000)
+            return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
+        elif mode == 'rmag':
+            min_rmag = kwargs.get('min', 16)
+            max_rmag = kwargs.get('max', 23)
+            base = np.random.power(2, size=size)
+            rmag = base*(max_rmag - min_rmag) + min_rmag
+            flux_factor = 10**(0.4*(23.4-rmag))
+            snr = flux_factor*5
+            return torch.from_numpy(snr).float().to(self.device)
+        else:
+            raise ValueError("Invalid SNR generation mode")
 
 #------------------#
 # Global functions #
@@ -432,8 +442,11 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
 
     return model
 
-def apply_noise(data, snr, device='cpu'):
-    noise = torch.randn_like(data, device=device)
+def apply_noise(data, snr, randgen=None, device='cpu'):
+    if randgen is None:
+        noise = torch.randn(data.size(), device=device)
+    else:
+        noise = torch.randn(data.size(), device=device, generator=randgen)
     maxs = torch.amax(data, dim=(-1, -2, -3))
     seg = data > 0.1*maxs.view(-1, 1, 1, 1)
     npix = torch.sum(seg, dim=(-1, -2, -3))
@@ -514,76 +527,34 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, vcirc_mu=No
 
     return log_probs, true, snrs
 
-def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, device='cpu'):
+def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, randgen=None, return_log_prob=False,device='cpu'):
     '''
     Run this function to sample from trained density estimation models
     '''
+    if snr is None and randgen is not None:
+        snr = torch.rand(len(test_ds), generator=randgen, device=device)*990 + 10
     if model.mode == 2:
         assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
     samples = []
-    snrs = snr if snr is not None else torch.rand((len(test_ds),),device=device)*990 + 10
+    if return_log_prob:
+        log_probs = []
+    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*990 + 10
     with torch.no_grad():
         for i in range(len(test_ds)):
             snr = snrs[i]
             vcircs = vcirc_mu[i] if vcirc_mu is not None else None
-            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, device=device)
-            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, device=device)
-            sample = model.sample(img, spec, nsamples, vcirc_mu=vcircs)
+            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            if return_log_prob:
+                sample, log_prob = model.sample(img, spec, nsamples, return_log_prob=True, vcirc_mu=vcircs)
+                log_probs.append(log_prob.detach().cpu().numpy())
+            else:
+                sample = model.sample(img, spec, nsamples, vcirc_mu=vcircs)
             samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     snrs = snrs.cpu().numpy()
-
+    if return_log_prob:
+        log_probs = np.vstack(log_probs)
+        return samples, log_probs, snrs
     return samples, snrs
-
-##################################################
-
-# Old/defective functions, not in use
-    
-class MSBLoss(nn.Module):
-    def __init__(self):
-        super(MSBLoss, self).__init__()
-        
-    def forward(self,x,y):
-        
-        if torch.std(y,axis=1).any() != 0:
-            print('Warning!')
-            # print(y)
-        
-        # print(x.shape)
-        # print(y.shape)
-        l = torch.mean(((torch.mean(x,axis=1)-torch.mean(y,axis=1))**2),axis=0)
-        # print(torch.mean(x,axis=1)-torch.mean(y,axis=1))
-        # print(l)
-        return l
-
-def cali_predict(test_dl,MODEL,criterion=MSBLoss()):
-
-    MODEL.eval()
-    losses=[]
-    for i, batch in enumerate(test_dl):
-        inputs, labels = batch['input'].float().to(torch.device(config.train['device'])), \
-                         batch['label'].float().to(torch.device(config.train['device']))
-        outputs = MODEL.forward(inputs)
-        
-        # remember to reshape it before feeding into loss calculation
-        outputs = torch.reshape(outputs,(-1,test_dl.dataset.real_size))
-        labels = torch.reshape(labels,(-1,test_dl.dataset.real_size))
-
-        loss = criterion(outputs, labels)
-        losses.append(loss.item())
-        if i == 0:
-            # ids = i
-            res = np.mean(outputs.detach().cpu().numpy(),axis=1)
-            labels_true = np.mean(labels.cpu().numpy(),axis=1)
-        else:
-            # ids = np.append(ids, i)
-            res = np.concatenate((res, np.mean(outputs.detach().cpu().numpy(),axis=1)),axis=0)
-            labels_true = np.concatenate((labels_true, np.mean(labels.cpu().numpy(),axis=1)),axis=0)  
-
-    # combined_pred = np.column_stack((ids, res))
-    # combined_true = np.column_stack((ids, labels_true))
-
-    epoch_loss = np.sqrt(sum(losses) / len(losses))
-    return res, labels_true, epoch_loss
-    

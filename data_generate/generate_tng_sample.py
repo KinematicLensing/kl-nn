@@ -3,7 +3,6 @@ from os.path import join
 from argparse import ArgumentParser
 from datetime import datetime
 
-import galsim as gs
 import numpy as np
 from astropy.io import fits
 import jax
@@ -106,23 +105,10 @@ def main() -> int:
         'g2': args.g2,
     }
 
-    image_pars = ImagePars(shape=(96, 96), pixel_scale=0.2637 / 2.0, indexing='ij')
-    psfscale = 1.028993969962188
-    psf = gs.Airy(lam_over_diam=1.0 / psfscale, scale_unit=gs.arcsec)
+    image_pars = ImagePars(shape=(48, 48), pixel_scale=0.2637, indexing='ij')
 
+    # Use a clean render configuration; PSF is applied by observation configs.
     render_cfg = TNGRenderConfig(
-        image_pars=image_pars,
-        band='r',
-        use_dusted=True,
-        center_on_peak=True,
-        use_native_orientation=False,
-        pars=params,
-        use_cic_gridding=True,
-        target_redshift=args.z,
-        preserve_gas_stellar_offset=True,
-        psf=psf,
-    )
-    render_cfg_clean = TNGRenderConfig(
         image_pars=image_pars,
         band='r',
         use_dusted=True,
@@ -135,9 +121,29 @@ def main() -> int:
     )
 
     spec_cfg = make_spectral_config(lines=[halpha_vac_line()], R_func=desi_z_R)
+    cube_pars_phot = CubePars.from_range(image_pars, 565.5, 717.0, 5.0)
     cube_pars_spec = CubePars.from_range(image_pars, 851.0, 855.81, 0.08)
     line_fluxes = {'Ha': 1e-16}
     line_continua = {'Ha': 1e-16}
+
+    phot_obs_cfg = {
+        'INSTNAME': 'CTIO/DECam',
+        'OBSTYPE': 0,
+        'NAXIS': 2,
+        'NAXIS1': 48,
+        'NAXIS2': 48,
+        'PIXSCALE': 0.2637,
+        'PSFTYPE': 'airy_fwhm',
+        'PSFFWHM': 1.0,
+        'DIAMETER': 378.2856,
+        'GAIN': 4.0,
+        'NOISETYP': 'ccd',
+        'RDNOISE': 2.6,
+        'ADDNOISE': False,
+        'BANDPASS': join(TEMPLATE_DIR, 'Bandpass/CTIO/DECam.r.dat'),
+        'SKYLEVEL': 44.54,
+        'EXPTIME': 60,
+    }
 
     base_obs_cfg = {
         'INSTNAME': 'DESI',
@@ -156,6 +162,18 @@ def main() -> int:
         'RDNOISE': 2.6,
     }
 
+    log('Generating photometric image')
+    phot_pars = FiberPars.from_cube_pars(cube_pars_phot, phot_obs_cfg)
+    phot_gen = FiberDataVector(galaxy, phot_pars)
+    cube_phot = phot_gen.generate_cube(
+        render_cfg,
+        cube_pars_phot,
+        spec_cfg,
+        line_fluxes=line_fluxes,
+        line_continua=line_continua,
+    )
+    image = np.asarray(phot_gen.fiber_observe_cube(cube_phot), dtype=np.float32)
+
     log('Computing transformed 5-fiber layout')
     offsets = compute_fiber_offsets(args.g1, args.g2, args.cosi, args.theta_int, fiber_offset=1.5)
 
@@ -165,7 +183,7 @@ def main() -> int:
     center_pars = FiberPars.from_cube_pars(cube_pars_spec, center_cfg)
     center_gen = FiberDataVector(galaxy, center_pars)
     cube = center_gen.generate_cube(
-        render_cfg_clean,
+        render_cfg,
         cube_pars_spec,
         spec_cfg,
         line_fluxes=line_fluxes,
@@ -193,7 +211,7 @@ def main() -> int:
 
     flux = np.asarray(spectra, dtype=np.float32)
 
-    # Save minimal data-only FITS with spectra and fiber geometry metadata.
+    # Save data-only FITS with photometric image, spectra, and fiber geometry metadata.
     primary = fits.PrimaryHDU()
     primary.header['GALID'] = int(args.s)
     primary.header['SAMPLEID'] = int(args.ID)
@@ -204,6 +222,7 @@ def main() -> int:
     primary.header['REDSHIFT'] = float(args.z)
     primary.header['NFIBERS'] = 5
 
+    image_hdu = fits.ImageHDU(data=image, name='IMAGE')
     flux_hdu = fits.ImageHDU(data=flux, name='FLUX')
     fiber_tbl = fits.BinTableHDU.from_columns(
         [
@@ -214,12 +233,9 @@ def main() -> int:
         name='FIBERS',
     )
 
-    hdul = fits.HDUList([primary, flux_hdu, fiber_tbl])
+    hdul = fits.HDUList([primary, image_hdu, flux_hdu, fiber_tbl])
     hdul.writeto(out_file, overwrite=True)
     log(f'Saved FITS: {out_file}')
-
-    # Keep this call to preserve notebook-equivalent render path including PSF setup.
-    _ = render_cfg
     return 0
 
 

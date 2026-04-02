@@ -164,6 +164,71 @@ class ForkCNN(nn.Module):
         log_norm = torch.log(torch.tensor(math.sqrt(2.0 * math.pi), device=values.device, dtype=values.dtype) * bandwidth)
         log_kernel = -0.5 * diffs.pow(2) - log_norm
         return torch.logsumexp(log_kernel, dim=1) - torch.log(torch.tensor(float(n), device=values.device, dtype=values.dtype))
+
+    def _kde_log_density_2d(self, values_2d, bandwidth='scott'):
+        """Gaussian KDE log-density in 2D evaluated at sample locations."""
+        n = values_2d.shape[0]
+        if n < 2:
+            return torch.zeros(n, device=values_2d.device, dtype=values_2d.dtype)
+
+        if bandwidth == 'scott':
+            factor = float(n) ** (-1.0 / 6.0)
+            std = values_2d.std(dim=0, unbiased=False).clamp(min=1e-6)
+            bw = (factor * std).clamp(min=1e-6)
+        elif isinstance(bandwidth, (int, float)):
+            bw = torch.full((2,), float(bandwidth), device=values_2d.device, dtype=values_2d.dtype).clamp(min=1e-6)
+        elif torch.is_tensor(bandwidth):
+            bw = bandwidth.to(device=values_2d.device, dtype=values_2d.dtype).reshape(-1)
+            if bw.numel() != 2:
+                raise ValueError('bandwidth tensor must have 2 elements for 2D KDE')
+            bw = bw.clamp(min=1e-6)
+        else:
+            raise ValueError("bandwidth must be 'scott', scalar, or length-2 tensor")
+
+        diffs = (values_2d[:, None, :] - values_2d[None, :, :]) / bw
+        sq_dist = diffs.pow(2).sum(dim=-1)
+
+        two_pi = values_2d.new_tensor(2.0 * math.pi)
+        log_norm = torch.log(two_pi) + torch.log(bw).sum()
+        log_kernel = -0.5 * sq_dist - log_norm
+        return torch.logsumexp(log_kernel, dim=1) - torch.log(values_2d.new_tensor(float(n)))
+
+    def marginalize_resample(self, samples, target_feature_idx, num_resamples=None, bandwidth='scott', return_log_prob=False):
+        """Resample in a 2D marginalized space estimated by KDE from posterior samples."""
+        if not torch.is_tensor(samples):
+            raise TypeError('samples must be a torch.Tensor')
+
+        if samples.ndim == 3:
+            if samples.shape[0] != 1:
+                raise ValueError('samples with 3 dims must have shape (1, N, D)')
+            flat_samples = samples[0]
+        elif samples.ndim == 2:
+            flat_samples = samples
+        else:
+            raise ValueError('samples must have shape (1, N, D) or (N, D)')
+
+        if len(target_feature_idx) != 2:
+            raise ValueError('target_feature_idx must contain exactly 2 feature indices')
+
+        d = flat_samples.shape[1]
+        idx0, idx1 = int(target_feature_idx[0]), int(target_feature_idx[1])
+        if idx0 < 0 or idx0 >= d or idx1 < 0 or idx1 >= d:
+            raise ValueError('target_feature_idx out of bounds for sample feature dimension')
+
+        marg_samples = flat_samples[:, [idx0, idx1]]
+        n = marg_samples.shape[0]
+        m = n if num_resamples is None else int(num_resamples)
+        if m < 1:
+            raise ValueError('num_resamples must be a positive integer')
+
+        log_density = self._kde_log_density_2d(marg_samples, bandwidth=bandwidth)
+        weights = torch.softmax(log_density, dim=0)
+        resample_idx = torch.multinomial(weights, num_samples=m, replacement=True)
+        resamples = marg_samples[resample_idx].unsqueeze(0)
+
+        if return_log_prob:
+            return resamples, log_density[resample_idx]
+        return resamples
     
     def setup_flows(self):
         '''

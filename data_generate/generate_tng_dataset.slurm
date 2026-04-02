@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_tng_dataset_%A_%a.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=1:00:00
+#SBATCH --time=8:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --array=1-50
+#SBATCH --ntasks-per-node=4
+#SBATCH --array=113-120
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
@@ -22,13 +22,50 @@ SAMPROOT=/ocean/projects/phy250048p/shared/samples
 OUTROOT=/ocean/projects/phy250048p/shared/fits/test_tng_10k
 CHUNK_SIZE=500
 
+SAMPLE_NAME=${SAMPLE_NAME:-tng_10k}
+DATASET_NAME=${DATASET_NAME:-test_tng_10k}
+NGAL=${NGAL:-50}
+ROWS_PER_GAL=${ROWS_PER_GAL:-10000}
+SECTIONS_PER_GAL=${SECTIONS_PER_GAL:-8}
+ID_STRIDE=${ID_STRIDE:-10000}
+
 # Test-mode controls (override at submit time, e.g. --export=ALL,TEST_MODE=1,TEST_MAX_ROWS=20)
 TEST_MODE=${TEST_MODE:-0}
 TEST_MAX_ROWS=${TEST_MAX_ROWS:-20}
 TEST_CHUNK_SIZE=${TEST_CHUNK_SIZE:-50}
 
-GAL_IDX=$((SLURM_ARRAY_TASK_ID - 1))
-SAMPFILE=${SAMPROOT}/samples_tng_10k_${GAL_IDX}.csv
+if [ ${SECTIONS_PER_GAL} -le 0 ]; then
+  echo "[ERROR] SECTIONS_PER_GAL must be >= 1, got ${SECTIONS_PER_GAL}"
+  exit 1
+fi
+
+TASK_INDEX=$((SLURM_ARRAY_TASK_ID - 1))
+GAL_IDX=$(( TASK_INDEX / SECTIONS_PER_GAL ))
+SECTION_IDX=$(( TASK_INDEX % SECTIONS_PER_GAL ))
+
+if [ ${GAL_IDX} -ge ${NGAL} ]; then
+  echo "[INFO] Task ${SLURM_ARRAY_TASK_ID} maps to galaxy ${GAL_IDX}, beyond NGAL=${NGAL}; skipping"
+  exit 0
+fi
+
+BASE_ROWS=$((ROWS_PER_GAL / SECTIONS_PER_GAL))
+EXTRA_ROWS=$((ROWS_PER_GAL % SECTIONS_PER_GAL))
+if [ ${SECTION_IDX} -lt ${EXTRA_ROWS} ]; then
+  SECTION_ROWS=$((BASE_ROWS + 1))
+  START_REALIZ=$((SECTION_IDX * SECTION_ROWS))
+else
+  SECTION_ROWS=${BASE_ROWS}
+  START_REALIZ=$((EXTRA_ROWS * (BASE_ROWS + 1) + (SECTION_IDX - EXTRA_ROWS) * BASE_ROWS))
+fi
+END_REALIZ=$((START_REALIZ + SECTION_ROWS))
+
+if [ ${SECTION_ROWS} -le 0 ]; then
+  echo "[INFO] Galaxy ${GAL_IDX} section ${SECTION_IDX}: empty section; skipping"
+  exit 0
+fi
+
+OUTROOT=/ocean/projects/phy250048p/shared/fits/${DATASET_NAME}
+SAMPFILE=${SAMPROOT}/samples_${SAMPLE_NAME}_${GAL_IDX}.csv
 GAL_DIR=${OUTROOT}/galaxy_${GAL_IDX}
 
 mkdir -p ${OUTROOT}
@@ -39,12 +76,8 @@ if [ ! -f "${SAMPFILE}" ]; then
   exit 1
 fi
 
-TOTAL_ROWS=$(( $(wc -l < "${SAMPFILE}") - 1 ))
-if [ ${TOTAL_ROWS} -le 0 ]; then
-  echo "[ERROR] No sample rows found in ${SAMPFILE}"
-  exit 1
-fi
-
+# For this section, we process SECTION_ROWS rows (or fewer in TEST_MODE)
+TOTAL_ROWS=${SECTION_ROWS}
 if [ "${TEST_MODE}" -eq 1 ]; then
   if [ ${TEST_MAX_ROWS} -lt ${TOTAL_ROWS} ]; then
     TOTAL_ROWS=${TEST_MAX_ROWS}
@@ -53,24 +86,26 @@ if [ "${TEST_MODE}" -eq 1 ]; then
   echo "[INFO] TEST_MODE enabled: processing first ${TOTAL_ROWS} rows with chunk size ${CHUNK_SIZE}"
 fi
 
+SECTION_END=$((START_REALIZ + TOTAL_ROWS))
+
 NUM_CHUNKS=$(( (TOTAL_ROWS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
 SUCCESS=0
 FAIL=0
 
-echo "[INFO] Start galaxy ${GAL_IDX}"
+echo "[INFO] Start galaxy ${GAL_IDX}, section ${SECTION_IDX}/${SECTIONS_PER_GAL} (realizations ${START_REALIZ}-$((END_REALIZ - 1)))"
 echo "[INFO] Input sample file: ${SAMPFILE}"
 echo "[INFO] Output directory: ${GAL_DIR}"
-echo "[INFO] Total rows: ${TOTAL_ROWS}; chunk size: ${CHUNK_SIZE}; chunks: ${NUM_CHUNKS}"
+echo "[INFO] Total rows for this section: ${TOTAL_ROWS}; chunk size: ${CHUNK_SIZE}; chunks: ${NUM_CHUNKS}"
 
 for (( chunk=0; chunk<NUM_CHUNKS; chunk++ ))
 do
-  START=$((chunk * CHUNK_SIZE))
-  END=$(((chunk + 1) * CHUNK_SIZE))
-  if [ ${END} -gt ${TOTAL_ROWS} ]; then
-    END=${TOTAL_ROWS}
+  START=$((START_REALIZ + chunk * CHUNK_SIZE))
+  END=$((START + CHUNK_SIZE))
+  if [ ${END} -gt ${SECTION_END} ]; then
+    END=${SECTION_END}
   fi
 
-  echo "[INFO] Galaxy ${GAL_IDX}: processing chunk $((chunk + 1))/${NUM_CHUNKS}, rows ${START}..$((END - 1))"
+  echo "[INFO] Galaxy ${GAL_IDX} section ${SECTION_IDX}: processing chunk $((chunk + 1))/${NUM_CHUNKS}, rows ${START}..$((END - 1))"
 
   while IFS=, read -r row_id g1 g2 cosi theta_int
   do
@@ -78,7 +113,7 @@ do
       continue
     fi
 
-    GLOBAL_ID=$((GAL_IDX * 10000 + row_id))
+    GLOBAL_ID=$((GAL_IDX * ID_STRIDE + row_id))
     echo "[INFO] Galaxy ${GAL_IDX}: sample row ${row_id}, global ID ${GLOBAL_ID}"
 
     python ${SCRIPT} \
@@ -88,7 +123,7 @@ do
       -cosi=${cosi} \
       -theta_int=${theta_int} \
       -ID=${GLOBAL_ID} \
-      -d=test_tng_10k
+      -d=${DATASET_NAME}
 
     STATUS=$?
     if [ ${STATUS} -eq 0 ]; then
@@ -100,6 +135,6 @@ do
   done < <(awk -F, -v s="${START}" -v e="${END}" 'NR>1 {idx=NR-2; if (idx>=s && idx<e) print $1","$2","$3","$4","$5}' "${SAMPFILE}")
 done
 
-echo "[INFO] Finished galaxy ${GAL_IDX}"
+echo "[INFO] Finished galaxy ${GAL_IDX} section ${SECTION_IDX}"
 echo "[INFO] Success count: ${SUCCESS}"
 echo "[INFO] Failure count: ${FAIL}"

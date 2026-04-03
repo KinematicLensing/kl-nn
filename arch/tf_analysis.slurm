@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/tf_analysis.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/tf_analysis_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=1:00:00
@@ -21,14 +21,7 @@ SAMPFILE=samples_test_1m_low_hlr.csv
 DATASET=test_1m_low_hlr
 NGALS=10000
 NSAMPS=10000
-hit=0
+NPARTS=10
 
-for (( c=0; c<11; c++ ))
-do
-  hit=$((${hit}+1))
-  if [ ${hit} -eq ${SLURM_ARRAY_TASK_ID} ]
-  then
-    i=$((${SLURM_ARRAY_TASK_ID}-1))
-    python ${SCRIPT} -i=${i} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --dataset=${DATASET} --sample-set=${SAMPFILE}
-  fi
-done
+i=$((${SLURM_ARRAY_TASK_ID}-1))
+python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --dataset=${DATASET} --sample-set=${SAMPFILE}

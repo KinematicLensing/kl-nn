@@ -188,7 +188,9 @@ def main():
             f'Partition range [{start}, {end}) exceeds dataset size {len(test_ds)} for partition {partition_label}.'
         )
     subset = Subset(test_ds, np.arange(start, end))
-    gen = torch.Generator(device=device).manual_seed(42)
+    rng_seed = 42
+    snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
+    snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 990 + 10
 
     # Collect true values for g and vcirc
     g_true = torch.zeros((args.ngals,2), dtype=torch.float32).to(device)
@@ -205,9 +207,12 @@ def main():
     # sample for each galaxy and each mode
     for mode in modes:
         model.mode = mode
+        # Reset the noise RNG so each mode sees the same injected img/spec noise.
+        noise_gen = torch.Generator(device=device).manual_seed(rng_seed)
         samples, log_probs, SNR = sample_density(model, subset, nsamples, 
                                                 vcirc_mu=vcirc_mu, 
-                                                randgen=gen,
+                                                snr=snr_shared,
+                                                randgen=noise_gen,
                                                 return_log_prob=True, 
                                                 device=device)
         for i in range(args.ngals):

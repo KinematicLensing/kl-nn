@@ -337,17 +337,23 @@ class ForkCNN(nn.Module):
             mu = vcirc_mu.to(device=candidates.device, dtype=candidates.dtype).reshape(-1)
             assert mu.numel() == 1, 'vcirc_mu must have shape (1,) in sample()'
             tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm, mu[0])
-            # flow_log_p_v = self._kde_log_density_1d(v_circ)
+            flow_log_p_v = self._kde_log_density_1d(v_circ)
 
-            # log_w = tf_log_p_v - flow_log_p_v
-            log_w = tf_log_p_v
+            log_w = tf_log_p_v - flow_log_p_v
+            # log_w = tf_log_p_v
             weights = torch.softmax(log_w, dim=0)
             resample_idx = torch.multinomial(weights, num_samples=num_samples, replacement=True)
             samples = candidates[resample_idx].unsqueeze(0)
 
         if return_log_prob:
             z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)
-            return samples.view(1, num_samples, -1), self.flow.log_prob(samples.view(num_samples, -1), context=z_rep)
+            flow_log_prob = self.flow.log_prob(samples.view(num_samples, -1), context=z_rep)
+            
+            # For mode 2, compute TF-adjusted posterior log_prob
+            if self.mode == 2:
+                flow_log_prob = flow_log_prob + log_w[resample_idx]
+            
+            return samples.view(1, num_samples, -1), flow_log_prob
         return samples.view(1, num_samples, -1)
 
 class MLP(nn.Module):

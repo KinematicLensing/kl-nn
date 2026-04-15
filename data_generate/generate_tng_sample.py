@@ -68,8 +68,11 @@ def parse_args() -> ArgumentParser:
     parser.add_argument('-s', type=int, required=True, help='subhalo id (TNG galaxy index)')
     parser.add_argument('-g1', type=float, required=True, help='shear component 1')
     parser.add_argument('-g2', type=float, required=True, help='shear component 2')
-    parser.add_argument('-cosi', type=float, required=True, help='cos(inclination angle)')
+    parser.add_argument('-i', type=float, required=True, help='inclination angle [rad]')
     parser.add_argument('-theta_int', type=float, required=True, help='intrinsic position angle [rad]')
+    parser.add_argument('-v0', type=float, default=0.0, help='fitted systemic velocity [km/s]')
+    parser.add_argument('-vcirc', type=float, default=0.0, help='fitted circular velocity [km/s]')
+    parser.add_argument('-rscale', type=float, default=0.0, help='fitted arctan scale radius')
     parser.add_argument('-ID', type=int, default=0, help='global sample id for output naming')
     parser.add_argument('-d', type=str, default='test_tng_10k', help='dataset directory name')
     parser.add_argument('-z', type=float, default=0.3, help='target redshift')
@@ -85,11 +88,13 @@ def main() -> int:
 
     log(
         f'Start sample: galaxy={args.s}, ID={args.ID}, '
-        f'g1={args.g1:.6f}, g2={args.g2:.6f}, cosi={args.cosi:.6f}, theta_int={args.theta_int:.6f}'
+        f'g1={args.g1:.6f}, g2={args.g2:.6f}, i={args.i:.6f}, theta_int={args.theta_int:.6f}'
     )
 
-    if not (-1.0 <= args.cosi <= 1.0):
-        raise ValueError(f'cosi must be in [-1, 1], got {args.cosi}')
+    if not (0.0 <= args.i <= np.pi):
+        raise ValueError(f'i must be in [0, pi], got {args.i}')
+
+    cosi = float(np.cos(args.i))
 
     log('Loading TNG galaxy data')
     tng = TNG50Galaxy(index=args.s)
@@ -98,7 +103,7 @@ def main() -> int:
 
     params = {
         'theta_int': args.theta_int,
-        'cosi': args.cosi,
+        'cosi': cosi,
         'x0': 0.0,
         'y0': 0.0,
         'g1': args.g1,
@@ -175,7 +180,7 @@ def main() -> int:
     image = np.asarray(phot_gen.fiber_observe_cube(cube_phot), dtype=np.float32)
 
     log('Computing transformed 5-fiber layout')
-    offsets = compute_fiber_offsets(args.g1, args.g2, args.cosi, args.theta_int, fiber_offset=1.5)
+    offsets = compute_fiber_offsets(args.g1, args.g2, cosi, args.theta_int, fiber_offset=1.5)
 
     log('Generating spectral cube')
     center_cfg = dict(base_obs_cfg)
@@ -217,8 +222,12 @@ def main() -> int:
     primary.header['SAMPLEID'] = int(args.ID)
     primary.header['G1'] = float(args.g1)
     primary.header['G2'] = float(args.g2)
-    primary.header['COSI'] = float(args.cosi)
+    primary.header['INCL'] = float(args.i)
+    primary.header['COSI'] = cosi
     primary.header['THETAINT'] = float(args.theta_int)
+    primary.header['V0FIT'] = float(args.v0)
+    primary.header['VCIRCFIT'] = float(args.vcirc)
+    primary.header['RSCLFIT'] = float(args.rscale)
     primary.header['REDSHIFT'] = float(args.z)
     primary.header['NFIBERS'] = 5
 

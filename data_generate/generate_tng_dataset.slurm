@@ -107,7 +107,7 @@ do
 
   echo "[INFO] Galaxy ${GAL_IDX} section ${SECTION_IDX}: processing chunk $((chunk + 1))/${NUM_CHUNKS}, rows ${START}..$((END - 1))"
 
-  while IFS=, read -r row_id g1 g2 cosi theta_int
+  while IFS=, read -r row_id g1 g2 theta_int incl v0 vcirc rscale
   do
     if [ -z "${row_id}" ]; then
       continue
@@ -120,8 +120,11 @@ do
       -s=${GAL_IDX} \
       -g1=${g1} \
       -g2=${g2} \
-      -cosi=${cosi} \
       -theta_int=${theta_int} \
+      -i=${incl} \
+      -v0=${v0} \
+      -vcirc=${vcirc} \
+      -rscale=${rscale} \
       -ID=${GLOBAL_ID} \
       -d=${DATASET_NAME}
 
@@ -132,7 +135,7 @@ do
       FAIL=$((FAIL + 1))
       echo "[WARN] Failed sample row ${row_id} for galaxy ${GAL_IDX} (exit ${STATUS})"
     fi
-  done < <(awk -F, -v s="${START}" -v e="${END}" 'NR>1 {idx=NR-2; if (idx>=s && idx<e) print $1","$2","$3","$4","$5}' "${SAMPFILE}")
+  done < <(awk -F, -v s="${START}" -v e="${END}" 'NR>1 {idx=NR-2; if (idx>=s && idx<e) print $1","$2","$3","$4","$5","$6","$7","$8}' "${SAMPFILE}")
 done
 
 echo "[INFO] Finished galaxy ${GAL_IDX} section ${SECTION_IDX}"

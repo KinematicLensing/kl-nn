@@ -64,7 +64,7 @@ def load_fiducial_parameters(sample_name, ngal, rows_per_gal):
     fids = np.zeros((total, 7), dtype=np.float32)
 
     for gal_idx in range(ngal):
-        sample_file = get_tng_sample_file(sample_name, gal_idx)
+        sample_file = get_tng_sample_file(sample_name, gal_idx+50)
         if not isfile(sample_file):
             raise FileNotFoundError(f'Missing sample file: {sample_file}')
 
@@ -152,10 +152,11 @@ def main():
     fids_all = load_fiducial_parameters(args.s, args.ngal, args.rows_per_gal)
 
     with px.Writer(dirpath=save_dir, map_size_limit=200000, ram_gb_limit=2) as db:
-        for gal_idx in range(args.ngal):
+        for gal_id in range(args.ngal):
+            gal_idx = gal_id+50
             start_time = time.time()
-            start_id = gal_idx * args.rows_per_gal
-            end_id = (gal_idx + 1) * args.rows_per_gal
+            start_id = gal_id * args.rows_per_gal
+            end_id = (gal_id + 1) * args.rows_per_gal
             file_id_start = gal_idx * args.id_stride
 
             n_this = end_id - start_id
@@ -174,6 +175,8 @@ def main():
                 )
                 img_stack[i, 0] = image
                 spec_stack[i, 0] = specs
+
+            print(img_stack.shape, spec_stack.shape, fids.shape, ids.shape)
 
             db.put_samples(
                 {

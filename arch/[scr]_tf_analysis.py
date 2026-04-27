@@ -176,7 +176,7 @@ def main():
         raise FileNotFoundError(f'Sample set not found: {samp_dir}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_file = join(model_dir, f'{stem}149')
+    model_file = join(model_dir, f'{stem}5')
     model = load_model(mode=2, path=model_file,strict=True, assign=True, device=device)
 
     # Get data loader

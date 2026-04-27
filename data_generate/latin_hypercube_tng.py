@@ -18,7 +18,7 @@ def main():
                      [-np.pi, np.pi]] # theta_int
     ndim = len(sample_limits)
     nsamples = int(1e4)
-    ngals = 50
+    ngals = 10
 
     sample_centers = []
     sample_scale = []
@@ -26,7 +26,7 @@ def main():
         sample_centers.append((limit[-1] + limit[0])/2)
         sample_scale.append(limit[-1] - limit[0])
 
-    for n in range(ngals):
+    for n in range(50, 50+ngals):
         fit = fit_galaxy_rotation_params(n)
         print(
             f'galaxy {n}: fitted v0={fit.v0:.3f}, vcirc={fit.vcirc:.3f}, '
@@ -49,7 +49,7 @@ def main():
         df.insert(0, 'row_id', np.arange(nsamples, dtype=np.int64))
 
         # Save parameter samples
-        df.to_csv(join(SAMPDIR, f'samples_tng_10k_{n}.csv'), index=False)
+        df.to_csv(join(SAMPDIR, f'samples_test_tng_10k_{n}.csv'), index=False)
 
 
 if __name__ == '__main__':

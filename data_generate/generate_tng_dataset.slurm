@@ -3,8 +3,8 @@
 #SBATCH --partition=RM-shared
 #SBATCH --time=8:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --array=113-120
+#SBATCH --ntasks-per-node=1
+#SBATCH --array=401-480
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
@@ -22,9 +22,9 @@ SAMPROOT=/ocean/projects/phy250048p/shared/samples
 OUTROOT=/ocean/projects/phy250048p/shared/fits/test_tng_10k
 CHUNK_SIZE=500
 
-SAMPLE_NAME=${SAMPLE_NAME:-tng_10k}
+SAMPLE_NAME=${SAMPLE_NAME:-test_tng_10k}
 DATASET_NAME=${DATASET_NAME:-test_tng_10k}
-NGAL=${NGAL:-50}
+NGAL=${NGAL:-60}
 ROWS_PER_GAL=${ROWS_PER_GAL:-10000}
 SECTIONS_PER_GAL=${SECTIONS_PER_GAL:-8}
 ID_STRIDE=${ID_STRIDE:-10000}

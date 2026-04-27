@@ -3,7 +3,7 @@
 set -u
 
 FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/test_tng_10k}
-NGAL=${NGAL:-50}
+NGAL=${NGAL:-60}
 ROWSPERGAL=${ROWSPERGAL:-10000}
 IDSTRIDE=${IDSTRIDE:-10000}
 OUTFILE=${1:-missing_tng_fits.txt}

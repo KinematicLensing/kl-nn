@@ -3,11 +3,11 @@
 set -euo pipefail
 
 input_dir="${1:-/ocean/projects/phy250048p/shared/samples}"
-output_file="${2:-${input_dir}/samples_tng_10k_all.csv}"
+output_file="${2:-${input_dir}/samples_test_tng_10k_all.csv}"
 
 shopt -s nullglob
 mapfile -t files < <(
-    for file in "${input_dir}"/samples_tng_10k_*.csv; do
+    for file in "${input_dir}"/samples_test_tng_10k_*.csv; do
         [[ "${file}" == "${output_file}" ]] && continue
         printf '%s\n' "${file}"
     done | sort -V

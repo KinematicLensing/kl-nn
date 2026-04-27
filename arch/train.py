@@ -121,17 +121,7 @@ class CNNTrainer:
         torch.distributed.barrier()
         
     def _apply_noise(self, data, snr):
-        noise = torch.randn_like(data, device=self.device)
-        maxs = torch.amax(data, dim=(-1, -2, -3))
-        seg = data > 0.1*maxs.view(-1, 1, 1, 1)
-        npix = torch.sum(seg, dim=(-1, -2, -3))
-        total = torch.sum(data, dim=(-1, -2, -3))
-        factor = total/(npix**0.5*snr)
-        data = data + noise*factor.view(-1, 1, 1, 1)
-        #mean = data.mean()
-        #std = data.std()
-        #return (data-mean)/std
-        return data
+        return apply_noise(data, snr, device=self.device, use_iterative=True)
 
     def _run_batch(self, img, spec, fid):
         self.optimizer.zero_grad()
@@ -210,7 +200,7 @@ class CNNTrainer:
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
-                snr = self.SNR_train[batch_ids]
+                snr = self.SNR_valid[batch_ids]
                 img = self._apply_noise(self.img_valid[batch_ids], snr)
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr)
                 # img = self.img_valid[batch_ids]
@@ -442,21 +432,50 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
 
     return model
 
-def apply_noise(data, snr, randgen=None, device='cpu'):
+def _noise_scale_from_seg(data, snr, seg, eps=1e-8):
+    snr = torch.clamp(snr, min=eps)
+    npix = torch.sum(seg, dim=(-1, -2, -3)).float()
+    npix = torch.clamp(npix, min=1.0)
+    signal = torch.sum(data*seg.float(), dim=(-1, -2, -3))
+    return signal/(torch.sqrt(npix)*snr)
+
+
+def _estimate_noise_rms(noise, seg, eps=1e-8):
+    # Prefer background pixels to estimate RMS; fall back to full-frame RMS if needed.
+    bkg = (~seg).float()
+    bkg_count = torch.sum(bkg, dim=(-1, -2, -3))
+    bkg_count_safe = torch.clamp(bkg_count, min=1.0)
+    bkg_rms = torch.sqrt(torch.sum((noise*bkg)**2, dim=(-1, -2, -3))/bkg_count_safe)
+    full_rms = torch.sqrt(torch.mean(noise**2, dim=(-1, -2, -3)))
+    return torch.where(bkg_count > eps, bkg_rms, full_rms)
+
+
+def apply_noise(data, snr, randgen=None, device='cpu', use_iterative=True,
+                base_signal_frac=0.1, threshold_sigma=1.5, eps=1e-8):
+    """
+    Apply Gaussian noise to batched data using an SNR-controlled scale.
+
+    When use_iterative=True, a second pass refines the segmentation threshold to
+    threshold_sigma * estimated_noise_rms for a more realistic signal mask.
+    """
     if randgen is None:
         noise = torch.randn(data.size(), device=device)
     else:
         noise = torch.randn(data.size(), device=device, generator=randgen)
+
     maxs = torch.amax(data, dim=(-1, -2, -3))
-    seg = data > 0.1*maxs.view(-1, 1, 1, 1)
-    npix = torch.sum(seg, dim=(-1, -2, -3))
-    total = torch.sum(data, dim=(-1, -2, -3))
-    factor = total/(npix**0.5*snr)
-    data = data + noise*factor.view(-1, 1, 1, 1)
-    #mean = data.mean()
-    #std = data.std()
-    #return (data-mean)/std
-    return data
+    seg_coarse = data > (base_signal_frac*maxs).view(-1, 1, 1, 1)
+    factor_coarse = _noise_scale_from_seg(data, snr, seg_coarse, eps=eps)
+
+    if not use_iterative:
+        return data + noise*factor_coarse.view(-1, 1, 1, 1)
+
+    coarse_noise = noise*factor_coarse.view(-1, 1, 1, 1)
+    coarse_rms = _estimate_noise_rms(coarse_noise, seg_coarse, eps=eps)
+    refined_threshold = threshold_sigma*coarse_rms
+    seg_refined = data > refined_threshold.view(-1, 1, 1, 1)
+    factor_refined = _noise_scale_from_seg(data, snr, seg_refined, eps=eps)
+    return data + noise*factor_refined.view(-1, 1, 1, 1)
 
 def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(), device='cpu'):
     '''

@@ -8,7 +8,7 @@ data = \
     'size': 1000000,
     'nimg': 1,
     'nspec': 5,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_tng_10k/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/train_1m_low_hlr/',
     'data_stem': 'gal_',
 }
 
@@ -18,7 +18,7 @@ test = \
     'size': 100000,
     'nimg': 1,
     'nspec': 5,
-    'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_tng_10k/',
+    'data_dir': '/ocean/projects/phy250048p/shared/datasets/test_1m_low_hlr/',
     'data_stem': 'gal_'
 }
 

@@ -16,6 +16,7 @@ from train import (
 import config
 from utils import (
     denormalize,
+    resolve_feature_index,
 )
 
 BASE_SHARED_DIR = '/ocean/projects/phy250048p/shared'
@@ -57,6 +58,12 @@ def parse_args():
         type=str,
         default='CNN-CNN-flow_1m_tf_noprior',
         help='Model stem used for model input and output file names.',
+    )
+    parser.add_argument(
+        '--epoch',
+        type=int,
+        default=199,
+        help='Epoch number of the model to load.',
     )
     parser.add_argument(
         '--dataset',
@@ -146,11 +153,42 @@ def ensure_output_dirs(cache_root, model_name, dataset_name):
 def now_utc_iso():
     return datetime.now(timezone.utc).isoformat()
 
+
+FID_PARS_INDEX_BY_FEATURE = {
+    'g1': 0,
+    'g2': 1,
+    'theta_int': 2,
+    'sini': 3,
+    'v0': 4,
+    'vcirc': 5,
+    'rscale': 6,
+    'hlr': 7,
+}
+
+
+def build_truth_array(subset, feature_names):
+    truth = np.empty((len(subset), len(feature_names)), dtype=np.float32)
+    for row_idx in range(len(subset)):
+        fid_pars = subset[row_idx]['fid_pars']
+        if torch.is_tensor(fid_pars):
+            fid_pars = fid_pars.detach().cpu().numpy()
+        else:
+            fid_pars = np.asarray(fid_pars)
+
+        for col_idx, feature_name in enumerate(feature_names):
+            try:
+                source_idx = FID_PARS_INDEX_BY_FEATURE[feature_name]
+            except KeyError as exc:
+                raise ValueError(f'Unsupported feature name in config.train["feature_names"]: {feature_name}') from exc
+            truth[row_idx, col_idx] = fid_pars[source_idx]
+    return truth
+
 def main():
     setup_logging()
     args = parse_args()
 
     stem = args.stem
+    epoch = args.epoch
     nsamples = args.nsamples
     data_dir = resolve_path(BASE_DATASETS_DIR, args.dataset)
     samp_dir = resolve_path(BASE_SAMPLES_DIR, args.sample_set)
@@ -158,6 +196,13 @@ def main():
     dataset_name = os.path.basename(os.path.normpath(data_dir))
     total_partitions = infer_total_partitions(args)
     partition_label = build_partition_label(args.i, total_partitions)
+    nfeatures = config.train['feature_number']
+    feature_names = config.train['feature_names']
+
+    if len(feature_names) != nfeatures:
+        raise ValueError(
+            f"config.train['feature_names'] length {len(feature_names)} does not match feature_number {nfeatures}."
+        )
 
     fig_dir = join(BASE_SHARED_DIR, 'figures')
     model_dir = join(BASE_SHARED_DIR, 'models', stem)
@@ -176,7 +221,7 @@ def main():
         raise FileNotFoundError(f'Sample set not found: {samp_dir}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_file = join(model_dir, f'{stem}5')
+    model_file = join(model_dir, f'{stem}{epoch}')
     model = load_model(mode=2, path=model_file,strict=True, assign=True, device=device)
 
     # Get data loader
@@ -192,16 +237,20 @@ def main():
     snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
     snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 990 + 10
 
-    # Collect true values for g and vcirc
-    g_true = torch.zeros((args.ngals,2), dtype=torch.float32).to(device)
-    vcirc_true = torch.zeros((args.ngals), dtype=torch.float32).to(device)
-    for i in range(g_true.shape[0]):
-        g_true[i] = subset[i]['fid_pars'][:2]
-        vcirc_true[i] = subset[i]['fid_pars'][5]
-    vcirc_mu = 0.5*(vcirc_true + 1.)*480. + 60. # center of prior
+    vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
+    vcirc_name = feature_names[vcirc_idx]
+    vcirc_low, vcirc_high = config.par_ranges[vcirc_name]
+
+    # Collect true vcirc values in normalized space and convert to km/s center of prior.
+    vcirc_true = torch.zeros((args.ngals), dtype=torch.float32, device=device)
+    for i in range(args.ngals):
+        vcirc_true[i] = subset[i]['fid_pars'][vcirc_idx]
+    vcirc_mu = 0.5 * (vcirc_true + 1.0) * (vcirc_high - vcirc_low) + vcirc_low
+
+    truth = build_truth_array(subset, feature_names)
 
     modes = [1, 2] # 1: no TF prior, 2: TF prior
-    sample_list = np.empty((len(modes), args.ngals, args.nsamples, 3), dtype=np.float32)
+    sample_list = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
     log_prob_list = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
 
     # sample for each galaxy and each mode
@@ -216,11 +265,10 @@ def main():
                                                 return_log_prob=True, 
                                                 device=device)
         for i in range(args.ngals):
-            sample_list[mode-1, i] = denormalize(samples[i], par_ranges=config.par_ranges)
+            sample_list[mode-1, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
             log_prob_list[mode-1, i] = log_probs[i]
-    
-    trues = np.stack((g_true[:, 0].cpu().numpy(), g_true[:, 1].cpu().numpy(), vcirc_true.cpu().numpy()), axis=-1)
-    truth_denorm = denormalize(trues, par_ranges=config.par_ranges)
+
+    truth_denorm = denormalize(truth, par_ranges=config.par_ranges, feature_names=feature_names)
 
     # Save samples and SNR to cache directory
     saved_files = {}
@@ -246,8 +294,8 @@ def main():
     logging.info('Saved truth: %s', truth_path)
 
     # Compute MAP and mean estimates for each galaxy and mode
-    map_estimates = np.zeros((len(modes), args.ngals, 3)) # g1, g2, vcirc
-    mean_estimates = np.zeros((len(modes), args.ngals, 3, 3)) # mean with high and low bounds
+    map_estimates = np.zeros((len(modes), args.ngals, nfeatures))
+    mean_estimates = np.zeros((len(modes), args.ngals, 3, nfeatures))
     for i in range(args.ngals):
         for mode in modes:
             samples = sample_list[mode-1, i]

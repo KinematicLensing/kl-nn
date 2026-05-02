@@ -10,15 +10,52 @@ import scipy.optimize as so
 from os.path import join
 
 
-def denormalize(samples, par_ranges):
+def resolve_feature_index(feature_names, target_name, aliases=None):
+    """Resolve feature index by name with optional aliases."""
+    names = [str(name).strip() for name in feature_names]
+    target_candidates = [target_name]
+    if aliases is not None:
+        target_candidates.extend(list(aliases))
+
+    normalized_candidates = {str(name).strip().lower() for name in target_candidates}
+    matches = [idx for idx, name in enumerate(names) if name.lower() in normalized_candidates]
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) == 0:
+        raise ValueError(
+            f"Could not find any of {sorted(normalized_candidates)} in feature_names={names}."
+        )
+    raise ValueError(
+        f"Found multiple matches for {sorted(normalized_candidates)} in feature_names={names}: indices={matches}."
+    )
+
+
+def denormalize(samples, par_ranges, feature_names=None):
+    samples = np.asarray(samples)
     denorm = np.empty_like(samples)
-    for i, par in enumerate(par_ranges.values()):
-        low, high = par
-        values = samples[:, i]
+
+    if feature_names is None:
+        feature_names = list(par_ranges.keys())
+    else:
+        feature_names = list(feature_names)
+
+    if samples.shape[-1] != len(feature_names):
+        raise ValueError(
+            f"Sample feature dimension {samples.shape[-1]} does not match feature list length {len(feature_names)}."
+        )
+
+    missing = [name for name in feature_names if name not in par_ranges]
+    if missing:
+        raise ValueError(f"Feature names missing from par_ranges: {missing}")
+
+    for i, name in enumerate(feature_names):
+        low, high = par_ranges[name]
+        values = samples[..., i].copy()
         values += 1
         values *= (high - low) / 2
         values += low
-        denorm[:, i] = values
+        denorm[..., i] = values
     return denorm
 
 
@@ -443,6 +480,45 @@ def generate_grid_plot(grid_prob, param1_axis, param2_axis, labels=None, true_po
     plt.suptitle("2D Grid Posterior Plot", y=0.95, fontsize=12)
 
 
+def filter_samples_sigma_clip(samples, n_sigma=5.0, min_keep=100, return_mask=False):
+    """Filter rows outside +/- n_sigma per dimension for plotting stability."""
+    arr = np.asarray(samples)
+    if arr.ndim != 2:
+        raise ValueError("samples must have shape (nsamples, nfeatures).")
+    if arr.shape[0] == 0:
+        raise ValueError("samples must contain at least one row.")
+    if n_sigma <= 0:
+        raise ValueError("n_sigma must be > 0.")
+    if min_keep < 1:
+        raise ValueError("min_keep must be >= 1.")
+
+    finite_row_mask = np.all(np.isfinite(arr), axis=1)
+    finite_idx = np.flatnonzero(finite_row_mask)
+    if finite_idx.size == 0:
+        raise ValueError("No finite rows available after filtering NaN/Inf values.")
+
+    finite_samples = arr[finite_row_mask]
+    mean = finite_samples.mean(axis=0)
+    std = finite_samples.std(axis=0)
+
+    z = np.zeros_like(finite_samples, dtype=float)
+    nonzero_std = std > 0
+    if np.any(nonzero_std):
+        z[:, nonzero_std] = np.abs((finite_samples[:, nonzero_std] - mean[nonzero_std]) / std[nonzero_std])
+
+    keep_finite = np.all(z <= n_sigma, axis=1)
+    if int(np.sum(keep_finite)) < min_keep:
+        keep_finite = np.ones(finite_samples.shape[0], dtype=bool)
+
+    keep_mask = np.zeros(arr.shape[0], dtype=bool)
+    keep_mask[finite_idx[keep_finite]] = True
+
+    filtered = arr[keep_mask]
+    if return_mask:
+        return filtered, keep_mask
+    return filtered
+
+
 def make_corner_plot(
     samples,
     truth=None,
@@ -463,6 +539,9 @@ def make_corner_plot(
     width_inch=None,
     settings=None,
     suptitle=None,
+    sigma_clip_enabled=True,
+    sigma_clip_n=5.0,
+    sigma_clip_min_keep=100,
 ):
     """Make a getdist corner plot from posterior samples.
 
@@ -613,6 +692,25 @@ def make_corner_plot(
             sample_labels = list(sample_labels)
         if len(sample_labels) != nsets:
             raise ValueError("sample_labels must have one label per sample set.")
+
+    if sigma_clip_enabled:
+        filtered_sample_sets = []
+        filtered_weight_sets = []
+        for s, w in zip(sample_sets, weights_sets):
+            s_filtered, keep_mask = filter_samples_sigma_clip(
+                s,
+                n_sigma=sigma_clip_n,
+                min_keep=sigma_clip_min_keep,
+                return_mask=True,
+            )
+            filtered_sample_sets.append(s_filtered)
+            if w is None:
+                filtered_weight_sets.append(None)
+            else:
+                filtered_weight_sets.append(w[keep_mask])
+
+        sample_sets = filtered_sample_sets
+        weights_sets = filtered_weight_sets
 
     mc_samples_list = []
     for s, w in zip(sample_sets, weights_sets):

@@ -11,6 +11,7 @@ from torch.utils.data import Subset
 
 import config
 from train import load_model, sample_density
+from utils import resolve_feature_index
 
 
 def parse_args() -> argparse.Namespace:
@@ -171,9 +172,10 @@ def build_subset(test_ds, n_galaxies: int, split_start: int, split_end: int):
 
 
 def get_vcirc_mu(test_ds, device: torch.device) -> torch.Tensor:
+	vcirc_idx = resolve_feature_index(config.train["feature_names"], "vcirc", aliases=("v_circ",))
 	vcirc_mu = torch.zeros((len(test_ds),), dtype=torch.float32, device=device)
 	for i in range(len(test_ds)):
-		vcirc_mu[i] = float(test_ds[i]["fid_pars"][5])
+		vcirc_mu[i] = float(test_ds[i]["fid_pars"][vcirc_idx])
 	return vcirc_mu
 
 

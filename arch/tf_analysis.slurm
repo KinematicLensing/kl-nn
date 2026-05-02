@@ -16,12 +16,13 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=CNN-CNN-flow_tf_tng
-SAMPFILE=samples_test_tng_10k_all.csv
-DATASET=test_tng_10k
+MODEL=CNN-CNN-flow_all_params_unif_snr
+EPOCH=180
+SAMPFILE=samples_test_1m_low_hlr.csv
+DATASET=test_1m_low_hlr
 NGALS=10000
 NSAMPS=10000
 NPARTS=10
 
 i=$((${SLURM_ARRAY_TASK_ID}-1))
-python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --dataset=${DATASET} --sample-set=${SAMPFILE}
+python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE}

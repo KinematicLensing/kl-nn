@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+from scipy.optimize import curve_fit
 
 import torch
 from torch import optim, nn
@@ -35,6 +36,47 @@ Need to create a wrapper trainer class eventually
 #-------------#
 # CNN Trainer #
 #-------------#
+
+
+def _rmag_snr_model(log_snr, a, b):
+    return a * log_snr + b
+
+
+def _fit_rmag_snr_relation(source_path=None, fit_path=None):
+    if source_path is None:
+        source_path = config.rmag_snr_source_path
+    if fit_path is None:
+        fit_path = config.rmag_snr_fit_path
+
+    with np.load(source_path) as data:
+        snr = np.asarray(data['SNR'], dtype=float)
+        rmag = np.asarray(data['rmag'], dtype=float)
+
+    valid = np.isfinite(snr) & np.isfinite(rmag) & (snr > 0)
+    snr = snr[valid]
+    rmag = rmag[valid]
+    coeffs, _ = curve_fit(_rmag_snr_model, np.log10(snr), rmag)
+    a, b = map(float, coeffs)
+
+    os.makedirs(os.path.dirname(fit_path), exist_ok=True)
+    np.savez(
+        fit_path,
+        a=a,
+        b=b,
+        source_path=source_path,
+        model='rmag = a * log10(SNR) + b',
+    )
+    return a, b
+
+
+def _load_rmag_snr_relation(fit_path=None):
+    if fit_path is None:
+        fit_path = config.rmag_snr_fit_path
+
+    if os.path.exists(fit_path):
+        with np.load(fit_path, allow_pickle=False) as data:
+            return float(data['a']), float(data['b'])
+    return _fit_rmag_snr_relation(fit_path=fit_path)
 
 class CNNTrainer:
     def __init__(
@@ -93,8 +135,6 @@ class CNNTrainer:
             self.img_train[i] = self.train_data[i_db]['img']
             self.spec_train[i] = self.train_data[i_db]['spec']
             self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
-            if config.train.get('mode', 1) == 2:
-                self.fid_train[i, 2] = self.train_data[i_db]['fid_pars'][5]
 
             prog = 100*i//self.ntrain
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
@@ -110,8 +150,6 @@ class CNNTrainer:
             self.img_valid[i] = self.valid_data[i_db]['img']
             self.spec_valid[i] = self.valid_data[i_db]['spec']
             self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
-            if config.train.get('mode', 1) == 2:
-                self.fid_valid[i, 2] = self.valid_data[i_db]['fid_pars'][5]
 
             prog = 100*i//self.nvalid
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
@@ -136,8 +174,8 @@ class CNNTrainer:
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Starting epoch {epoch}')
             
-        self.SNR_train = self.generate_snr(size=self.ntrain, mode='rmag')
-        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='rmag')
+        self.SNR_train = self.generate_snr(size=self.ntrain, mode='uniform')
+        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='uniform')
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
@@ -267,16 +305,14 @@ class CNNTrainer:
 
     def generate_snr(self, size, mode='uniform', **kwargs):
         if mode == 'uniform':
-            min_snr = kwargs.get('min', 10)
+            min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
             return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
         elif mode == 'rmag':
-            min_rmag = kwargs.get('min', 16)
-            max_rmag = kwargs.get('max', 23)
-            base = np.random.power(2, size=size)
-            rmag = base*(max_rmag - min_rmag) + min_rmag
-            flux_factor = 10**(0.4*(23.4-rmag))
-            snr = flux_factor*5
+            rmag = sample_magnitudes(size, m_min=15, m_max=23)
+            a, b = _load_rmag_snr_relation()
+            log_snr = (rmag - b) / a
+            snr = 10**log_snr
             return torch.from_numpy(snr).float().to(self.device)
         else:
             raise ValueError("Invalid SNR generation mode")
@@ -476,6 +512,16 @@ def apply_noise(data, snr, randgen=None, device='cpu', use_iterative=True,
     seg_refined = data > refined_threshold.view(-1, 1, 1, 1)
     factor_refined = _noise_scale_from_seg(data, snr, seg_refined, eps=eps)
     return data + noise*factor_refined.view(-1, 1, 1, 1)
+
+def sample_magnitudes(n_samples, m_min, m_max):
+    u = np.random.uniform(0, 1, n_samples)
+    
+    val_min = 10**(0.6 * m_min)
+    val_max = 10**(0.6 * m_max)
+    
+    # Inverse Transform Sampling Formula
+    m = (5/3) * np.log10(u * (val_max - val_min) + val_min)
+    return m
 
 def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(), device='cpu'):
     '''

@@ -6,10 +6,11 @@ from nflows.flows.base import Flow
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.permutations import ReversePermutation
+from nflows.transforms.permutations import ReversePermutation, RandomPermutation
 from nflows.nn.nets import ResidualNet
 
 import config
+from utils import resolve_feature_index
 
 ### Main Network ###
 class ForkCNN(nn.Module):
@@ -26,7 +27,7 @@ class ForkCNN(nn.Module):
                  vcirc_dex=0.05,   # scatter in dex; fixed, represents TF relation scatter
                  vcirc_min=config.par_ranges.get('vcirc', [60.0, 540.0])[0],
                  vcirc_max=config.par_ranges.get('vcirc', [60.0, 540.0])[1],
-                 vcirc_idx=2):    # index of v_circ in target vector, e.g. 2 for [g1, g2, v_circ]
+                 vcirc_idx=None):
 
         self.bs = batch_size
         self.nfeatures = nfeatures
@@ -42,7 +43,16 @@ class ForkCNN(nn.Module):
         self.vcirc_min = float(vcirc_min)
         self.vcirc_max = float(vcirc_max)
         self.vcirc_jac = 0.5 * (self.vcirc_max - self.vcirc_min)  # |dv/dx| for x in [-1, 1]
-        self.vcirc_idx = vcirc_idx
+        if vcirc_idx is None:
+            feature_names = config.train.get('feature_names', None)
+            if feature_names is None:
+                raise ValueError("config.train['feature_names'] is required to infer vcirc_idx")
+            vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
+        self.vcirc_idx = int(vcirc_idx)
+        if self.vcirc_idx < 0 or self.vcirc_idx >= self.nfeatures:
+            raise ValueError(
+                f'vcirc_idx={self.vcirc_idx} is out of bounds for nfeatures={self.nfeatures}'
+            )
 
         super(ForkCNN, self).__init__()
         
@@ -85,8 +95,7 @@ class ForkCNN(nn.Module):
         '''
         x: image tensor
         y: spectrum tensor
-        true: target tensor of shape (batch, nfeatures), e.g. [g1, g2, v_circ_norm]
-              no TF prior is applied during training, including mode 2.
+        true: target tensor of shape (batch, nfeatures)
         '''
         # Feature extraction from img and spec
         x = nn.functional.normalize(x, dim=[2,3])
@@ -109,6 +118,26 @@ class ForkCNN(nn.Module):
             loss = -self.flow.log_prob(true, context=z).mean()
 
         return loss
+    
+    def extract_latent(self, x, y, true):
+        '''
+        Run through feature extraction but map from true parameters to latent space in flow
+        '''
+        # Feature extraction from img and spec
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
+        x = self.img_net(x)
+        y = self.spec_net(y)
+
+        # Flatten and concatenate
+        x = x.view(int(self.bs),-1)
+        y = y.view(int(self.bs),-1)
+        z = torch.cat((x, y), -1)
+
+        z = self.layer_norm(z)
+        latent = self.flow.transform_to_noise(true, context=z)
+
+        return latent
 
     def _norm_to_vcirc(self, v_norm):
         v_norm = v_norm.clamp(min=-1.0, max=1.0)
@@ -165,90 +194,24 @@ class ForkCNN(nn.Module):
         log_kernel = -0.5 * diffs.pow(2) - log_norm
         return torch.logsumexp(log_kernel, dim=1) - torch.log(torch.tensor(float(n), device=values.device, dtype=values.dtype))
 
-    def _kde_log_density_2d(self, values_2d, bandwidth='scott'):
-        """Gaussian KDE log-density in 2D evaluated at sample locations."""
-        n = values_2d.shape[0]
-        if n < 2:
-            return torch.zeros(n, device=values_2d.device, dtype=values_2d.dtype)
-
-        if bandwidth == 'scott':
-            factor = float(n) ** (-1.0 / 6.0)
-            std = values_2d.std(dim=0, unbiased=False).clamp(min=1e-6)
-            bw = (factor * std).clamp(min=1e-6)
-        elif isinstance(bandwidth, (int, float)):
-            bw = torch.full((2,), float(bandwidth), device=values_2d.device, dtype=values_2d.dtype).clamp(min=1e-6)
-        elif torch.is_tensor(bandwidth):
-            bw = bandwidth.to(device=values_2d.device, dtype=values_2d.dtype).reshape(-1)
-            if bw.numel() != 2:
-                raise ValueError('bandwidth tensor must have 2 elements for 2D KDE')
-            bw = bw.clamp(min=1e-6)
-        else:
-            raise ValueError("bandwidth must be 'scott', scalar, or length-2 tensor")
-
-        diffs = (values_2d[:, None, :] - values_2d[None, :, :]) / bw
-        sq_dist = diffs.pow(2).sum(dim=-1)
-
-        two_pi = values_2d.new_tensor(2.0 * math.pi)
-        log_norm = torch.log(two_pi) + torch.log(bw).sum()
-        log_kernel = -0.5 * sq_dist - log_norm
-        return torch.logsumexp(log_kernel, dim=1) - torch.log(values_2d.new_tensor(float(n)))
-
-    def marginalize_resample(self, samples, target_feature_idx, num_resamples=None, bandwidth='scott', return_log_prob=False):
-        """Resample in a 2D marginalized space estimated by KDE from posterior samples."""
-        if not torch.is_tensor(samples):
-            raise TypeError('samples must be a torch.Tensor')
-
-        if samples.ndim == 3:
-            if samples.shape[0] != 1:
-                raise ValueError('samples with 3 dims must have shape (1, N, D)')
-            flat_samples = samples[0]
-        elif samples.ndim == 2:
-            flat_samples = samples
-        else:
-            raise ValueError('samples must have shape (1, N, D) or (N, D)')
-
-        if len(target_feature_idx) != 2:
-            raise ValueError('target_feature_idx must contain exactly 2 feature indices')
-
-        d = flat_samples.shape[1]
-        idx0, idx1 = int(target_feature_idx[0]), int(target_feature_idx[1])
-        if idx0 < 0 or idx0 >= d or idx1 < 0 or idx1 >= d:
-            raise ValueError('target_feature_idx out of bounds for sample feature dimension')
-
-        marg_samples = flat_samples[:, [idx0, idx1]]
-        n = marg_samples.shape[0]
-        m = n if num_resamples is None else int(num_resamples)
-        if m < 1:
-            raise ValueError('num_resamples must be a positive integer')
-
-        log_density = self._kde_log_density_2d(marg_samples, bandwidth=bandwidth)
-        weights = torch.softmax(log_density, dim=0)
-        resample_idx = torch.multinomial(weights, num_samples=m, replacement=True)
-        resamples = marg_samples[resample_idx].unsqueeze(0)
-
-        if return_log_prob:
-            return resamples, log_density[resample_idx]
-        return resamples
-    
     def setup_flows(self):
         '''
         Set up normalizing flows for density estimation
         '''
         # Define flows
         num_layers = config.flow['num_layers']
-        n_features = config.train['feature_number']
         hidden_units = 64
         num_blocks = 2
         context_size = 1024
         
         # Set base distribution
-        self.base = ConditionalDiagonalNormal(shape=[n_features], 
-                                              context_encoder=MLP([context_size, 128, 64, n_features*2]))
+        self.base = ConditionalDiagonalNormal(shape=[self.nfeatures], 
+                                              context_encoder=MLP([context_size, 128, 64, self.nfeatures*2]))
 
         transforms = []
         for i in range(num_layers):
-            transforms.append(ReversePermutation(features=n_features))
-            transforms.append(MaskedAffineAutoregressiveTransform(features=n_features, 
+            transforms.append(RandomPermutation(features=self.nfeatures))
+            transforms.append(MaskedAffineAutoregressiveTransform(features=self.nfeatures, 
                                                                 hidden_features=hidden_units, 
                                                                 context_features=context_size))
 
@@ -324,6 +287,7 @@ class ForkCNN(nn.Module):
 
         # Sample from flow
         samples = self.flow.sample(num_samples, context=z)  # (1, num_samples, nfeatures)
+        samples = samples.clamp(min=-1.5, max=1.5)
 
         if self.mode == 2:
             assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
@@ -331,7 +295,7 @@ class ForkCNN(nn.Module):
 
             # Importance-resample flow samples so vcirc follows TF prior at inference time.
             candidates = samples[0]  # (num_samples, nfeatures)
-            v_norm = candidates[:, self.vcirc_idx].clamp(min=-1.0, max=1.0)
+            v_norm = candidates[:, self.vcirc_idx]
             v_circ = self._norm_to_vcirc(v_norm)
 
             mu = vcirc_mu.to(device=candidates.device, dtype=candidates.dtype).reshape(-1)
@@ -340,7 +304,7 @@ class ForkCNN(nn.Module):
             flow_log_p_v = self._kde_log_density_1d(v_circ)
 
             log_w = tf_log_p_v - flow_log_p_v
-            # log_w = tf_log_p_v
+            log_w = log_w - log_w.max()
             weights = torch.softmax(log_w, dim=0)
             resample_idx = torch.multinomial(weights, num_samples=num_samples, replacement=True)
             samples = candidates[resample_idx].unsqueeze(0)

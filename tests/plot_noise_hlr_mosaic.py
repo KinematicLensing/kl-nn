@@ -131,12 +131,6 @@ def main() -> None:
         cbar = fig.colorbar(im, ax=axes[r, :], shrink=0.8, pad=0.01)
         cbar.set_label("Flux")
 
-    fig.suptitle(
-        "Noised Galaxy Images (rows: low/high HLR) with Noiseless Contours\n"
-        "Selection: low sini + low shear from samples_test_1m_low_hlr.csv",
-        fontsize=12,
-    )
-
     fig.savefig(OUT_PATH, dpi=180)
     print("Selected rows:")
     print(selected[["g1", "g2", "sini", "hlr", "shear"]])

@@ -27,6 +27,18 @@ from train import estimate_density, load_model
 from utils import denormalize, make_corner_plot
 
 
+FEATURE_INDEX_BY_NAME = {
+    "g1": 0,
+    "g2": 1,
+    "theta_int": 2,
+    "sini": 3,
+    "v0": 4,
+    "vcirc": 5,
+    "rscale": 6,
+    "hlr": 7,
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe flow density estimation on a configurable grid.")
     parser.add_argument("--model-name", default=config.train["model_name"], help="Model directory name.")
@@ -147,8 +159,10 @@ def run(args: argparse.Namespace) -> None:
     if nfeatures not in (2, 3):
         raise ValueError(f"Unsupported feature_number={nfeatures}; expected 2 or 3.")
 
+    feature_names = ["g1", "g2"] if nfeatures == 2 else ["g1", "g2", "vcirc"]
+
     zz, grid_np = build_grid(args.grid_size, nfeatures, device)
-    grid_phys = denormalize(grid_np.copy(), config.par_ranges)
+    grid_phys = denormalize(grid_np.copy(), config.par_ranges, feature_names=feature_names)
 
     test_ds = pxt.TorchDataset(args.dataset_dir)
     n_eval = min(args.n_galaxies, len(test_ds))
@@ -183,8 +197,11 @@ def run(args: argparse.Namespace) -> None:
     for i in range(n_plot):
         posterior_draws = weighted_draws_from_grid(log_probs[i], grid_phys, args.posterior_draws, rng)
 
-        true_norm = subset[i]["fid_pars"][:nfeatures].unsqueeze(0).detach().cpu().numpy()
-        true_phys = denormalize(true_norm.copy(), config.par_ranges)[0]
+        fid_pars = subset[i]["fid_pars"]
+        if torch.is_tensor(fid_pars):
+            fid_pars = fid_pars.detach().cpu().numpy()
+        true_norm = np.array([[fid_pars[FEATURE_INDEX_BY_NAME[name]] for name in feature_names]], dtype=np.float32)
+        true_phys = denormalize(true_norm.copy(), config.par_ranges, feature_names=feature_names)[0]
 
         fig, _, _ = make_corner_plot(
             posterior_draws,

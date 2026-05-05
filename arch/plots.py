@@ -7,10 +7,10 @@ import numpy as np
 
 try:
     from . import config
-    from .utils import density_contour, resolve_feature_index
+    from .utils import density_contour, img_to_gal_axis, resolve_feature_index
 except ImportError:
     import config
-    from utils import density_contour, resolve_feature_index
+    from utils import density_contour, img_to_gal_axis, resolve_feature_index
 
 
 class ParameterContourPlotter:
@@ -72,9 +72,36 @@ class ParameterContourPlotter:
 
     @staticmethod
     def _sanitize_token(token):
+        normalized = str(token).strip().lower()
+        special_tokens = {
+            "g+": "g_plus",
+            "g_plus": "g_plus",
+            "gplus": "g_plus",
+            "gx": "g_x",
+            "g_x": "g_x",
+            "gcross": "g_x",
+            "g_cross": "g_x",
+        }
+        if normalized in special_tokens:
+            return special_tokens[normalized]
+
         sanitized = re.sub(r"[^0-9A-Za-z]+", "_", str(token).strip())
         sanitized = re.sub(r"_+", "_", sanitized).strip("_")
         return sanitized or "value"
+
+    @staticmethod
+    def _display_name(name):
+        normalized = str(name).strip().lower()
+        special_tokens = {
+            "g+": "g+",
+            "g_plus": "g+",
+            "gplus": "g+",
+            "gx": "g_x",
+            "g_x": "g_x",
+            "gcross": "g_x",
+            "g_cross": "g_x",
+        }
+        return special_tokens.get(normalized, str(name).strip())
 
     @staticmethod
     def _format_value_token(value):
@@ -84,6 +111,33 @@ class ParameterContourPlotter:
 
     def _resolve_index(self, name):
         return resolve_feature_index(self.feature_names, name)
+
+    def _resolve_theta_values(self):
+        theta_idx = self._resolve_index("theta_int")
+        return self.true[:, theta_idx]
+
+    def _resolve_named_series(self, name, selected_pred):
+        """Resolve a plot/mask series from a parameter name.
+
+        Returns true_values, pred_values, display_name.
+        """
+        normalized = str(name).strip().lower()
+        if normalized in {"g+", "g_plus", "gplus", "gx", "g_x", "gcross", "g_cross"}:
+            theta = self._resolve_theta_values()
+            g1_idx = self._resolve_index("g1")
+            g2_idx = self._resolve_index("g2")
+            true_g1 = self.true[:, g1_idx]
+            true_g2 = self.true[:, g2_idx]
+            pred_g1 = selected_pred[:, g1_idx]
+            pred_g2 = selected_pred[:, g2_idx]
+            true_plus, true_cross = img_to_gal_axis(true_g1, true_g2, theta)
+            pred_plus, pred_cross = img_to_gal_axis(pred_g1, pred_g2, theta)
+            if normalized in {"g+", "g_plus", "gplus"}:
+                return true_plus, pred_plus, "g+"
+            return true_cross, pred_cross, "g_x"
+
+        idx = self._resolve_index(name)
+        return self.true[:, idx], selected_pred[:, idx], self.feature_names[idx]
 
     def _resolve_mask_source(self, mask_param, selected_pred=None):
         """Return (array_source, label) for a given mask_param.
@@ -105,19 +159,17 @@ class ParameterContourPlotter:
         m = re.match(r"^(.+)_diff$", lowname)
         if m:
             base_name = m.group(1)
-            # resolve index (resolve_feature_index is case-insensitive)
-            base_idx = self._resolve_index(base_name)
             if selected_pred is None:
                 selected = self.pred
             else:
                 selected = selected_pred
-            # compute residual: selected - true
-            resid = np.abs(np.asarray(selected[:, base_idx]) - np.asarray(self.true[:, base_idx]))
-            return resid, f"{self.feature_names[base_idx]}_diff"
+            true_values, pred_values, display_name = self._resolve_named_series(base_name, selected)
+            resid = np.asarray(pred_values) - np.asarray(true_values)
+            return resid, f"{display_name}_diff"
 
         # fallback: treat as a true-valued parameter name
-        mask_idx = self._resolve_index(mask_name)
-        return self.true[:, mask_idx], self.feature_names[mask_idx]
+        true_values, _, display_name = self._resolve_named_series(mask_name, self.pred if selected_pred is None else selected_pred)
+        return true_values, display_name
 
     def _build_filename(self, param, mask_param, masking_value, flip_mask, use_tf):
         param_token = self._sanitize_token(param)
@@ -171,10 +223,9 @@ class ParameterContourPlotter:
         if use_tf and self.pred_tf is None:
             raise ValueError("use_tf=True requires pred_tf to be provided at initialization.")
 
-        param_idx = self._resolve_index(param)
-        true_values = self.true[:, param_idx]
         selected_pred = self.pred_tf if use_tf else self.pred
-        residuals = selected_pred[:, param_idx] - true_values
+        true_values, pred_values, param_label = self._resolve_named_series(param, selected_pred)
+        residuals = pred_values - true_values
 
         mask = None
         comparator_label = None
@@ -221,14 +272,14 @@ class ParameterContourPlotter:
                 )
 
         ax.axhline(0.0, color="k", linestyle="--", linewidth=1)
-        ax.set_xlabel(f"{param} true")
+        ax.set_xlabel(f"{param_label} true")
         pred_label = "pred_tf" if use_tf else "pred"
         ax.set_ylabel(f"{pred_label} - true")
 
         if mask is None:
-            title = f"{param} contour"
+            title = f"{param_label} contour"
         else:
-            title = f"{param} contour with {mask_param} {comparator_label} {masking_value:g}"
+            title = f"{param_label} contour with {mask_label} {comparator_label} {masking_value:g}"
         if use_tf:
             title += " (with tf)"
         ax.set_title(title)

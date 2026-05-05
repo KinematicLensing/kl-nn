@@ -98,9 +98,6 @@ def main():
                         specs[k, :spec.shape[0]] = spec
                     spec_stack[i, 0] = specs
             
-            # img_stack = normalize('std', img_stack, (img_mean, img_std))
-            # spec_stack = normalize('std', spec_stack, (spec_mean, spec_std))
-            
             db.put_samples({'img': img_stack,
                             'spec': spec_stack,
                             'fid_pars': fids,

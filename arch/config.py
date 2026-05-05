@@ -32,7 +32,7 @@ par_ranges = \
 {
     'g1': [-0.1, 0.1],
     'g2': [-0.1, 0.1],
-    'theta_int': [0, np.pi],
+    'theta_int': [-np.pi, np.pi],
     'sini': [0, 1],
     'v0': [-30, 30],
     'vcirc': [60, 540],
@@ -56,7 +56,7 @@ train = \
     
     'save_model': True,
     'model_path': '/ocean/projects/phy250048p/shared/models/',
-    'model_name': 'CNN-CNN-flow_all_params_unif_snr',
+    'model_name': 'CNN-CNN-flow_all_params_unif_snr_fib_pos',
     'transform_to_gal': False,
 
     'use_pretrain': False,

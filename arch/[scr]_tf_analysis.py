@@ -14,6 +14,7 @@ from train import (
     sample_density,
 )
 import config
+from model_registry import load_model_config
 from utils import (
     denormalize,
     resolve_feature_index,
@@ -193,6 +194,8 @@ def main():
     data_dir = resolve_path(BASE_DATASETS_DIR, args.dataset)
     samp_dir = resolve_path(BASE_SAMPLES_DIR, args.sample_set)
     model_name = os.path.basename(os.path.normpath(stem))
+    model_cfg = load_model_config(model_name, allow_fallback_current=True)
+    config.set_model_config(model_cfg)
     dataset_name = os.path.basename(os.path.normpath(data_dir))
     total_partitions = infer_total_partitions(args)
     partition_label = build_partition_label(args.i, total_partitions)

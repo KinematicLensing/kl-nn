@@ -28,3 +28,12 @@ Network configuration is all done in `networks.py`. Loss function and training p
 Training configuration is done in `config.py`. Important parameters are `'size', 'pars_dir', 'data_dir'` as well as all the parameters in the `train` dictionary. To train simply configure and run `train_model_full.slurm`. the notebook `train_model.ipynb` only exists for debug purposes.
 
 To test the network simply follow the `test_model.ipynb` notebook.
+
+### Model config and architecture snapshots
+
+When training starts via `arch/[scr]_train_model.py`, the current model setup is snapshotted automatically:
+
+- `ModelConfig` is saved as human-readable JSON in `/ocean/projects/phy250048p/shared/configs` (`cfg_<model_name>.json`)
+- `arch/networks.py` is copied to `/ocean/projects/phy250048p/shared/networks` (`networks_<model_name>.py`)
+
+Analysis scripts can then resolve model configuration by model name without requiring manual edits to the live `config.py`.

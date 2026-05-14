@@ -1,6 +1,9 @@
 from __future__ import print_function
 from os.path import join
 import time
+import importlib.util
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -52,17 +55,18 @@ def normalize(form, data, pars=None):
         else:
             raise ValueError("Invalid form, must be '01', '-11', or 'std'.")
 
-par_ranges = \
-{
-    'g1': [-0.1, 0.1],
-    'g2': [-0.1, 0.1],
-    'theta_int': [-np.pi, np.pi],
-    'sini': [0, 1],
-    'v0': [-30, 30],
-    'vcirc': [60, 540],
-    'rscale': [0.1, 10],
-    'hlr': [0.1, 1],
-}
+def load_default_par_ranges():
+    config_path = Path(__file__).resolve().parents[1] / 'arch' / 'config.py'
+    spec = importlib.util.spec_from_file_location('arch_config', config_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Failed to load config module from {config_path}')
+    arch_config = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = arch_config
+    spec.loader.exec_module(arch_config)
+    return arch_config.MODEL_CONFIG.par_ranges.copy()
+
+
+par_ranges = load_default_par_ranges()
 
 def main():
     data_dir = f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
@@ -80,6 +84,7 @@ def main():
             folder = index+1
             img_stack = np.full((n, 1, 48, 48), 0.)
             spec_stack = np.full((n, 1, nspec, 64), 0.)
+            fib_pos_stack = np.full((n, nspec, 2), 0.)
             start_id = index*n
             file_id = index*n
             ids = np.arange(start_id, start_id+n, dtype=np.uint64)
@@ -92,14 +97,14 @@ def main():
                 with fits.open(join(data_dir, f'part_{folder}/gal_{ID}.fits')) as hdu:
                     img_stack[i, 0] = hdu[nspec+1].data
                     
-                    specs = np.full((nspec, 64), 0.)
                     for k in range(nspec):
+                        fib_pos_stack[i, k] = hdu[k+1].header['FIBERDX'], hdu[k+1].header['FIBERDY']
                         spec = hdu[k+1].data
-                        specs[k, :spec.shape[0]] = spec
-                    spec_stack[i, 0] = specs
+                        spec_stack[i, 0, k, :spec.shape[0]] = spec
             
             db.put_samples({'img': img_stack,
                             'spec': spec_stack,
+                            'fib_pos': fib_pos_stack,
                             'fid_pars': fids,
                             'id': ids})
             t = round(time.time() - start, 2)

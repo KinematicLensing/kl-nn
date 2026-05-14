@@ -91,11 +91,12 @@ class ForkCNN(nn.Module):
             #         param.zero_()  # Initialize flow to identity
 
     
-    def forward(self, x, y, true):
+    def forward(self, x, y, true, fp=None):
         '''
         x: image tensor
         y: spectrum tensor
         true: target tensor of shape (batch, nfeatures)
+        fp: fiber position tensor of shape (batch, nspecs, 2)
         '''
         # Feature extraction from img and spec
         x = nn.functional.normalize(x, dim=[2,3])
@@ -107,7 +108,9 @@ class ForkCNN(nn.Module):
         x = x.view(int(self.bs),-1)
         y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
-        # z = x
+        if fp is not None:
+            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
+            z = torch.cat((z, fp), dim=-1)
 
         # Point/density estimate
         if self.mode == 0:
@@ -119,7 +122,7 @@ class ForkCNN(nn.Module):
 
         return loss
     
-    def extract_latent(self, x, y, true):
+    def extract_latent(self, x, y, true, fp=None):
         '''
         Run through feature extraction but map from true parameters to latent space in flow
         '''
@@ -133,6 +136,9 @@ class ForkCNN(nn.Module):
         x = x.view(int(self.bs),-1)
         y = y.view(int(self.bs),-1)
         z = torch.cat((x, y), -1)
+        if fp is not None:
+            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
+            z = torch.cat((z, fp), dim=-1)
 
         z = self.layer_norm(z)
         latent = self.flow.transform_to_noise(true, context=z)
@@ -268,7 +274,7 @@ class ForkCNN(nn.Module):
 
         return log_prob
 
-    def sample(self, x, y, num_samples, vcirc_mu=None, return_log_prob=False):
+    def sample(self, x, y, num_samples, fp=None, vcirc_mu=None, return_log_prob=False):
         '''
         Sample from the conditional distribution p(params | x, y)
         num_samples: number of samples to draw per galaxy
@@ -282,7 +288,9 @@ class ForkCNN(nn.Module):
         x = x.view(1,-1)
         y = y.view(1,-1)
         z = torch.cat((x, y), -1)
-        # z = x
+        if fp is not None:
+            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
+            z = torch.cat((z, fp), dim=-1)
         z = self.layer_norm(z)
 
         # Sample from flow
@@ -627,8 +635,8 @@ class SpecCNN(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(True),
 
-            nn.Conv2d(256, 512, kernel_size=(self.nspecs, 4), stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(256, 512-2*nspecs, kernel_size=(self.nspecs, 4), stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512-2*nspecs),
             nn.ReLU(True),
             
         )

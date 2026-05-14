@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Subset
 
 import config
+from model_registry import load_model_config
 from train import load_model, sample_density
 from utils import resolve_feature_index
 
@@ -44,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 	)
 	parser.add_argument(
 		"--model-root",
-		default=config.train["model_path"],
+		default=None,
 		help="Root folder containing model subdirectories.",
 	)
 	parser.add_argument(
@@ -85,7 +86,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument(
 		"--mode",
 		type=int,
-		default=config.train.get("mode", 2),
+		default=None,
 		help="Model mode used by load_model (0/1/2).",
 	)
 	parser.add_argument(
@@ -186,6 +187,8 @@ def ensure_writable(path: str, overwrite: bool) -> None:
 
 def main() -> None:
 	args = parse_args()
+	model_cfg = load_model_config(args.model_name, allow_fallback_current=True)
+	config.set_model_config(model_cfg)
 
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
@@ -193,13 +196,16 @@ def main() -> None:
 		torch.cuda.manual_seed_all(args.seed)
 
 	device = resolve_device(args.device)
+	model_root = args.model_root if args.model_root is not None else model_cfg.train.model_path
+	mode = args.mode if args.mode is not None else model_cfg.train.mode
 	data_dir = join(args.data_root, args.dataset_name)
 	if not os.path.isdir(data_dir):
 		raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
 
+	args.model_root = model_root
 	checkpoint_path = resolve_checkpoint_path(args)
 	print(f"Loading checkpoint: {checkpoint_path}")
-	model = load_model(mode=args.mode, path=checkpoint_path, strict=True, assign=True, device=str(device))
+	model = load_model(mode=mode, path=checkpoint_path, strict=True, assign=True, device=str(device))
 
 	print(f"Loading test dataset: {data_dir}")
 	test_ds = pxt.TorchDataset(data_dir)
@@ -211,7 +217,7 @@ def main() -> None:
 	)
 	ngals = len(test_subset)
 
-	vcirc_mu = get_vcirc_mu(test_subset, device=device) if args.mode == 2 else None
+	vcirc_mu = get_vcirc_mu(test_subset, device=device) if mode == 2 else None
 
 	print(
 		"Sampling posterior with "
@@ -249,7 +255,7 @@ def main() -> None:
 		"checkpoint_path": checkpoint_path,
 		"dataset_name": args.dataset_name,
 		"dataset_dir": data_dir,
-		"mode": args.mode,
+		"mode": mode,
 		"limited_size": limited_size,
 		"split_start": split_start,
 		"split_end": split_end,

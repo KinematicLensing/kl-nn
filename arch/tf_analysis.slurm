@@ -2,7 +2,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/tf_analysis_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=1:00:00
+#SBATCH --time=1:30:00
 #SBATCH --nodes=1
 #SBATCH --array=1-10
 #SBATCH --mail-type=ALL
@@ -16,10 +16,10 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=CNN-CNN-flow_all_params_unif_snr
-EPOCH=180
-SAMPFILE=samples_test_1m_low_hlr.csv
-DATASET=test_1m_low_hlr
+MODEL=CNN-CNN-flow
+EPOCH=100
+SAMPFILE=samples_valid_1m.csv
+DATASET=valid_1m
 NGALS=10000
 NSAMPS=10000
 NPARTS=10

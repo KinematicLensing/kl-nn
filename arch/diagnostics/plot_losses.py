@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import os
 import sys
 from os.path import join
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Model name. When provided, runtime settings are loaded from "
-            "<configs-root>/cfg_train_model_<model-name>.py."
+            "a JSON config in <configs-root> (cfg_<model-name>.json by default)."
         ),
     )
     parser.add_argument(
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--configs-root",
         default=DEFAULT_CONFIGS_ROOT,
-        help="Directory containing saved training configs named cfg_train_model_<model>.py.",
+        help="Directory containing saved training configs named cfg_<model>.json.",
     )
     parser.add_argument(
         "--output-name",
@@ -78,32 +78,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_saved_train_config(configs_root: str, model_name: str) -> dict:
-    cfg_path = join(configs_root, f"cfg_train_model_{model_name}.py")
-    if not os.path.exists(cfg_path):
-        raise FileNotFoundError(f"Saved training config not found: {cfg_path}")
+def _get_saved_config_candidates(configs_root: str, model_name: str) -> tuple[str, ...]:
+    return (
+        join(configs_root, f"cfg_{model_name}.json"),
+        join(configs_root, f"cfg_train_model_{model_name}.json"),
+    )
 
-    module_name = f"cfg_train_model_{model_name}"
-    spec = importlib.util.spec_from_file_location(module_name, cfg_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load config module from: {cfg_path}")
 
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def load_saved_train_config(configs_root: str, model_name: str, *, required: bool = True) -> dict | None:
+    cfg_path = next(
+        (path for path in _get_saved_config_candidates(configs_root, model_name) if os.path.exists(path)),
+        None,
+    )
+    if cfg_path is None:
+        if required:
+            candidates = ", ".join(_get_saved_config_candidates(configs_root, model_name))
+            raise FileNotFoundError(f"Saved training config not found. Tried: {candidates}")
+        return None
 
-    train_cfg = getattr(module, "train", None)
+    with open(cfg_path, "r", encoding="utf-8") as fobj:
+        payload = json.load(fobj)
+
+    train_cfg = payload.get("train")
     if not isinstance(train_cfg, dict):
         raise ValueError(f"Saved config missing 'train' dictionary: {cfg_path}")
     return train_cfg
 
 
 def resolve_runtime_settings(args: argparse.Namespace) -> tuple[str, str]:
-    if args.model_name is not None:
-        train_cfg = load_saved_train_config(args.configs_root, args.model_name)
+    requested_model_name = args.model_name if args.model_name is not None else config.train["model_name"]
+    train_cfg = load_saved_train_config(
+        args.configs_root,
+        requested_model_name,
+        required=args.model_name is not None,
+    )
+    if train_cfg is not None:
         model_root = train_cfg.get("model_path")
         if model_root is None:
             raise ValueError("Saved train config is missing train['model_path'].")
-        model_name = train_cfg.get("model_name", args.model_name)
+        model_name = train_cfg.get("model_name", requested_model_name)
         return model_name, model_root
 
     model_name = config.train["model_name"]
@@ -139,14 +152,14 @@ def plot_losses(train_losses: np.ndarray, valid_losses: np.ndarray, model_name: 
     epochs = np.arange(1, train_losses.shape[0] + 1)
 
     plt.rcParams.update({"text.usetex": False, "font.family": "serif", "figure.dpi": 300})
-    fig = plt.figure(figsize=(4, 4))
+    fig = plt.figure(figsize=(6, 5))
     plt.plot(epochs, train_losses, "r.-", label="Training Set")
     plt.plot(epochs, valid_losses, "b.-", label="Validation Set")
     plt.xlabel("Epoch", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.tick_params(axis="both", which="major", labelsize=14)
-    plt.xticks([])
-    plt.yticks([])
+    # plt.xticks([])
+    # plt.yticks([])
     plt.legend(fontsize=14)
     plt.title(model_name, fontsize=14)
     plt.tight_layout()

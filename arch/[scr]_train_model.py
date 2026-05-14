@@ -10,6 +10,7 @@ import pyxis.torch as pxt
 from networks import *
 from train import *
 import config
+from model_registry import save_model_artifacts
 
 if __name__ == "__main__":
 
@@ -17,6 +18,9 @@ if __name__ == "__main__":
     # os.environ['NCCL_DEBUG_SUBSYS'] = 'ALL'
     # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'INFO'
 
+    artifacts = save_model_artifacts(config.MODEL_CONFIG, overwrite=True)
+    print(f"Saved model config JSON: {artifacts['config_path']}")
+    print(f"Saved networks snapshot: {artifacts['network_path']}")
     os.makedirs(join(config.train['model_path'], config.train['model_name']), exist_ok=True)
     # os.environ["CUDA_VISIBLE_DEVICES"] = "1,3,5,6,7" #(Put the number(s) you want for the GPUs)
     

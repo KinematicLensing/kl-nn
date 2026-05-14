@@ -27,6 +27,7 @@ from networks import *
 from dataset import *
 from utils import *
 import config
+from model_registry import infer_model_name_from_checkpoint_path, load_networks_module_for_model
 
 """
 Module that manages all the trainer classes and testing functions. 
@@ -107,9 +108,8 @@ class CNNTrainer:
         self.nvalid = len(valid_ds)//world_size
         self.nbatch_train = self.ntrain//self.batch_size
         self.nbatch_valid = self.nvalid//self.batch_size
-        self.transform_to_gal = config.train.get('transform_to_gal', False)
         self.logger = logging.getLogger('Trainer')
-        self.sigma = config.sigma
+        self.has_fib_pos = 'fib_pos' in self.train_data[0] and 'fib_pos' in self.valid_data[0]
         
     def _set_tensors(self):
         '''
@@ -124,6 +124,9 @@ class CNNTrainer:
         self.spec_valid = torch.empty((self.nvalid, 1, 5, 64), dtype=torch.float, device=self.device)
         self.fid_train = torch.empty((self.ntrain, self.nfeatures), dtype=torch.float, device=self.device)
         self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
+        if self.has_fib_pos:
+            self.fibpos_train = torch.empty((self.ntrain, 5, 2), dtype=torch.float, device=self.device)
+            self.fibpos_valid = torch.empty((self.nvalid, 5, 2), dtype=torch.float, device=self.device)
         
         # Fill arrays with values
         start = self.gpu_id*self.ntrain
@@ -135,6 +138,8 @@ class CNNTrainer:
             self.img_train[i] = self.train_data[i_db]['img']
             self.spec_train[i] = self.train_data[i_db]['spec']
             self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
+            if self.has_fib_pos:
+                self.fibpos_train[i] = self.train_data[i_db]['fib_pos']
 
             prog = 100*i//self.ntrain
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
@@ -150,6 +155,8 @@ class CNNTrainer:
             self.img_valid[i] = self.valid_data[i_db]['img']
             self.spec_valid[i] = self.valid_data[i_db]['spec']
             self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
+            if self.has_fib_pos:
+                self.fibpos_valid[i] = self.valid_data[i_db]['fib_pos']
 
             prog = 100*i//self.nvalid
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
@@ -161,9 +168,9 @@ class CNNTrainer:
     def _apply_noise(self, data, snr):
         return apply_noise(data, snr, device=self.device, use_iterative=True)
 
-    def _run_batch(self, img, spec, fid):
+    def _run_batch(self, img, spec, fid, fp=None):
         self.optimizer.zero_grad()
-        loss = self.model(img, spec, fid)
+        loss = self.model(img, spec, fid, fp=fp)
         if ~(torch.isnan(loss) | torch.isinf(loss)):
             loss.backward()                   
             self.optimizer.step()
@@ -203,11 +210,9 @@ class CNNTrainer:
             snr = self.SNR_train[batch_ids]
             img = self._apply_noise(self.img_train[batch_ids], snr)
             spec = self._apply_noise(self.spec_train[batch_ids], snr)
-            # img = self.img_train[batch_ids]
-            # spec = self.spec_train[batch_ids]
             fid = self.fid_train[batch_ids]
-            
-            loss = self._run_batch(img, spec, fid)
+            fp = self.fibpos_train[batch_ids] if self.has_fib_pos else None
+            loss = self._run_batch(img, spec, fid, fp=fp)
             if ~(torch.isnan(loss) | torch.isinf(loss)):
                 losses.append(loss.item())
             elif torch.isnan(loss):
@@ -241,11 +246,9 @@ class CNNTrainer:
                 snr = self.SNR_valid[batch_ids]
                 img = self._apply_noise(self.img_valid[batch_ids], snr)
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr)
-                # img = self.img_valid[batch_ids]
-                # spec = self.spec_valid[batch_ids]
                 fid = self.fid_valid[batch_ids]
-                
-                loss = self.model(img, spec, fid)
+                fp = self.fibpos_valid[batch_ids] if self.has_fib_pos else None
+                loss = self.model(img, spec, fid, fp=fp)
                 if ~(torch.isnan(loss) | torch.isinf(loss)):
                     losses.append(loss.item())
                 elif torch.isnan(loss):
@@ -464,7 +467,23 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
         model = DDP(model, device_ids=None)
 
     if path != None:
-        model.load_state_dict(torch.load(path, weights_only=False, map_location=torch.device(device)), strict=strict, assign=assign)
+        state_dict = torch.load(path, weights_only=False, map_location=torch.device(device))
+        try:
+            model.load_state_dict(state_dict, strict=strict, assign=assign)
+        except RuntimeError:
+            model_name = infer_model_name_from_checkpoint_path(path)
+            if model_name is None:
+                raise
+
+            archived_module = load_networks_module_for_model(model_name)
+            archived_model_cls = getattr(archived_module, Model.__name__)
+            model = archived_model_cls(mode)
+            model.to(device)
+
+            if GPUs > 1:
+                model = DDP(model, device_ids=None)
+
+            model.load_state_dict(state_dict, strict=strict, assign=assign)
 
     return model
 
@@ -611,11 +630,12 @@ def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, randgen=No
             vcircs = vcirc_mu[i] if vcirc_mu is not None else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            fp = apply_noise(test_ds[i]['fib_pos'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device) if 'fib_pos' in test_ds[i] else None
             if return_log_prob:
-                sample, log_prob = model.sample(img, spec, nsamples, return_log_prob=True, vcirc_mu=vcircs)
+                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs)
                 log_probs.append(log_prob.detach().cpu().numpy())
             else:
-                sample = model.sample(img, spec, nsamples, vcirc_mu=vcircs)
+                sample = model.sample(img, spec, nsamples, fp=fp, vcirc_mu=vcircs)
             samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     snrs = snrs.cpu().numpy()

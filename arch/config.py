@@ -36,6 +36,7 @@ class TrainConfig:
     use_pretrain: bool
     pretrained_name: str
     pretrain_from: int
+    enable_handedness_flip: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,7 +95,7 @@ def _default_model_config() -> ModelConfig:
             size=1000000,
             nimg=1,
             nspec=5,
-            data_dir="/ocean/projects/phy250048p/shared/datasets/train_1m/",
+            data_dir="/ocean/projects/phy250048p/shared/datasets/valid_1m/",
             data_stem="gal_",
         ),
         test=DatasetConfig(
@@ -125,10 +126,11 @@ def _default_model_config() -> ModelConfig:
             feature_names=["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="CNN-CNN-flow",
+            model_name="CNN-CNN-flow_flips",
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",
             pretrain_from=99,
+            enable_handedness_flip=True,
         ),
         flow=FlowConfig(num_layers=12),
     )

@@ -4,6 +4,8 @@ from os.path import join
 from argparse import ArgumentParser
 from astropy.units import Unit
 SCR_DIR = os.path.dirname(os.path.abspath(__file__))
+HOME_DIR = os.path.dirname(os.path.dirname(SCR_DIR))
+KL_TOOLS_DATA_DIR = join(HOME_DIR, "kl-tools", "data")
 
 # From KL-tools
 import kl_tools.priors as priors
@@ -23,6 +25,9 @@ parser.add_argument('-v0', type=float, default=0, help='systemic velocity')
 parser.add_argument('-vcirc', type=float, default=300, help='max rotation velocity')
 parser.add_argument('-rscale', type=float, default=1, help='velocity scale radius')
 parser.add_argument('-hlr', type=float, default=1, help='half-light radius')
+parser.add_argument('-n_s', type=float, default=1, help='sersic index')
+parser.add_argument('--fiber_perm', type=str, default='0,1,2,3,4',
+                    help='comma-separated permutation for the 5 fiber order')
 args = parser.parse_args()
 n = args.n
 d = args.d
@@ -35,30 +40,35 @@ v0 = args.v0
 vcirc = args.vcirc
 rscale = args.rscale
 hlr = args.hlr
+n_s = args.n_s
+fiber_perm = [int(x.strip()) for x in args.fiber_perm.split(',')]
+if len(fiber_perm) != 5 or sorted(fiber_perm) != [0, 1, 2, 3, 4]:
+    raise ValueError(f'Invalid --fiber_perm={args.fiber_perm}; expected permutation of 0,1,2,3,4')
 
 # Some global observation variables
 fiber_blur = 3.4 # pixels
 atm_psf_fwhm = 1.0 # arcsec
-fiber_rad = 0.75 # arcsec
-fiber_offset = 1.5 # arcsec
+fiber_rad = 0.75 # arcsec 
+fiber_offset = 1.5 # arcsec 
 exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
 FITS_DIR = f'/ocean/projects/phy250048p/shared/fits/{d}/part_{n}/'
+# FITS_DIR = f'/ocean/projects/phy250048p/shared/temp/'
 
 ##################### Setting up observation configurations ####################
 
 default_photo_conf = {'INSTNAME': "CTIO/DECam", 'OBSTYPE': 0, 'NAXIS': 2,
     'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': "airy_fwhm",
-    'PSFFWHM': 1.0, 'DIAMETER': 378.2856, 'GAIN': 4.0,
+    'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 378.2856, 'GAIN': 4.0,
     'NOISETYP': 'ccd', 'RDNOISE': 2.6, 'ADDNOISE': ADD_NOISE
 }
 
 default_fiber_conf = {'INSTNAME': "DESI", 'OBSTYPE': 1,
-    'SKYMODEL': join(SCR_DIR, "../data/Skyspectra/spec-sky.dat"), 'PSFTYPE': "airy_fwhm", 
-    'PSFFWHM': 1.0, 'DIAMETER': 332.42, 'EXPTIME': 180, 'GAIN': 1.0,
-    'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': 0.75, 'FIBRBLUR': 3.4
+    'SKYMODEL': join(KL_TOOLS_DATA_DIR, "Skyspectra", "spec-sky.dat"), 'PSFTYPE': "airy_fwhm", 
+    'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 332.42, 'EXPTIME': 180, 'GAIN': 1.0,
+    'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': fiber_rad, 'FIBRBLUR': fiber_blur
 }
 
 default_obs_conf, _index_ = [], 0
@@ -90,19 +100,23 @@ P = np.array([[1, 0],
               [0, cosi]])
 T = np.matmul(A, np.matmul(R, P))
 U, S, Vh = np.linalg.svd(T)
+v_ref = T @ np.array([1, 0])
+if np.dot(U[:, 0], v_ref) < 0:
+    U *= -1
 offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
            (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
            (0,0),
            (fiber_offset*np.cos(np.pi/2), fiber_offset*np.sin(np.pi/2)),
            (fiber_offset*np.cos(3*np.pi/2), fiber_offset*np.sin(3*np.pi/2))]
 offsets = np.matmul(offsets, U)
+offsets = np.asarray(offsets)[fiber_perm]
 OFFSETX = 1
 
 ### Choose fiber configurations
 for i in range(len(emlines)):
     if spec_mask[i]==1:
         eml, bid, chn, rdn = emlines[i], blockids[i], channels[i], rdnoise[i]
-        _bp = join(SCR_DIR, "../data/Bandpass/DESI/%s.dat"%(chn))
+        _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "DESI", "%s.dat"%(chn))
         for (dx, dy) in offsets:
             _conf = copy.deepcopy(default_fiber_conf)
             _conf.update({'OBSINDEX': _index_, 'SEDBLKID': bid, 'BANDPASS': _bp,
@@ -117,13 +131,13 @@ for i in range(len(emlines)):
 photometry_band = ['r', 'g', 'z']
 sky_levels = [44.54, 19.02, 168.66]
 LS_DR9_exptime = [60, 100, 80]
-PHOT_MASK = 7
+PHOT_MASK = 4
 phot_mask = np.array([int(bit) for bit in ("{0:0%db}"%len(photometry_band)).format(PHOT_MASK)])
 Nphot_used = np.sum(phot_mask)
 
 for i in range(len(photometry_band)):
     if phot_mask[i]==1:
-        _bp = join(SCR_DIR, "../data/Bandpass/CTIO/DECam.%s.dat"%photometry_band[i])
+        _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "CTIO", "DECam.%s.dat"%photometry_band[i])
         _conf = copy.deepcopy(default_photo_conf)
         _conf.update({"OBSINDEX": _index_, 'BANDPASS': _bp, "SKYLEVEL": sky_levels[i],
             "EXPTIME": exptime_photo if exptime_photo>0 else LS_DR9_exptime[i]})
@@ -213,7 +227,8 @@ def main():
         ### intensity model
         'intensity': {
             ### Inclined Exp profile
-            'type': 'inclined_exp',
+            'type': 'inclined_sersic', # 'inclined_exp
+            'sersic_n': n_s,
             'flux': 1.0, # counts
             'hlr': hlr,
         },
@@ -246,7 +261,7 @@ def main():
         'sed':{
             'z': redshift,
             'continuum_type': 'temp',
-            'restframe_temp': join(SCR_DIR, '../data/Simulation/GSB2.spec'),
+            'restframe_temp': join(KL_TOOLS_DATA_DIR, "Simulation", "GSB2.spec"),
             'temp_wave_type': 'Ang',
             'temp_flux_type': 'flambda',
             'cont_norm_method': 'flux',
@@ -269,7 +284,7 @@ def main():
     }
     pars = Pars(sampled_pars, meta_pars)
      
-    fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value)
+    fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value, pickle_cubes=False)
     datavector = get_GlobalDataVector(0)
     print(f'Dataset {d} #{ID} generated')
     datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)

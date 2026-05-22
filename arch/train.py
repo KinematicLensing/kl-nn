@@ -26,6 +26,14 @@ from nflows.nn.nets import ResidualNet
 from networks import *
 from dataset import *
 from utils import *
+from data import (
+    _load_rmag_snr_relation,
+    _resolve_handedness_flip_feature_indices,
+    apply_handedness_flip,
+    apply_noise,
+    make_exact_half_flip_mask,
+    sample_magnitudes,
+)
 import config
 from model_registry import infer_model_name_from_checkpoint_path, load_networks_module_for_model
 
@@ -37,47 +45,6 @@ Need to create a wrapper trainer class eventually
 #-------------#
 # CNN Trainer #
 #-------------#
-
-
-def _rmag_snr_model(log_snr, a, b):
-    return a * log_snr + b
-
-
-def _fit_rmag_snr_relation(source_path=None, fit_path=None):
-    if source_path is None:
-        source_path = config.rmag_snr_source_path
-    if fit_path is None:
-        fit_path = config.rmag_snr_fit_path
-
-    with np.load(source_path) as data:
-        snr = np.asarray(data['SNR'], dtype=float)
-        rmag = np.asarray(data['rmag'], dtype=float)
-
-    valid = np.isfinite(snr) & np.isfinite(rmag) & (snr > 0)
-    snr = snr[valid]
-    rmag = rmag[valid]
-    coeffs, _ = curve_fit(_rmag_snr_model, np.log10(snr), rmag)
-    a, b = map(float, coeffs)
-
-    os.makedirs(os.path.dirname(fit_path), exist_ok=True)
-    np.savez(
-        fit_path,
-        a=a,
-        b=b,
-        source_path=source_path,
-        model='rmag = a * log10(SNR) + b',
-    )
-    return a, b
-
-
-def _load_rmag_snr_relation(fit_path=None):
-    if fit_path is None:
-        fit_path = config.rmag_snr_fit_path
-
-    if os.path.exists(fit_path):
-        with np.load(fit_path, allow_pickle=False) as data:
-            return float(data['a']), float(data['b'])
-    return _fit_rmag_snr_relation(fit_path=fit_path)
 
 class CNNTrainer:
     def __init__(
@@ -110,6 +77,12 @@ class CNNTrainer:
         self.nbatch_valid = self.nvalid//self.batch_size
         self.logger = logging.getLogger('Trainer')
         self.has_fib_pos = 'fib_pos' in self.train_data[0] and 'fib_pos' in self.valid_data[0]
+        self.enable_handedness_flip = bool(config.train.get('enable_handedness_flip', False))
+        self.g2_idx = None
+        self.theta_idx = None
+        if self.enable_handedness_flip:
+            feature_names = config.train['feature_names'][:self.nfeatures]
+            self.g2_idx, self.theta_idx = _resolve_handedness_flip_feature_indices(feature_names)
         
     def _set_tensors(self):
         '''
@@ -183,6 +156,16 @@ class CNNTrainer:
             
         self.SNR_train = self.generate_snr(size=self.ntrain, mode='uniform')
         self.SNR_valid = self.generate_snr(size=self.nvalid, mode='uniform')
+        self.flip_mask_train = (
+            make_exact_half_flip_mask(self.ntrain, device=self.device)
+            if self.enable_handedness_flip
+            else None
+        )
+        self.flip_mask_valid = (
+            make_exact_half_flip_mask(self.nvalid, device=self.device)
+            if self.enable_handedness_flip
+            else None
+        )
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
@@ -212,6 +195,16 @@ class CNNTrainer:
             spec = self._apply_noise(self.spec_train[batch_ids], snr)
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids] if self.has_fib_pos else None
+            batch_flip_mask = self.flip_mask_train[batch_ids] if self.flip_mask_train is not None else None
+            img, spec, fid, fp = apply_handedness_flip(
+                img,
+                spec,
+                fid,
+                fp=fp,
+                flip_mask=batch_flip_mask,
+                g2_idx=self.g2_idx,
+                theta_idx=self.theta_idx,
+            )
             loss = self._run_batch(img, spec, fid, fp=fp)
             if ~(torch.isnan(loss) | torch.isinf(loss)):
                 losses.append(loss.item())
@@ -248,6 +241,16 @@ class CNNTrainer:
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr)
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids] if self.has_fib_pos else None
+                batch_flip_mask = self.flip_mask_valid[batch_ids] if self.flip_mask_valid is not None else None
+                img, spec, fid, fp = apply_handedness_flip(
+                    img,
+                    spec,
+                    fid,
+                    fp=fp,
+                    flip_mask=batch_flip_mask,
+                    g2_idx=self.g2_idx,
+                    theta_idx=self.theta_idx,
+                )
                 loss = self.model(img, spec, fid, fp=fp)
                 if ~(torch.isnan(loss) | torch.isinf(loss)):
                     losses.append(loss.item())
@@ -487,66 +490,25 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
 
     return model
 
-def _noise_scale_from_seg(data, snr, seg, eps=1e-8):
-    snr = torch.clamp(snr, min=eps)
-    npix = torch.sum(seg, dim=(-1, -2, -3)).float()
-    npix = torch.clamp(npix, min=1.0)
-    signal = torch.sum(data*seg.float(), dim=(-1, -2, -3))
-    return signal/(torch.sqrt(npix)*snr)
-
-
-def _estimate_noise_rms(noise, seg, eps=1e-8):
-    # Prefer background pixels to estimate RMS; fall back to full-frame RMS if needed.
-    bkg = (~seg).float()
-    bkg_count = torch.sum(bkg, dim=(-1, -2, -3))
-    bkg_count_safe = torch.clamp(bkg_count, min=1.0)
-    bkg_rms = torch.sqrt(torch.sum((noise*bkg)**2, dim=(-1, -2, -3))/bkg_count_safe)
-    full_rms = torch.sqrt(torch.mean(noise**2, dim=(-1, -2, -3)))
-    return torch.where(bkg_count > eps, bkg_rms, full_rms)
-
-
-def apply_noise(data, snr, randgen=None, device='cpu', use_iterative=True,
-                base_signal_frac=0.1, threshold_sigma=1.5, eps=1e-8):
-    """
-    Apply Gaussian noise to batched data using an SNR-controlled scale.
-
-    When use_iterative=True, a second pass refines the segmentation threshold to
-    threshold_sigma * estimated_noise_rms for a more realistic signal mask.
-    """
-    if randgen is None:
-        noise = torch.randn(data.size(), device=device)
-    else:
-        noise = torch.randn(data.size(), device=device, generator=randgen)
-
-    maxs = torch.amax(data, dim=(-1, -2, -3))
-    seg_coarse = data > (base_signal_frac*maxs).view(-1, 1, 1, 1)
-    factor_coarse = _noise_scale_from_seg(data, snr, seg_coarse, eps=eps)
-
-    if not use_iterative:
-        return data + noise*factor_coarse.view(-1, 1, 1, 1)
-
-    coarse_noise = noise*factor_coarse.view(-1, 1, 1, 1)
-    coarse_rms = _estimate_noise_rms(coarse_noise, seg_coarse, eps=eps)
-    refined_threshold = threshold_sigma*coarse_rms
-    seg_refined = data > refined_threshold.view(-1, 1, 1, 1)
-    factor_refined = _noise_scale_from_seg(data, snr, seg_refined, eps=eps)
-    return data + noise*factor_refined.view(-1, 1, 1, 1)
-
-def sample_magnitudes(n_samples, m_min, m_max):
-    u = np.random.uniform(0, 1, n_samples)
-    
-    val_min = 10**(0.6 * m_min)
-    val_max = 10**(0.6 * m_max)
-    
-    # Inverse Transform Sampling Formula
-    m = (5/3) * np.log10(u * (val_max - val_min) + val_min)
-    return m
-
-def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(), device='cpu'):
+def predict(
+    nfeatures,
+    test_data,
+    model,
+    batch_size=100,
+    criterion=nn.MSELoss(),
+    device='cpu',
+    flip_handedness=None,
+):
     '''
     Run this function to test performance of trained models
     '''
     model.eval()
+    do_flip = bool(config.train.get('enable_handedness_flip', False)) if flip_handedness is None else bool(flip_handedness)
+    g2_idx = None
+    theta_idx = None
+    if do_flip:
+        feature_names = config.train['feature_names'][:nfeatures]
+        g2_idx, theta_idx = _resolve_handedness_flip_feature_indices(feature_names)
     losses=[]
     with torch.no_grad():
         for i, batch in enumerate(test_data):
@@ -562,6 +524,16 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
                 fid[:, 2][neg] += 1
                 fid[:, 2] = fid[:, 2]*2 - 1
             fid = fid.float().to(device)
+            if do_flip:
+                flip_mask = make_exact_half_flip_mask(fid.shape[0], device=device)
+                img, spec, fid, _ = apply_handedness_flip(
+                    img,
+                    spec,
+                    fid,
+                    flip_mask=flip_mask,
+                    g2_idx=g2_idx,
+                    theta_idx=theta_idx,
+                )
             outputs = model.point_estimate(img, spec)
             loss = criterion(outputs, fid)
             losses.append(loss.item())
@@ -583,13 +555,28 @@ def predict(nfeatures, test_data, model, batch_size=100, criterion=nn.MSELoss(),
     
     return combined_pred, combined_fid, epoch_loss, snrs
 
-def estimate_density(zz, test_data, model, batch_size=100, snr=None, vcirc_mu=None,device='cpu'):
+def estimate_density(
+    zz,
+    test_data,
+    model,
+    batch_size=100,
+    snr=None,
+    vcirc_mu=None,
+    device='cpu',
+    flip_handedness=None,
+):
     '''
     Run this function to test performance of trained density estimation models
     '''
     if model.mode == 2:
         assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
+    do_flip = bool(config.train.get('enable_handedness_flip', False)) if flip_handedness is None else bool(flip_handedness)
+    g2_idx = None
+    theta_idx = None
+    if do_flip:
+        feature_names = config.train['feature_names'][:2]
+        g2_idx, theta_idx = _resolve_handedness_flip_feature_indices(feature_names)
     true = []
     log_probs = []
     snrs = snr if snr is not None else torch.rand((batch_size*len(test_data),),device=device)*990 + 10
@@ -602,6 +589,16 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, vcirc_mu=No
             # img = batch['img'].float().to(device)
             # spec = batch['spec'].float().to(device)
             fid = batch['fid_pars'][:, :2].float().to(device)
+            if do_flip:
+                flip_mask = make_exact_half_flip_mask(fid.shape[0], device=device)
+                img, spec, fid, _ = apply_handedness_flip(
+                    img,
+                    spec,
+                    fid,
+                    flip_mask=flip_mask,
+                    g2_idx=g2_idx,
+                    theta_idx=theta_idx,
+                )
             log_prob = model.estimate_log_prob(img, spec, zz, batch_size, vcirc_mu=vcircs)
             log_probs.append(log_prob.detach().cpu().numpy())
             true.append(fid.cpu().numpy())
@@ -611,7 +608,17 @@ def estimate_density(zz, test_data, model, batch_size=100, snr=None, vcirc_mu=No
 
     return log_probs, true, snrs
 
-def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, randgen=None, return_log_prob=False,device='cpu'):
+def sample_density(
+    model,
+    test_ds,
+    nsamples,
+    snr=None,
+    vcirc_mu=None,
+    randgen=None,
+    return_log_prob=False,
+    device='cpu',
+    flip_handedness=None,
+):
     '''
     Run this function to sample from trained density estimation models
     '''
@@ -620,6 +627,16 @@ def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, randgen=No
     if model.mode == 2:
         assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
+    do_flip = bool(config.train.get('enable_handedness_flip', False)) if flip_handedness is None else bool(flip_handedness)
+    g2_idx = None
+    theta_idx = None
+    feature_names = None
+    if do_flip:
+        feature_names = config.train['feature_names'][: config.train['feature_number']]
+        g2_idx, theta_idx = _resolve_handedness_flip_feature_indices(feature_names)
+        flip_mask_all = make_exact_half_flip_mask(len(test_ds), device=device)
+    else:
+        flip_mask_all = None
     samples = []
     if return_log_prob:
         log_probs = []
@@ -630,7 +647,22 @@ def sample_density(model, test_ds, nsamples, snr=None, vcirc_mu=None, randgen=No
             vcircs = vcirc_mu[i] if vcirc_mu is not None else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
-            fp = apply_noise(test_ds[i]['fib_pos'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device) if 'fib_pos' in test_ds[i] else None
+            fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
+            if do_flip:
+                fid_row = torch.as_tensor(
+                    test_ds[i]['fid_pars'][: len(feature_names)],
+                    dtype=torch.float32,
+                    device=device,
+                ).unsqueeze(0)
+                img, spec, _, fp = apply_handedness_flip(
+                    img,
+                    spec,
+                    fid_row,
+                    fp=fp,
+                    flip_mask=flip_mask_all[i:i+1],
+                    g2_idx=g2_idx,
+                    theta_idx=theta_idx,
+                )
             if return_log_prob:
                 sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs)
                 log_probs.append(log_prob.detach().cpu().numpy())

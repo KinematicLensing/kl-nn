@@ -10,7 +10,13 @@ class _DummyDataset:
         return 4
 
     def __getitem__(self, idx):
-        raise IndexError("Not used in this test")
+        # CNNTrainer probes dataset[0] during init to infer fib_pos availability.
+        # Return a minimal sample shape compatible with that check.
+        return {
+            "img": torch.zeros((1, 48, 48), dtype=torch.float32),
+            "spec": torch.zeros((1, 5, 64), dtype=torch.float32),
+            "fid_pars": torch.zeros((2,), dtype=torch.float32),
+        }
 
 
 def test_trainer_apply_noise_delegates_to_shared_function(monkeypatch):

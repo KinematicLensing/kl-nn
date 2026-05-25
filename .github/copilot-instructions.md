@@ -4,6 +4,7 @@
 
 There is no dedicated build/lint config in this repo (`pyproject.toml`, `setup.cfg`, `tox.ini`, `ruff.toml`, etc. are not present).
 
+- **Before running tests:** `conda activate kl-nn`
 - **Run all tests:** `pytest -q tests`
 - **Run one test file:** `pytest -q tests/test_model_config_registry.py`
 - **Run one test case:** `pytest -q tests/test_noise_apply.py -k test_apply_noise_preserves_shape_dtype`

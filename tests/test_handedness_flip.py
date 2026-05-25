@@ -53,6 +53,7 @@ def test_apply_handedness_flip_transforms_only_masked_rows():
     assert torch.equal(out_img[3], torch.flip(img[3], dims=(-2,)))
 
     assert torch.equal(out_fid[[0, 2], :], fid[[0, 2], :])
+    assert torch.allclose(out_fid[mask, 0], fid[mask, 0])
     assert torch.allclose(out_fid[mask, 1], -fid[mask, 1])
     assert torch.allclose(out_fid[mask, 2], -fid[mask, 2])
 

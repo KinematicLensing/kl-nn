@@ -461,9 +461,43 @@ def prepare_dataloader(train_ds, valid_ds, batch_size, GPUs):
     )
     return train_dl, valid_dl
 
-def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs=1, device='cpu'):
+def load_model(
+    mode=1,
+    Model=ForkCNN,
+    path=None,
+    strict=True,
+    assign=False,
+    GPUs=1,
+    device='cpu',
+    model_name=None,
+    networks_root=None,
+):
 
-    model = Model(mode)
+    model_cls = Model
+    resolved_name = None
+    if path is not None:
+        resolved_name = model_name or infer_model_name_from_checkpoint_path(path)
+        if resolved_name:
+            try:
+                if networks_root is None:
+                    archived_module = load_networks_module_for_model(resolved_name)
+                else:
+                    archived_module = load_networks_module_for_model(
+                        resolved_name, networks_root=networks_root
+                    )
+            except FileNotFoundError:
+                archived_module = None
+
+            if archived_module is not None:
+                try:
+                    model_cls = getattr(archived_module, Model.__name__)
+                except AttributeError as exc:
+                    raise AttributeError(
+                        f"Archived networks module for '{resolved_name}' "
+                        f"does not define {Model.__name__}."
+                    ) from exc
+
+    model = model_cls(mode)
     model.to(device)
 
     if GPUs > 1:
@@ -471,22 +505,7 @@ def load_model(mode=1, Model=ForkCNN, path=None, strict=True, assign=False, GPUs
 
     if path != None:
         state_dict = torch.load(path, weights_only=False, map_location=torch.device(device))
-        try:
-            model.load_state_dict(state_dict, strict=strict, assign=assign)
-        except RuntimeError:
-            model_name = infer_model_name_from_checkpoint_path(path)
-            if model_name is None:
-                raise
-
-            archived_module = load_networks_module_for_model(model_name)
-            archived_model_cls = getattr(archived_module, Model.__name__)
-            model = archived_model_cls(mode)
-            model.to(device)
-
-            if GPUs > 1:
-                model = DDP(model, device_ids=None)
-
-            model.load_state_dict(state_dict, strict=strict, assign=assign)
+        model.load_state_dict(state_dict, strict=strict, assign=assign)
 
     return model
 

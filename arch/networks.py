@@ -5,12 +5,12 @@ import normflows as nf
 from nflows.flows.base import Flow
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
 from nflows.transforms.permutations import ReversePermutation, RandomPermutation
 from nflows.nn.nets import ResidualNet
 
 import config
 from utils import resolve_feature_index
+from circular_spline import CircularAutoregressiveRationalQuadraticSpline
 
 ### Main Network ###
 class ForkCNN(nn.Module):
@@ -155,14 +155,25 @@ class ForkCNN(nn.Module):
         v_norm: normalized vcirc in [-1, 1], shape (...)
         vcirc_mu: TF prior center in km/s, broadcastable to v_norm
         """
+        min_val = 1
         v_circ = self._norm_to_vcirc(v_norm)
-        mu = vcirc_mu.to(device=v_circ.device, dtype=v_circ.dtype).clamp(min=1e-8)
+        v_circ = torch.where(
+            torch.isfinite(v_circ) & (v_circ > 0),
+            v_circ,
+            torch.full_like(v_circ, min_val),
+        )
+        mu = vcirc_mu.to(device=v_circ.device, dtype=v_circ.dtype)
+        mu = torch.where(
+            torch.isfinite(mu) & (mu > 0),
+            mu,
+            torch.full_like(mu, min_val),
+        )
         prior = torch.distributions.LogNormal(
             loc=torch.log(mu),
             scale=torch.full_like(v_circ, self.vcirc_log_scale)
         )
-        return prior.log_prob(v_circ)
-        # return prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
+        # return prior.log_prob(v_circ)
+        return prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
 
     def _flow_v_marginal_from_grid(self, flow_log_prob, v_norm_grid):
         """
@@ -209,6 +220,16 @@ class ForkCNN(nn.Module):
         hidden_units = 64
         num_blocks = 2
         context_size = 1024
+        num_bins = 8
+        theta_idx = None
+        feature_names = config.train.get('feature_names', None)
+        if feature_names:
+            feature_names = feature_names[: self.nfeatures]
+            try:
+                theta_idx = resolve_feature_index(feature_names, 'theta_int')
+            except ValueError:
+                theta_idx = None
+        circular_indices = [theta_idx] if theta_idx is not None else []
         
         # Set base distribution
         self.base = ConditionalDiagonalNormal(shape=[self.nfeatures], 
@@ -217,9 +238,17 @@ class ForkCNN(nn.Module):
         transforms = []
         for i in range(num_layers):
             transforms.append(RandomPermutation(features=self.nfeatures))
-            transforms.append(MaskedAffineAutoregressiveTransform(features=self.nfeatures, 
-                                                                hidden_features=hidden_units, 
-                                                                context_features=context_size))
+            transforms.append(
+                CircularAutoregressiveRationalQuadraticSpline(
+                    num_input_channels=self.nfeatures,
+                    num_blocks=num_blocks,
+                    num_hidden_channels=hidden_units,
+                    ind_circ=circular_indices,
+                    num_context_channels=context_size,
+                    num_bins=num_bins,
+                    tail_bound=1.0,
+                )
+            )
 
         self.transform = CompositeTransform(transforms)
 

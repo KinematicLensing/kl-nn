@@ -95,7 +95,7 @@ def _default_model_config() -> ModelConfig:
             size=1000000,
             nimg=1,
             nspec=5,
-            data_dir="/ocean/projects/phy250048p/shared/datasets/valid_1m/",
+            data_dir="/ocean/projects/phy250048p/shared/datasets/train_1m/",
             data_stem="gal_",
         ),
         test=DatasetConfig(
@@ -127,10 +127,10 @@ def _default_model_config() -> ModelConfig:
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
             model_name="CNN-CNN-flow_flips",
+            enable_handedness_flip=True,
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",
             pretrain_from=99,
-            enable_handedness_flip=True,
         ),
         flow=FlowConfig(num_layers=12),
     )

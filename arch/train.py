@@ -42,6 +42,58 @@ Module that manages all the trainer classes and testing functions.
 Need to create a wrapper trainer class eventually
 """
 
+def _resolve_amp_dtype(value: str) -> torch.dtype:
+    normalized = value.strip().lower()
+    if normalized in ("float16", "fp16", "half"):
+        return torch.float16
+    if normalized in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported amp_dtype '{value}'. Use 'float16' or 'bfloat16'.")
+
+def _patch_networkx_entry_points() -> None:
+    try:
+        import importlib.metadata as importlib_metadata
+    except Exception:
+        return
+    entry_points = getattr(importlib_metadata, "entry_points", None)
+    if entry_points is None or getattr(entry_points, "_kl_nn_filtered", False):
+        return
+
+    def _filtered_entry_points(*args, **kwargs):
+        eps = entry_points(*args, **kwargs)
+        group = kwargs.get("group")
+        if group in ("networkx.backends", "networkx.backend_info"):
+            try:
+                return [ep for ep in eps if ep.name != "nx-loopback"]
+            except TypeError:
+                return eps
+        return eps
+
+    _filtered_entry_points._kl_nn_filtered = True  # type: ignore[attr-defined]
+    importlib_metadata.entry_points = _filtered_entry_points
+
+
+def _maybe_compile_model(model: torch.nn.Module, log: logging.Logger | None = None) -> torch.nn.Module:
+    if log is not None:
+        log.info(type(model))
+    if not config.train.get('use_compile', False):
+        return model
+    if not hasattr(torch, "compile"):
+        if log is not None:
+            log.warning("torch.compile is not available in this Torch build; skipping.")
+        return model
+    try:
+        _patch_networkx_entry_points()
+        mode = config.train.get('compile_mode', 'default')
+        backend = config.train.get('compile_backend', 'inductor')
+        if backend is None:
+            return torch.compile(model, mode=mode)
+        return torch.compile(model, mode=mode, backend=backend)
+    except Exception as exc:
+        if log is not None:
+            log.warning("torch.compile failed; continuing without compilation: %s", exc)
+        return model
+
 #-------------#
 # CNN Trainer #
 #-------------#
@@ -78,6 +130,14 @@ class CNNTrainer:
         self.logger = logging.getLogger('Trainer')
         self.has_fib_pos = 'fib_pos' in self.train_data[0] and 'fib_pos' in self.valid_data[0]
         self.enable_handedness_flip = bool(config.train.get('enable_handedness_flip', False))
+        self.use_amp = bool(config.train.get('use_amp', False)) and torch.cuda.is_available()
+        self.amp_dtype = _resolve_amp_dtype(config.train.get('amp_dtype', 'float16'))
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        else:
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.use_channels_last = bool(config.train.get('channels_last', False))
+        self.use_noise_cache_maxs = bool(config.train.get('noise_cache_maxs', False))
         self.g2_idx = None
         self.theta_idx = None
         if self.enable_handedness_flip:
@@ -91,10 +151,31 @@ class CNNTrainer:
         # Initialize large arrays on GPU
         if self.gpu_id == self.log_rank:
             self.logger.info("Setting up tensors on GPU")
-        self.img_train = torch.empty((self.ntrain, 1, 48, 48), dtype=torch.float, device=self.device)
-        self.img_valid = torch.empty((self.nvalid, 1, 48, 48), dtype=torch.float, device=self.device)
-        self.spec_train = torch.empty((self.ntrain, 1, 5, 64), dtype=torch.float, device=self.device)
-        self.spec_valid = torch.empty((self.nvalid, 1, 5, 64), dtype=torch.float, device=self.device)
+        img_format = torch.channels_last if self.use_channels_last else torch.contiguous_format
+        self.img_train = torch.empty(
+            (self.ntrain, 1, 48, 48),
+            dtype=torch.float,
+            device=self.device,
+            memory_format=img_format,
+        )
+        self.img_valid = torch.empty(
+            (self.nvalid, 1, 48, 48),
+            dtype=torch.float,
+            device=self.device,
+            memory_format=img_format,
+        )
+        self.spec_train = torch.empty(
+            (self.ntrain, 1, 5, 64),
+            dtype=torch.float,
+            device=self.device,
+            memory_format=img_format,
+        )
+        self.spec_valid = torch.empty(
+            (self.nvalid, 1, 5, 64),
+            dtype=torch.float,
+            device=self.device,
+            memory_format=img_format,
+        )
         self.fid_train = torch.empty((self.ntrain, self.nfeatures), dtype=torch.float, device=self.device)
         self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
         if self.has_fib_pos:
@@ -135,18 +216,46 @@ class CNNTrainer:
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
                 self.logger.info(f"{prog}% complete")
+
+        self.img_train_maxs = None
+        self.img_valid_maxs = None
+        self.spec_train_maxs = None
+        self.spec_valid_maxs = None
+        if self.use_noise_cache_maxs:
+            if self.gpu_id == self.log_rank:
+                self.logger.info("Precomputing noise max caches")
+            self.img_train_maxs = torch.amax(self.img_train, dim=(-1, -2, -3))
+            self.img_valid_maxs = torch.amax(self.img_valid, dim=(-1, -2, -3))
+            self.spec_train_maxs = torch.amax(self.spec_train, dim=(-1, -2, -3))
+            self.spec_valid_maxs = torch.amax(self.spec_valid, dim=(-1, -2, -3))
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         
-        torch.distributed.barrier()
-        
-    def _apply_noise(self, data, snr):
-        return apply_noise(data, snr, device=self.device, use_iterative=True)
+    def _apply_noise(self, data, snr, maxs=None):
+        output = apply_noise(
+            data,
+            snr,
+            device=self.device,
+            use_iterative=True,
+            maxs=maxs,
+        )
+        if self.use_channels_last:
+            output = output.contiguous(memory_format=torch.channels_last)
+        return output
 
     def _run_batch(self, img, spec, fid, fp=None):
-        self.optimizer.zero_grad()
-        loss = self.model(img, spec, fid, fp=fp)
-        if ~(torch.isnan(loss) | torch.isinf(loss)):
-            loss.backward()                   
-            self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            loss = self.model(img, spec, fid, fp=fp)
+        if torch.isfinite(loss):
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
         return loss
 
     def _run_epoch(self, epoch, show_log=True):
@@ -171,17 +280,21 @@ class CNNTrainer:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
 
         train_loss, train_nans, train_infs = self._trainFunc(epoch)
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         valid_loss, valid_nans, valid_infs = self._validFunc(epoch)
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         return train_loss, train_nans, train_infs, valid_loss, valid_nans, valid_infs
 
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
-        np.random.shuffle(self.train_order)
+        self.train_order = torch.randperm(self.ntrain, device=self.device)
         losses = []
         epoch_start = time.time()
         nans = 0
@@ -191,8 +304,10 @@ class CNNTrainer:
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids]
-            img = self._apply_noise(self.img_train[batch_ids], snr)
-            spec = self._apply_noise(self.spec_train[batch_ids], snr)
+            img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
+            spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
+            img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
+            spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids] if self.has_fib_pos else None
             batch_flip_mask = self.flip_mask_train[batch_ids] if self.flip_mask_train is not None else None
@@ -205,6 +320,9 @@ class CNNTrainer:
                 g2_idx=self.g2_idx,
                 theta_idx=self.theta_idx,
             )
+            if self.use_channels_last:
+                img = img.contiguous(memory_format=torch.channels_last)
+                spec = spec.contiguous(memory_format=torch.channels_last)
             loss = self._run_batch(img, spec, fid, fp=fp)
             if ~(torch.isnan(loss) | torch.isinf(loss)):
                 losses.append(loss.item())
@@ -227,7 +345,7 @@ class CNNTrainer:
 
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
-        np.random.shuffle(self.valid_order)
+        self.valid_order = torch.randperm(self.nvalid, device=self.device)
         losses = []
         epoch_start = time.time()
         nans = 0
@@ -237,8 +355,10 @@ class CNNTrainer:
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
                 snr = self.SNR_valid[batch_ids]
-                img = self._apply_noise(self.img_valid[batch_ids], snr)
-                spec = self._apply_noise(self.spec_valid[batch_ids], snr)
+                img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
+                spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
+                img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
+                spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids] if self.has_fib_pos else None
                 batch_flip_mask = self.flip_mask_valid[batch_ids] if self.flip_mask_valid is not None else None
@@ -251,6 +371,9 @@ class CNNTrainer:
                     g2_idx=self.g2_idx,
                     theta_idx=self.theta_idx,
                 )
+                if self.use_channels_last:
+                    img = img.contiguous(memory_format=torch.channels_last)
+                    spec = spec.contiguous(memory_format=torch.channels_last)
                 loss = self.model(img, spec, fid, fp=fp)
                 if ~(torch.isnan(loss) | torch.isinf(loss)):
                     losses.append(loss.item())
@@ -284,8 +407,8 @@ class CNNTrainer:
         train_infs_list = []
         valid_nans_list = []
         valid_infs_list = []
-        self.train_order = np.linspace(0, self.ntrain-1, self.ntrain, dtype=int)
-        self.valid_order = np.linspace(0, self.nvalid-1, self.nvalid, dtype=int)
+        self.train_order = torch.arange(self.ntrain, device=self.device)
+        self.valid_order = torch.arange(self.nvalid, device=self.device)
         if self.gpu_id == self.log_rank:
             self.logger.info("Training start")
         for epoch in range(max_epochs):
@@ -346,10 +469,37 @@ def train_nn(rank: int, world_size: int, Model=ForkCNN, Trainer=CNNTrainer,
     
     ddp_setup(rank, world_size)
     log.info(f'[rank: {rank}] Successfully set up device')
+    torch.backends.cudnn.benchmark = bool(config.train.get('cudnn_benchmark', False))
 
-    train_ds, valid_ds, model, optimizer = load_train_objs(mode, nfeatures, batch_size, world_size, Model, rank, epoch, log=log)
-    model = model.to(rank)
-    model = DDP(model, device_ids=[rank])
+    device = torch.device(f"cuda:{rank}")
+    train_ds, valid_ds, model, optimizer = load_train_objs(
+        mode,
+        nfeatures,
+        batch_size,
+        world_size,
+        Model,
+        rank,
+        epoch,
+        log=log,
+        device=device,
+    )
+    if config.train.get('channels_last', False):
+        model = model.to(memory_format=torch.channels_last)
+    model = _maybe_compile_model(model, log=log)
+    ddp_kwargs = {
+        "device_ids": [rank],
+        "find_unused_parameters": bool(config.train.get('ddp_find_unused_parameters', False)),
+        "broadcast_buffers": bool(config.train.get('ddp_broadcast_buffers', False)),
+        "gradient_as_bucket_view": bool(config.train.get('ddp_gradient_as_bucket_view', True)),
+    }
+    if config.train.get('ddp_static_graph', False):
+        ddp_kwargs["static_graph"] = True
+    try:
+        model = DDP(model, **ddp_kwargs)
+    except TypeError:
+        ddp_kwargs.pop("static_graph", None)
+        ddp_kwargs.pop("gradient_as_bucket_view", None)
+        model = DDP(model, **ddp_kwargs)
     log.info(f'[rank: {rank}] Successfully loaded training objects')
     
     #train_dl, valid_dl = prepare_dataloader(train_ds, valid_ds, batch_size, world_size)
@@ -422,7 +572,18 @@ def setup_flows():
 
     return base, transform
 
-def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None, log=None,**kwargs):
+def load_train_objs(
+    mode,
+    nfeatures,
+    batch_size,
+    nGPUs,
+    Model,
+    rank,
+    epoch=None,
+    log=None,
+    device=None,
+    **kwargs,
+):
     # Create dataset objects
     train_ds = pxt.TorchDataset(config.data['data_dir'])
     valid_ds = pxt.TorchDataset(config.test['data_dir'])
@@ -439,12 +600,32 @@ def load_train_objs(mode, nfeatures, batch_size, nGPUs, Model, rank, epoch=None,
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded new model {config.train['model_name']}")
+    if device is not None:
+        model = model.to(device)
     # optimizer = optim.SGD(model.parameters(), 
     #                       lr=config.train['initial_learning_rate'],
     #                       momentum=config.train['momentum'])
-    optimizer = optim.AdamW(model.parameters(), 
-                            lr=config.train['initial_learning_rate'], 
-                            weight_decay=config.train['weight_decay'])
+    use_fused = (
+        bool(config.train.get('use_fused_adamw', False))
+        and torch.cuda.is_available()
+        and next(model.parameters()).is_cuda
+    )
+    optimizer_kwargs = dict(
+        lr=config.train['initial_learning_rate'],
+        weight_decay=config.train['weight_decay'],
+    )
+    if use_fused:
+        optimizer_kwargs["fused"] = True
+    try:
+        optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
+    except TypeError:
+        if use_fused and log is not None:
+            log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.train['initial_learning_rate'],
+            weight_decay=config.train['weight_decay'],
+        )
 
     return train_ds, valid_ds, model, optimizer
 

@@ -37,6 +37,19 @@ class TrainConfig:
     pretrained_name: str
     pretrain_from: int
     enable_handedness_flip: bool = False
+    use_amp: bool = True
+    amp_dtype: str = "float16"
+    use_compile: bool = True
+    compile_mode: str = "default"
+    compile_backend: str | None = None
+    use_fused_adamw: bool = True
+    cudnn_benchmark: bool = True
+    channels_last: bool = True
+    ddp_static_graph: bool = True
+    ddp_find_unused_parameters: bool = False
+    ddp_gradient_as_bucket_view: bool = True
+    ddp_broadcast_buffers: bool = False
+    noise_cache_maxs: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -131,6 +144,19 @@ def _default_model_config() -> ModelConfig:
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",
             pretrain_from=99,
+            use_amp=True,
+            amp_dtype="float16",
+            use_compile=True,
+            compile_mode="default",
+            compile_backend=None,
+            use_fused_adamw=True,
+            cudnn_benchmark=True,
+            channels_last=True,
+            ddp_static_graph=True,
+            ddp_find_unused_parameters=False,
+            ddp_gradient_as_bucket_view=False,
+            ddp_broadcast_buffers=False,
+            noise_cache_maxs=True,
         ),
         flow=FlowConfig(num_layers=12),
     )

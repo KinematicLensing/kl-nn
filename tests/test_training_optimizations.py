@@ -1,0 +1,144 @@
+import inspect
+
+import numpy as np
+import pytest
+import torch
+
+import config
+import train
+from data import apply_noise
+from networks import ForkCNN
+
+
+class DummyDataset:
+    def __init__(self, size: int, nfeatures: int) -> None:
+        self.size = size
+        self.nfeatures = nfeatures
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int):
+        return {
+            "img": torch.rand((1, 48, 48), dtype=torch.float32),
+            "spec": torch.rand((1, 5, 64), dtype=torch.float32),
+            "fid_pars": torch.rand((self.nfeatures,), dtype=torch.float32),
+        }
+
+
+def _set_basic_train_config(monkeypatch, nfeatures: int, batch_size: int) -> None:
+    monkeypatch.setitem(config.train, "mode", 0)
+    monkeypatch.setitem(config.train, "batch_size", batch_size)
+    monkeypatch.setitem(config.train, "feature_number", nfeatures)
+    base_names = ["g1", "g2", "vcirc"]
+    monkeypatch.setitem(config.train, "feature_names", base_names[:nfeatures])
+    monkeypatch.setitem(config.train, "enable_handedness_flip", False)
+    monkeypatch.setitem(config.train, "epoch_number", 1)
+    monkeypatch.setitem(config.train, "initial_learning_rate", 1e-3)
+    monkeypatch.setitem(config.train, "weight_decay", 0.0)
+
+
+def test_train_config_has_optimization_defaults():
+    for key in (
+        "use_amp",
+        "amp_dtype",
+        "use_compile",
+        "compile_mode",
+        "compile_backend",
+        "use_fused_adamw",
+        "cudnn_benchmark",
+        "channels_last",
+        "ddp_static_graph",
+        "ddp_find_unused_parameters",
+        "ddp_gradient_as_bucket_view",
+        "ddp_broadcast_buffers",
+        "noise_cache_maxs",
+    ):
+        assert key in config.train
+    assert config.train["use_amp"] is True
+    assert config.train["use_compile"] is True
+    assert config.train["use_fused_adamw"] is True
+    assert config.train["cudnn_benchmark"] is True
+    assert config.train["channels_last"] is True
+
+
+def test_apply_noise_cached_maxs_matches_uncached():
+    data = torch.arange(2 * 1 * 4 * 4, dtype=torch.float32).reshape(2, 1, 4, 4)
+    snr = torch.tensor([10.0, 50.0], dtype=torch.float32)
+    gen_a = torch.Generator().manual_seed(1234)
+    gen_b = torch.Generator().manual_seed(1234)
+    maxs = torch.amax(data, dim=(-1, -2, -3))
+
+    out_uncached = apply_noise(data, snr, randgen=gen_a, device="cpu")
+    out_cached = apply_noise(data, snr, randgen=gen_b, device="cpu", maxs=maxs)
+
+    assert torch.allclose(out_uncached, out_cached)
+
+
+def test_load_train_objs_fused_adamw_flag(monkeypatch):
+    _set_basic_train_config(monkeypatch, nfeatures=3, batch_size=2)
+    monkeypatch.setitem(config.train, "use_fused_adamw", True)
+    monkeypatch.setattr(train.pxt, "TorchDataset", lambda path: DummyDataset(4, 3))
+
+    train_ds, valid_ds, model, optimizer = train.load_train_objs(
+        mode=0,
+        nfeatures=3,
+        batch_size=2,
+        nGPUs=1,
+        Model=ForkCNN,
+        rank=0,
+    )
+
+    fused_supported = (
+        "fused" in inspect.signature(torch.optim.AdamW).parameters
+        and torch.cuda.is_available()
+        and next(model.parameters()).is_cuda
+    )
+    fused_value = bool(optimizer.defaults.get("fused", False))
+    assert fused_value == fused_supported
+    assert len(train_ds) == 4
+    assert len(valid_ds) == 4
+    assert model is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for training smoke test")
+def test_trainer_amp_compile_channels_last_smoke(monkeypatch):
+    _set_basic_train_config(monkeypatch, nfeatures=3, batch_size=2)
+    monkeypatch.setitem(config.train, "use_amp", True)
+    monkeypatch.setitem(config.train, "amp_dtype", "float16")
+    monkeypatch.setitem(config.train, "use_compile", True)
+    monkeypatch.setitem(config.train, "compile_mode", "default")
+    monkeypatch.setitem(config.train, "compile_backend", None)
+    monkeypatch.setitem(config.train, "channels_last", True)
+    monkeypatch.setitem(config.train, "noise_cache_maxs", True)
+
+    device = torch.device("cuda:0")
+    model = ForkCNN(mode=0, batch_size=2, nfeatures=3, nspec=5).to(device)
+    model = train._maybe_compile_model(model, log=None)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+
+    train_ds = DummyDataset(4, 3)
+    valid_ds = DummyDataset(4, 3)
+    trainer = train.CNNTrainer(
+        world_size=1,
+        model=model,
+        nfeatures=3,
+        train_ds=train_ds,
+        valid_ds=valid_ds,
+        optimizer=optimizer,
+        gpu_id=0,
+        save_every=1,
+        batch_size=2,
+    )
+    trainer._set_tensors()
+    trainer.SNR_train = trainer.generate_snr(size=trainer.ntrain, mode="uniform")
+    trainer.SNR_valid = trainer.generate_snr(size=trainer.nvalid, mode="uniform")
+    trainer.flip_mask_train = None
+    trainer.flip_mask_valid = None
+    trainer.train_order = torch.arange(trainer.ntrain, device=trainer.device)
+    trainer.valid_order = torch.arange(trainer.nvalid, device=trainer.device)
+
+    train_loss, nans, infs = trainer._trainFunc(epoch=0, show_log=False)
+    assert nans == 0
+    assert infs == 0
+    assert np.isfinite(train_loss)

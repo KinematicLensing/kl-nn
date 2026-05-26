@@ -11,6 +11,16 @@ There is no dedicated build/lint config in this repo (`pyproject.toml`, `setup.c
 
 Tests depend on the ML runtime stack (notably `torch`, `pyxis`, and training dependencies imported by `arch/train.py`).
 
+## Recent updates (2026-05-25)
+
+- `train.load_model` now prefers archived `networks_<model>.py` from `/ocean/projects/phy250048p/shared/networks`, falling back to repo `networks.py` if missing.
+- Training optimizations are default-on (AMP, `torch.compile`, fused AdamW with fallback, cuDNN benchmark, channels_last, GPU-side shuffling, noise max caching, DDP efficiency flags).
+- Added `tests/test_training_optimizations.py` for config and short training-path coverage (GPU tests auto-skip when CUDA is unavailable).
+- `train._maybe_compile_model` now filters the NetworkX `nx-loopback` entry point to avoid `torch.compile` failures in this environment (invalid syntax during NetworkX backend import) and handles `compile_backend=None` explicitly.
+- `ForkCNN` pads missing `fib_pos` features when absent so the concatenated feature vector remains 1024-d, preventing training shape mismatches when datasets omit fiber positions.
+- `circular_spline.unconstrained_rational_quadratic_spline` was refactored to avoid in-place masked indexing; uses clamped inputs + `torch.where` to eliminate `torch.compile` graph breaks and CopySlices anomaly warnings.
+- Test suite currently fails on `tests/test_rmag_calibration.py::test_generate_snr_rmag_uses_fitted_relation` (pre-existing mismatch).
+
 ## High-level architecture
 
 `kl-nn` has two primary surfaces:

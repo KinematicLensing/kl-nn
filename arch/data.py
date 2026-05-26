@@ -115,14 +115,27 @@ def _estimate_noise_rms(noise, seg, eps=1e-8):
     return torch.where(bkg_count > eps, bkg_rms, full_rms)
 
 
-def apply_noise(data, snr, randgen=None, device='cpu', use_iterative=True,
-                base_signal_frac=0.1, threshold_sigma=1.5, eps=1e-8):
+def apply_noise(
+    data,
+    snr,
+    randgen=None,
+    device='cpu',
+    use_iterative=True,
+    base_signal_frac=0.1,
+    threshold_sigma=1.5,
+    eps=1e-8,
+    maxs=None,
+):
     if randgen is None:
         noise = torch.randn(data.size(), device=device)
     else:
         noise = torch.randn(data.size(), device=device, generator=randgen)
 
-    maxs = torch.amax(data, dim=(-1, -2, -3))
+    if maxs is None:
+        maxs = torch.amax(data, dim=(-1, -2, -3))
+    else:
+        if maxs.ndim != 1 or maxs.shape[0] != data.shape[0]:
+            raise ValueError("maxs must be a 1D tensor matching batch size")
     seg_coarse = data > (base_signal_frac * maxs).view(-1, 1, 1, 1)
     factor_coarse = _noise_scale_from_seg(data, snr, seg_coarse, eps=eps)
 

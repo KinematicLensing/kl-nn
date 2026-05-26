@@ -16,7 +16,7 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=CNN-CNN-flow
+MODEL=CNN-CNN-flow_flips
 EPOCH=199
 SAMPFILE=samples_valid_1m.csv
 DATASET=valid_1m

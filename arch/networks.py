@@ -111,6 +111,19 @@ class ForkCNN(nn.Module):
         if fp is not None:
             fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
             z = torch.cat((z, fp), dim=-1)
+        else:
+            expected_dim = (
+                self.fully_connected_layer[0].in_features
+                if self.mode == 0
+                else int(self.layer_norm.normalized_shape[0])
+            )
+            if z.size(-1) < expected_dim:
+                pad = z.new_zeros((z.size(0), expected_dim - z.size(-1)))
+                z = torch.cat((z, pad), dim=-1)
+            elif z.size(-1) > expected_dim:
+                raise ValueError(
+                    f"Expected feature dim {expected_dim} without fib_pos, got {z.size(-1)}"
+                )
 
         # Point/density estimate
         if self.mode == 0:
@@ -139,6 +152,15 @@ class ForkCNN(nn.Module):
         if fp is not None:
             fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
             z = torch.cat((z, fp), dim=-1)
+        else:
+            expected_dim = int(self.layer_norm.normalized_shape[0])
+            if z.size(-1) < expected_dim:
+                pad = z.new_zeros((z.size(0), expected_dim - z.size(-1)))
+                z = torch.cat((z, pad), dim=-1)
+            elif z.size(-1) > expected_dim:
+                raise ValueError(
+                    f"Expected feature dim {expected_dim} without fib_pos, got {z.size(-1)}"
+                )
 
         z = self.layer_norm(z)
         latent = self.flow.transform_to_noise(true, context=z)

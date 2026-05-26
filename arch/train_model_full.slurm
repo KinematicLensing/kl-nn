@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_CNN-CNN-flow_flips.out
-#SBATCH --partition=GPU
-#SBATCH --gpus=v100-16:8
-#SBATCH --time=20:00:00
+#SBATCH --partition=GPU-shared
+#SBATCH --gpus=v100-32:4
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu

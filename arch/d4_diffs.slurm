@@ -3,8 +3,8 @@
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=3:00:00
-#SBATCH --nodes=1-10
-#SBATCH --array=1
+#SBATCH --nodes=1
+#SBATCH --array=1-10
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 

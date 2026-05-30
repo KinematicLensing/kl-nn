@@ -84,6 +84,7 @@ def apply_handedness_flip(img, spec, fid, fp=None, flip_mask=None, g2_idx=None, 
         return img, spec, fid, fp
 
     img_out = img.clone()
+    spec_out = spec.clone() if spec is not None else None
     fid_out = fid.clone()
     fp_out = fp.clone() if fp is not None else None
 
@@ -92,10 +93,18 @@ def apply_handedness_flip(img, spec, fid, fp=None, flip_mask=None, g2_idx=None, 
     if theta_idx is not None:
         fid_out[flip_mask, theta_idx] = -fid_out[flip_mask, theta_idx]
 
+    if spec_out is not None:
+        if spec_out.shape[-2] < 5:
+            raise ValueError("spec must include 5 fiber spectra to swap minor-axis fibers")
+        spec_out[flip_mask] = spec_out[flip_mask][:, :, [0, 1, 2, 4, 3], :]
+
     if fp_out is not None:
+        if fp_out.shape[1] < 5:
+            raise ValueError("fp must include 5 fiber positions to swap minor-axis fibers")
+        fp_out[flip_mask] = fp_out[flip_mask][:, [0, 1, 2, 4, 3], :]
         fp_out[flip_mask, :, 1] = -fp_out[flip_mask, :, 1]
 
-    return img_out, spec, fid_out, fp_out
+    return img_out, spec_out, fid_out, fp_out
 
 
 def _noise_scale_from_seg(data, snr, seg, eps=1e-8):

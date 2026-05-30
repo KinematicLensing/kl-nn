@@ -46,7 +46,14 @@ def test_apply_handedness_flip_transforms_only_masked_rows():
         theta_idx=2,
     )
 
-    assert torch.allclose(out_spec, spec)
+    assert torch.equal(out_spec[0], spec[0])
+    assert torch.equal(out_spec[2], spec[2])
+    assert torch.equal(out_spec[1, :, 0:3], spec[1, :, 0:3])
+    assert torch.equal(out_spec[3, :, 0:3], spec[3, :, 0:3])
+    assert torch.equal(out_spec[1, :, 3], spec[1, :, 4])
+    assert torch.equal(out_spec[1, :, 4], spec[1, :, 3])
+    assert torch.equal(out_spec[3, :, 3], spec[3, :, 4])
+    assert torch.equal(out_spec[3, :, 4], spec[3, :, 3])
     assert torch.equal(out_img[0], img[0])
     assert torch.equal(out_img[2], img[2])
     assert torch.equal(out_img[1], torch.flip(img[1], dims=(-2,)))

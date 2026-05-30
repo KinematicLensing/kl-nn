@@ -20,7 +20,7 @@ def main():
                      [0.1, 2],       # rscale
                      [0.1, 3]]        # hlr
     ndim = len(sample_limits)
-    nsamples = int(1e5)
+    nsamples = int(1e4)
 
     sample_centers = []
     sample_scale = []
@@ -39,7 +39,7 @@ def main():
     # df['sini'] = np.sqrt(1-df['sini']**2)
     
     # Save parameter samples
-    df.to_csv(join(SAMPDIR, 'samples_test_1m.csv'))
+    df.to_csv(join(SAMPDIR, 'samples_small_1m.csv'))
 
 
 if __name__ == '__main__':

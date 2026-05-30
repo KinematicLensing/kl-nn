@@ -2,7 +2,9 @@ import os
 import argparse
 import json
 import logging
+import time
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from os.path import join
 import copy
 
@@ -10,10 +12,16 @@ import numpy as np
 import pandas as pd
 import torch
 import pyxis.torch as pxt
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from train import (
     load_model,
     apply_noise,
+    _resolve_amp_dtype,
 )
 import config
 from model_registry import load_model_config
@@ -36,10 +44,10 @@ D4_SPEC_PERM = {
     'r90': [0, 1, 2, 3, 4],
     'r180': [0, 1, 2, 3, 4],
     'r270': [0, 1, 2, 3, 4],
-    'v': [0, 1, 2, 3, 4],
-    't': [0, 1, 2, 3, 4],
-    'h': [0, 1, 2, 3, 4],
-    'hvt': [0, 1, 2, 3, 4],
+    'v': [0, 1, 2, 4, 3],
+    't': [0, 1, 2, 4, 3],
+    'h': [0, 1, 2, 4, 3],
+    'hvt': [0, 1, 2, 4, 3],
 }
 
 
@@ -100,6 +108,65 @@ def parse_args():
         type=str,
         default=DEFAULT_CACHE_ROOT,
         help='Root directory for cache outputs.',
+    )
+    parser.add_argument(
+        '--compile',
+        dest='use_compile',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Enable torch.compile (default: config.train).',
+    )
+    parser.add_argument(
+        '--compile-mode',
+        type=str,
+        default=None,
+        help='torch.compile mode (default: config.train).',
+    )
+    parser.add_argument(
+        '--compile-backend',
+        type=str,
+        default=None,
+        help='torch.compile backend (default: config.train; use "none" to disable override).',
+    )
+    parser.add_argument(
+        '--amp',
+        dest='use_amp',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Enable AMP autocast (default: config.train).',
+    )
+    parser.add_argument(
+        '--amp-dtype',
+        type=str,
+        default=None,
+        help='AMP dtype (float16 or bfloat16; default: config.train).',
+    )
+    parser.add_argument(
+        '--channels-last',
+        dest='channels_last',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use channels_last memory format (default: config.train).',
+    )
+    parser.add_argument(
+        '--inference-mode',
+        dest='inference_mode',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use torch.inference_mode (default: True).',
+    )
+    parser.add_argument(
+        '--use-optimization',
+        dest='use_optimization',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Toggle optimization bundle (compile/AMP/channels_last).',
+    )
+    parser.add_argument(
+        '--profile',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Log timing for key phases.',
     )
     return parser.parse_args()
 
@@ -223,13 +290,13 @@ def d4_fib_pos(fp, transform_id):
     if transform_id == 'r270':
         return fp[[4, 3, 2, 0, 1]]
     if transform_id == 'v':
-        return fp[[0, 1, 2, 3, 4]] @ ref
+        return fp[[0, 1, 2, 4, 3]] @ ref
     if transform_id == 't':
-        return fp[[3, 4, 2, 1, 0]] @ ref
+        return fp[[4, 3, 2, 1, 0]] @ ref
     if transform_id == 'h':
-        return fp[[1, 0, 2, 4, 3]] @ ref
+        return fp[[1, 0, 2, 3, 4]] @ ref
     if transform_id == 'hvt':
-        return fp[[4, 3, 2, 0, 1]] @ ref
+        return fp[[3, 4, 2, 0, 1]] @ ref
     return fp
 
 
@@ -273,19 +340,40 @@ def to_numpy(value):
         return value.detach().cpu().numpy()
     return np.asarray(value)
 
+def _sync_cuda(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
 
-def d4_diff(gal_id, gal, model, device, fid_pars_phys, use_vcirc, nsamples):
+
+def d4_diff(
+    gal_id,
+    gal,
+    model,
+    device,
+    fid_pars_phys,
+    use_vcirc,
+    nsamples,
+    channels_last=False,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    inference_mode=True,
+):
     d4_set, _ = build_d4_datavector_set(gal)
 
     model.eval()
     samples = []
     log_probs = []
     snr = torch.rand((1,), device=device) * 995 + 5
-    with torch.no_grad():
-        for g in d4_set:
+    amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else nullcontext()
+    grad_ctx = torch.inference_mode() if inference_mode else torch.no_grad()
+    with grad_ctx, amp_ctx:
+        for d4_idx, g in enumerate(d4_set):
             img = apply_noise(g['img'].float().unsqueeze(0).to(device), snr, device=device)
             spec = apply_noise(g['spec'].float().unsqueeze(0).to(device), snr, device=device)
             fp = apply_noise(g['fib_pos'].float().unsqueeze(0).to(device), snr, device=device)
+            if channels_last:
+                img = img.contiguous(memory_format=torch.channels_last)
+                spec = spec.contiguous(memory_format=torch.channels_last)
             vcirc = None
             if use_vcirc:
                 try:
@@ -300,6 +388,7 @@ def d4_diff(gal_id, gal, model, device, fid_pars_phys, use_vcirc, nsamples):
                 fp=fp,
                 vcirc_mu=vcirc,
                 return_log_prob=True,
+                log_context=f'gal={gal_id} d4={d4_idx}',
             )
             samples.append(samp.detach().cpu().numpy())
             log_probs.append(lp.detach().cpu().numpy())
@@ -352,9 +441,52 @@ def main():
             raise ValueError('vcirc column missing from sample CSV.')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    profile = bool(args.profile)
+    use_compile = args.use_compile
+    compile_mode = args.compile_mode
+    compile_backend = args.compile_backend
+    if isinstance(compile_backend, str) and compile_backend.lower() == 'none':
+        compile_backend = None
+    use_amp = args.use_amp if args.use_amp is not None else bool(config.train.get('use_amp', False))
+    if device.type != 'cuda':
+        use_amp = False
+    amp_dtype = args.amp_dtype or config.train.get('amp_dtype', 'float16')
+    amp_dtype = _resolve_amp_dtype(amp_dtype)
+    channels_last = args.channels_last if args.channels_last is not None else bool(config.train.get('channels_last', False))
+    inference_mode = True if args.inference_mode is None else bool(args.inference_mode)
+    use_optimization = args.use_optimization
+    if args.mode == 1 and use_optimization is None:
+        use_optimization = False
+    if use_optimization is False:
+        if use_amp:
+            logging.info('Disabling AMP via --no-use-optimization.')
+        use_amp = False
+        if use_compile is None or use_compile:
+            logging.info('Disabling torch.compile via --no-use-optimization.')
+        use_compile = False
+        if channels_last:
+            logging.info('Disabling channels_last via --no-use-optimization.')
+        channels_last = False
+
     model_dir = join(BASE_SHARED_DIR, 'models', stem)
     model_file = join(model_dir, f'{stem}{epoch}')
-    model = load_model(mode=model_mode, path=model_file, strict=True, assign=True, device=device)
+    if profile:
+        _sync_cuda(device)
+        start = time.perf_counter()
+    model = load_model(
+        mode=model_mode,
+        path=model_file,
+        strict=True,
+        assign=True,
+        device=device,
+        use_compile=use_compile,
+        compile_mode=compile_mode,
+        compile_backend=compile_backend,
+        channels_last=channels_last,
+    )
+    if profile:
+        _sync_cuda(device)
+        logging.info('Timing: load model took %.2fs', time.perf_counter() - start)
     model.mode = model_mode
 
     cache_root = os.path.normpath(cache_root)
@@ -372,7 +504,11 @@ def main():
     diffs = []
     truths = []
     preds = []
-    for gal_id in range(start, end):
+    iterator = tqdm(range(start, end), desc="D4 diffs") if end > start else range(start, end)
+    if profile:
+        _sync_cuda(device)
+        start = time.perf_counter()
+    for gal_id in iterator:
         gal = test_ds[gal_id]
         diff, truth, maps = d4_diff(
             gal_id,
@@ -382,10 +518,17 @@ def main():
             fid_pars_phys,
             use_vcirc,
             nsamples,
+            channels_last=channels_last,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            inference_mode=inference_mode,
         )
         diffs.append(diff)
         truths.append(truth)
         preds.append(maps)
+    if profile:
+        _sync_cuda(device)
+        logging.info('Timing: sampling loop took %.2fs', time.perf_counter() - start)
 
     diffs = np.stack(diffs, axis=0)
     truths = np.stack(truths, axis=0)

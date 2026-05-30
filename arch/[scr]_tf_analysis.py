@@ -2,16 +2,25 @@ import os
 import argparse
 import json
 import logging
+import time
+import functools
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from os.path import join
 import numpy as np
 import torch
 from torch.utils.data import Subset
 import pyxis.torch as pxt
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from train import (
     load_model,
     sample_density,
+    _resolve_amp_dtype,
 )
 import config
 from model_registry import load_model_config
@@ -84,6 +93,58 @@ def parse_args():
         type=int,
         default=None,
         help='Total number of partitions for partXofN naming. If omitted, read from SLURM env.',
+    )
+    parser.add_argument(
+        '--compile',
+        dest='use_compile',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Enable torch.compile (default: config.train).',
+    )
+    parser.add_argument(
+        '--compile-mode',
+        type=str,
+        default=None,
+        help='torch.compile mode (default: config.train).',
+    )
+    parser.add_argument(
+        '--compile-backend',
+        type=str,
+        default=None,
+        help='torch.compile backend (default: config.train; use "none" to disable override).',
+    )
+    parser.add_argument(
+        '--amp',
+        dest='use_amp',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Enable AMP autocast (default: config.train).',
+    )
+    parser.add_argument(
+        '--amp-dtype',
+        type=str,
+        default=None,
+        help='AMP dtype (float16 or bfloat16; default: config.train).',
+    )
+    parser.add_argument(
+        '--channels-last',
+        dest='channels_last',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use channels_last memory format (default: config.train).',
+    )
+    parser.add_argument(
+        '--inference-mode',
+        dest='inference_mode',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use torch.inference_mode (default: True).',
+    )
+    parser.add_argument(
+        '--profile',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Log timing for key phases.',
     )
     return parser.parse_args()
 
@@ -167,9 +228,12 @@ FID_PARS_INDEX_BY_FEATURE = {
 }
 
 
-def build_truth_array(subset, feature_names):
+def build_truth_array(subset, feature_names, progress=None):
     truth = np.empty((len(subset), len(feature_names)), dtype=np.float32)
-    for row_idx in range(len(subset)):
+    iterator = range(len(subset))
+    if progress is not None:
+        iterator = progress(iterator, total=len(subset), desc="Collect truth")
+    for row_idx in iterator:
         fid_pars = subset[row_idx]['fid_pars']
         if torch.is_tensor(fid_pars):
             fid_pars = fid_pars.detach().cpu().numpy()
@@ -183,6 +247,15 @@ def build_truth_array(subset, feature_names):
                 raise ValueError(f'Unsupported feature name in config.train["feature_names"]: {feature_name}') from exc
             truth[row_idx, col_idx] = fid_pars[source_idx]
     return truth
+
+def _sync_cuda(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+def sampling_progress(iterable, mode, **kwargs):
+    cleaned = dict(kwargs)
+    cleaned.pop("desc", None)
+    return tqdm(iterable, desc=f"Sampling mode {mode}", **cleaned)
 
 def main():
     setup_logging()
@@ -224,8 +297,51 @@ def main():
         raise FileNotFoundError(f'Sample set not found: {samp_dir}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    profile = bool(args.profile)
+    use_compile = args.use_compile
+    effective_use_compile = use_compile if use_compile is not None else bool(config.train.get('use_compile', False))
+    compile_mode = args.compile_mode
+    compile_backend = args.compile_backend
+    if isinstance(compile_backend, str) and compile_backend.lower() == 'none':
+        compile_backend = None
+    use_amp = args.use_amp if args.use_amp is not None else bool(config.train.get('use_amp', False))
+    if device.type != 'cuda':
+        use_amp = False
+    amp_dtype = args.amp_dtype or config.train.get('amp_dtype', 'float16')
+    amp_dtype = _resolve_amp_dtype(amp_dtype)
+    channels_last = args.channels_last if args.channels_last is not None else bool(config.train.get('channels_last', False))
+    inference_mode = True if args.inference_mode is None else bool(args.inference_mode)
+
     model_file = join(model_dir, f'{stem}{epoch}')
-    model = load_model(mode=2, path=model_file,strict=True, assign=True, device=device)
+    models = {}
+    use_separate_models = bool(effective_use_compile)
+
+    def get_model_for_mode(mode):
+        if mode in models:
+            return models[mode]
+        if profile:
+            _sync_cuda(device)
+            start = time.perf_counter()
+        model = load_model(
+            mode=mode,
+            path=model_file,
+            strict=True,
+            assign=True,
+            device=device,
+            model_name=model_name,
+            use_compile=use_compile,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+            channels_last=channels_last,
+        )
+        if profile:
+            _sync_cuda(device)
+            logging.info('Timing: load model mode %s took %.2fs', mode, time.perf_counter() - start)
+        models[mode] = model
+        return model
+
+    if not use_separate_models:
+        get_model_for_mode(2)
 
     # Get data loader
     test_ds = pxt.TorchDataset(data_dir)
@@ -245,31 +361,59 @@ def main():
     vcirc_low, vcirc_high = config.par_ranges[vcirc_name]
 
     # Collect true vcirc values in normalized space and convert to km/s center of prior.
+    if profile:
+        _sync_cuda(device)
+        start = time.perf_counter()
     vcirc_true = torch.zeros((args.ngals), dtype=torch.float32, device=device)
-    for i in range(args.ngals):
+    vcirc_iter = tqdm(range(args.ngals), desc="Collect vcirc") if args.ngals else range(0)
+    for i in vcirc_iter:
         vcirc_true[i] = subset[i]['fid_pars'][vcirc_idx]
     vcirc_mu = 0.5 * (vcirc_true + 1.0) * (vcirc_high - vcirc_low) + vcirc_low
 
-    truth = build_truth_array(subset, feature_names)
+    truth = build_truth_array(subset, feature_names, progress=tqdm)
+    if profile:
+        _sync_cuda(device)
+        logging.info('Timing: prep vcirc/truth took %.2fs', time.perf_counter() - start)
 
     modes = [1, 2] # 1: no TF prior, 2: TF prior
     sample_list = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
     log_prob_list = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
 
     # sample for each galaxy and each mode
-    for mode in modes:
-        model.mode = mode
-        # Reset the noise RNG so each mode sees the same injected img/spec noise.
-        noise_gen = torch.Generator(device=device).manual_seed(rng_seed)
-        samples, log_probs, SNR = sample_density(model, subset, nsamples, 
-                                                vcirc_mu=vcirc_mu, 
-                                                snr=snr_shared,
-                                                randgen=noise_gen,
-                                                return_log_prob=True, 
-                                                device=device)
-        for i in range(args.ngals):
-            sample_list[mode-1, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
-            log_prob_list[mode-1, i] = log_probs[i]
+    amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else nullcontext()
+    infer_ctx = torch.inference_mode() if inference_mode else nullcontext()
+    with infer_ctx, amp_ctx:
+        for mode in modes:
+            model = get_model_for_mode(mode) if use_separate_models else models[2]
+            model.mode = mode
+            # Reset the noise RNG so each mode sees the same injected img/spec noise.
+            noise_gen = torch.Generator(device=device).manual_seed(rng_seed)
+            if profile:
+                _sync_cuda(device)
+                start = time.perf_counter()
+            sampling_progress_fn = functools.partial(sampling_progress, mode=mode)
+            samples, log_probs, SNR = sample_density(
+                model,
+                subset,
+                nsamples,
+                vcirc_mu=vcirc_mu,
+                snr=snr_shared,
+                randgen=noise_gen,
+                return_log_prob=True,
+                device=device,
+                channels_last=channels_last,
+                progress=sampling_progress_fn,
+            )
+            if profile:
+                _sync_cuda(device)
+                logging.info('Timing: sample_density mode %s took %.2fs', mode, time.perf_counter() - start)
+            post_iter = tqdm(range(args.ngals), desc=f"Postprocess mode {mode}") if args.ngals else range(0)
+            post_start = time.perf_counter() if profile else None
+            for i in post_iter:
+                sample_list[mode-1, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
+                log_prob_list[mode-1, i] = log_probs[i]
+            if profile and post_start is not None:
+                logging.info('Timing: postprocess mode %s took %.2fs', mode, time.perf_counter() - post_start)
 
     truth_denorm = denormalize(truth, par_ranges=config.par_ranges, feature_names=feature_names)
 

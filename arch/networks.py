@@ -1,3 +1,4 @@
+import logging
 import torch
 from torch import nn
 import math
@@ -325,7 +326,16 @@ class ForkCNN(nn.Module):
 
         return log_prob
 
-    def sample(self, x, y, num_samples, fp=None, vcirc_mu=None, return_log_prob=False):
+    def sample(
+        self,
+        x,
+        y,
+        num_samples,
+        fp=None,
+        vcirc_mu=None,
+        return_log_prob=False,
+        log_context=None,
+    ):
         '''
         Sample from the conditional distribution p(params | x, y)
         num_samples: number of samples to draw per galaxy
@@ -354,19 +364,101 @@ class ForkCNN(nn.Module):
 
             # Importance-resample flow samples so vcirc follows TF prior at inference time.
             candidates = samples[0]  # (num_samples, nfeatures)
-            v_norm = candidates[:, self.vcirc_idx]
-            v_circ = self._norm_to_vcirc(v_norm)
+            finite_candidates = torch.isfinite(candidates).all(dim=1)
+            total_candidates = int(candidates.shape[0])
+            bad_candidates = int((~finite_candidates).sum().item())
+            log_w_for_stats = None
+            if not finite_candidates.any():
+                logging.warning(
+                    'Mode 2 sampling: all candidates non-finite; using uniform resampling from raw samples.'
+                )
+                candidates_for_resample = candidates
+                log_w = torch.zeros(
+                    candidates_for_resample.shape[0],
+                    device=candidates_for_resample.device,
+                    dtype=candidates_for_resample.dtype,
+                )
+                weights = torch.full(
+                    (candidates_for_resample.shape[0],),
+                    1.0 / candidates_for_resample.shape[0],
+                    device=candidates_for_resample.device,
+                    dtype=torch.float32,
+                )
+            else:
+                if (~finite_candidates).any():
+                    logging.warning(
+                        'Mode 2 sampling: dropping %s non-finite candidates.',
+                        int((~finite_candidates).sum().item()),
+                    )
+                candidates_for_resample = candidates[finite_candidates]
+                v_norm = candidates_for_resample[:, self.vcirc_idx]
+                v_circ = self._norm_to_vcirc(v_norm)
 
-            mu = vcirc_mu.to(device=candidates.device, dtype=candidates.dtype).reshape(-1)
-            assert mu.numel() == 1, 'vcirc_mu must have shape (1,) in sample()'
-            tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm, mu[0])
-            flow_log_p_v = self._kde_log_density_1d(v_circ)
+                mu = vcirc_mu.to(
+                    device=candidates_for_resample.device,
+                    dtype=candidates_for_resample.dtype,
+                ).reshape(-1)
+                assert mu.numel() == 1, 'vcirc_mu must have shape (1,) in sample()'
+                tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm, mu[0])
+                flow_log_p_v = self._kde_log_density_1d(v_circ)
 
-            log_w = tf_log_p_v - flow_log_p_v
-            log_w = log_w - log_w.max()
-            weights = torch.softmax(log_w, dim=0)
+                log_w = tf_log_p_v - flow_log_p_v
+                log_w_for_weights = log_w.float()
+                log_w_for_stats = log_w_for_weights
+                finite_mask = torch.isfinite(log_w_for_weights)
+                fallback = False
+                if not finite_mask.any():
+                    fallback = True
+                else:
+                    safe_log_w = torch.where(
+                        finite_mask,
+                        log_w_for_weights,
+                        torch.full_like(log_w_for_weights, -torch.inf),
+                    )
+                    max_log_w = safe_log_w.max()
+                    if not torch.isfinite(max_log_w):
+                        fallback = True
+                    else:
+                        weights = torch.softmax(safe_log_w - max_log_w, dim=0)
+                        if not torch.isfinite(weights).all() or weights.sum() <= 0:
+                            fallback = True
+                if fallback:
+                    logging.warning(
+                        'Mode 2 sampling: invalid log-weights; falling back to uniform resampling.'
+                    )
+                    weights = torch.full(
+                        (log_w_for_weights.numel(),),
+                        1.0 / log_w_for_weights.numel(),
+                        device=log_w_for_weights.device,
+                        dtype=torch.float32,
+                    )
+                    log_w = torch.zeros_like(log_w)
+                elif not torch.isfinite(log_w).all():
+                    log_w = torch.where(
+                        torch.isfinite(log_w),
+                        log_w,
+                        torch.full_like(log_w, -torch.inf),
+                    )
+
+            if log_context is not None and bad_candidates > 0:
+                log_w_min = float('nan')
+                log_w_max = float('nan')
+                if log_w_for_stats is not None:
+                    finite_log_w = log_w_for_stats[torch.isfinite(log_w_for_stats)]
+                    if finite_log_w.numel() > 0:
+                        log_w_min = float(finite_log_w.min().item())
+                        log_w_max = float(finite_log_w.max().item())
+                logging.info(
+                    'Mode 2 sampling stats (%s): bad_candidates=%d/%d, log_w_min=%.6g, log_w_max=%.6g',
+                    log_context,
+                    bad_candidates,
+                    total_candidates,
+                    log_w_min,
+                    log_w_max,
+                )
+
             resample_idx = torch.multinomial(weights, num_samples=num_samples, replacement=True)
-            samples = candidates[resample_idx].unsqueeze(0)
+            samples = candidates_for_resample[resample_idx].unsqueeze(0)
 
         if return_log_prob:
             z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)

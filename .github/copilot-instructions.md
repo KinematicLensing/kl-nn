@@ -54,7 +54,9 @@ Tests depend on the ML runtime stack (notably `torch`, `pyxis`, and training dep
 - **Fiber ordering and geometry conventions (D4/diagnostics):**
   - Fibers are always arranged in a cross centered on the galaxy and aligned with the galaxy’s major axis; array order is **(+major, −major, center, +minor, −minor)**.
   - “Positive” is defined as toward +x (rightward) in the image when `theta_int == 0`.
-  - When rotating the galaxy, **fiber ordering should not change**, but **fiber positions should**.
+  - D4 transforms rotate/reflect images; rotations keep spectra order fixed, while reflections swap the ±minor spectra (see `D4_SPEC_PERM`).
+  - `fib_pos` is always transformed to match the image transform (see `d4_fib_pos`).
+  - Reflections/handedness flips **swap the ±minor fibers** and negate `g2` and `theta_int` to reflect the spin-2 ambiguity.
   - The simulation uses the **opposite sign convention from NumPy** for `theta_int`, so correcting `theta_int` in the opposite direction of the image transform is intentional.
   - Diagonal flips are treated as **flip across y** followed by **±90° rotation**; this is the intended convention in the diagnostics.
 

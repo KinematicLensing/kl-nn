@@ -73,10 +73,18 @@ def _patch_networkx_entry_points() -> None:
     importlib_metadata.entry_points = _filtered_entry_points
 
 
-def _maybe_compile_model(model: torch.nn.Module, log: logging.Logger | None = None) -> torch.nn.Module:
+def _maybe_compile_model(
+    model: torch.nn.Module,
+    log: logging.Logger | None = None,
+    use_compile: bool | None = None,
+    compile_mode: str | None = None,
+    compile_backend: str | None = None,
+) -> torch.nn.Module:
     if log is not None:
         log.info(type(model))
-    if not config.train.get('use_compile', False):
+    if use_compile is None:
+        use_compile = bool(config.train.get('use_compile', False))
+    if not use_compile:
         return model
     if not hasattr(torch, "compile"):
         if log is not None:
@@ -84,8 +92,8 @@ def _maybe_compile_model(model: torch.nn.Module, log: logging.Logger | None = No
         return model
     try:
         _patch_networkx_entry_points()
-        mode = config.train.get('compile_mode', 'default')
-        backend = config.train.get('compile_backend', 'inductor')
+        mode = compile_mode if compile_mode is not None else config.train.get('compile_mode', 'default')
+        backend = compile_backend if compile_backend is not None else config.train.get('compile_backend', 'inductor')
         if backend is None:
             return torch.compile(model, mode=mode)
         return torch.compile(model, mode=mode, backend=backend)
@@ -93,6 +101,23 @@ def _maybe_compile_model(model: torch.nn.Module, log: logging.Logger | None = No
         if log is not None:
             log.warning("torch.compile failed; continuing without compilation: %s", exc)
         return model
+
+
+def _maybe_strip_state_dict_prefix(
+    state_dict: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    prefix: str,
+) -> dict[str, torch.Tensor]:
+    if not any(key.startswith(prefix) for key in state_dict.keys()):
+        return state_dict
+    stripped = {
+        (key[len(prefix):] if key.startswith(prefix) else key): value
+        for key, value in state_dict.items()
+    }
+    model_keys = set(model.state_dict().keys())
+    raw_matches = sum(1 for key in state_dict.keys() if key in model_keys)
+    stripped_matches = sum(1 for key in stripped.keys() if key in model_keys)
+    return stripped if stripped_matches >= raw_matches else state_dict
 
 #-------------#
 # CNN Trainer #
@@ -652,6 +677,10 @@ def load_model(
     device='cpu',
     model_name=None,
     networks_root=None,
+    use_compile: bool | None = None,
+    compile_mode: str | None = None,
+    compile_backend: str | None = None,
+    channels_last: bool | None = None,
 ):
 
     model_cls = Model
@@ -677,16 +706,31 @@ def load_model(
                         f"Archived networks module for '{resolved_name}' "
                         f"does not define {Model.__name__}."
                     ) from exc
-
     model = model_cls(mode)
     model.to(device)
-
+    if channels_last is None:
+        channels_last = bool(config.train.get('channels_last', False))
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     if GPUs > 1:
         model = DDP(model, device_ids=None)
 
     if path != None:
         state_dict = torch.load(path, weights_only=False, map_location=torch.device(device))
+        state_dict = _maybe_strip_state_dict_prefix(state_dict, model, "module.")
+        state_dict = _maybe_strip_state_dict_prefix(state_dict, model, "_orig_mod.")
         model.load_state_dict(state_dict, strict=strict, assign=assign)
+
+    if use_compile is None:
+        use_compile = bool(config.train.get('use_compile', False))
+    if use_compile and GPUs <= 1:
+        model = _maybe_compile_model(
+            model,
+            log=None,
+            use_compile=use_compile,
+            compile_mode=compile_mode,
+            compile_backend=compile_backend,
+        )
 
     return model
 
@@ -818,10 +862,14 @@ def sample_density(
     return_log_prob=False,
     device='cpu',
     flip_handedness=None,
+    channels_last: bool | None = None,
+    progress=None,
 ):
     '''
     Run this function to sample from trained density estimation models
     '''
+    if channels_last is None:
+        channels_last = bool(config.train.get('channels_last', False))
     if snr is None and randgen is not None:
         snr = torch.rand(len(test_ds), generator=randgen, device=device)*990 + 10
     if model.mode == 2:
@@ -841,8 +889,11 @@ def sample_density(
     if return_log_prob:
         log_probs = []
     snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*990 + 10
+    iterator = range(len(test_ds))
+    if progress is not None:
+        iterator = progress(iterator, total=len(test_ds), desc="Sampling")
     with torch.no_grad():
-        for i in range(len(test_ds)):
+        for i in iterator:
             snr = snrs[i]
             vcircs = vcirc_mu[i] if vcirc_mu is not None else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
@@ -863,6 +914,9 @@ def sample_density(
                     g2_idx=g2_idx,
                     theta_idx=theta_idx,
                 )
+            if channels_last:
+                img = img.contiguous(memory_format=torch.channels_last)
+                spec = spec.contiguous(memory_format=torch.channels_last)
             if return_log_prob:
                 sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs)
                 log_probs.append(log_prob.detach().cpu().numpy())

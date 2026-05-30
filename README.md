@@ -37,3 +37,6 @@ When training starts via `arch/[scr]_train_model.py`, the current model setup is
 - `arch/networks.py` is copied to `/ocean/projects/phy250048p/shared/networks` (`networks_<model_name>.py`)
 
 Analysis scripts can then resolve model configuration by model name without requiring manual edits to the live `config.py`.
+
+### D4 and handedness conventions
+Fiber order is fixed as **(+major, −major, center, +minor, −minor)** with “positive” defined toward +x when `theta_int == 0`. D4 diagnostics rotate/reflect images; rotations keep spectra order fixed, while reflections **swap the ±minor spectra** to capture the spin-2 ambiguity. `fib_pos` is always transformed to match the image transform.

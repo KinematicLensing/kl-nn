@@ -4,7 +4,7 @@
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=3:00:00
 #SBATCH --nodes=1
-#SBATCH --array=1-10
+#SBATCH --array=4
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
@@ -23,6 +23,13 @@ DATASET=valid_1m
 NSAMPS=10000
 NPARTS=10
 MODE=1
+USE_OPTIMIZATION=1
 
 i=$((${SLURM_ARRAY_TASK_ID}-1))
-python ${SCRIPT} -i=${i} --nparts=${NPARTS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE} --mode=${MODE}
+if [[ "${USE_OPTIMIZATION}" == "1" ]]; then
+  OPT_FLAG="--use-optimization"
+else
+  OPT_FLAG="--no-use-optimization"
+fi
+
+python ${SCRIPT} -i=${i} --nparts=${NPARTS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE} --mode=${MODE} ${OPT_FLAG}

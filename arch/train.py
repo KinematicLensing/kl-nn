@@ -918,10 +918,10 @@ def sample_density(
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
             if return_log_prob:
-                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs)
+                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs, sample_id=i)
                 log_probs.append(log_prob.detach().cpu().numpy())
             else:
-                sample = model.sample(img, spec, nsamples, fp=fp, vcirc_mu=vcircs)
+                sample = model.sample(img, spec, nsamples, fp=fp, vcirc_mu=vcircs, sample_id=i)
             samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     snrs = snrs.cpu().numpy()

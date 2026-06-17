@@ -4,6 +4,7 @@ import time
 import importlib.util
 import sys
 from pathlib import Path
+import logging
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,27 @@ N = args.N
 nspec = args.nspec
 sample_name = args.s
 dataset_name = args.d
+
+
+def rotate_by_90_degrees(img, spec, fid, fp=None):
+    img_out = np.rot90(img, k=1, axes=(2, 3))
+    spec_out = spec.copy()
+    fid_out = fid.copy()
+    fp_out = fp.copy() if fp is not None else None
+
+    fid_out[:, 0] = -fid_out[:, 0]
+    fid_out[:, 1] = -fid_out[:, 1]
+    fid_out[:, 2] = fid_out[:, 2] - 1/2
+    wrap = np.where(fid_out[:, 2] < -1)[0]
+    fid_out[wrap, 2] = fid_out[wrap, 2] + 2
+
+    if fp_out is not None:
+        if fp_out.shape[1] < 5:
+            raise ValueError("fp must include 5 fiber positions to swap minor-axis fibers")
+        fp_out = fp_out[:, [3, 4, 2, 1, 0], :]
+
+    return img_out, spec_out, fid_out, fp_out
+
 
 def normalize(form, data, pars=None):
     '''
@@ -102,6 +124,8 @@ def main():
                         spec = hdu[k+1].data
                         spec_stack[i, 0, k, :spec.shape[0]] = spec
             
+            # img_stack, spec_stack, fids, fib_pos_stack = rotate_by_90_degrees(img_stack, spec_stack, fids, fp=fib_pos_stack)
+            
             db.put_samples({'img': img_stack,
                             'spec': spec_stack,
                             'fib_pos': fib_pos_stack,
@@ -109,7 +133,7 @@ def main():
                             'id': ids})
             t = round(time.time() - start, 2)
             
-            print(f'folder {folder} complete, {t} seconds')
+            logging.info(f'Finished entry {index+1}/{N} in {t} seconds.')
 
 if __name__ == '__main__':
     main()

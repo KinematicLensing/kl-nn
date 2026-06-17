@@ -28,6 +28,7 @@ parser.add_argument('-hlr', type=float, default=1, help='half-light radius')
 parser.add_argument('-n_s', type=float, default=1, help='sersic index')
 parser.add_argument('--fiber_perm', type=str, default='0,1,2,3,4',
                     help='comma-separated permutation for the 5 fiber order')
+parser.add_argument('--no_psf', action='store_true', help='if set, no PSF convolution will be applied to the fiber spectra')
 args = parser.parse_args()
 n = args.n
 d = args.d
@@ -41,6 +42,8 @@ vcirc = args.vcirc
 rscale = args.rscale
 hlr = args.hlr
 n_s = args.n_s
+no_psf = args.no_psf
+psf_type = 'none' if no_psf else 'airy_fwhm'
 fiber_perm = [int(x.strip()) for x in args.fiber_perm.split(',')]
 if len(fiber_perm) != 5 or sorted(fiber_perm) != [0, 1, 2, 3, 4]:
     raise ValueError(f'Invalid --fiber_perm={args.fiber_perm}; expected permutation of 0,1,2,3,4')
@@ -55,18 +58,17 @@ exptime_photo = -1
 ADD_NOISE = False
 
 FITS_DIR = f'/ocean/projects/phy250048p/shared/fits/{d}/part_{n}/'
-# FITS_DIR = f'/ocean/projects/phy250048p/shared/temp/'
 
 ##################### Setting up observation configurations ####################
 
 default_photo_conf = {'INSTNAME': "CTIO/DECam", 'OBSTYPE': 0, 'NAXIS': 2,
-    'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': "airy_fwhm",
+    'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': psf_type,
     'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 378.2856, 'GAIN': 4.0,
     'NOISETYP': 'ccd', 'RDNOISE': 2.6, 'ADDNOISE': ADD_NOISE
 }
 
 default_fiber_conf = {'INSTNAME': "DESI", 'OBSTYPE': 1,
-    'SKYMODEL': join(KL_TOOLS_DATA_DIR, "Skyspectra", "spec-sky.dat"), 'PSFTYPE': "airy_fwhm", 
+    'SKYMODEL': join(KL_TOOLS_DATA_DIR, "Skyspectra", "spec-sky.dat"), 'PSFTYPE': psf_type, 
     'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 332.42, 'EXPTIME': 180, 'GAIN': 1.0,
     'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': fiber_rad, 'FIBRBLUR': fiber_blur
 }

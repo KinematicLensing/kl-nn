@@ -106,7 +106,6 @@ def apply_handedness_flip(img, spec, fid, fp=None, flip_mask=None, g2_idx=None, 
 
     return img_out, spec_out, fid_out, fp_out
 
-
 def _noise_scale_from_seg(data, snr, seg, eps=1e-8):
     snr = torch.clamp(snr, min=eps)
     npix = torch.sum(seg, dim=(-1, -2, -3)).float()

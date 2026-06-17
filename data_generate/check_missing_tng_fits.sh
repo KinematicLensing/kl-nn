@@ -2,12 +2,12 @@
 
 set -u
 
-FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/test_tng_10k}
-NGAL=${NGAL:-60}
-ROWSPERGAL=${ROWSPERGAL:-10000}
-IDSTRIDE=${IDSTRIDE:-10000}
-OUTFILE=${1:-missing_tng_fits.txt}
-PREVFILE=${2:-missing_tng_fits.txt}
+FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/train_100k_nopsf}
+NGAL=${NGAL:-50}
+ROWSPERGAL=${ROWSPERGAL:-2000}
+IDSTRIDE=${IDSTRIDE:-2000}
+OUTFILE=${1:-missing_fits.txt}
+PREVFILE=${2:-missing_fits.txt}
 
 missing=0
 found=0
@@ -44,10 +44,11 @@ echo "[INFO] Checking FITS under ${FITS_ROOT}" | tee -a "${OUTFILE}"
 echo "[INFO] Expected galaxies: ${NGAL}, rows per galaxy: ${ROWSPERGAL}, id stride: ${IDSTRIDE}" | tee -a "${OUTFILE}"
 
 for gal in "${GALAXIES_TO_SCAN[@]}"; do
-  gal_dir="${FITS_ROOT}/galaxy_${gal}"
+  pid=$((${gal}+1))
+  gal_dir="${FITS_ROOT}/part_${pid}"
   start_id=$((gal * IDSTRIDE))
   end_id=$((start_id + ROWSPERGAL - 1))
-  echo "[INFO] Checking galaxy folder ${gal}" | tee -a "${OUTFILE}"
+  echo "[INFO] Checking galaxy folder ${pid}" | tee -a "${OUTFILE}"
 
   if [ ! -d "${gal_dir}" ]; then
     echo "[MISSING] ${start_id}-${end_id}" | tee -a "${OUTFILE}"

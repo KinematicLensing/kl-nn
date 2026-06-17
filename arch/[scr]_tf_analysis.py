@@ -146,6 +146,12 @@ def parse_args():
         default=False,
         help='Log timing for key phases.',
     )
+    parser.add_argument(
+        '--cached-snrs-path',
+        type=str,
+        default=None,
+        help='Path to .npy file containing pre-saved SNR values to use instead of generating new ones.',
+    )
     return parser.parse_args()
 
 
@@ -353,8 +359,21 @@ def main():
         )
     subset = Subset(test_ds, np.arange(start, end))
     rng_seed = 42
-    snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
-    snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 990 + 10
+    if args.cached_snrs_path is not None:
+        if not os.path.exists(args.cached_snrs_path):
+            raise FileNotFoundError(f'Cached SNRs file not found: {args.cached_snrs_path}')
+        snrs = []
+        for i in range(total_partitions):
+            snr_path = os.path.join(args.cached_snrs_path, f'part{i}of{total_partitions}.npy')
+            if not os.path.exists(snr_path):
+                raise FileNotFoundError(f'Cached SNRs file for partition not found: {snr_path}')
+            snrs.append(np.load(snr_path))
+        snr_shared = torch.from_numpy(np.concatenate(snrs)).to(device)
+        if snr_shared.shape != (args.ngals,):
+            raise ValueError(f'Cached SNRs shape {snr_shared.shape} does not match expected ({args.ngals},)')
+    else:
+        snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
+        snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 995 + 5
 
     vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
     vcirc_name = feature_names[vcirc_idx]

@@ -198,24 +198,6 @@ class ForkCNN(nn.Module):
         # return prior.log_prob(v_circ)
         return prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
 
-    def _flow_v_marginal_from_grid(self, flow_log_prob, v_norm_grid):
-        """
-        Approximate log P_flow(v_circ | data) by summing over candidates that share v_circ.
-        Expects zz to be a structured grid where each v value appears across many (g1, g2).
-        flow_log_prob: (batch_size, N)
-        v_norm_grid: (N,)
-        """
-        _, inverse = torch.unique(v_norm_grid, sorted=True, return_inverse=True)
-        num_unique = int(inverse.max().item()) + 1
-        batch_size = flow_log_prob.shape[0]
-
-        log_p_v_unique = flow_log_prob.new_full((batch_size, num_unique), -torch.inf)
-        for idx in range(num_unique):
-            mask = inverse == idx
-            log_p_v_unique[:, idx] = torch.logsumexp(flow_log_prob[:, mask], dim=1)
-
-        return log_p_v_unique[:, inverse]
-
     def _kde_log_density_1d(self, values):
         """
         Gaussian KDE log-density estimate at sample locations.
@@ -268,45 +250,6 @@ class ForkCNN(nn.Module):
         z = torch.cat((x, y), -1)
         z = self.fully_connected_layer(z)
         return z
-
-    def estimate_log_prob(self, x, y, zz, batch_size, vcirc_mu=None):
-        '''
-        Estimate log probability density for given inputs and parameters.
-        zz: candidate parameter vectors of shape (N, nfeatures), e.g. [g1, g2, v_circ_norm]
-        vcirc_mu: per-galaxy prior center, shape (batch_size,), units km/s (linear).
-                  Required when mode == 2. Each galaxy's N candidates share the same mu.
-        '''
-        x = nn.functional.normalize(x, dim=[2,3])
-        y = nn.functional.normalize(y, dim=[2,3])
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(batch_size, -1)
-        y = y.view(batch_size, -1)
-        z = torch.cat((x, y), -1)
-        # z = x
-        z = self.layer_norm(z)
-        num_candidates = zz.shape[0]
-        z_rep = torch.repeat_interleave(z, repeats=num_candidates, dim=0)
-        zz_rep = zz.repeat(batch_size, 1)
-        flow_log_prob = self.flow.log_prob(zz_rep, context=z_rep).view(batch_size, -1)
-
-        log_prob = flow_log_prob
-
-        # mode 2 inference: replace flow marginal P_flow(v_circ|data) with TF prior P_TF(v_circ|data)
-        # log p_new(g1,g2,v|data) = log p_flow(g1,g2,v|data) - log p_flow(v|data) + log p_TF(v|data)
-        if self.mode == 2:
-            assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
-
-            v_norm_grid = zz[:, self.vcirc_idx].clamp(min=-1.0, max=1.0)
-            flow_log_p_v = self._flow_v_marginal_from_grid(flow_log_prob, v_norm_grid)
-
-            mu = vcirc_mu.to(device=log_prob.device, dtype=log_prob.dtype).reshape(-1, 1)
-            assert mu.shape[0] == batch_size, 'vcirc_mu must have shape (batch_size,)'
-            tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm_grid.unsqueeze(0), mu)
-
-            log_prob = flow_log_prob - flow_log_p_v + tf_log_p_v
-
-        return log_prob
 
     def sample(
         self,

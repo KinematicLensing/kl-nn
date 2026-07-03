@@ -60,15 +60,15 @@ class ForkCNN(nn.Module):
         
 
         # Vision Transformer for image feature extraction
-        # self.img_net = VisionTransformer(in_channels=1, 
-        #                              embed_dim=512, 
-        #                              img_size=48, 
-        #                              patch_size=6, 
-        #                              num_layers=6, 
-        #                              num_heads=8, 
-        #                              mlp_ratio=4.0, 
-        #                              dropout=0.1)
-        self.img_net = ImgCNN()
+        self.img_net = VisionTransformer(in_channels=1, 
+                                     embed_dim=512, 
+                                     img_size=48, 
+                                     patch_size=6, 
+                                     num_layers=6, 
+                                     num_heads=8, 
+                                     mlp_ratio=4.0, 
+                                     dropout=0.1)
+        # self.img_net = ImgCNN()
                                      
         # CNN + RNN for spectra feature extraction
         # self.spec_net = LargeSpecRNN(self.nspecs)
@@ -387,6 +387,68 @@ class ForkCNN(nn.Module):
             
             return samples.view(1, num_samples, -1), flow_log_prob
         return samples.view(1, num_samples, -1)
+    
+    def evaluate_conditional_2d(
+        self,
+        x,
+        y,
+        true_params,
+        idx1,
+        idx2,
+        fp=None,
+        grid_bins=200,
+        bounds=(-1, 1)
+    ):
+        '''
+        Diagnostic: Sample 2 parameters conditional on all other parameters being fixed.
+        Evaluates the flow log_prob over a 2D grid and samples from the resulting PDF.
+        
+        true_params: Tensor of shape (1, nfeatures) containing the fixed parameter values.
+        idx1, idx2: Integers representing the parameter indices for g1 and g2.
+        '''
+        # 1. Extract context 'z' identically to your sample() function
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
+        x = self.img_net(x)
+        y = self.spec_net(y)
+        x = x.view(1,-1)
+        y = y.view(1,-1)
+        z = torch.cat((x, y), -1)
+        if fp is not None:
+            fp = nn.functional.normalize(fp, dim=[1,2])
+            fp = fp.view(fp.size(0), -1)
+            z = torch.cat((z, fp), dim=-1)
+        z = self.layer_norm(z)
+        
+        # 2. Create a 2D grid for the two parameters
+        g1_vals = torch.linspace(bounds[0], bounds[1], grid_bins, device=z.device)
+        g2_vals = torch.linspace(bounds[0], bounds[1], grid_bins, device=z.device)
+        G1, G2 = torch.meshgrid(g1_vals, g2_vals, indexing='ij')
+        
+        flat_g1 = G1.flatten()
+        flat_g2 = G2.flatten()
+        num_grid_points = flat_g1.size(0)
+        
+        # 3. Prepare the massive batch of parameter vectors
+        # Clone the true_params vector for every point on the grid
+        theta_grid = true_params.repeat(num_grid_points, 1)
+        
+        # Overwrite the g1 and g2 columns with the grid points
+        theta_grid[:, idx1] = flat_g1
+        theta_grid[:, idx2] = flat_g2
+        
+        # Repeat the context vector to match the grid size
+        z_rep = z.repeat(num_grid_points, 1)
+        
+        # 4. Evaluate log probabilities for the entire grid in one forward pass
+        log_probs = self.flow.log_prob(theta_grid, context=z_rep)
+        
+        # 5. Convert to normalized probabilities 
+        # (Subtract max for numerical stability before exp to avoid overflow)
+        probs = torch.exp(log_probs - log_probs.max())
+        probs = probs / probs.sum()
+        
+        return probs.view(grid_bins, grid_bins), g1_vals, g2_vals
 
 class MLP(nn.Module):
     '''
@@ -565,8 +627,10 @@ class SpecRNN(nn.Module):
         return out
     
 class LargeSpecRNN(nn.Module):
-    def __init__(self, nspec, hidden_size=1024, num_layers=4, bidirectional=True):
+    def __init__(self, nspecs, hidden_size=1024, num_layers=4, bidirectional=True):
         super().__init__()
+
+        self.nspecs = nspecs
 
         # Deeper local feature extractor across time
         self.cnn_spec = nn.Sequential(
@@ -606,10 +670,13 @@ class LargeSpecRNN(nn.Module):
             nn.BatchNorm1d(1024),
             nn.ReLU(True),
             nn.Dropout(0.3),
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(1024, 512-2*self.nspecs),  # Final feature dim reduced to accommodate fiber position if needed
+            nn.BatchNorm1d(512-2*self.nspecs),
             nn.ReLU(True)
         )
+
+        # Add a linear layer to fuse the 1024 concatenated features back to 512
+        self.pool_fusion = nn.Linear(1024-4*self.nspecs, 512-2*self.nspecs)  # Adjust input dim to account for removed fiber position features
 
     def forward(self, x):
         # x: (batch, 1, nspec, time)
@@ -634,6 +701,21 @@ class LargeSpecRNN(nn.Module):
         
         # Reshape back
         x = x.view(b, t, -1)  # (batch, time, 512)
+
+        # 1. Extract the sharp features
+        x_max = x.max(dim=1)[0]   # (batch, 512)
+        
+        # 2. Extract the global continuum
+        x_avg = x.mean(dim=1)     # (batch, 512)
+        
+        # 3. Combine them
+        x_cat = torch.cat([x_max, x_avg], dim=-1) # (batch, 1024)
+        
+        # 4. Fuse back to the required 512 dimension
+        x = self.pool_fusion(x_cat) # (batch, 512)
+        
+        # Optional: Add a non-linearity depending on your architecture design
+        x = nn.functional.relu(x)
         
         return x
 

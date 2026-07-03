@@ -2,12 +2,13 @@
 
 set -u
 
-FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/train_100k_nopsf}
-NGAL=${NGAL:-50}
+DATASET=${DATASET:-valid_10k}
+FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/${DATASET}}
+NGAL=${NGAL:-5}
 ROWSPERGAL=${ROWSPERGAL:-2000}
 IDSTRIDE=${IDSTRIDE:-2000}
-OUTFILE=${1:-missing_fits.txt}
-PREVFILE=${2:-missing_fits.txt}
+OUTFILE=${1:-missing_fits_${DATASET}.txt}
+PREVFILE=${2:-missing_fits_${DATASET}.txt}
 
 missing=0
 found=0

@@ -258,6 +258,8 @@ class CNNTrainer:
             torch.distributed.barrier()
         
     def _apply_noise(self, data, snr, maxs=None):
+        if snr is None:
+            return data
         output = apply_noise(
             data,
             snr,
@@ -328,7 +330,7 @@ class CNNTrainer:
         for i in range(self.nbatch_train):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
-            snr = self.SNR_train[batch_ids]
+            snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
             img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
@@ -379,7 +381,7 @@ class CNNTrainer:
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
-                snr = self.SNR_valid[batch_ids]
+                snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
                 img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
@@ -458,6 +460,8 @@ class CNNTrainer:
         nans_infs.to_csv(join(losses_dir, f'nans_infs_{model_name}.csv'), index=False)
 
     def generate_snr(self, size, mode='uniform', **kwargs):
+        if mode == 'none':
+            return None
         if mode == 'uniform':
             min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
@@ -753,7 +757,7 @@ def sample_density(
     if channels_last is None:
         channels_last = bool(config.train.get('channels_last', False))
     if snr is None and randgen is not None:
-        snr = torch.rand(len(test_ds), generator=randgen, device=device)*990 + 10
+        snr = torch.rand(len(test_ds), generator=randgen, device=device)*995 + 5
     if model.mode == 2:
         assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
@@ -770,7 +774,7 @@ def sample_density(
     samples = []
     if return_log_prob:
         log_probs = []
-    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*990 + 10
+    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*995 + 5
     iterator = range(len(test_ds))
     if progress is not None:
         iterator = progress(iterator, total=len(test_ds), desc="Sampling")
@@ -780,6 +784,8 @@ def sample_density(
             vcircs = vcirc_mu[i] if vcirc_mu is not None else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            # img = test_ds[i]['img'].unsqueeze(0).float().to(device)
+            # spec = test_ds[i]['spec'].unsqueeze(0).float().to(device)
             fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
             if do_flip:
                 fid_row = torch.as_tensor(
@@ -811,3 +817,45 @@ def sample_density(
         log_probs = np.vstack(log_probs)
         return samples, log_probs, snrs
     return samples, snrs
+
+
+def evaluate_conditional_2d(
+    model,
+    test_ds,
+    snr=None,
+    randgen=None,
+    device='cpu',
+    channels_last: bool | None = None,
+    progress=None,
+):
+    if channels_last is None:
+        channels_last = bool(config.train.get('channels_last', False))
+    if snr is None and randgen is not None:
+        snr = torch.rand(len(test_ds), generator=randgen, device=device)*995 + 5
+    model.eval()
+    probs = []
+    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*995 + 5
+    # snrs = torch.full((len(test_ds),), 1000.0, device=device)
+    iterator = range(len(test_ds))
+    if progress is not None:
+        iterator = progress(iterator, total=len(test_ds), desc="Evaluating")
+    with torch.no_grad():
+        for i in iterator:
+            snr = snrs[i]
+            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            fids = torch.as_tensor(test_ds[i]['fid_pars'][:model.nfeatures], dtype=torch.float32, device=device).unsqueeze(0)
+            fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
+            if channels_last:
+                img = img.contiguous(memory_format=torch.channels_last)
+                spec = spec.contiguous(memory_format=torch.channels_last)
+            if i == 0:
+                prob, g1_vals, g2_vals = model.evaluate_conditional_2d(img, spec, fids, 0, 1, fp=fp, grid_bins=200)
+            else:
+                prob, _, _ = model.evaluate_conditional_2d(img, spec, fids, 0, 1, fp=fp, grid_bins=200)
+            probs.append(prob.unsqueeze(0).detach().cpu().numpy())
+    probs = np.vstack(probs)
+    g1_vals = g1_vals.cpu().numpy()
+    g2_vals = g2_vals.cpu().numpy()
+    snrs = snrs.cpu().numpy()
+    return probs, g1_vals, g2_vals, snrs

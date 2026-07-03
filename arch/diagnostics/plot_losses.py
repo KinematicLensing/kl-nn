@@ -155,6 +155,7 @@ def plot_losses(train_losses: np.ndarray, valid_losses: np.ndarray, model_name: 
     fig = plt.figure(figsize=(6, 5))
     plt.plot(epochs, train_losses, "r.-", label="Training Set")
     plt.plot(epochs, valid_losses, "b.-", label="Validation Set")
+    plt.text(0.95, 0.75, f"Epoch with lowest validation loss: {np.argmin(valid_losses)}", transform=plt.gca().transAxes, fontsize=12, ha="right", va="top")
     plt.xlabel("Epoch", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.tick_params(axis="both", which="major", labelsize=14)

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_train_100k.out
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_valid_10k.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=3:00:00
+#SBATCH --time=1:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mail-type=ALL
@@ -15,10 +15,10 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=make_database.py
-SAMPLE=train_100k
-DATASET=train_100k_nopsf
+SAMPLE=valid_10k
+DATASET=valid_10k
 NSAMPS=2000
-NPARTS=50
+NPARTS=5
 NSPEC=5
 hit=0
 

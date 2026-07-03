@@ -1,11 +1,106 @@
 import os
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import curve_fit
 import torch
+from astropy.cosmology import Planck18 as cosmo
 
 import config
 from utils import resolve_feature_index
+
+@dataclass
+class TFCalculator:
+    slope: float
+    intercept: float
+
+    def vcirc_to_mag(self, vcirc):
+        """
+        Calculates apparent magnitude from circular velocity.
+        Supports scalar, numpy array, and PyTorch tensor.
+        """
+        if isinstance(vcirc, torch.Tensor):
+            return self.slope * torch.log10(vcirc) + self.intercept
+        elif isinstance(vcirc, np.ndarray):
+            return self.slope * np.log10(vcirc) + self.intercept
+        else:
+            import math
+            return self.slope * math.log10(vcirc) + self.intercept
+
+    def mag_to_vcirc(self, mag):
+        """
+        Calculates circular velocity from apparent magnitude.
+        Supports scalar, numpy array, and PyTorch tensor.
+        """
+        if isinstance(mag, torch.Tensor):
+            return 10.0 ** ((mag - self.intercept) / self.slope)
+        elif isinstance(mag, np.ndarray):
+            return 10.0 ** ((mag - self.intercept) / self.slope)
+        else:
+            return 10.0 ** ((mag - self.intercept) / self.slope)
+
+def abs_mag_to_snr(abs_mag, z, band='r'):
+    band_depths = {
+        'g': 24.0,
+        'r': 23.4,
+        'z': 22.5,
+        }
+    assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
+    d_L = cosmo.luminosity_distance(z).to('pc').value
+    mu = 5 * np.log10(d_L / 10)
+    app_mag = abs_mag + mu
+    depth = band_depths[band]
+    C = depth + 2.5 * np.log10(5)
+    log_snr = (C - app_mag) / 2.5
+    return 10 ** log_snr
+
+def snr_to_abs_mag(snr, z, band='r'):
+    band_depths = {
+        'g': 24.0,
+        'r': 23.4,
+        'z': 22.5,
+        }
+    assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
+    d_L = cosmo.luminosity_distance(z).to('pc').value
+    mu = 5 * np.log10(d_L / 10)
+    depth = band_depths[band]
+    C = depth + 2.5 * np.log10(5)
+    log_snr = np.log10(snr)
+    app_mag = C - 2.5 * log_snr
+    abs_mag = app_mag - mu
+    return abs_mag
+
+def app_mag_to_snr(app_mag, band='r'):
+    band_depths = {
+        'g': 24.0,
+        'r': 23.4,
+        'z': 22.5,
+        }
+    assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
+    depth = band_depths[band]
+    C = depth + 2.5 * np.log10(5)
+    log_snr = (C - app_mag) / 2.5
+    return 10 ** log_snr
+
+def snr_to_app_mag(snr, band='r'):
+    band_depths = {
+        'g': 24.0,
+        'r': 23.4,
+        'z': 22.5,
+        }
+    assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
+    depth = band_depths[band]
+    C = depth + 2.5 * np.log10(5)
+    log_snr = np.log10(snr)
+    app_mag = C - 2.5 * log_snr
+    return app_mag
+
+def tf_vcirc_to_mag(vcirc, a, b):
+    log_vcirc = np.log10(vcirc)
+    return a * log_vcirc + b
+
+def tf_mag_to_vcirc(mag, a, b):
+    return 10 ** ((mag - b) / a)
 
 
 def _rmag_snr_model(log_snr, a, b):

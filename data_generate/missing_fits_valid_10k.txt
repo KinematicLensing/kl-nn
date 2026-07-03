@@ -1,0 +1,9 @@
+[INFO] Checking FITS under /ocean/projects/phy250048p/shared/fits/valid_10k
+[INFO] Expected galaxies: 5, rows per galaxy: 2000, id stride: 2000
+[INFO] Checking galaxy folder 1
+[INFO] Checking galaxy folder 2
+[INFO] Checking galaxy folder 3
+[INFO] Checking galaxy folder 4
+[INFO] Checking galaxy folder 5
+[INFO] Found: 10000
+[INFO] Missing: 0

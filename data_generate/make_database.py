@@ -89,6 +89,8 @@ def load_default_par_ranges():
 
 
 par_ranges = load_default_par_ranges()
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def main():
     data_dir = f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
@@ -133,7 +135,7 @@ def main():
                             'id': ids})
             t = round(time.time() - start, 2)
             
-            logging.info(f'Finished entry {index+1}/{N} in {t} seconds.')
+            logger.info(f'Finished entry {index+1}/{N} in {t} seconds.')
 
 if __name__ == '__main__':
     main()

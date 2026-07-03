@@ -16,10 +16,10 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=CNN-CNN-flow_mirror
-EPOCH=199
-SAMPFILE=samples_valid_100k_mirror.csv
-DATASET=valid_100k_mirror
+MODEL=ViT-CNN-flow
+EPOCH=187
+SAMPFILE=samples_valid_1m.csv
+DATASET=valid_1m
 NGALS=10000
 NSAMPS=10000
 NPARTS=10

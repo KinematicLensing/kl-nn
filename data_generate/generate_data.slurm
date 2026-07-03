@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_data_%A_%a.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 ###SBATCH --cpus-per-task=3
@@ -18,14 +18,14 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=generate_fits_wrapper.py
-SAMPFILE=samples_small_1m.csv
-DATASET=valid_10k_nopsf
+SAMPFILE=samples_valid_10k.csv
+DATASET=valid_10k
 NSAMPS=2000
 hit=0
 
 mkdir /ocean/projects/phy250048p/shared/fits/${DATASET}
 
-for (( c=0; c<6; c++ ))
+for (( c=0; c<51; c++ ))
 do
   hit=$((${hit}+1))
   if [ ${hit} -eq ${SLURM_ARRAY_TASK_ID} ]
@@ -33,6 +33,6 @@ do
     i=$(((${SLURM_ARRAY_TASK_ID}-1)*${NSAMPS}))
     j=$((${i}+${NSAMPS}))
     echo ${i} ${j}
-    python ${SCRIPT} -i=${i} -j=${j} -n=${SLURM_ARRAY_TASK_ID} -s=${SAMPFILE} -d=${DATASET} --no_psf
+    python ${SCRIPT} -i=${i} -j=${j} -n=${SLURM_ARRAY_TASK_ID} -s=${SAMPFILE} -d=${DATASET}
   fi
 done

@@ -25,10 +25,14 @@ parser.add_argument('-v0', type=float, default=0, help='systemic velocity')
 parser.add_argument('-vcirc', type=float, default=300, help='max rotation velocity')
 parser.add_argument('-rscale', type=float, default=1, help='velocity scale radius')
 parser.add_argument('-hlr', type=float, default=1, help='half-light radius')
+parser.add_argument('-dx_disk', type=float, default=0, help='disk offset in x')
+parser.add_argument('-dy_disk', type=float, default=0, help='disk offset in y')
+parser.add_argument('-dx_spec', type=float, default=0, help='spec offset in x')
+parser.add_argument('-dy_spec', type=float, default=0, help='spec offset in y')
 parser.add_argument('-n_s', type=float, default=1, help='sersic index')
 parser.add_argument('--fiber_perm', type=str, default='0,1,2,3,4',
                     help='comma-separated permutation for the 5 fiber order')
-parser.add_argument('--no_psf', action='store_true', help='if set, no PSF convolution will be applied to the fiber spectra')
+parser.add_argument('--low_psf', action='store_true', help='if set, use low PSF FWHM of 0.5 arcsec; otherwise use 1.0 arcsec')
 args = parser.parse_args()
 n = args.n
 d = args.d
@@ -41,16 +45,19 @@ v0 = args.v0
 vcirc = args.vcirc
 rscale = args.rscale
 hlr = args.hlr
+dx_disk = args.dx_disk
+dy_disk = args.dy_disk
+dx_spec = args.dx_spec
+dy_spec = args.dy_spec
 n_s = args.n_s
-no_psf = args.no_psf
-psf_type = 'none' if no_psf else 'airy_fwhm'
+low_psf = args.low_psf
 fiber_perm = [int(x.strip()) for x in args.fiber_perm.split(',')]
 if len(fiber_perm) != 5 or sorted(fiber_perm) != [0, 1, 2, 3, 4]:
     raise ValueError(f'Invalid --fiber_perm={args.fiber_perm}; expected permutation of 0,1,2,3,4')
 
 # Some global observation variables
 fiber_blur = 3.4 # pixels
-atm_psf_fwhm = 1.0 # arcsec
+atm_psf_fwhm = 0.5 if low_psf else 1.0 # arcsec
 fiber_rad = 0.75 # arcsec 
 fiber_offset = 1.5 # arcsec 
 exptime_offset = 600 # seconds
@@ -62,13 +69,13 @@ FITS_DIR = f'/ocean/projects/phy250048p/shared/fits/{d}/part_{n}/'
 ##################### Setting up observation configurations ####################
 
 default_photo_conf = {'INSTNAME': "CTIO/DECam", 'OBSTYPE': 0, 'NAXIS': 2,
-    'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': psf_type,
+    'NAXIS1': 48, 'NAXIS2': 48, 'PIXSCALE': 0.2637, 'PSFTYPE': 'airy_fwhm',
     'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 378.2856, 'GAIN': 4.0,
     'NOISETYP': 'ccd', 'RDNOISE': 2.6, 'ADDNOISE': ADD_NOISE
 }
 
 default_fiber_conf = {'INSTNAME': "DESI", 'OBSTYPE': 1,
-    'SKYMODEL': join(KL_TOOLS_DATA_DIR, "Skyspectra", "spec-sky.dat"), 'PSFTYPE': psf_type, 
+    'SKYMODEL': join(KL_TOOLS_DATA_DIR, "Skyspectra", "spec-sky.dat"), 'PSFTYPE': 'airy_fwhm', 
     'PSFFWHM': atm_psf_fwhm, 'DIAMETER': 332.42, 'EXPTIME': 180, 'GAIN': 1.0,
     'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': fiber_rad, 'FIBRBLUR': fiber_blur
 }
@@ -158,7 +165,11 @@ def main():
         'v0',
         'vcirc',
         'rscale',
-        'hlr'
+        'hlr',
+        'dx_disk',
+        'dy_disk',
+        'dx_spec',
+        'dy_spec'
         ]
     sampled_pars_value_dict = {
         "g1": g1,
@@ -168,29 +179,13 @@ def main():
         "v0": v0,
         "vcirc": vcirc,
         "rscale": rscale,
-        "hlr": hlr
+        "hlr": hlr,
+        "dx_disk": dx_disk,
+        "dy_disk": dy_disk,
+        "dx_spec": dx_spec,
+        "dy_spec": dy_spec,
     }
     ########################### Supporting #################################
-    sampled_pars_label = {
-        "g1": r'g_1', 
-        "g2": r'g_2', 
-        "theta_int": r'{\theta}_{\mathrm{int}}',
-        "sini": r'\mathrm{sin}(i)',
-        "v0": r'v_0', 
-        "vcirc": r'v_\mathrm{circ}', 
-        "rscale": r'r_\mathrm{scale}',
-        "hlr": r'\mathrm{hlr}'
-    }
-    param_limit = {
-        "g1": [-1.0, 1.0],
-        "g2": [-1.0, 1.0],
-        "theta_int": [-np.pi, np.pi],
-        "sini": [0, 1.0],
-        "v0": [-30, 30],
-        "vcirc": [60, 540],
-        "rscale": [0, 10],
-        "hlr": [0, 5]
-    }
     sampled_pars_std_dict = {
         "g1": 0.01,
         "g2": 0.01,
@@ -201,7 +196,11 @@ def main():
         "v0": 1,
         "vcirc": 1,
         "rscale": 0.01,
-        "hlr": 0.01
+        "hlr": 0.01,
+        "dx_disk": 0.01,
+        "dy_disk": 0.01,
+        "dx_spec": 0.01,
+        "dy_spec": 0.01,
     }
     sampled_pars_value = [sampled_pars_value_dict[k] for k in sampled_pars]
     sampled_pars_std=np.array([sampled_pars_std_dict[k] for k in sampled_pars])
@@ -218,6 +217,10 @@ def main():
             'vcirc': priors.LognormalPrior(300, 0.06, clip_sigmas=3),
             'rscale': priors.UniformPrior(0.1, 5),
             'hlr': priors.UniformPrior(0.1, 5),
+            'dx_disk': priors.UniformPrior(-1, 1),
+            'dy_disk': priors.UniformPrior(-1, 1),
+            'dx_spec': priors.UniformPrior(-1, 1),
+            'dy_spec': priors.UniformPrior(-1, 1),
         },
         ### velocity model
         'velocity': {
@@ -229,10 +232,14 @@ def main():
         ### intensity model
         'intensity': {
             ### Inclined Exp profile
-            'type': 'inclined_sersic', # 'inclined_exp
-            'sersic_n': n_s,
+            'type': 'inclined_exp',
+            # 'sersic_n': n_s,
             'flux': 1.0, # counts
             'hlr': hlr,
+            'dx_disk': dx_disk,
+            'dy_disk': dy_disk,
+            'dx_spec': dx_spec,
+            'dy_spec': dy_spec,
         },
         ### misc
         'units': {

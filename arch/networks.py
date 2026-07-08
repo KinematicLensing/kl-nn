@@ -12,6 +12,7 @@ from nflows.nn.nets import ResidualNet
 
 import config
 from utils import resolve_feature_index
+from data import TFCalculator
 from circular_spline import CircularAutoregressiveRationalQuadraticSpline
 
 ### Main Network ###
@@ -26,7 +27,7 @@ class ForkCNN(nn.Module):
                  nfeatures=config.train['feature_number'],
                  nspec=config.data['nspec'],
                  # Lognormal TF prior parameters (only used when mode == 2)
-                 vcirc_dex=0.05,   # scatter in dex; fixed, represents TF relation scatter
+                 vcirc_dex=config.tf['scatter'],   # scatter in dex; fixed, represents TF relation scatter
                  vcirc_min=config.par_ranges.get('vcirc', [60.0, 540.0])[0],
                  vcirc_max=config.par_ranges.get('vcirc', [60.0, 540.0])[1],
                  vcirc_idx=None):
@@ -39,8 +40,12 @@ class ForkCNN(nn.Module):
         else:
             raise ValueError('Mode must be 0 (point estimate), 1 (density estimate), or 2 (density estimate with TF prior)!')
 
+        # Initialize apparent magnitude TF calculator with standard values
+        self.tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'])
+
         # Lognormal TF prior settings (only used when mode == 2)
         # dex is fixed (TF scatter); mu is supplied per-galaxy at runtime from magnitude measurements
+        self.vcirc_dex = float(vcirc_dex)
         self.vcirc_log_scale = vcirc_dex * torch.log(torch.tensor(10.)).item()  # convert dex -> natural-log std
         self.vcirc_min = float(vcirc_min)
         self.vcirc_max = float(vcirc_max)
@@ -90,7 +95,7 @@ class ForkCNN(nn.Module):
             self.flow = Flow(self.transform, self.base)
 
     
-    def forward(self, x, y, true, fp=None):
+    def forward(self, x, y, true, fp=None, mag=None, snr=None):
         '''
         x: image tensor
         y: spectrum tensor
@@ -131,7 +136,13 @@ class ForkCNN(nn.Module):
             loss = self.loss(z, true)
         else:
             z = self.layer_norm(z)
-            loss = -self.flow.log_prob(true, context=z).mean()
+            log_prob = self.flow.log_prob(true, context=z)
+            if self.mode == 2:
+                # Calculate importance weights to weight each batch element's loss contribution
+                weights = self._compute_tf_weights(true, mag, snr)
+                loss = -(weights * log_prob).mean()
+            else:
+                loss = -log_prob.mean()
 
         return loss
     
@@ -197,6 +208,71 @@ class ForkCNN(nn.Module):
         )
         # return prior.log_prob(v_circ)
         return prior.log_prob(v_circ) + torch.log(torch.full_like(v_circ, self.vcirc_jac))
+    
+    def _get_tf_prior_params(self, mag, snr):
+        """
+        Computes the LogNormal prior parameters for vcirc based on magnitude.
+        Uses 0.1 dex base width, modified with a magnitude-dependent observational error.
+        """
+        # Calculate the expected vcirc center (mu)
+        vcirc_mu = self.tf_calc.mag_to_vcirc(mag)
+        
+        if snr is None:
+            # Calculate magnitude-dependent observational uncertainty
+            # SNR = 5 * 10**(-0.4 * (mag - 23.4))
+            snr = 5.0 * torch.pow(10.0, -0.4 * (mag - 23.4))
+
+        sigma_m = 1.086 / snr
+        
+        # Propagate error into the TF space (sigma_total_dex = sqrt(0.1^2 + (sigma_m / slope)^2))
+        slope = self.tf_calc.slope
+        sigma_total_dex = torch.sqrt(self.vcirc_dex**2 + (sigma_m / slope)**2)
+        
+        # Convert dex back to natural log space for LogNormal prior evaluation
+        sigma_total_ln = sigma_total_dex * math.log(10.0)
+        
+        return vcirc_mu, sigma_total_ln
+
+    def _compute_tf_weights(self, true, mag, snr):
+        """
+        Computes normalized importance weights based on the TF prior for the batch.
+        """
+        if mag is None:
+            return torch.ones(true.size(0), device=true.device, dtype=true.dtype)
+            
+        v_norm = true[:, self.vcirc_idx]
+        v_circ = self._norm_to_vcirc(v_norm)
+        
+        # Regularize non-finite elements
+        min_val = 1.0
+        v_circ = torch.where(
+            torch.isfinite(v_circ) & (v_circ > 0),
+            v_circ,
+            torch.full_like(v_circ, min_val),
+        )
+        
+        # Compute prior parameters
+        vcirc_mu, sigma_total_ln = self._get_tf_prior_params(mag, snr)
+        
+        # Match devices and dtypes
+        vcirc_mu = vcirc_mu.to(device=v_circ.device, dtype=v_circ.dtype)
+        sigma_total_ln = sigma_total_ln.to(device=v_circ.device, dtype=v_circ.dtype)
+        
+        # Setup the physical LogNormal distribution
+        prior = torch.distributions.LogNormal(
+            loc=torch.log(vcirc_mu),
+            scale=sigma_total_ln
+        )
+        
+        # Calculate the physical log prob and apply change of variables back to normalized [-1, 1] space
+        log_prob_physical = prior.log_prob(v_circ)
+        log_jacobian = math.log(self.vcirc_jac)
+        log_prob_tf = log_prob_physical + log_jacobian
+        
+        # Convert to importance weights and normalize across the batch elements
+        weights = torch.exp(log_prob_tf).detach()
+        weights = weights / (weights.mean() + 1e-8)
+        return weights
 
     def _kde_log_density_1d(self, values):
         """

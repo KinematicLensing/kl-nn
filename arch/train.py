@@ -33,6 +33,8 @@ from data import (
     apply_noise,
     make_exact_half_flip_mask,
     sample_magnitudes,
+    app_mag_to_snr,
+    snr_to_app_mag,
 )
 import config
 from model_registry import infer_model_name_from_checkpoint_path, load_networks_module_for_model
@@ -271,10 +273,15 @@ class CNNTrainer:
             output = output.contiguous(memory_format=torch.channels_last)
         return output
 
-    def _run_batch(self, img, spec, fid, fp=None):
+    def _run_batch(self, img, spec, fid, fp=None, snr=None):
         self.optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            loss = self.model(img, spec, fid, fp=fp)
+        if self.model.module.mode == 2:
+            self.mag_train = snr_to_app_mag(snr) if snr is not None else None
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                loss = self.model(img, spec, fid, fp=fp, mag=self.mag_train, snr=snr)
+        else:
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                loss = self.model(img, spec, fid, fp=fp)
         if torch.isfinite(loss):
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -350,7 +357,7 @@ class CNNTrainer:
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-            loss = self._run_batch(img, spec, fid, fp=fp)
+            loss = self._run_batch(img, spec, fid, fp=fp, snr=snr)
             if ~(torch.isnan(loss) | torch.isinf(loss)):
                 losses.append(loss.item())
             elif torch.isnan(loss):
@@ -401,7 +408,11 @@ class CNNTrainer:
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                loss = self.model(img, spec, fid, fp=fp)
+                if self.model.module.mode == 2:
+                    self.mag_valid = snr_to_app_mag(snr) if snr is not None else None
+                    loss = self.model(img, spec, fid, fp=fp, mag=self.mag_valid, snr=snr)
+                else:
+                    loss = self.model(img, spec, fid, fp=fp)
                 if ~(torch.isnan(loss) | torch.isinf(loss)):
                     losses.append(loss.item())
                 elif torch.isnan(loss):
@@ -781,7 +792,7 @@ def sample_density(
     with torch.no_grad():
         for i in iterator:
             snr = snrs[i]
-            vcircs = vcirc_mu[i] if vcirc_mu is not None else None
+            mag = snr_to_app_mag(snr) if model.mode == 2 else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             # img = test_ds[i]['img'].unsqueeze(0).float().to(device)
@@ -806,10 +817,10 @@ def sample_density(
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
             if return_log_prob:
-                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, return_log_prob=True, vcirc_mu=vcircs, sample_id=i)
+                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, return_log_prob=True, sample_id=i)
                 log_probs.append(log_prob.detach().cpu().numpy())
             else:
-                sample = model.sample(img, spec, nsamples, fp=fp, vcirc_mu=vcircs, sample_id=i)
+                sample = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, sample_id=i)
             samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     snrs = snrs.cpu().numpy()

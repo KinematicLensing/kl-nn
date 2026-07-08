@@ -13,6 +13,7 @@ from utils import resolve_feature_index
 class TFCalculator:
     slope: float
     intercept: float
+    scatter: float = 0.1
 
     def vcirc_to_mag(self, vcirc):
         """
@@ -38,6 +39,26 @@ class TFCalculator:
             return 10.0 ** ((mag - self.intercept) / self.slope)
         else:
             return 10.0 ** ((mag - self.intercept) / self.slope)
+        
+    def sample_mag_from_vcirc(self, vcirc):
+        """
+        Sample a physically consistent apparent magnitude given a vcirc value, 
+        incorporating intrinsic astrophysical scatter.
+        Compatible with scalars, numpy arrays, and PyTorch tensors.
+        """
+        # 1. Compute the clean mean magnitude
+        m_mean = self.vcirc_to_mag(vcirc)
+
+        # 2. Translate the intrinsic dex scatter to magnitude space:
+        # sigma_m = |slope| * sigma_intrinsic_dex
+        sigma_m_intrinsic = abs(self.slope) * self.scatter
+
+        if isinstance(vcirc, torch.Tensor):
+            return m_mean + torch.randn_like(m_mean) * sigma_m_intrinsic
+        elif isinstance(vcirc, np.ndarray):
+            return m_mean + np.random.normal(0.0, sigma_m_intrinsic, size=m_mean.shape)
+        else:
+            return m_mean + np.random.normal(0.0, sigma_m_intrinsic)
 
 def abs_mag_to_snr(abs_mag, z, band='r'):
     band_depths = {
@@ -78,9 +99,14 @@ def app_mag_to_snr(app_mag, band='r'):
         }
     assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
     depth = band_depths[band]
-    C = depth + 2.5 * np.log10(5)
-    log_snr = (C - app_mag) / 2.5
-    return 10 ** log_snr
+    if isinstance(app_mag, torch.Tensor):
+        C = depth + 2.5 * torch.log10(torch.tensor(5.0, device=app_mag.device))
+        log_snr = (C - app_mag) / 2.5
+        return 10 ** log_snr
+    else:
+        C = depth + 2.5 * np.log10(5)
+        log_snr = (C - app_mag) / 2.5
+        return 10 ** log_snr
 
 def snr_to_app_mag(snr, band='r'):
     band_depths = {
@@ -90,10 +116,16 @@ def snr_to_app_mag(snr, band='r'):
         }
     assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
     depth = band_depths[band]
-    C = depth + 2.5 * np.log10(5)
-    log_snr = np.log10(snr)
-    app_mag = C - 2.5 * log_snr
-    return app_mag
+    if isinstance(snr, torch.Tensor):
+        C = depth + 2.5 * torch.log10(torch.tensor(5.0, device=snr.device))
+        log_snr = torch.log10(snr)
+        app_mag = C - 2.5 * log_snr
+        return app_mag
+    else:
+        C = depth + 2.5 * np.log10(5)
+        log_snr = np.log10(snr)
+        app_mag = C - 2.5 * log_snr
+        return app_mag
 
 def tf_vcirc_to_mag(vcirc, a, b):
     log_vcirc = np.log10(vcirc)

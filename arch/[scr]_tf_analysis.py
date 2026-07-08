@@ -95,6 +95,13 @@ def parse_args():
         help='Total number of partitions for partXofN naming. If omitted, read from SLURM env.',
     )
     parser.add_argument(
+        '--conform-to-tf',
+        dest='conform_to_tf',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Conform dataset to TF prior (default: False).',
+    )
+    parser.add_argument(
         '--compile',
         dest='use_compile',
         action=argparse.BooleanOptionalAction,
@@ -276,6 +283,8 @@ def main():
     model_cfg = load_model_config(model_name, allow_fallback_current=True)
     config.set_model_config(model_cfg)
     dataset_name = os.path.basename(os.path.normpath(data_dir))
+    if args.conform_to_tf:
+        dataset_name += '_tf_conformed'
     total_partitions = infer_total_partitions(args)
     partition_label = build_partition_label(args.i, total_partitions)
     nfeatures = config.train['feature_number']
@@ -358,22 +367,6 @@ def main():
             f'Partition range [{start}, {end}) exceeds dataset size {len(test_ds)} for partition {partition_label}.'
         )
     subset = Subset(test_ds, np.arange(start, end))
-    rng_seed = 42
-    if args.cached_snrs_path is not None:
-        if not os.path.exists(args.cached_snrs_path):
-            raise FileNotFoundError(f'Cached SNRs file not found: {args.cached_snrs_path}')
-        snrs = []
-        for i in range(total_partitions):
-            snr_path = os.path.join(args.cached_snrs_path, f'part{i}of{total_partitions}.npy')
-            if not os.path.exists(snr_path):
-                raise FileNotFoundError(f'Cached SNRs file for partition not found: {snr_path}')
-            snrs.append(np.load(snr_path))
-        snr_shared = torch.from_numpy(np.concatenate(snrs)).to(device)
-        if snr_shared.shape != (args.ngals,):
-            raise ValueError(f'Cached SNRs shape {snr_shared.shape} does not match expected ({args.ngals},)')
-    else:
-        snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
-        snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 995 + 5
 
     vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
     vcirc_name = feature_names[vcirc_idx]
@@ -393,8 +386,32 @@ def main():
     if profile:
         _sync_cuda(device)
         logging.info('Timing: prep vcirc/truth took %.2fs', time.perf_counter() - start)
+    
+    rng_seed = 42
+    if args.conform_to_tf:
+        logging.info('Conforming dataset to TF prior')
+        from data import TFCalculator, app_mag_to_snr
+        tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'], scatter=config.tf['scatter'])
+        app_mag = tf_calc.sample_mag_from_vcirc(vcirc_mu)
+        snr_shared = app_mag_to_snr(app_mag)
+        print('SNR range: min %.2f, max %.2f, mean %.2f' % (snr_shared.min().item(), snr_shared.max().item(), snr_shared.mean().item()))
+    elif args.cached_snrs_path is not None:
+        if not os.path.exists(args.cached_snrs_path):
+            raise FileNotFoundError(f'Cached SNRs file not found: {args.cached_snrs_path}')
+        snrs = []
+        for i in range(total_partitions):
+            snr_path = os.path.join(args.cached_snrs_path, f'part{i}of{total_partitions}.npy')
+            if not os.path.exists(snr_path):
+                raise FileNotFoundError(f'Cached SNRs file for partition not found: {snr_path}')
+            snrs.append(np.load(snr_path))
+        snr_shared = torch.from_numpy(np.concatenate(snrs)).to(device)
+        if snr_shared.shape != (args.ngals,):
+            raise ValueError(f'Cached SNRs shape {snr_shared.shape} does not match expected ({args.ngals},)')
+    else:
+        snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
+        snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 995 + 5
 
-    modes = [1, 2] # 1: no TF prior, 2: TF prior
+    modes = [2] # 1: no TF prior, 2: TF prior
     sample_list = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
     log_prob_list = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
 
@@ -402,7 +419,7 @@ def main():
     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else nullcontext()
     infer_ctx = torch.inference_mode() if inference_mode else nullcontext()
     with infer_ctx, amp_ctx:
-        for mode in modes:
+        for j, mode in enumerate(modes):
             model = get_model_for_mode(mode) if use_separate_models else models[2]
             model.mode = mode
             # Reset the noise RNG so each mode sees the same injected img/spec noise.
@@ -429,8 +446,8 @@ def main():
             post_iter = tqdm(range(args.ngals), desc=f"Postprocess mode {mode}") if args.ngals else range(0)
             post_start = time.perf_counter() if profile else None
             for i in post_iter:
-                sample_list[mode-1, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
-                log_prob_list[mode-1, i] = log_probs[i]
+                sample_list[j, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
+                log_prob_list[j, i] = log_probs[i]
             if profile and post_start is not None:
                 logging.info('Timing: postprocess mode %s took %.2fs', mode, time.perf_counter() - post_start)
 
@@ -463,18 +480,18 @@ def main():
     map_estimates = np.zeros((len(modes), args.ngals, nfeatures))
     mean_estimates = np.zeros((len(modes), args.ngals, 3, nfeatures))
     for i in range(args.ngals):
-        for mode in modes:
-            samples = sample_list[mode-1, i]
-            log_probs = log_prob_list[mode-1, i]
+        for j, mode in enumerate(modes):
+            samples = sample_list[j, i]
+            log_probs = log_prob_list[j, i]
 
             # MAP estimate
             map_idx = np.argmax(log_probs)
-            map_estimates[mode-1, i] = samples[map_idx]
+            map_estimates[j, i] = samples[map_idx]
 
             # Mean estimate with bounds
-            mean_estimates[mode-1, i, 0] = np.percentile(samples, 16, axis=0) # low bound
-            mean_estimates[mode-1, i, 1] = np.mean(samples, axis=0) # mean
-            mean_estimates[mode-1, i, 2] = np.percentile(samples, 84, axis=0) # high bound
+            mean_estimates[j, i, 0] = np.percentile(samples, 16, axis=0) # low bound
+            mean_estimates[j, i, 1] = np.mean(samples, axis=0) # mean
+            mean_estimates[j, i, 2] = np.percentile(samples, 84, axis=0) # high bound
     
     map_path = get_cache_path(cache_dir, model_name, dataset_name, 'map_estimates', f'{partition_label}.npy')
     np.save(map_path, map_estimates)

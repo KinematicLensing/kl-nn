@@ -62,7 +62,15 @@ class FlowConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+    
+@dataclass
+class TFConfig:
+    slope: float = -7.22
+    intercept: float = 36.0
+    scatter: float = 0.1
 
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 @dataclass
 class ModelConfig:
@@ -73,6 +81,7 @@ class ModelConfig:
     par_ranges: dict[str, list[float]]
     train: TrainConfig
     flow: FlowConfig
+    tf: TFConfig
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -87,6 +96,7 @@ class ModelConfig:
             par_ranges={k: [float(v[0]), float(v[1])] for k, v in payload["par_ranges"].items()},
             train=TrainConfig(**payload["train"]),
             flow=FlowConfig(**payload["flow"]),
+            tf=TFConfig(**payload["tf"])
         )
 
     def to_json(self, path: str, *, indent: int = 2) -> None:
@@ -139,7 +149,7 @@ def _default_model_config() -> ModelConfig:
             feature_names=["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="ViT-CNN-flow",
+            model_name="ViT-CNN-flow_tf_train",
             enable_handedness_flip=False,
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",
@@ -159,6 +169,7 @@ def _default_model_config() -> ModelConfig:
             noise_cache_maxs=True,
         ),
         flow=FlowConfig(num_layers=12),
+        tf=TFConfig(slope=-7.22, intercept=36.0, scatter=0.1)
     )
 
 
@@ -166,7 +177,7 @@ MODEL_CONFIG: ModelConfig = _default_model_config()
 
 
 def _sync_legacy_globals(model_config: ModelConfig) -> None:
-    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, train, flow
+    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, train, flow, tf
 
     rmag_snr_source_path = model_config.rmag_snr_source_path
     rmag_snr_fit_path = model_config.rmag_snr_fit_path
@@ -175,6 +186,7 @@ def _sync_legacy_globals(model_config: ModelConfig) -> None:
     par_ranges = model_config.par_ranges.copy()
     train = model_config.train.to_dict()
     flow = model_config.flow.to_dict()
+    tf = model_config.tf.to_dict()
 
 
 def set_model_config(model_config: ModelConfig) -> None:

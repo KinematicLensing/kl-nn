@@ -2,7 +2,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_model_ViT-CNN-flow.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
-#SBATCH --time=16:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu

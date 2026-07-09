@@ -19,13 +19,37 @@ class DatasetConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+@dataclass
+class PretrainConfig:
+    epoch_number: int
+    initial_learning_rate: float
+    weight_decay: float
+    batch_size: int
+    save_model: bool
+    model_path: str
+    model_name: str
+    use_amp: bool = True
+    amp_dtype: str = "float16"
+    use_compile: bool = True
+    compile_mode: str = "default"
+    compile_backend: str | None = None
+    use_fused_adamw: bool = True
+    cudnn_benchmark: bool = True
+    channels_last: bool = True
+    ddp_static_graph: bool = True
+    ddp_find_unused_parameters: bool = False
+    ddp_gradient_as_bucket_view: bool = True
+    ddp_broadcast_buffers: bool = False
+    noise_cache_maxs: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 @dataclass
 class TrainConfig:
     mode: int
     epoch_number: int
     initial_learning_rate: float
-    momentum: float
     weight_decay: float
     batch_size: int
     feature_number: int
@@ -36,7 +60,6 @@ class TrainConfig:
     use_pretrain: bool
     pretrained_name: str
     pretrain_from: int
-    enable_handedness_flip: bool = False
     use_amp: bool = True
     amp_dtype: str = "float16"
     use_compile: bool = True
@@ -79,6 +102,7 @@ class ModelConfig:
     data: DatasetConfig
     test: DatasetConfig
     par_ranges: dict[str, list[float]]
+    pretrain: PretrainConfig
     train: TrainConfig
     flow: FlowConfig
     tf: TFConfig
@@ -94,6 +118,7 @@ class ModelConfig:
             data=DatasetConfig(**payload["data"]),
             test=DatasetConfig(**payload["test"]),
             par_ranges={k: [float(v[0]), float(v[1])] for k, v in payload["par_ranges"].items()},
+            pretrain=PretrainConfig(**payload["pretrain"]),
             train=TrainConfig(**payload["train"]),
             flow=FlowConfig(**payload["flow"]),
             tf=TFConfig(**payload["tf"])
@@ -138,11 +163,19 @@ def _default_model_config() -> ModelConfig:
             "rscale": [0.1, 2.0],
             "hlr": [0.1, 3.0],
         },
+        pretrain=PretrainConfig(
+            epoch_number=200,
+            initial_learning_rate=1e-3,
+            weight_decay=1e-4,
+            batch_size=100,
+            save_model=True,
+            model_path="/ocean/projects/phy250048p/shared/models/",
+            model_name="ViT-CNN",
+        ),
         train=TrainConfig(
             mode=2,  # 0: point estimate; 1: density estimate; 2: density estimate with TF prior
             epoch_number=200,
             initial_learning_rate=1e-4,
-            momentum=0.9,
             weight_decay=1e-5,
             batch_size=100,
             feature_number=8,
@@ -150,7 +183,6 @@ def _default_model_config() -> ModelConfig:
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
             model_name="ViT-CNN-flow_tf_train",
-            enable_handedness_flip=False,
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",
             pretrain_from=99,
@@ -177,13 +209,14 @@ MODEL_CONFIG: ModelConfig = _default_model_config()
 
 
 def _sync_legacy_globals(model_config: ModelConfig) -> None:
-    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, train, flow, tf
+    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, pretrain, train, flow, tf
 
     rmag_snr_source_path = model_config.rmag_snr_source_path
     rmag_snr_fit_path = model_config.rmag_snr_fit_path
     data = model_config.data.to_dict()
     test = model_config.test.to_dict()
     par_ranges = model_config.par_ranges.copy()
+    pretrain = model_config.pretrain.to_dict()
     train = model_config.train.to_dict()
     flow = model_config.flow.to_dict()
     tf = model_config.tf.to_dict()

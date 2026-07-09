@@ -1,6 +1,7 @@
 import logging
 import torch
 from torch import nn
+import torch.nn.functional as F
 import math
 import normflows as nf
 from nflows.flows.base import Flow
@@ -16,13 +17,14 @@ from data import TFCalculator
 from circular_spline import CircularAutoregressiveRationalQuadraticSpline
 
 ### Main Network ###
-class ForkCNN(nn.Module):
+class KLNPE(nn.Module):
     '''
     Main network consisting of feature extraction branches for images and spectra,
     followed by either point estimate or density estimate layers.
     '''
     def __init__(self, 
-                 mode=0,    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
+                 feature_extractor,
+                 mode=config.train['mode'],    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
                  batch_size=config.train['batch_size'],
                  nfeatures=config.train['feature_number'],
                  nspec=config.data['nspec'],
@@ -61,24 +63,9 @@ class ForkCNN(nn.Module):
                 f'vcirc_idx={self.vcirc_idx} is out of bounds for nfeatures={self.nfeatures}'
             )
 
-        super(ForkCNN, self).__init__()
-        
+        super(KLNPE, self).__init__()
 
-        # Vision Transformer for image feature extraction
-        self.img_net = VisionTransformer(in_channels=1, 
-                                     embed_dim=512, 
-                                     img_size=48, 
-                                     patch_size=6, 
-                                     num_layers=6, 
-                                     num_heads=8, 
-                                     mlp_ratio=4.0, 
-                                     dropout=0.1)
-        # self.img_net = ImgCNN()
-                                     
-        # CNN + RNN for spectra feature extraction
-        # self.spec_net = LargeSpecRNN(self.nspecs)
-        self.spec_net = SpecCNN(self.nspecs)
-
+        self.feature_extractor = feature_extractor
 
         # Define point estimate or density estimate layers
         if self.mode == 0:
@@ -95,40 +82,14 @@ class ForkCNN(nn.Module):
             self.flow = Flow(self.transform, self.base)
 
     
-    def forward(self, x, y, true, fp=None, mag=None, snr=None):
+    def forward(self, x, y, true, fp, mag=None, snr=None):
         '''
         x: image tensor
         y: spectrum tensor
         true: target tensor of shape (batch, nfeatures)
         fp: fiber position tensor of shape (batch, nspecs, 2)
         '''
-        # Feature extraction from img and spec
-        x = nn.functional.normalize(x, dim=[2,3])
-        y = nn.functional.normalize(y, dim=[2,3])
-        x = self.img_net(x)
-        y = self.spec_net(y)
-
-        # Flatten and concatenate
-        x = x.view(int(self.bs),-1)
-        y = y.view(int(self.bs),-1)
-        z = torch.cat((x, y), -1)
-        if fp is not None:
-            fp = nn.functional.normalize(fp, dim=[1,2])  # Normalize fiber positions across the nspecs dimension
-            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
-            z = torch.cat((z, fp), dim=-1)
-        else:
-            expected_dim = (
-                self.fully_connected_layer[0].in_features
-                if self.mode == 0
-                else int(self.layer_norm.normalized_shape[0])
-            )
-            if z.size(-1) < expected_dim:
-                pad = z.new_zeros((z.size(0), expected_dim - z.size(-1)))
-                z = torch.cat((z, pad), dim=-1)
-            elif z.size(-1) > expected_dim:
-                raise ValueError(
-                    f"Expected feature dim {expected_dim} without fib_pos, got {z.size(-1)}"
-                )
+        z = self.feature_extractor(x, y, fp)
 
         # Point/density estimate
         if self.mode == 0:
@@ -146,34 +107,11 @@ class ForkCNN(nn.Module):
 
         return loss
     
-    def extract_latent(self, x, y, true, fp=None):
+    def extract_latent(self, x, y, true, fp):
         '''
         Run through feature extraction but map from true parameters to latent space in flow
         '''
-        # Feature extraction from img and spec
-        x = nn.functional.normalize(x, dim=[2,3])
-        y = nn.functional.normalize(y, dim=[2,3])
-        x = self.img_net(x)
-        y = self.spec_net(y)
-
-        # Flatten and concatenate
-        x = x.view(int(self.bs),-1)
-        y = y.view(int(self.bs),-1)
-        z = torch.cat((x, y), -1)
-        if fp is not None:
-            fp = nn.functional.normalize(fp, dim=[1,2])  # Normalize fiber positions across the nspecs dimension
-            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
-            z = torch.cat((z, fp), dim=-1)
-        else:
-            expected_dim = int(self.layer_norm.normalized_shape[0])
-            if z.size(-1) < expected_dim:
-                pad = z.new_zeros((z.size(0), expected_dim - z.size(-1)))
-                z = torch.cat((z, pad), dim=-1)
-            elif z.size(-1) > expected_dim:
-                raise ValueError(
-                    f"Expected feature dim {expected_dim} without fib_pos, got {z.size(-1)}"
-                )
-
+        z = self.feature_extractor(x, y, fp)
         z = self.layer_norm(z)
         latent = self.flow.transform_to_noise(true, context=z)
 
@@ -315,24 +253,12 @@ class ForkCNN(nn.Module):
 
         self.transform = CompositeTransform(transforms)
 
-    def point_estimate(self, x, y):
-        '''
-        Get point estimate for given inputs
-        '''
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(int(self.bs),-1)
-        y = y.view(int(self.bs),-1)
-        z = torch.cat((x, y), -1)
-        z = self.fully_connected_layer(z)
-        return z
-
     def sample(
         self,
         x,
         y,
         num_samples,
-        fp=None,
+        fp,
         vcirc_mu=None,
         return_log_prob=False,
         log_context=None,
@@ -344,17 +270,7 @@ class ForkCNN(nn.Module):
         vcirc_mu: per-galaxy prior center, shape (1,), units km/s (linear).
                   Required when mode == 2. Each galaxy's N samples share the same mu.
         '''
-        x = nn.functional.normalize(x, dim=[2,3])
-        y = nn.functional.normalize(y, dim=[2,3])
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(1,-1)
-        y = y.view(1,-1)
-        z = torch.cat((x, y), -1)
-        if fp is not None:
-            fp = nn.functional.normalize(fp, dim=[1,2])  # Normalize fiber positions across the nspecs dimension
-            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
-            z = torch.cat((z, fp), dim=-1)
+        z = self.feature_extractor(x, y, fp)
         z = self.layer_norm(z)
 
         # Sample from flow
@@ -483,17 +399,7 @@ class ForkCNN(nn.Module):
         idx1, idx2: Integers representing the parameter indices for g1 and g2.
         '''
         # 1. Extract context 'z' identically to your sample() function
-        x = nn.functional.normalize(x, dim=[2,3])
-        y = nn.functional.normalize(y, dim=[2,3])
-        x = self.img_net(x)
-        y = self.spec_net(y)
-        x = x.view(1,-1)
-        y = y.view(1,-1)
-        z = torch.cat((x, y), -1)
-        if fp is not None:
-            fp = nn.functional.normalize(fp, dim=[1,2])
-            fp = fp.view(fp.size(0), -1)
-            z = torch.cat((z, fp), dim=-1)
+        z = self.feature_extractor(x, y, fp)
         z = self.layer_norm(z)
         
         # 2. Create a 2D grid for the two parameters
@@ -526,6 +432,110 @@ class ForkCNN(nn.Module):
         
         return probs.view(grid_bins, grid_bins), g1_vals, g2_vals
 
+class FeatureExtractor(nn.Module):
+    def __init__(self, nspec=config.data['nspec']):
+        super().__init__()
+        self.nspecs = nspec
+        
+        # Vision Transformer for images
+        self.img_net = VisionTransformer(
+            in_channels=1, embed_dim=512, img_size=48, patch_size=6, 
+            num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1
+        )
+        
+        # CNN for spectra
+        self.spec_net = SpecCNN(self.nspecs)
+
+    def forward_features(self, x, y, fp):
+        '''Extracts raw features independently for both modalities'''
+        x = nn.functional.normalize(x, dim=[2, 3])
+        y = nn.functional.normalize(y, dim=[2, 3])
+        fp = nn.functional.normalize(fp, dim=[1, 2])
+        
+        img_feats = self.img_net(x)     # Shape: (B, 512)
+        spec_feats = self.spec_net(y)   # Shape: (B, 512 - 2*nspecs)
+        spec_feats = torch.cat((spec_feats, fp.view(fp.size(0), -1)), dim=-1)  # Concatenate fiber positions
+        
+        # Flatten explicitly to ensure safety
+        img_feats = img_feats.view(img_feats.size(0), -1)
+        spec_feats = spec_feats.view(spec_feats.size(0), -1)
+        
+        return img_feats, spec_feats
+
+    def forward(self, x, y, fp):
+        '''Fuses features together (Matches your original ForkCNN concatenation)'''
+        img_feats, spec_feats = self.forward_features(x, y)
+        z = torch.cat((img_feats, spec_feats), -1)
+        
+        fp = nn.functional.normalize(fp, dim=[1, 2])
+        fp = fp.view(fp.size(0), -1)
+        z = torch.cat((z, fp), dim=-1)
+        return z
+    
+class VICRegPretrain(nn.Module):
+    def __init__(self, backbone, projector_dim=1024):
+        super().__init__()
+        self.backbone = backbone
+        
+        # Get feature dimensions dynamically
+        # Image is fixed at 512; Spec is 512 - 2 * nspecs
+        img_in = 512
+        spec_in = 512
+        
+        # Projector networks mapping onto a common high-dimensional space
+        self.img_projector = MLP([img_in, 1024, 2048, projector_dim])
+        self.spec_projector = MLP([spec_in, 1024, 2048, projector_dim])
+        
+        self.vicreg_loss = VICRegLoss(lam=25.0, mu=25.0, nu=1.0, gamma=1.0)
+
+    def forward(self, x, y, fp):
+        # 1. Extract raw, un-fused features
+        img_feats, spec_feats = self.backbone.forward_features(x, y, fp)
+        
+        # 2. Project to high-dimensional space
+        z1 = self.img_projector(img_feats)
+        z2 = self.spec_projector(spec_feats)
+        
+        # 3. Compute loss
+        loss = self.vicreg_loss(z1, z2)
+        return loss
+
+class VICRegLoss(nn.Module):
+    def __init__(self, lam=25.0, mu=25.0, nu=1.0, gamma=1.0, eps=1e-4):
+        super().__init__()
+        self.lam = lam
+        self.mu = mu
+        self.nu = nu
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, z1, z2):
+        # 1. Invariance Loss
+        sim_loss = F.mse_loss(z1, z2)
+
+        # Center the representations
+        z1 = z1 - z1.mean(dim=0)
+        z2 = z2 - z2.mean(dim=0)
+
+        # 2. Variance Loss
+        std_z1 = torch.sqrt(z1.var(dim=0) + self.eps)
+        std_z2 = torch.sqrt(z2.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(self.gamma - std_z1)) + torch.mean(F.relu(self.gamma - std_z2))
+
+        # 3. Covariance Loss
+        batch_size = z1.size(0)
+        num_features = z1.size(1)
+        
+        cov_z1 = (z1.T @ z1) / (batch_size - 1)
+        cov_z2 = (z2.T @ z2) / (batch_size - 1)
+        
+        # Mask out diagonal elements
+        diag_mask = ~torch.eye(num_features, device=z1.device).bool()
+        cov_loss = (cov_z1[diag_mask].pow(2).sum() / num_features) + (cov_z2[diag_mask].pow(2).sum() / num_features)
+
+        # Total Loss
+        return self.lam * sim_loss + self.mu * var_loss + self.nu * cov_loss
+    
 class MLP(nn.Module):
     '''
     A simple MLP with Linear and ReLU
@@ -906,86 +916,5 @@ class ImgCNN(nn.Module):
     def forward(self, x):
         
         x = self.cnn_img(x)
-        
-        return x
-
-
-class DeconvNN(nn.Module):
-    '''
-    A deconv model in testing
-    '''
-    def __init__(self, batch_size, GPUs=1, 
-                 nspec=config.data['nspec'], 
-                 nfeatures=config.train['feature_number']):
-        
-        self.nfeatures = nfeatures
-        self.bs = batch_size
-        self.GPUs = GPUs
-        
-        super(DeconvNN, self).__init__()
-        
-        self.dnn_img = nn.Sequential(
-            
-            nn.ConvTranspose2d(512, 512, kernel_size=3, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(512, 512, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2, padding=0, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            
-            nn.ConvTranspose2d(32, 1, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.ReLU(True),
-        )
-        
-        ### Fully-connected layers
-        self.linear = nn.Sequential(
-            
-            nn.Linear(self.nfeatures, 32),
-            nn.Linear(32, 128),
-            nn.Linear(128, 256),
-            nn.Linear(256, 512),
-        )
-
-    
-    def forward(self, x):
-        
-        x = self.linear(x)
-        
-        x = x.view(int(self.bs),-1, 1, 1)
-        
-        x = self.dnn_img(x)
         
         return x

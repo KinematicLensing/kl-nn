@@ -22,6 +22,7 @@ from train import (
     sample_density,
     _resolve_amp_dtype,
 )
+from networks import KLNPE
 import config
 from model_registry import load_model_config
 from utils import (
@@ -338,7 +339,8 @@ def main():
             _sync_cuda(device)
             start = time.perf_counter()
         model = load_model(
-            mode=mode,
+            train_config=config.train,
+            Model=KLNPE,
             path=model_file,
             strict=True,
             assign=True,

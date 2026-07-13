@@ -38,7 +38,7 @@ def main():
                 'dx_spec': 0.,
                 'dy_spec': 0.
                 }
-    nsamples = int(1e4)
+    nsamples = int(5e6)
 
     sample_centers = []
     sample_scale = []
@@ -54,18 +54,18 @@ def main():
     for i, param in enumerate(param_list):
         df[param] = df[param]*sample_scale[i] + sample_centers[i]
     
-    # Optional set some parameters to default values, comment out if not needed
-    for param, _ in df.items():
-        if param in defaults.keys():
-            if type(defaults[param]) != np.ndarray:
-                df[param] = defaults[param]
-            else:
-                values = defaults[param]
-                df_list = [df.copy() for _ in range(len(values))]
-                for i, value in enumerate(values):
-                    # print(df_list[i][param][0])
-                    df_list[i][param] = value
-                df = pd.concat(df_list, ignore_index=True)
+    # # Optional set some parameters to default values, comment out if not needed
+    # for param, _ in df.items():
+    #     if param in defaults.keys():
+    #         if type(defaults[param]) != np.ndarray:
+    #             df[param] = defaults[param]
+    #         else:
+    #             values = defaults[param]
+    #             df_list = [df.copy() for _ in range(len(values))]
+    #             for i, value in enumerate(values):
+    #                 # print(df_list[i][param][0])
+    #                 df_list[i][param] = value
+    #             df = pd.concat(df_list, ignore_index=True)
 
     # df['sini'] = np.sqrt(1-df['sini']**2)
 
@@ -78,7 +78,7 @@ def main():
     # df = pd.concat([df, df_rot90], ignore_index=True)
     
     # Save parameter samples
-    df.to_csv(join(SAMPDIR, 'samples_valid_10k.csv'))
+    df.to_csv(join(SAMPDIR, 'samples_pretrain_5m.csv'))
 
 
 if __name__ == '__main__':

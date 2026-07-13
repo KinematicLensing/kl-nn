@@ -8,13 +8,11 @@ from nflows.flows.base import Flow
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.permutations import ReversePermutation, RandomPermutation
-from nflows.nn.nets import ResidualNet
+from nflows.transforms.permutations import RandomPermutation
 
 import config
 from utils import resolve_feature_index
 from data import TFCalculator
-from circular_spline import CircularAutoregressiveRationalQuadraticSpline
 
 ### Main Network ###
 class KLNPE(nn.Module):
@@ -23,7 +21,7 @@ class KLNPE(nn.Module):
     followed by either point estimate or density estimate layers.
     '''
     def __init__(self, 
-                 feature_extractor,
+                 feature_extractor=None,
                  mode=config.train['mode'],    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
                  batch_size=config.train['batch_size'],
                  nfeatures=config.train['feature_number'],
@@ -65,15 +63,12 @@ class KLNPE(nn.Module):
 
         super(KLNPE, self).__init__()
 
-        self.feature_extractor = feature_extractor
+        self.feature_extractor = FeatureExtractor(nspec=self.nspecs) if feature_extractor is None else feature_extractor
 
         # Define point estimate or density estimate layers
         if self.mode == 0:
             ### Fully-connected layers
-            self.fully_connected_layer = nn.Sequential(
-                # make sure the first number is equal to the sum of final # of channels in both img and spec branches
-                nn.Linear(1024, self.nfeatures),
-            )
+            self.fully_connected_layer = MLP([1024, 512, 256, self.nfeatures])
             self.loss = nn.MSELoss()
         elif self.mode >= 1:
             # Normalizing flow for density estimation
@@ -106,6 +101,14 @@ class KLNPE(nn.Module):
                 loss = -log_prob.mean()
 
         return loss
+    
+    def point_estimate(self, x, y, fp):
+        '''
+        Run through feature extraction and return point estimate of parameters
+        '''
+        z = self.feature_extractor(x, y, fp)
+        z = self.fully_connected_layer(z)
+        return z
     
     def extract_latent(self, x, y, true, fp):
         '''
@@ -259,7 +262,8 @@ class KLNPE(nn.Module):
         y,
         num_samples,
         fp,
-        vcirc_mu=None,
+        mag=None,
+        snr=None,
         return_log_prob=False,
         log_context=None,
         sample_id=None,
@@ -313,7 +317,7 @@ class KLNPE(nn.Module):
                 break
 
         if self.mode == 2:
-            assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
+            assert mag is not None and snr is not None, 'mag (per-galaxy apparent magnitude) must be provided for mode 2'
             z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)
 
             # Importance-resample flow samples so vcirc follows TF prior at inference time.
@@ -321,12 +325,29 @@ class KLNPE(nn.Module):
             v_norm = candidates[:, self.vcirc_idx]
             v_circ = self._norm_to_vcirc(v_norm)
 
-            mu = vcirc_mu.to(
-                device=candidates.device,
-                dtype=candidates.dtype,
-            ).reshape(-1)
-            assert mu.numel() == 1, 'vcirc_mu must have shape (1,) in sample()'
-            tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm, mu[0])
+            # Ensure mag is a tensor of compatible dtype and device
+            if not isinstance(mag, torch.Tensor):
+                mag_tensor = torch.tensor([float(mag)], device=candidates.device, dtype=candidates.dtype)
+            else:
+                mag_tensor = mag.to(device=candidates.device, dtype=candidates.dtype).view(-1)
+            if not isinstance(snr, torch.Tensor):
+                snr_tensor = torch.tensor([float(snr)], device=candidates.device, dtype=candidates.dtype)
+            else:
+                snr_tensor = snr.to(device=candidates.device, dtype=candidates.dtype).view(-1)
+            
+            # Fetch dynamically computed prior parameters matching the forward pass
+            vcirc_mu, sigma_total_ln = self._get_tf_prior_params(mag_tensor, snr_tensor)
+            mu_val = vcirc_mu[0]
+            sigma_val = sigma_total_ln[0]
+
+            # Setup the physical LogNormal distribution
+            prior = torch.distributions.LogNormal(
+                loc=torch.log(mu_val),
+                scale=torch.full_like(v_circ, sigma_val)
+            )
+
+            # Calculate the physical log prob and apply Jacobian change of variables
+            tf_log_p_v = prior.log_prob(v_circ) + math.log(self.vcirc_jac)
             flow_log_p_v = self._kde_log_density_1d(v_circ)
 
             log_w = tf_log_p_v - flow_log_p_v
@@ -451,31 +472,26 @@ class FeatureExtractor(nn.Module):
         x = nn.functional.normalize(x, dim=[2, 3])
         y = nn.functional.normalize(y, dim=[2, 3])
         fp = nn.functional.normalize(fp, dim=[1, 2])
+        fp = fp.view(fp.size(0), -1)
         
-        img_feats = self.img_net(x)     # Shape: (B, 512)
-        spec_feats = self.spec_net(y)   # Shape: (B, 512 - 2*nspecs)
-        spec_feats = torch.cat((spec_feats, fp.view(fp.size(0), -1)), dim=-1)  # Concatenate fiber positions
-        
-        # Flatten explicitly to ensure safety
-        img_feats = img_feats.view(img_feats.size(0), -1)
-        spec_feats = spec_feats.view(spec_feats.size(0), -1)
+        img_feats = self.img_net(x).view(x.size(0), -1)     # Shape: (B, 512)
+        spec_feats = self.spec_net(y).view(y.size(0), -1)   # Shape: (B, 512 - 2*nspecs)
+        spec_feats = torch.cat((spec_feats, fp), dim=-1)     # Shape: (B, 512)
         
         return img_feats, spec_feats
 
     def forward(self, x, y, fp):
         '''Fuses features together (Matches your original ForkCNN concatenation)'''
-        img_feats, spec_feats = self.forward_features(x, y)
+        img_feats, spec_feats = self.forward_features(x, y, fp)
         z = torch.cat((img_feats, spec_feats), -1)
-        
-        fp = nn.functional.normalize(fp, dim=[1, 2])
-        fp = fp.view(fp.size(0), -1)
-        z = torch.cat((z, fp), dim=-1)
+
         return z
     
 class VICRegPretrain(nn.Module):
-    def __init__(self, backbone, projector_dim=1024):
+    def __init__(self, backbone=None, projector_dim=64):
         super().__init__()
-        self.backbone = backbone
+
+        self.backbone = FeatureExtractor() if backbone is None else backbone
         
         # Get feature dimensions dynamically
         # Image is fixed at 512; Spec is 512 - 2 * nspecs
@@ -483,12 +499,12 @@ class VICRegPretrain(nn.Module):
         spec_in = 512
         
         # Projector networks mapping onto a common high-dimensional space
-        self.img_projector = MLP([img_in, 1024, 2048, projector_dim])
-        self.spec_projector = MLP([spec_in, 1024, 2048, projector_dim])
+        self.img_projector = MLP([img_in, 1024, 256, projector_dim], use_batchnorm=True, use_dropout=True)
+        self.spec_projector = MLP([spec_in, 1024, 256, projector_dim], use_batchnorm=True, use_dropout=True)
         
         self.vicreg_loss = VICRegLoss(lam=25.0, mu=25.0, nu=1.0, gamma=1.0)
 
-    def forward(self, x, y, fp):
+    def forward(self, x, y, fp, return_components=False):
         # 1. Extract raw, un-fused features
         img_feats, spec_feats = self.backbone.forward_features(x, y, fp)
         
@@ -497,11 +513,11 @@ class VICRegPretrain(nn.Module):
         z2 = self.spec_projector(spec_feats)
         
         # 3. Compute loss
-        loss = self.vicreg_loss(z1, z2)
+        loss = self.vicreg_loss(z1, z2, return_components=return_components)
         return loss
 
 class VICRegLoss(nn.Module):
-    def __init__(self, lam=25.0, mu=25.0, nu=1.0, gamma=1.0, eps=1e-4):
+    def __init__(self, lam=20.0, mu=20.0, nu=5.0, gamma=1.0, eps=1e-4):
         super().__init__()
         self.lam = lam
         self.mu = mu
@@ -509,7 +525,7 @@ class VICRegLoss(nn.Module):
         self.gamma = gamma
         self.eps = eps
 
-    def forward(self, z1, z2):
+    def forward(self, z1, z2, return_components=False):
         # 1. Invariance Loss
         sim_loss = F.mse_loss(z1, z2)
 
@@ -533,15 +549,33 @@ class VICRegLoss(nn.Module):
         diag_mask = ~torch.eye(num_features, device=z1.device).bool()
         cov_loss = (cov_z1[diag_mask].pow(2).sum() / num_features) + (cov_z2[diag_mask].pow(2).sum() / num_features)
 
+        # Compute effective dimensions
+        eig_z1 = torch.linalg.eigvalsh(cov_z1)
+        eig_z2 = torch.linalg.eigvalsh(cov_z2)
+        sum_ev_z1 = eig_z1.sum()
+        sum_sq_ev_z1 = (eig_z1 ** 2).sum()
+        sum_ev_z2 = eig_z2.sum()
+        sum_sq_ev_z2 = (eig_z2 ** 2).sum()
+        eff_dim_z1 = (sum_ev_z1 ** 2) / (sum_sq_ev_z1)
+        eff_dim_z2 = (sum_ev_z2 ** 2) / (sum_sq_ev_z2)
+
+        sim_component = self.lam * sim_loss
+        var_component = self.mu * var_loss
+        cov_component = self.nu * cov_loss
+        total_loss = sim_component + var_component + cov_component
+
         # Total Loss
-        return self.lam * sim_loss + self.mu * var_loss + self.nu * cov_loss
+        if return_components:
+            return total_loss, sim_component, var_component, cov_component, eff_dim_z1, eff_dim_z2
+        else:
+            return total_loss
     
 class MLP(nn.Module):
     '''
     A simple MLP with Linear and ReLU
     '''
     
-    def __init__(self, layers):
+    def __init__(self, layers, use_batchnorm=False, use_dropout=False):
         
         super(MLP,self).__init__()
 
@@ -550,6 +584,10 @@ class MLP(nn.Module):
             modules.append(nn.Linear(layers[i],layers[i+1]))
             if i != len(layers)-2:
                 modules.append(nn.ReLU(True))
+                if use_batchnorm:
+                    modules.append(nn.BatchNorm1d(layers[i+1], affine=False))
+                if use_dropout:
+                    modules.append(nn.Dropout(0.1))
 
         self.mlp = nn.Sequential(*modules)
 
@@ -918,3 +956,7 @@ class ImgCNN(nn.Module):
         x = self.cnn_img(x)
         
         return x
+
+class ForkCNN(nn.Module):
+    def __init__(self, nspecs):
+        pass

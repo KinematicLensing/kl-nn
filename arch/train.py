@@ -19,9 +19,9 @@ from networks import *
 from dataset import *
 from utils import *
 from data import (
+    TFCalculator,
     _load_rmag_snr_relation,
     apply_noise,
-    make_exact_half_flip_mask,
     sample_magnitudes,
     app_mag_to_snr,
     snr_to_app_mag,
@@ -142,6 +142,8 @@ class Trainer:
         self.nvalid = len(valid_ds)//world_size
         self.nbatch_train = self.ntrain//self.batch_size
         self.nbatch_valid = self.nvalid//self.batch_size
+        self.nfeatures = config.train['feature_number']
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
         self.logger = logging.getLogger('Trainer')
         self.use_amp = bool(config.train.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.train.get('amp_dtype', 'float16'))
@@ -184,6 +186,8 @@ class Trainer:
             device=self.device,
             memory_format=img_format,
         )
+        self.fid_train = torch.empty((self.ntrain, self.nfeatures), dtype=torch.float, device=self.device)
+        self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
         self.fibpos_train = torch.empty((self.ntrain, 5, 2), dtype=torch.float, device=self.device)
         self.fibpos_valid = torch.empty((self.nvalid, 5, 2), dtype=torch.float, device=self.device)
         
@@ -196,6 +200,7 @@ class Trainer:
             i_db = start+i
             self.img_train[i] = self.train_data[i_db]['img']
             self.spec_train[i] = self.train_data[i_db]['spec']
+            self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
             self.fibpos_train[i] = self.train_data[i_db]['fib_pos']
 
             prog = 100*i//self.ntrain
@@ -211,6 +216,7 @@ class Trainer:
             i_db = start+i
             self.img_valid[i] = self.valid_data[i_db]['img']
             self.spec_valid[i] = self.valid_data[i_db]['spec']
+            self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
             self.fibpos_valid[i] = self.valid_data[i_db]['fib_pos']
 
             prog = 100*i//self.nvalid
@@ -250,13 +256,17 @@ class Trainer:
     def _run_epoch(self, epoch, show_log=True):
         
         if self.gpu_id == self.log_rank:
-            self.logger.info(f'Starting epoch {epoch}')
+            self.logger.info(f'Starting epoch {epoch+1}')
+            
+        # Generate the permutation arrays BEFORE building the corresponding SNRs
+        self.train_order = torch.randperm(self.ntrain, device=self.device)
+        self.valid_order = torch.randperm(self.nvalid, device=self.device)
             
         self.SNR_train = self.generate_snr(size=self.ntrain, mode='uniform')
         self.SNR_valid = self.generate_snr(size=self.nvalid, mode='uniform')
         
         if self.gpu_id == self.log_rank:
-            self.logger.info(f'Randomized SNR and noise for epoch {epoch}')
+            self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
 
         train_loss = self._trainFunc(epoch)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -270,32 +280,42 @@ class Trainer:
             torch.cuda.synchronize()
 
         return train_loss, valid_loss
+    
+    def _trainFunc(self, epoch, show_log=True):
+        raise NotImplementedError("Subclasses must implement _trainFunc")
+    
+    def _validFunc(self, epoch, show_log=True):
+        raise NotImplementedError("Subclasses must implement _validFunc")
 
     def _save_checkpoint(self, epoch):
-        pass
+        raise NotImplementedError("Subclasses must implement _save_checkpoint")
     
     def train(self, max_epochs: int):
         self._set_tensors()
         train_losses = []
         valid_losses = []
-        self.train_order = torch.arange(self.ntrain, device=self.device)
-        self.valid_order = torch.arange(self.nvalid, device=self.device)
         if self.gpu_id == self.log_rank:
             self.logger.info("Training start")
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
-            self.scheduler.step()
+            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                self.scheduler.step(valid_loss)
+            else:
+                self.scheduler.step()
             if self.gpu_id == self.log_rank:
                 self.logger.info(f"Current LR is {self.scheduler.get_last_lr()}")
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == self.log_rank and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
-        losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
-        model_name = config.train['model_name']
-        losses_dir = join(config.train['model_path'], 'losses')
-        os.makedirs(losses_dir, exist_ok=True)
-        losses.to_csv(join(losses_dir, f'losses_{model_name}.csv'), index=False)
+
+        if self.gpu_id == self.log_rank:
+            losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
+            model_name = config.train['model_name']
+            losses_dir = join(config.train['model_path'], 'losses')
+            os.makedirs(losses_dir, exist_ok=True)
+            losses.to_csv(join(losses_dir, f'losses_{model_name}.csv'), index=False)
+            self.logger.info("Loss history saved successfully. Training cycle complete.")
     
     def generate_snr(self, size, mode='uniform', **kwargs):
         if mode == 'none':
@@ -304,6 +324,18 @@ class Trainer:
             min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
             return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
+        elif mode == 'tf':
+            tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'], scatter=config.tf['scatter'])
+            if size == self.ntrain:
+                vcirc_norm = self.fid_train[self.train_order][:, 5]
+            elif size == self.nvalid:
+                vcirc_norm = self.fid_valid[self.valid_order][:, 5]
+            vcirc_min = config.par_ranges['vcirc'][0]
+            vcirc_max = config.par_ranges['vcirc'][1]
+            vcirc_mu = ((vcirc_norm + 1)/2 * (vcirc_max - vcirc_min) + vcirc_min).cpu().numpy()
+            mag = tf_calc.sample_mag_from_vcirc(vcirc_mu)
+            snr = app_mag_to_snr(mag)
+            return torch.from_numpy(snr).float().to(self.device)
         elif mode == 'rmag':
             rmag = sample_magnitudes(size, m_min=15, m_max=23)
             a, b = _load_rmag_snr_relation()
@@ -332,6 +364,7 @@ class FETrainer(Trainer):
         
         super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
 
+        self.return_components = True
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number'])
         self.use_amp = bool(config.pretrain.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.pretrain.get('amp_dtype', 'float16'))
@@ -344,22 +377,23 @@ class FETrainer(Trainer):
     
     def _run_batch(self, img, spec, fp):
         self.optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            loss = self.model(img, spec, fp)
+        all_loss = self.model(img, spec, fp, return_components=self.return_components)
+        loss = all_loss[0] if self.return_components else all_loss
         if torch.isfinite(loss):
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
-        return loss
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.module.parameters(), max_norm=1.0)
+            self.optimizer.step()
+        return all_loss
     
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
-        self.train_order = torch.randperm(self.ntrain, device=self.device)
         losses = []
+        if self.return_components:
+            sim_losses = []
+            var_losses = []
+            cov_losses = []
+            eff_dim_img_list = []
+            eff_dim_spec_list = []
         epoch_start = time.time()
         
         for i in range(self.nbatch_train):
@@ -374,14 +408,32 @@ class FETrainer(Trainer):
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-            loss = self._run_batch(img, spec, fp, snr=snr)
-            if ~(torch.isnan(loss) | torch.isinf(loss)):
+            all_loss = self._run_batch(img, spec, fp)
+            if self.return_components:
+                loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
+                sim_losses.append(sim.item())
+                var_losses.append(var.item())
+                cov_losses.append(cov.item())
+                eff_dim_img_list.append(eff_dim_img.item())
+                eff_dim_spec_list.append(eff_dim_spec.item())
+            else:
+                loss = all_loss
+            if torch.isfinite(loss):
                 losses.append(loss.item())
 
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                 self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
+        if self.return_components:
+            epoch_sim_loss = sum(sim_losses) / len(sim_losses)
+            epoch_var_loss = sum(var_losses) / len(var_losses)
+            epoch_cov_loss = sum(cov_losses) / len(cov_losses)
+            epoch_eff_dim_img = sum(eff_dim_img_list) / len(eff_dim_img_list)
+            epoch_eff_dim_spec = sum(eff_dim_spec_list) / len(eff_dim_spec_list)
+            if show_log and self.gpu_id == self.log_rank:
+                self.logger.info(f"[TRAIN] Epoch: {epoch+1} Loss: {epoch_loss} Sim: {epoch_sim_loss} Var: {epoch_var_loss} Cov: {epoch_cov_loss}")
+                self.logger.info(f"[TRAIN] Epoch: {epoch+1} Effective Dimensionality - Image: {epoch_eff_dim_img} Spectrum: {epoch_eff_dim_spec}")
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
@@ -391,11 +443,14 @@ class FETrainer(Trainer):
 
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
-        self.valid_order = torch.randperm(self.nvalid, device=self.device)
         losses = []
+        if self.return_components:
+            sim_losses = []
+            var_losses = []
+            cov_losses = []
+            eff_dim_img_list = []
+            eff_dim_spec_list = []
         epoch_start = time.time()
-        nans = 0
-        infs = 0
         with torch.no_grad():
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
@@ -409,18 +464,32 @@ class FETrainer(Trainer):
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                loss = self.model(img, spec, fp)
-                if ~(torch.isnan(loss) | torch.isinf(loss)):
+                all_loss = self.model(img, spec, fp, return_components=self.return_components)
+                if self.return_components:
+                    loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
+                    sim_losses.append(sim.item())
+                    var_losses.append(var.item())
+                    cov_losses.append(cov.item())
+                    eff_dim_img_list.append(eff_dim_img.item())
+                    eff_dim_spec_list.append(eff_dim_spec.item())
+                else:
+                    loss = all_loss
+                if torch.isfinite(loss):
                     losses.append(loss.item())
-                elif torch.isnan(loss):
-                    nans += 1
-                elif torch.isinf(loss):
-                    infs += 1
 
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
+        if self.return_components:
+            epoch_sim_loss = sum(sim_losses) / len(sim_losses)
+            epoch_var_loss = sum(var_losses) / len(var_losses)
+            epoch_cov_loss = sum(cov_losses) / len(cov_losses)
+            epoch_eff_dim_img = sum(eff_dim_img_list) / len(eff_dim_img_list)
+            epoch_eff_dim_spec = sum(eff_dim_spec_list) / len(eff_dim_spec_list)
+            if show_log and self.gpu_id == self.log_rank:
+                self.logger.info(f"[VALID] Epoch: {epoch+1} Loss: {epoch_loss} Sim: {epoch_sim_loss} Var: {epoch_var_loss} Cov: {epoch_cov_loss}")
+                self.logger.info(f"[VALID] Epoch: {epoch+1} Effective Dimensionality - Image: {epoch_eff_dim_img} Spectrum: {epoch_eff_dim_spec}")
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
@@ -452,37 +521,11 @@ class NPETrainer(Trainer):
         
         super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
 
-        self.nfeatures = config.train['feature_number']
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
-        
-    def _set_tensors(self):
-        '''
-        Put dataset arrays on GPU for direct access in training
-        '''
-        super()._set_tensors()
-
-        self.fid_train = torch.empty((self.ntrain, self.nfeatures), dtype=torch.float, device=self.device)
-        self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
-        
-        start = self.gpu_id*self.ntrain
-        if self.gpu_id == self.log_rank:
-            self.logger.info("Uploading training fiducial parameters to GPU...")
-        for i in range(self.ntrain):
-            i_db = start+i
-            self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
-        
-        start = self.gpu_id*self.nvalid
-        if self.gpu_id == self.log_rank:
-            self.logger.info("Uploading validation fiducial parameters to GPU...")
-        for i in range(self.nvalid):
-            i_db = start+i
-            self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=20)
 
     def _run_batch(self, img, spec, fid, fp=None, snr=None):
         self.optimizer.zero_grad(set_to_none=True)
+        
         if self.model.module.mode == 2:
             self.mag_train = snr_to_app_mag(snr) if snr is not None else None
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -490,7 +533,16 @@ class NPETrainer(Trainer):
         else:
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 loss = self.model(img, spec, fid, fp=fp)
-        if torch.isfinite(loss):
+
+        # Check locally if loss is valid
+        valid_loss = torch.isfinite(loss).to(dtype=torch.float32).view(1)
+        
+        # Check globally across all ranks
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(valid_loss, op=torch.distributed.ReduceOp.MIN)
+
+        # Only proceed if EVERY rank has a finite loss
+        if valid_loss.item() == 1.0:
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
@@ -498,15 +550,16 @@ class NPETrainer(Trainer):
             else:
                 loss.backward()
                 self.optimizer.step()
+        else:
+            self.invalid_loss_count += 1
+                
         return loss
 
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
-        self.train_order = torch.randperm(self.ntrain, device=self.device)
         losses = []
         epoch_start = time.time()
-        nans = 0
-        infs = 0
+        self.invalid_loss_count = 0
         
         for i in range(self.nbatch_train):
             start = i*self.batch_size
@@ -522,32 +575,27 @@ class NPETrainer(Trainer):
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
             loss = self._run_batch(img, spec, fid, fp=fp, snr=snr)
-            if ~(torch.isnan(loss) | torch.isinf(loss)):
+            if torch.isfinite(loss):
                 losses.append(loss.item())
-            elif torch.isnan(loss):
-                nans += 1
-            elif torch.isinf(loss):
-                infs += 1
 
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                 self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
-        # epoch_loss = np.sqrt(epoch_loss) # comment out if not using MSE
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
+            self.logger.info(f"Invalid loss count for epoch {epoch+1}: {self.invalid_loss_count}")
         return epoch_loss
 
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
-        self.valid_order = torch.randperm(self.nvalid, device=self.device)
         losses = []
         epoch_start = time.time()
-        nans = 0
-        infs = 0
+        self.invalid_loss_count = 0
+
         with torch.no_grad():
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
@@ -567,12 +615,8 @@ class NPETrainer(Trainer):
                     loss = self.model(img, spec, fid, fp=fp, mag=self.mag_valid, snr=snr)
                 else:
                     loss = self.model(img, spec, fid, fp=fp)
-                if ~(torch.isnan(loss) | torch.isinf(loss)):
+                if torch.isfinite(loss):
                     losses.append(loss.item())
-                elif torch.isnan(loss):
-                    nans += 1
-                elif torch.isinf(loss):
-                    infs += 1
 
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
@@ -583,6 +627,7 @@ class NPETrainer(Trainer):
             self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
+            self.logger.info(f"Invalid loss count for epoch {epoch+1}: {self.invalid_loss_count}")
         return epoch_loss
     
     def _save_checkpoint(self, epoch):
@@ -594,7 +639,7 @@ class NPETrainer(Trainer):
 # Global functions #
 #------------------#
 
-def train_nn(rank: int, world_size: int, Model=FeatureExtractor, Trainer=FETrainer,
+def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer,
              save_every=1, train_mode='pretrain'):
     '''
     Main function to train any network.
@@ -609,7 +654,7 @@ def train_nn(rank: int, world_size: int, Model=FeatureExtractor, Trainer=FETrain
     # Set parameters based on stage
     total_epochs = train_config['epoch_number']
     batch_size = train_config['batch_size']
-    pretrain_epoch = train_config.get('pretrain_epoch', None)
+    pretrain_epoch = train_config.get('pretrain_from', None)
     
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger('Setup')
@@ -631,7 +676,7 @@ def train_nn(rank: int, world_size: int, Model=FeatureExtractor, Trainer=FETrain
     )
     if train_config.get('channels_last', False):
         model = model.to(memory_format=torch.channels_last)
-    model = _maybe_compile_model(model, log=log)
+    model = _maybe_compile_model(model, log=log, use_compile=train_config.get('use_compile', False),)
     ddp_kwargs = {
         "device_ids": [rank],
         "find_unused_parameters": bool(train_config.get('ddp_find_unused_parameters', False)),
@@ -684,7 +729,10 @@ def load_train_objs(
     if epoch is not None: # if epoch is specified, load pretrained model
         strict = True
         model_dir = train_config['model_path'] + train_config['pretrained_name'] + '/' + train_config['pretrained_name'] + str(epoch)
-        model = load_model(train_config, path=model_dir, strict=strict, assign=True)
+        pretrained_model = load_model(train_config, Model=VICRegPretrain, path=model_dir, strict=strict, assign=True)
+        model = Model(pretrained_model.backbone, **kwargs)
+        for param in model.feature_extractor.parameters():
+            param.requires_grad = False
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded model {train_config['pretrained_name']} at epoch {epoch}")
@@ -703,6 +751,7 @@ def load_train_objs(
     optimizer_kwargs = dict(
         lr=train_config['initial_learning_rate'],
         weight_decay=train_config['weight_decay'],
+        eps=train_config.get('eps', 1e-8)
     )
     if use_fused:
         optimizer_kwargs["fused"] = True
@@ -735,7 +784,6 @@ def load_model(
     channels_last: bool | None = None,
 ):
 
-    model_cls = Model
     resolved_name = None
     if path is not None:
         resolved_name = model_name or infer_model_name_from_checkpoint_path(path)
@@ -758,6 +806,8 @@ def load_model(
                         f"Archived networks module for '{resolved_name}' "
                         f"does not define {Model.__name__}."
                     ) from exc
+    else:
+        model_cls = Model
     model = model_cls()
     model.to(device)
     if channels_last is None:
@@ -785,6 +835,40 @@ def load_model(
         )
 
     return model
+
+def point_estimate(
+    model,
+    test_ds,
+    snr=None,
+    randgen=None,
+    device='cpu',
+    progress=None,
+):
+    '''
+    Run this function to get point estimates from trained density estimation models
+    '''
+    model.eval()
+    preds = []
+    trues = []
+    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*995 + 5
+    iterator = range(len(test_ds))
+    if progress is not None:
+        iterator = progress(iterator, total=len(test_ds), desc="Estimating")
+    with torch.no_grad():
+        for i in iterator:
+            snr = snrs[i]
+            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            fids = torch.as_tensor(test_ds[i]['fid_pars'][:model.nfeatures], dtype=torch.float32, device=device).unsqueeze(0)
+            trues.append(fids.detach().cpu().numpy())
+            fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
+            pred = model.point_estimate(img, spec, fp)
+            preds.append(pred.detach().cpu().numpy())
+    
+    preds = np.vstack(preds)
+    trues = np.vstack(trues)
+    snrs = snrs.cpu().numpy()
+    return preds, trues, snrs
 
 def sample_density(
     model,

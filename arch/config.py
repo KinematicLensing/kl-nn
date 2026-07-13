@@ -24,6 +24,7 @@ class PretrainConfig:
     epoch_number: int
     initial_learning_rate: float
     weight_decay: float
+    eps: float
     batch_size: int
     save_model: bool
     model_path: str
@@ -164,31 +165,45 @@ def _default_model_config() -> ModelConfig:
             "hlr": [0.1, 3.0],
         },
         pretrain=PretrainConfig(
-            epoch_number=200,
+            epoch_number=20,
             initial_learning_rate=1e-3,
             weight_decay=1e-4,
-            batch_size=100,
+            eps=1e-5,
+            batch_size=125,
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
             model_name="ViT-CNN",
+            use_amp=False,
+            amp_dtype="float16",
+            use_compile=True,
+            compile_mode="default",
+            compile_backend=None,
+            use_fused_adamw=True,
+            cudnn_benchmark=True,
+            channels_last=True,
+            ddp_static_graph=True,
+            ddp_find_unused_parameters=False,
+            ddp_gradient_as_bucket_view=True,
+            ddp_broadcast_buffers=False,
+            noise_cache_maxs=True
         ),
         train=TrainConfig(
             mode=2,  # 0: point estimate; 1: density estimate; 2: density estimate with TF prior
-            epoch_number=200,
+            epoch_number=250,
             initial_learning_rate=1e-4,
             weight_decay=1e-5,
-            batch_size=100,
+            batch_size=125,
             feature_number=8,
             feature_names=["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="ViT-CNN-flow_tf_train",
-            use_pretrain=False,
-            pretrained_name="CNN-CNN-flow_all_params",
-            pretrain_from=99,
+            model_name="ViT-CNN-flow_pretrained",
+            use_pretrain=True,
+            pretrained_name="ViT-CNN",
+            pretrain_from=16,
             use_amp=True,
             amp_dtype="float16",
-            use_compile=True,
+            use_compile=False,
             compile_mode="default",
             compile_backend=None,
             use_fused_adamw=True,

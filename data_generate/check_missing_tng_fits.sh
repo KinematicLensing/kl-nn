@@ -2,11 +2,11 @@
 
 set -u
 
-DATASET=${DATASET:-valid_10k}
+DATASET=${DATASET:-pretrain_5m}
 FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/${DATASET}}
-NGAL=${NGAL:-5}
-ROWSPERGAL=${ROWSPERGAL:-2000}
-IDSTRIDE=${IDSTRIDE:-2000}
+NGAL=${NGAL:-1000}
+ROWSPERGAL=${ROWSPERGAL:-5000}
+IDSTRIDE=${IDSTRIDE:-5000}
 OUTFILE=${1:-missing_fits_${DATASET}.txt}
 PREVFILE=${2:-missing_fits_${DATASET}.txt}
 

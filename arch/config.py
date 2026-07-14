@@ -25,7 +25,6 @@ class TrainConfig:
     mode: int
     epoch_number: int
     initial_learning_rate: float
-    momentum: float
     weight_decay: float
     batch_size: int
     feature_number: int
@@ -142,7 +141,6 @@ def _default_model_config() -> ModelConfig:
             mode=2,  # 0: point estimate; 1: density estimate; 2: density estimate with TF prior
             epoch_number=200,
             initial_learning_rate=1e-4,
-            momentum=0.9,
             weight_decay=1e-5,
             batch_size=100,
             feature_number=8,

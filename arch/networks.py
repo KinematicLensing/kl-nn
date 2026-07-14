@@ -1,6 +1,7 @@
 import logging
 import torch
 from torch import nn
+import torch.nn.functional as F
 import math
 import normflows as nf
 from nflows.flows.base import Flow
@@ -145,6 +146,40 @@ class ForkCNN(nn.Module):
                 loss = -log_prob.mean()
 
         return loss
+    
+    def extract_features(self, x, y, fp=None):
+        '''
+        Run through feature extraction and return concatenated features
+        '''
+        # Feature extraction from img and spec
+        x = nn.functional.normalize(x, dim=[2,3])
+        y = nn.functional.normalize(y, dim=[2,3])
+        x = self.img_net(x)
+        y = self.spec_net(y)
+
+        # Flatten and concatenate
+        x = x.view(int(self.bs),-1)
+        y = y.view(int(self.bs),-1)
+        z = torch.cat((x, y), -1)
+        if fp is not None:
+            fp = nn.functional.normalize(fp, dim=[1,2])  # Normalize fiber positions across the nspecs dimension
+            fp = fp.view(fp.size(0), -1)  # Flatten fiber positions
+            z = torch.cat((z, fp), dim=-1)
+        else:
+            expected_dim = (
+                self.fully_connected_layer[0].in_features
+                if self.mode == 0
+                else int(self.layer_norm.normalized_shape[0])
+            )
+            if z.size(-1) < expected_dim:
+                pad = z.new_zeros((z.size(0), expected_dim - z.size(-1)))
+                z = torch.cat((z, pad), dim=-1)
+            elif z.size(-1) > expected_dim:
+                raise ValueError(
+                    f"Expected feature dim {expected_dim} without fib_pos, got {z.size(-1)}"
+                )
+
+        return z
     
     def extract_latent(self, x, y, true, fp=None):
         '''
@@ -989,3 +1024,57 @@ class DeconvNN(nn.Module):
         x = self.dnn_img(x)
         
         return x
+
+class VICRegLoss(nn.Module):
+    def __init__(self, lam=20.0, mu=20.0, nu=5.0, gamma=1.0, eps=1e-4):
+        super().__init__()
+        self.lam = lam
+        self.mu = mu
+        self.nu = nu
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, z1, z2, return_components=False):
+        # 1. Invariance Loss
+        sim_loss = F.mse_loss(z1, z2)
+
+        # Center the representations
+        z1 = z1 - z1.mean(dim=0)
+        z2 = z2 - z2.mean(dim=0)
+
+        # 2. Variance Loss
+        std_z1 = torch.sqrt(z1.var(dim=0) + self.eps)
+        std_z2 = torch.sqrt(z2.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(self.gamma - std_z1)) + torch.mean(F.relu(self.gamma - std_z2))
+
+        # 3. Covariance Loss
+        batch_size = z1.size(0)
+        num_features = z1.size(1)
+        
+        cov_z1 = (z1.T @ z1) / (batch_size - 1)
+        cov_z2 = (z2.T @ z2) / (batch_size - 1)
+        
+        # Mask out diagonal elements
+        diag_mask = ~torch.eye(num_features, device=z1.device).bool()
+        cov_loss = (cov_z1[diag_mask].pow(2).sum() / num_features) + (cov_z2[diag_mask].pow(2).sum() / num_features)
+
+        # Compute effective dimensions
+        eig_z1 = torch.linalg.eigvalsh(cov_z1)
+        eig_z2 = torch.linalg.eigvalsh(cov_z2)
+        sum_ev_z1 = eig_z1.sum()
+        sum_sq_ev_z1 = (eig_z1 ** 2).sum()
+        sum_ev_z2 = eig_z2.sum()
+        sum_sq_ev_z2 = (eig_z2 ** 2).sum()
+        eff_dim_z1 = (sum_ev_z1 ** 2) / (sum_sq_ev_z1)
+        eff_dim_z2 = (sum_ev_z2 ** 2) / (sum_sq_ev_z2)
+
+        sim_component = self.lam * sim_loss
+        var_component = self.mu * var_loss
+        cov_component = self.nu * cov_loss
+        total_loss = sim_component + var_component + cov_component
+
+        # Total Loss
+        if return_components:
+            return total_loss, sim_component, var_component, cov_component, eff_dim_z1, eff_dim_z2
+        else:
+            return total_loss

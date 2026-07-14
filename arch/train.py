@@ -27,6 +27,7 @@ from networks import *
 from dataset import *
 from utils import *
 from data import (
+    TFCalculator,
     _load_rmag_snr_relation,
     _resolve_handedness_flip_feature_indices,
     apply_handedness_flip,
@@ -477,6 +478,18 @@ class CNNTrainer:
             min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
             return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
+        elif mode == 'tf':
+            tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'], scatter=config.tf['scatter'])
+            if size == self.ntrain:
+                vcirc_norm = self.fid_train[self.train_order][:, 5]
+            elif size == self.nvalid:
+                vcirc_norm = self.fid_valid[self.valid_order][:, 5]
+            vcirc_min = config.par_ranges['vcirc'][0]
+            vcirc_max = config.par_ranges['vcirc'][1]
+            vcirc_mu = ((vcirc_norm + 1)/2 * (vcirc_max - vcirc_min) + vcirc_min).cpu().numpy()
+            mag = tf_calc.sample_mag_from_vcirc(vcirc_mu)
+            snr = app_mag_to_snr(mag)
+            return torch.from_numpy(snr).float().to(self.device)
         elif mode == 'rmag':
             rmag = sample_magnitudes(size, m_min=15, m_max=23)
             a, b = _load_rmag_snr_relation()

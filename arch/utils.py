@@ -248,17 +248,6 @@ def gal_to_img_axis(g_plus, g_cross, theta):
     return g1, g2
 
 
-def apply_noise(data, snr, device="cpu"):
-    noise = torch.randn_like(data, device=device)
-    maxs = torch.amax(data, dim=(-1, -2, -3))
-    seg = data > 0.1 * maxs.view(-1, 1, 1, 1)
-    npix = torch.sum(seg, dim=(-1, -2, -3))
-    total = torch.sum(data, dim=(-1, -2, -3))
-    factor = total / (npix ** 0.5 * snr)
-    data = data + noise * factor.view(-1, 1, 1, 1)
-    return data
-
-
 def saliency(ID, test_ds, model, SNR, PA, xx, yy, zz, device=None):
     if device is None:
         device = next(model.parameters()).device

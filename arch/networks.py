@@ -2,6 +2,8 @@ import logging
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather
 import math
 import normflows as nf
 from nflows.flows.base import Flow
@@ -239,7 +241,7 @@ class KLNPE(nn.Module):
         '''
         # Define flows
         num_layers = config.flow['num_layers']
-        hidden_units = 64
+        hidden_units = 256
         num_blocks = 2
         context_size = 1024
         
@@ -252,6 +254,7 @@ class KLNPE(nn.Module):
             transforms.append(RandomPermutation(features=self.nfeatures))
             transforms.append(MaskedAffineAutoregressiveTransform(features=self.nfeatures, 
                                                                 hidden_features=hidden_units, 
+                                                                num_blocks=num_blocks,
                                                                 context_features=context_size))
 
         self.transform = CompositeTransform(transforms)
@@ -467,7 +470,7 @@ class FeatureExtractor(nn.Module):
         # CNN for spectra
         self.spec_net = SpecCNN(self.nspecs)
 
-    def forward_features(self, x, y, fp):
+    def forward(self, x, y, fp):
         '''Extracts raw features independently for both modalities'''
         x = nn.functional.normalize(x, dim=[2, 3])
         y = nn.functional.normalize(y, dim=[2, 3])
@@ -478,46 +481,53 @@ class FeatureExtractor(nn.Module):
         spec_feats = self.spec_net(y).view(y.size(0), -1)   # Shape: (B, 512 - 2*nspecs)
         spec_feats = torch.cat((spec_feats, fp), dim=-1)     # Shape: (B, 512)
         
-        return img_feats, spec_feats
-
-    def forward(self, x, y, fp):
-        '''Fuses features together (Matches your original ForkCNN concatenation)'''
-        img_feats, spec_feats = self.forward_features(x, y, fp)
         z = torch.cat((img_feats, spec_feats), -1)
 
         return z
     
 class VICRegPretrain(nn.Module):
-    def __init__(self, backbone=None, projector_dim=64):
+    def __init__(self, backbone=None, projector_dim=128):
         super().__init__()
 
         self.backbone = FeatureExtractor() if backbone is None else backbone
         
         # Get feature dimensions dynamically
-        # Image is fixed at 512; Spec is 512 - 2 * nspecs
-        img_in = 512
-        spec_in = 512
+        dim_in = 1024
         
         # Projector networks mapping onto a common high-dimensional space
-        self.img_projector = MLP([img_in, 1024, 256, projector_dim], use_batchnorm=True, use_dropout=True)
-        self.spec_projector = MLP([spec_in, 1024, 256, projector_dim], use_batchnorm=True, use_dropout=True)
+        self.projector = MLP([dim_in, 2048, 512, projector_dim], use_batchnorm=True, use_dropout=True)
         
-        self.vicreg_loss = VICRegLoss(lam=25.0, mu=25.0, nu=1.0, gamma=1.0)
+        self.vicreg_loss = VICRegLoss(lam=20.0, mu=20.0, nu=5.0, gamma=1.0)
 
-    def forward(self, x, y, fp, return_components=False):
-        # 1. Extract raw, un-fused features
-        img_feats, spec_feats = self.backbone.forward_features(x, y, fp)
+    def forward(self, x1, y1, fp1, x2, y2, fp2, return_components=False):
+        # 1. Extract features from different views
+        z1 = self.backbone.forward(x1, y1, fp1)
+        z2 = self.backbone.forward(x2, y2, fp2)
         
         # 2. Project to high-dimensional space
-        z1 = self.img_projector(img_feats)
-        z2 = self.spec_projector(spec_feats)
+        z1 = self.projector(z1)
+        z2 = self.projector(z2)
+
+        if not dist.is_initialized():
+            # 3. Compute loss
+            loss = self.vicreg_loss(z1, z2, return_components=return_components)
+            return loss
+        else:
+            # 3. Gather features across distributed processes
+            z1_gathered = torch.cat(all_gather(z1), dim=0)
+            z2_gathered = torch.cat(all_gather(z2), dim=0)
+
+            # 4. Compute loss on gathered features
+            loss = self.vicreg_loss(z1_gathered, z2_gathered, return_components=return_components)
+            return loss
         
-        # 3. Compute loss
-        loss = self.vicreg_loss(z1, z2, return_components=return_components)
-        return loss
+    def extract_features(self, x, y, fp):
+        z = self.backbone.forward(x, y, fp)
+        # z = self.projector(z)
+        return z
 
 class VICRegLoss(nn.Module):
-    def __init__(self, lam=20.0, mu=20.0, nu=5.0, gamma=1.0, eps=1e-4):
+    def __init__(self, lam=25.0, mu=25.0, nu=1.0, gamma=1.0, eps=1e-4):
         super().__init__()
         self.lam = lam
         self.mu = mu

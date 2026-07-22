@@ -23,7 +23,7 @@ if __name__ == "__main__":
         train_config = config.pretrain
     else:
         train_config = config.train
-    artifacts = save_model_artifacts(config.MODEL_CONFIG, overwrite=True)
+    artifacts = save_model_artifacts(config.MODEL_CONFIG, train_type=args.train_type, overwrite=True)
     print(f"Saved model config JSON: {artifacts['config_path']}")
     print(f"Saved networks snapshot: {artifacts['network_path']}")
     os.makedirs(join(train_config['model_path'], train_config['model_name']), exist_ok=True)

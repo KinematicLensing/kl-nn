@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import curve_fit
 import torch
+from torchvision import transforms
 from astropy.cosmology import Planck18 as cosmo
 
 import config
@@ -185,6 +186,37 @@ def _resolve_handedness_flip_feature_indices(feature_names):
         theta_idx = None
     return g2_idx, theta_idx
 
+def apply_views(img, spec, img2, spec2):
+    # apply random masking to images
+    random_masking = transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3))
+    img = random_masking(img)
+    img2 = random_masking(img2)
+
+    # apply random masking to spectra
+    spec = random_mask_spec(spec)
+    spec2 = random_mask_spec(spec2)
+
+    return img, spec, img2, spec2
+
+def random_mask_spec(spec):
+    bs = spec.shape[0]
+    mask = torch.ones_like(spec, device=spec.device)
+    r_maj = torch.rand(bs, device=spec.device)
+    r_min = torch.rand(bs, device=spec.device)
+
+    # --- Major Pair Masking (Indices 0 & 1) ---
+    # 25% chance of masking major_1 (index 0)
+    mask[(r_maj >= 0.5) & (r_maj < 0.75), :, 0] = 0.0
+    # 25% chance of masking major_2 (index 1)
+    mask[r_maj >= 0.75, :, 1] = 0.0
+    
+    # --- Minor Pair Masking (Indices 3 & 4) ---
+    # 25% chance of masking minor_1 (index 3)
+    mask[(r_min >= 0.5) & (r_min < 0.75), :, 3] = 0.0
+    # 25% chance of masking minor_2 (index 4)
+    mask[r_min >= 0.75, :, 4] = 0.0
+
+    return spec * mask
 
 def make_exact_half_flip_mask(size, device):
     mask = torch.zeros((size,), dtype=torch.bool, device=device)

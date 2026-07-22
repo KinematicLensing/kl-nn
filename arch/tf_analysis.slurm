@@ -4,7 +4,7 @@
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=1:00:00
 #SBATCH --nodes=1
-#SBATCH --array=2-10
+#SBATCH --array=1-10
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
@@ -17,7 +17,7 @@ conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
 MODEL=ViT-CNN-flow_pretrained
-EPOCH=199
+EPOCH=248
 SAMPFILE=samples_valid_1m.csv
 DATASET=valid_1m
 NGALS=10000

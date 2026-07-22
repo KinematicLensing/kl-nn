@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_data_%A_%a.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=15:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 ###SBATCH --cpus-per-task=3
 ###SBATCH --mem=5G
-#SBATCH --array=1-1000
+#SBATCH --array=196,209,221,223-225,382,393,819-1000
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 

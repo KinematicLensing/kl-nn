@@ -43,13 +43,15 @@ def load_model_config(
 def save_model_artifacts(
     model_config: config.ModelConfig,
     *,
+    train_type: str = 'train',
     model_name: str | None = None,
     configs_root: str = DEFAULT_CONFIGS_ROOT,
     networks_root: str = DEFAULT_NETWORKS_ROOT,
     networks_source_path: str | None = None,
     overwrite: bool = True,
 ) -> dict[str, str]:
-    effective_model_name = model_name or model_config.train.model_name
+    train_config = model_config.train if train_type == 'train' else model_config.pretrain
+    effective_model_name = model_name or train_config.model_name
     if not effective_model_name:
         raise ValueError("model_name cannot be empty")
 

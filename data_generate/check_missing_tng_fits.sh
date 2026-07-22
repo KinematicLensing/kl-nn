@@ -45,6 +45,7 @@ echo "[INFO] Checking FITS under ${FITS_ROOT}" | tee -a "${OUTFILE}"
 echo "[INFO] Expected galaxies: ${NGAL}, rows per galaxy: ${ROWSPERGAL}, id stride: ${IDSTRIDE}" | tee -a "${OUTFILE}"
 
 for gal in "${GALAXIES_TO_SCAN[@]}"; do
+  gal=$((${gal}+640))
   pid=$((${gal}+1))
   gal_dir="${FITS_ROOT}/part_${pid}"
   start_id=$((gal * IDSTRIDE))

@@ -13,7 +13,9 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, LinearLR, SequentialLR
 import pyxis.torch as pxt
+from timm.optim.lars import Lars
 
 from networks import *
 from dataset import *
@@ -21,6 +23,7 @@ from utils import *
 from data import (
     TFCalculator,
     _load_rmag_snr_relation,
+    apply_views,
     apply_noise,
     sample_magnitudes,
     app_mag_to_snr,
@@ -128,6 +131,7 @@ class Trainer:
         batch_size: int,
     ) -> None:
         
+        self.model_name = config.train['model_name']
         self.world_size = world_size
         self.gpu_id = gpu_id
         self.log_rank = 0
@@ -143,7 +147,7 @@ class Trainer:
         self.nbatch_train = self.ntrain//self.batch_size
         self.nbatch_valid = self.nvalid//self.batch_size
         self.nfeatures = config.train['feature_number']
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
         self.logger = logging.getLogger('Trainer')
         self.use_amp = bool(config.train.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.train.get('amp_dtype', 'float16'))
@@ -262,8 +266,8 @@ class Trainer:
         self.train_order = torch.randperm(self.ntrain, device=self.device)
         self.valid_order = torch.randperm(self.nvalid, device=self.device)
             
-        self.SNR_train = self.generate_snr(size=self.ntrain, mode='uniform')
-        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='uniform')
+        self.SNR_train = self.generate_snr(size=self.ntrain, mode='tf')
+        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='tf')
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
@@ -311,10 +315,9 @@ class Trainer:
 
         if self.gpu_id == self.log_rank:
             losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
-            model_name = config.train['model_name']
             losses_dir = join(config.train['model_path'], 'losses')
             os.makedirs(losses_dir, exist_ok=True)
-            losses.to_csv(join(losses_dir, f'losses_{model_name}.csv'), index=False)
+            losses.to_csv(join(losses_dir, f'losses_{self.model_name}.csv'), index=False)
             self.logger.info("Loss history saved successfully. Training cycle complete.")
     
     def generate_snr(self, size, mode='uniform', **kwargs):
@@ -363,9 +366,13 @@ class FETrainer(Trainer):
     ) -> None:
         
         super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
-
+        
+        self.model_name = config.pretrain['model_name']
         self.return_components = True
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number'])
+        warmup_epochs = 5
+        lin_scheduler = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        cos_scheduler = CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number']-warmup_epochs, eta_min=1e-4)
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[lin_scheduler, cos_scheduler], milestones=[warmup_epochs])
         self.use_amp = bool(config.pretrain.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.pretrain.get('amp_dtype', 'float16'))
         if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -375,9 +382,9 @@ class FETrainer(Trainer):
         self.use_channels_last = bool(config.pretrain.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.pretrain.get('noise_cache_maxs', False))
     
-    def _run_batch(self, img, spec, fp):
+    def _run_batch(self, img, spec, fp, img2, spec2, fp2):
         self.optimizer.zero_grad(set_to_none=True)
-        all_loss = self.model(img, spec, fp, return_components=self.return_components)
+        all_loss = self.model(img, spec, fp, img2, spec2, fp2, return_components=self.return_components)
         loss = all_loss[0] if self.return_components else all_loss
         if torch.isfinite(loss):
             loss.backward()
@@ -395,20 +402,28 @@ class FETrainer(Trainer):
             eff_dim_img_list = []
             eff_dim_spec_list = []
         epoch_start = time.time()
+
+        self.SNR_train_2 = self.generate_snr(size=self.ntrain, mode='tf')
         
         for i in range(self.nbatch_train):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
+            snr2 = self.SNR_train_2[batch_ids] if self.SNR_train_2 is not None else None
             img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
             spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
+            img2 = self._apply_noise(self.img_train[batch_ids], snr2, maxs=img_maxs)
+            spec2 = self._apply_noise(self.spec_train[batch_ids], snr2, maxs=spec_maxs)
+            img, spec, img2, spec2 = apply_views(img, spec, img2, spec2)
             fp = self.fibpos_train[batch_ids]
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-            all_loss = self._run_batch(img, spec, fp)
+                img2 = img2.contiguous(memory_format=torch.channels_last)
+                spec2 = spec2.contiguous(memory_format=torch.channels_last)
+            all_loss = self._run_batch(img, spec, fp, img2, spec2, fp)
             if self.return_components:
                 loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
                 sim_losses.append(sim.item())
@@ -451,20 +466,27 @@ class FETrainer(Trainer):
             eff_dim_img_list = []
             eff_dim_spec_list = []
         epoch_start = time.time()
+
+        self.SNR_valid_2 = self.generate_snr(size=self.nvalid, mode='tf')
+
         with torch.no_grad():
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
+                snr2 = self.SNR_valid_2[batch_ids] if self.SNR_valid_2 is not None else None
                 img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
+                img2 = self._apply_noise(self.img_valid[batch_ids], snr2, maxs=img_maxs)
+                spec2 = self._apply_noise(self.spec_valid[batch_ids], snr2, maxs=spec_maxs)
+                img, spec, img2, spec2 = apply_views(img, spec, img2, spec2)
                 fp = self.fibpos_valid[batch_ids]
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                all_loss = self.model(img, spec, fp, return_components=self.return_components)
+                all_loss = self.model(img, spec, fp, img2, spec2, fp, return_components=self.return_components)
                 if self.return_components:
                     loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
                     sim_losses.append(sim.item())
@@ -520,8 +542,9 @@ class NPETrainer(Trainer):
     ) -> None:
         
         super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
-
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=20)
+        
+        self.model_name = config.train['model_name']
+        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
 
     def _run_batch(self, img, spec, fid, fp=None, snr=None):
         self.optimizer.zero_grad(set_to_none=True)
@@ -670,6 +693,7 @@ def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer
         Model,
         rank,
         train_config,
+        train_mode=train_mode,
         epoch=pretrain_epoch,
         log=log,
         device=device,
@@ -717,6 +741,7 @@ def load_train_objs(
     Model,
     rank,
     train_config,
+    train_mode='pretrain',
     epoch=None,
     log=None,
     device=None,
@@ -731,8 +756,8 @@ def load_train_objs(
         model_dir = train_config['model_path'] + train_config['pretrained_name'] + '/' + train_config['pretrained_name'] + str(epoch)
         pretrained_model = load_model(train_config, Model=VICRegPretrain, path=model_dir, strict=strict, assign=True)
         model = Model(pretrained_model.backbone, **kwargs)
-        for param in model.feature_extractor.parameters():
-            param.requires_grad = False
+        # for param in model.feature_extractor.parameters():
+        #     param.requires_grad = False
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded model {train_config['pretrained_name']} at epoch {epoch}")
@@ -743,28 +768,39 @@ def load_train_objs(
                 log.info(f"Loaded new model {train_config['model_name']}")
     if device is not None:
         model = model.to(device)
-    use_fused = (
-        bool(train_config.get('use_fused_adamw', False))
-        and torch.cuda.is_available()
-        and next(model.parameters()).is_cuda
-    )
-    optimizer_kwargs = dict(
-        lr=train_config['initial_learning_rate'],
-        weight_decay=train_config['weight_decay'],
-        eps=train_config.get('eps', 1e-8)
-    )
-    if use_fused:
-        optimizer_kwargs["fused"] = True
-    try:
-        optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
-    except TypeError:
-        if use_fused and log is not None:
-            log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
-        optimizer = optim.AdamW(
-            model.parameters(),
+    if train_mode == 'pretrain':
+        optimizer = Lars(
+            model.parameters(), 
+            lr=train_config['initial_learning_rate'], 
+            weight_decay=train_config['weight_decay'], 
+            momentum=0.9,
+            eps=train_config.get('eps', 1e-8),
+        )
+    else:
+        use_fused = (
+            bool(train_config.get('use_fused_adamw', False))
+            and torch.cuda.is_available()
+            and next(model.parameters()).is_cuda
+        )
+        optimizer_kwargs = dict(
             lr=train_config['initial_learning_rate'],
             weight_decay=train_config['weight_decay'],
+            eps=train_config.get('eps', 1e-8)
         )
+        optimizer_diff = [{'params': model.feature_extractor.parameters(), 'lr': train_config['initial_learning_rate']*0.1},
+                          {'params': model.flow.parameters(), 'lr': train_config['initial_learning_rate']*10}]
+        if use_fused:
+            optimizer_kwargs["fused"] = True
+        try:
+            optimizer = optim.AdamW(optimizer_diff, **optimizer_kwargs)
+        except TypeError:
+            if use_fused and log is not None:
+                log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
+            optimizer = optim.AdamW(
+                optimizer_diff,
+                lr=train_config['initial_learning_rate'],
+                weight_decay=train_config['weight_decay'],
+            )
 
     return train_ds, valid_ds, model, optimizer
 

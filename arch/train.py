@@ -298,8 +298,8 @@ class CNNTrainer:
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Starting epoch {epoch}')
             
-        self.SNR_train = self.generate_snr(size=self.ntrain, mode='uniform')
-        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='uniform')
+        self.SNR_train = self.generate_snr(size=self.ntrain, mode='tf')
+        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='tf')
         self.flip_mask_train = (
             make_exact_half_flip_mask(self.ntrain, device=self.device)
             if self.enable_handedness_flip
@@ -578,52 +578,6 @@ def ddp_setup(rank, world_size):
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
-
-# def setup_flows():
-#     # Define flows
-#     K = 4
-
-#     latent_size = config.train['feature_number']
-#     hidden_units = 64
-#     num_blocks = 2
-#     context_size = 1024
-
-#     flows = []
-#     for i in range(K):
-#         flows += [nf.flows.MaskedAffineAutoregressive(latent_size, hidden_units, 
-#                                                       context_features=context_size, 
-#                                                       num_blocks=num_blocks)]
-#         flows += [nf.flows.LULinearPermute(latent_size)]
-
-#     # Set base distribution
-#     context_encoder = MLP([context_size, 128, 64, latent_size*2],)
-#     q0 = nf.distributions.base.ConditionalDiagGaussian(latent_size, context_encoder)
-#     # q0 = nf.distributions.base.Uniform(2, low=-1.5, high=1.5)
-
-#     return q0, flows
-    
-def setup_flows():
-    # Define flows
-    num_layers = config.flow['num_layers']
-    n_features = config.train['feature_number']
-    hidden_units = 64
-    num_blocks = 2
-    context_size = 1024
-    
-    # Set base distribution
-    base = ConditionalDiagonalNormal(shape=[n_features], 
-                                     context_encoder=MLP([context_size, 128, 64, n_features*2],))
-
-    transforms = []
-    for i in range(num_layers):
-        transforms.append(ReversePermutation(features=n_features))
-        transforms.append(MaskedAffineAutoregressiveTransform(features=n_features, 
-                                                              hidden_features=hidden_units, 
-                                                              context_features=context_size))
-
-    transform = CompositeTransform(transforms)
-
-    return base, transform
 
 def load_train_objs(
     mode,

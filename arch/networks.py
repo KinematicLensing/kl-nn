@@ -367,8 +367,9 @@ class ForkCNN(nn.Module):
         x,
         y,
         num_samples,
-        fp=None,
-        vcirc_mu=None,
+        fp,
+        mag=None,
+        snr=None,
         return_log_prob=False,
         log_context=None,
         sample_id=None,
@@ -432,7 +433,7 @@ class ForkCNN(nn.Module):
                 break
 
         if self.mode == 2:
-            assert vcirc_mu is not None, 'vcirc_mu (per-galaxy) must be provided for mode 2'
+            assert mag is not None and snr is not None, 'mag (per-galaxy apparent magnitude) must be provided for mode 2'
             z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)
 
             # Importance-resample flow samples so vcirc follows TF prior at inference time.
@@ -440,12 +441,29 @@ class ForkCNN(nn.Module):
             v_norm = candidates[:, self.vcirc_idx]
             v_circ = self._norm_to_vcirc(v_norm)
 
-            mu = vcirc_mu.to(
-                device=candidates.device,
-                dtype=candidates.dtype,
-            ).reshape(-1)
-            assert mu.numel() == 1, 'vcirc_mu must have shape (1,) in sample()'
-            tf_log_p_v = self._tf_log_prob_from_vnorm(v_norm, mu[0])
+            # Ensure mag is a tensor of compatible dtype and device
+            if not isinstance(mag, torch.Tensor):
+                mag_tensor = torch.tensor([float(mag)], device=candidates.device, dtype=candidates.dtype)
+            else:
+                mag_tensor = mag.to(device=candidates.device, dtype=candidates.dtype).view(-1)
+            if not isinstance(snr, torch.Tensor):
+                snr_tensor = torch.tensor([float(snr)], device=candidates.device, dtype=candidates.dtype)
+            else:
+                snr_tensor = snr.to(device=candidates.device, dtype=candidates.dtype).view(-1)
+            
+            # Fetch dynamically computed prior parameters matching the forward pass
+            vcirc_mu, sigma_total_ln = self._get_tf_prior_params(mag_tensor, snr_tensor)
+            mu_val = vcirc_mu[0]
+            sigma_val = sigma_total_ln[0]
+
+            # Setup the physical LogNormal distribution
+            prior = torch.distributions.LogNormal(
+                loc=torch.log(mu_val),
+                scale=torch.full_like(v_circ, sigma_val)
+            )
+
+            # Calculate the physical log prob and apply Jacobian change of variables
+            tf_log_p_v = prior.log_prob(v_circ) + math.log(self.vcirc_jac)
             flow_log_p_v = self._kde_log_density_1d(v_circ)
 
             log_w = tf_log_p_v - flow_log_p_v

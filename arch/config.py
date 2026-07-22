@@ -147,7 +147,7 @@ def _default_model_config() -> ModelConfig:
             feature_names=["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
             save_model=True,
             model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="ViT-CNN-flow_tf_train",
+            model_name="ViT-CNN-flow_tf_data",
             enable_handedness_flip=False,
             use_pretrain=False,
             pretrained_name="CNN-CNN-flow_all_params",

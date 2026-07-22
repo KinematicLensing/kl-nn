@@ -16,8 +16,8 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=ViT-CNN-flow_tf_train
-EPOCH=199
+MODEL=ViT-CNN-flow_tf_data
+EPOCH=196
 SAMPFILE=samples_valid_1m.csv
 DATASET=valid_1m
 NGALS=10000

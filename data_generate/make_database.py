@@ -86,7 +86,7 @@ def merge_shards(base_save_dir, num_shards, chunk_size):
     """Combines all isolated LMDB shards sequentially into a master database and deletes the shards."""
     logger.info(f"Initiating compilation of {num_shards} shards into target destination: {base_save_dir}")
     
-    with px.Writer(dirpath=base_save_dir, map_size_limit=200000, ram_gb_limit=2) as final_db:
+    with px.Writer(dirpath=base_save_dir, map_size_limit=200000, ram_gb_limit=12) as final_db:
         for s_idx in range(num_shards):
             shard_dir = f"{base_save_dir}_shard_{s_idx}_of_{num_shards}"
             logger.info(f"Reading and importing data from: {shard_dir}")

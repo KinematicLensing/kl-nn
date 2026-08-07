@@ -1,9 +1,13 @@
 #!/bin/bash
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/merge_database_pretrain_5m.out
 #SBATCH --partition=RM-shared
-#SBATCH --time=2:00:00
+#SBATCH --time=8:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=15G
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=easonw2@andrew.cmu.edu
 
 module load anaconda3
 source ~/.bashrc

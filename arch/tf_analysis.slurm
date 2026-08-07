@@ -16,14 +16,13 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=ViT-CNN-flow_pretrained
-EPOCH=248
+MODEL=CNN-CNN-flow_pretrained_CCL
+EPOCH=196
 SAMPFILE=samples_valid_1m.csv
 DATASET=valid_1m
 NGALS=10000
 NSAMPS=10000
 NPARTS=10
-# CACHED_SNRS_PATH=/ocean/projects/phy250048p/shared/cache/CNN-CNN-flow/small_1m/snr
 
 i=$((${SLURM_ARRAY_TASK_ID}-1))
 python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE} --conform-to-tf

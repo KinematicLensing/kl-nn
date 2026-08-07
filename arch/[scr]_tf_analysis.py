@@ -29,6 +29,7 @@ from utils import (
     denormalize,
     resolve_feature_index,
 )
+from data import rot_90_param_only
 
 BASE_SHARED_DIR = '/ocean/projects/phy250048p/shared'
 BASE_DATASETS_DIR = join(BASE_SHARED_DIR, 'datasets')
@@ -101,6 +102,13 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help='Conform dataset to TF prior (default: False).',
+    )
+    parser.add_argument(
+        '--cancel-add-noise',
+        dest='cancel_add_noise',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Cancel the addition of noise to the images (default: False).',
     )
     parser.add_argument(
         '--compile',
@@ -412,10 +420,14 @@ def main():
     else:
         snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
         snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 995 + 5
+        app_mag = None
 
     modes = [2] # 1: no TF prior, 2: TF prior
     sample_list = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
     log_prob_list = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
+    if args.cancel_add_noise:
+        sample_list_rot90 = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
+        log_prob_list_rot90 = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
 
     # sample for each galaxy and each mode
     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if use_amp else nullcontext()
@@ -434,10 +446,12 @@ def main():
                 model,
                 subset,
                 nsamples,
-                vcirc_mu=vcirc_mu,
                 snr=snr_shared,
+                mag=app_mag,
+                vcirc_mu=vcirc_mu,
                 randgen=noise_gen,
                 return_log_prob=True,
+                apply_add_noise_cancellation=args.cancel_add_noise,
                 device=device,
                 channels_last=channels_last,
                 progress=sampling_progress_fn,
@@ -448,8 +462,14 @@ def main():
             post_iter = tqdm(range(args.ngals), desc=f"Postprocess mode {mode}") if args.ngals else range(0)
             post_start = time.perf_counter() if profile else None
             for i in post_iter:
-                sample_list[j, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
-                log_prob_list[j, i] = log_probs[i]
+                if args.cancel_add_noise:
+                    sample_list[j, i] = denormalize(samples[i, :, 0, :], par_ranges=config.par_ranges, feature_names=feature_names)
+                    sample_list_rot90[j, i] = denormalize(samples[i, :, 1, :], par_ranges=config.par_ranges, feature_names=feature_names)
+                    log_prob_list[j, i] = log_probs[i, :, 0]
+                    log_prob_list_rot90[j, i] = log_probs[i, :, 1]
+                else:
+                    sample_list[j, i] = denormalize(samples[i], par_ranges=config.par_ranges, feature_names=feature_names)
+                    log_prob_list[j, i] = log_probs[i]
             if profile and post_start is not None:
                 logging.info('Timing: postprocess mode %s took %.2fs', mode, time.perf_counter() - post_start)
 
@@ -485,10 +505,19 @@ def main():
         for j, mode in enumerate(modes):
             samples = sample_list[j, i]
             log_probs = log_prob_list[j, i]
+            if args.cancel_add_noise:
+                samples_rot90 = sample_list_rot90[j, i]
+                log_probs_rot90 = log_prob_list_rot90[j, i]
 
             # MAP estimate
-            map_idx = np.argmax(log_probs)
-            map_estimates[j, i] = samples[map_idx]
+            if args.cancel_add_noise:
+                map_idx = np.argmax(log_probs)
+                map_idx_rot90 = np.argmax(log_probs_rot90)
+                counter_sample = rot_90_param_only(samples_rot90[map_idx_rot90], reverse=True) # rotate best fit back to original orientation
+                map_estimates[j, i] = 0.5 * (samples[map_idx] + counter_sample)
+            else:
+                map_idx = np.argmax(log_probs)
+                map_estimates[j, i] = samples[map_idx]
 
             # Mean estimate with bounds
             mean_estimates[j, i, 0] = np.percentile(samples, 16, axis=0) # low bound

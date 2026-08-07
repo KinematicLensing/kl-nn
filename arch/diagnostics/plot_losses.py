@@ -35,6 +35,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--train-mode",
+        default="train",
+        help=(
+            "Training mode to use when loading saved config, either train or pretrain"
+        ),
+    )
+    parser.add_argument(
         "--model-name",
         default=None,
         help=(
@@ -85,7 +92,7 @@ def _get_saved_config_candidates(configs_root: str, model_name: str) -> tuple[st
     )
 
 
-def load_saved_train_config(configs_root: str, model_name: str, *, required: bool = True) -> dict | None:
+def load_saved_train_config(configs_root: str, model_name: str, train_mode: str, *, required: bool = True) -> dict | None:
     cfg_path = next(
         (path for path in _get_saved_config_candidates(configs_root, model_name) if os.path.exists(path)),
         None,
@@ -99,17 +106,19 @@ def load_saved_train_config(configs_root: str, model_name: str, *, required: boo
     with open(cfg_path, "r", encoding="utf-8") as fobj:
         payload = json.load(fobj)
 
-    train_cfg = payload.get("train")
+    train_cfg = payload.get(train_mode)
     if not isinstance(train_cfg, dict):
-        raise ValueError(f"Saved config missing 'train' dictionary: {cfg_path}")
+        raise ValueError(f"Saved config missing '{train_mode}' dictionary: {cfg_path}")
     return train_cfg
 
 
 def resolve_runtime_settings(args: argparse.Namespace) -> tuple[str, str]:
-    requested_model_name = args.model_name if args.model_name is not None else config.train["model_name"]
+    train_config = config.train if args.train_mode == "train" else config.pretrain
+    requested_model_name = args.model_name if args.model_name is not None else train_config["model_name"]
     train_cfg = load_saved_train_config(
         args.configs_root,
         requested_model_name,
+        args.train_mode,
         required=args.model_name is not None,
     )
     if train_cfg is not None:
@@ -119,8 +128,8 @@ def resolve_runtime_settings(args: argparse.Namespace) -> tuple[str, str]:
         model_name = train_cfg.get("model_name", requested_model_name)
         return model_name, model_root
 
-    model_name = config.train["model_name"]
-    model_root = args.model_root if args.model_root is not None else config.train["model_path"]
+    model_name = train_config["model_name"]
+    model_root = args.model_root if args.model_root is not None else train_config["model_path"]
     return model_name, model_root
 
 
@@ -158,6 +167,7 @@ def plot_losses(train_losses: np.ndarray, valid_losses: np.ndarray, model_name: 
     plt.text(0.95, 0.75, f"Epoch with lowest validation loss: {np.argmin(valid_losses)}", transform=plt.gca().transAxes, fontsize=12, ha="right", va="top")
     plt.xlabel("Epoch", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
+    plt.ylim((min(min(train_losses), min(valid_losses)), max(train_losses[0], valid_losses[0]) * 1.05))
     plt.tick_params(axis="both", which="major", labelsize=14)
     # plt.xticks([])
     # plt.yticks([])

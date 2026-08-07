@@ -10,7 +10,7 @@ from nflows.flows.base import Flow
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.permutations import RandomPermutation
+from nflows.transforms.permutations import ReversePermutation, RandomPermutation
 
 import config
 from utils import resolve_feature_index
@@ -251,7 +251,7 @@ class KLNPE(nn.Module):
 
         transforms = []
         for i in range(num_layers):
-            transforms.append(RandomPermutation(features=self.nfeatures))
+            transforms.append(ReversePermutation(features=self.nfeatures))
             transforms.append(MaskedAffineAutoregressiveTransform(features=self.nfeatures, 
                                                                 hidden_features=hidden_units, 
                                                                 num_blocks=num_blocks,
@@ -282,7 +282,7 @@ class KLNPE(nn.Module):
 
         # Sample from flow
         max_tries = 5
-        bad_samples_tolerance = 0.5  # allow up to 50% bad samples before giving up
+        bad_samples_tolerance = 0.75  # allow up to 75% bad samples before giving up
         while max_tries > 0:
             samples = self.flow.sample(num_samples, context=z)  # (1, num_samples, nfeatures)
             samples = samples.clamp(min=-1.5, max=1.5)
@@ -350,7 +350,7 @@ class KLNPE(nn.Module):
             )
 
             # Calculate the physical log prob and apply Jacobian change of variables
-            tf_log_p_v = prior.log_prob(v_circ) + math.log(self.vcirc_jac)
+            tf_log_p_v = prior.log_prob(v_circ)
             flow_log_p_v = self._kde_log_density_1d(v_circ)
 
             log_w = tf_log_p_v - flow_log_p_v
@@ -462,11 +462,12 @@ class FeatureExtractor(nn.Module):
         self.nspecs = nspec
         
         # Vision Transformer for images
-        self.img_net = VisionTransformer(
-            in_channels=1, embed_dim=512, img_size=48, patch_size=6, 
-            num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1
-        )
-        
+        # self.img_net = VisionTransformer(
+        #     in_channels=1, embed_dim=512, img_size=48, patch_size=6, 
+        #     num_layers=6, num_heads=8, mlp_ratio=4.0, dropout=0.1
+        # )
+        self.img_net = ImgCNN()
+
         # CNN for spectra
         self.spec_net = SpecCNN(self.nspecs)
 
@@ -474,7 +475,8 @@ class FeatureExtractor(nn.Module):
         '''Extracts raw features independently for both modalities'''
         x = nn.functional.normalize(x, dim=[2, 3])
         y = nn.functional.normalize(y, dim=[2, 3])
-        fp = nn.functional.normalize(fp, dim=[1, 2])
+        # fp = nn.functional.normalize(fp, dim=[1, 2])
+        fp = fp / 1.5
         fp = fp.view(fp.size(0), -1)
         
         img_feats = self.img_net(x).view(x.size(0), -1)     # Shape: (B, 512)
@@ -579,6 +581,87 @@ class VICRegLoss(nn.Module):
             return total_loss, sim_component, var_component, cov_component, eff_dim_z1, eff_dim_z2
         else:
             return total_loss
+
+class CCLPretrain(nn.Module):
+    def __init__(self, backbone=None, projector_dim=128):
+        super().__init__()
+
+        self.backbone = FeatureExtractor() if backbone is None else backbone
+        
+        # Get feature dimensions dynamically
+        dim_in = 1024
+        
+        # Projector networks mapping onto a common high-dimensional space
+        self.projector = MLP([dim_in, 2048, 512, projector_dim], use_batchnorm=True, use_dropout=False)
+        
+        self.ccl_loss = ContinuousContrastiveLoss(temperature=0.1, sigma_label=0.5, d_cutoff=2.0)
+
+    def forward(self, x, y, fp, labels):
+        z = self.backbone.forward(x, y, fp)
+        z = self.projector(z)
+
+        if not dist.is_initialized():
+            # 3. Compute loss
+            loss = self.ccl_loss(z, labels)
+            return loss
+        else:
+            # 3. Gather features across distributed processes
+            z_gathered = torch.cat(all_gather(z), dim=0)
+            labels_gathered = torch.cat(all_gather(labels), dim=0)
+
+            # 4. Compute loss on gathered features
+            loss = self.ccl_loss(z_gathered, labels_gathered)
+            return loss
+        
+    def extract_features(self, x, y, fp):
+        z = self.backbone.forward(x, y, fp)
+        return z
+
+class ContinuousContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.1, sigma_label=0.5, d_cutoff=2.0):
+        """
+        temperature: Controls scaling in embedding space.
+        sigma_label: Physical scale parameter (e.g., delta_g = 0.02 controls kernel falloff).
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.sigma_label = sigma_label
+        self.delta_bg = torch.exp(torch.tensor(-(d_cutoff ** 2) / (2 * (sigma_label ** 2))))
+
+    def forward(self, z, labels):
+        # 1. L2-normalize feature representations
+        z = F.normalize(z, dim=1)
+        batch_size = z.shape[0]
+
+        # 2. Standardize labels on-the-fly
+        labels_std = (labels - labels.mean(dim=0, keepdim=True)) / (labels.std(dim=0, keepdim=True) + 1e-6)
+
+        # 3. Pairwise distances in standardized label space
+        label_diff = labels_std.unsqueeze(1) - labels_std.unsqueeze(0)
+        label_dist_sq = torch.sum(label_diff ** 2, dim=-1)
+
+        # 4. Target weights
+        weights = torch.exp(-label_dist_sq / (2 * (self.sigma_label ** 2)))
+
+        # 5. Mask out self-contrast (diagonal)
+        mask = torch.eye(batch_size, dtype=torch.bool, device=z.device)
+        weights_masked = weights.masked_fill(mask, 0.0)
+
+        # 6. Row-normalize WITH DISTANCE FLOOR (delta_bg)
+        # If all weights in a row are tiny (< delta_bg), the target probabilities go to ~0
+        delta = self.delta_bg.to(z.device)
+        weights_norm = weights_masked / (torch.sum(weights_masked, dim=1, keepdim=True) + delta)
+
+        # 7. Latent similarities and cross-entropy
+        sim_matrix = torch.matmul(z, z.T) / self.temperature
+        sim_matrix_masked = sim_matrix.masked_fill(mask, -1e9)
+        exp_sim = torch.exp(sim_matrix_masked)
+        prob_sim = exp_sim / (torch.sum(exp_sim, dim=1, keepdim=True) + 1e-8)
+
+        # 8. Cross-entropy loss
+        loss = -torch.sum(weights_norm * torch.log(prob_sim + 1e-8), dim=1).mean()
+        
+        return loss
     
 class MLP(nn.Module):
     '''

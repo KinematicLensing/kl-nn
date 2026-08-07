@@ -28,6 +28,7 @@ from data import (
     sample_magnitudes,
     app_mag_to_snr,
     snr_to_app_mag,
+    rotate_90_degrees
 )
 import config
 from model_registry import infer_model_name_from_checkpoint_path, load_networks_module_for_model
@@ -266,8 +267,8 @@ class Trainer:
         self.train_order = torch.randperm(self.ntrain, device=self.device)
         self.valid_order = torch.randperm(self.nvalid, device=self.device)
             
-        self.SNR_train = self.generate_snr(size=self.ntrain, mode='tf')
-        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='tf')
+        self.SNR_train = self.generate_snr(size=self.ntrain, mode='log_uniform')
+        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='log_uniform')
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
@@ -327,6 +328,11 @@ class Trainer:
             min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
             return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
+        elif mode == 'log_uniform':
+            min_log_snr = kwargs.get('min', 0)
+            max_log_snr = kwargs.get('max', 4)
+            log_snr = torch.rand((size,), device=self.device) * (max_log_snr - min_log_snr) + min_log_snr
+            return 10**log_snr
         elif mode == 'tf':
             tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'], scatter=config.tf['scatter'])
             if size == self.ntrain:
@@ -368,10 +374,10 @@ class FETrainer(Trainer):
         super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
         
         self.model_name = config.pretrain['model_name']
-        self.return_components = True
+        self.return_components = False
         warmup_epochs = 5
         lin_scheduler = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        cos_scheduler = CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number']-warmup_epochs, eta_min=1e-4)
+        cos_scheduler = CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number']-warmup_epochs, eta_min=1e-6)
         self.scheduler = SequentialLR(self.optimizer, schedulers=[lin_scheduler, cos_scheduler], milestones=[warmup_epochs])
         self.use_amp = bool(config.pretrain.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.pretrain.get('amp_dtype', 'float16'))
@@ -382,10 +388,14 @@ class FETrainer(Trainer):
         self.use_channels_last = bool(config.pretrain.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.pretrain.get('noise_cache_maxs', False))
     
-    def _run_batch(self, img, spec, fp, img2, spec2, fp2):
+    def _run_batch(self, img, spec, fp, img2=None, spec2=None, fp2=None, fid=None):
         self.optimizer.zero_grad(set_to_none=True)
-        all_loss = self.model(img, spec, fp, img2, spec2, fp2, return_components=self.return_components)
-        loss = all_loss[0] if self.return_components else all_loss
+        if img2 is None or spec2 is None or fp2 is None:
+            all_loss = self.model(img, spec, fp, labels=fid)
+            loss = all_loss
+        else:
+            all_loss = self.model(img, spec, fp, img2, spec2, fp2, return_components=self.return_components)
+            loss = all_loss[0] if self.return_components else all_loss
         if torch.isfinite(loss):
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.module.parameters(), max_norm=1.0)
@@ -409,30 +419,22 @@ class FETrainer(Trainer):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
-            snr2 = self.SNR_train_2[batch_ids] if self.SNR_train_2 is not None else None
             img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
             spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
-            img2 = self._apply_noise(self.img_train[batch_ids], snr2, maxs=img_maxs)
-            spec2 = self._apply_noise(self.spec_train[batch_ids], snr2, maxs=spec_maxs)
-            img, spec, img2, spec2 = apply_views(img, spec, img2, spec2)
+            fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
+            img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
+            fid_90 = fid_90.contiguous()
+            fp_90 = fp_90.contiguous()
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-                img2 = img2.contiguous(memory_format=torch.channels_last)
-                spec2 = spec2.contiguous(memory_format=torch.channels_last)
-            all_loss = self._run_batch(img, spec, fp, img2, spec2, fp)
-            if self.return_components:
-                loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
-                sim_losses.append(sim.item())
-                var_losses.append(var.item())
-                cov_losses.append(cov.item())
-                eff_dim_img_list.append(eff_dim_img.item())
-                eff_dim_spec_list.append(eff_dim_spec.item())
-            else:
-                loss = all_loss
+                img_90 = img_90.contiguous(memory_format=torch.channels_last)
+            all_loss = self._run_batch(img, spec, fp, fid=fid)
+            all_loss_90 = self._run_batch(img_90, spec, fp_90, fid=fid_90)
+            loss = (all_loss + all_loss_90) / 2
             if torch.isfinite(loss):
                 losses.append(loss.item())
 
@@ -474,28 +476,22 @@ class FETrainer(Trainer):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
-                snr2 = self.SNR_valid_2[batch_ids] if self.SNR_valid_2 is not None else None
                 img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
-                img2 = self._apply_noise(self.img_valid[batch_ids], snr2, maxs=img_maxs)
-                spec2 = self._apply_noise(self.spec_valid[batch_ids], snr2, maxs=spec_maxs)
-                img, spec, img2, spec2 = apply_views(img, spec, img2, spec2)
+                fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
+                img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
+                fid_90 = fid_90.contiguous()
+                fp_90 = fp_90.contiguous()
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                all_loss = self.model(img, spec, fp, img2, spec2, fp, return_components=self.return_components)
-                if self.return_components:
-                    loss, sim, var, cov, eff_dim_img, eff_dim_spec = all_loss
-                    sim_losses.append(sim.item())
-                    var_losses.append(var.item())
-                    cov_losses.append(cov.item())
-                    eff_dim_img_list.append(eff_dim_img.item())
-                    eff_dim_spec_list.append(eff_dim_spec.item())
-                else:
-                    loss = all_loss
+                    img_90 = img_90.contiguous(memory_format=torch.channels_last)
+                all_loss = self.model(img, spec, fp, labels=fid)
+                all_loss_90 = self.model(img_90, spec, fp_90, labels=fid_90)
+                loss = (all_loss + all_loss_90) / 2
                 if torch.isfinite(loss):
                     losses.append(loss.item())
 
@@ -546,13 +542,14 @@ class NPETrainer(Trainer):
         self.model_name = config.train['model_name']
         self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
 
-    def _run_batch(self, img, spec, fid, fp=None, snr=None):
-        self.optimizer.zero_grad(set_to_none=True)
+    def _run_batch(self, img, spec, fid, mode, fp=None, snr=None):
+        if mode == 'train':
+            self.optimizer.zero_grad(set_to_none=True)
         
         if self.model.module.mode == 2:
-            self.mag_train = snr_to_app_mag(snr) if snr is not None else None
+            self.mag = snr_to_app_mag(snr) if snr is not None else None
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                loss = self.model(img, spec, fid, fp=fp, mag=self.mag_train, snr=snr)
+                loss = self.model(img, spec, fid, fp=fp, mag=self.mag, snr=snr)
         else:
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 loss = self.model(img, spec, fid, fp=fp)
@@ -566,13 +563,15 @@ class NPETrainer(Trainer):
 
         # Only proceed if EVERY rank has a finite loss
         if valid_loss.item() == 1.0:
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
+            if mode == 'train':
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.module.parameters(), max_norm=1.0)
+                    self.optimizer.step()
         else:
             self.invalid_loss_count += 1
                 
@@ -580,6 +579,8 @@ class NPETrainer(Trainer):
 
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
+        if hasattr(self.model.module, 'feature_extractor'):
+            self.model.module.feature_extractor.eval()
         losses = []
         epoch_start = time.time()
         self.invalid_loss_count = 0
@@ -594,10 +595,16 @@ class NPETrainer(Trainer):
             spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
+            img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
+            img = torch.cat([img, img_90], dim=0)
+            spec = torch.cat([spec, spec], dim=0)  # Spectrum remains unchanged under rotation
+            fid = torch.cat([fid, fid_90], dim=0)
+            fp = torch.cat([fp, fp_90], dim=0)
+            snr = torch.cat([snr, snr], dim=0) if snr is not None else None
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-            loss = self._run_batch(img, spec, fid, fp=fp, snr=snr)
+            loss = self._run_batch(img, spec, fid, 'train', fp=fp, snr=snr)
             if torch.isfinite(loss):
                 losses.append(loss.item())
 
@@ -630,14 +637,16 @@ class NPETrainer(Trainer):
                 spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
+                img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
+                img = torch.cat([img, img_90], dim=0)
+                spec = torch.cat([spec, spec], dim=0)
+                fid = torch.cat([fid, fid_90], dim=0)
+                fp = torch.cat([fp, fp_90], dim=0)
+                snr = torch.cat([snr, snr], dim=0) if snr is not None else None
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                if self.model.module.mode == 2:
-                    self.mag_valid = snr_to_app_mag(snr) if snr is not None else None
-                    loss = self.model(img, spec, fid, fp=fp, mag=self.mag_valid, snr=snr)
-                else:
-                    loss = self.model(img, spec, fid, fp=fp)
+                loss = self._run_batch(img, spec, fid, 'valid', fp=fp, snr=snr)
                 if torch.isfinite(loss):
                     losses.append(loss.item())
 
@@ -754,10 +763,10 @@ def load_train_objs(
     if epoch is not None: # if epoch is specified, load pretrained model
         strict = True
         model_dir = train_config['model_path'] + train_config['pretrained_name'] + '/' + train_config['pretrained_name'] + str(epoch)
-        pretrained_model = load_model(train_config, Model=VICRegPretrain, path=model_dir, strict=strict, assign=True)
+        pretrained_model = load_model(train_config, Model=CCLPretrain, path=model_dir, strict=strict, assign=True)
         model = Model(pretrained_model.backbone, **kwargs)
-        # for param in model.feature_extractor.parameters():
-        #     param.requires_grad = False
+        for param in model.feature_extractor.parameters():
+            param.requires_grad = False
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded model {train_config['pretrained_name']} at epoch {epoch}")
@@ -769,11 +778,17 @@ def load_train_objs(
     if device is not None:
         model = model.to(device)
     if train_mode == 'pretrain':
-        optimizer = Lars(
-            model.parameters(), 
-            lr=train_config['initial_learning_rate'], 
-            weight_decay=train_config['weight_decay'], 
-            momentum=0.9,
+        # optimizer = Lars(
+        #     model.parameters(), 
+        #     lr=train_config['initial_learning_rate'], 
+        #     weight_decay=train_config['weight_decay'], 
+        #     momentum=0.9,
+        #     eps=train_config.get('eps', 1e-8),
+        # )
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=train_config['initial_learning_rate'],
+            weight_decay=train_config['weight_decay'],
             eps=train_config.get('eps', 1e-8),
         )
     else:
@@ -787,12 +802,12 @@ def load_train_objs(
             weight_decay=train_config['weight_decay'],
             eps=train_config.get('eps', 1e-8)
         )
-        optimizer_diff = [{'params': model.feature_extractor.parameters(), 'lr': train_config['initial_learning_rate']*0.1},
-                          {'params': model.flow.parameters(), 'lr': train_config['initial_learning_rate']*10}]
+        # optimizer_diff = [{'params': model.feature_extractor.parameters(), 'lr': train_config['initial_learning_rate']*0.1},
+        #                   {'params': model.flow.parameters(), 'lr': train_config['initial_learning_rate']*10}]
         if use_fused:
             optimizer_kwargs["fused"] = True
         try:
-            optimizer = optim.AdamW(optimizer_diff, **optimizer_kwargs)
+            optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
         except TypeError:
             if use_fused and log is not None:
                 log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
@@ -911,8 +926,10 @@ def sample_density(
     test_ds,
     nsamples,
     snr=None,
+    mag=None,
     vcirc_mu=None,
     randgen=None,
+    apply_add_noise_cancellation=False,
     return_log_prob=False,
     device='cpu',
     channels_last: bool | None = None,
@@ -925,24 +942,21 @@ def sample_density(
         channels_last = bool(config.train.get('channels_last', False))
     if snr is None and randgen is not None:
         snr = torch.rand(len(test_ds), generator=randgen, device=device)*995 + 5
-    if model.mode == 2:
-        assert vcirc_mu is not None, "Must provide vcirc_mu for mode 2 density estimation"
     model.eval()
     samples = []
     if return_log_prob:
         log_probs = []
     snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*995 + 5
+    mags = mag if mag is not None else snr_to_app_mag(snrs) if model.mode == 2 else None
     iterator = range(len(test_ds))
     if progress is not None:
         iterator = progress(iterator, total=len(test_ds), desc="Sampling")
     with torch.no_grad():
         for i in iterator:
             snr = snrs[i]
-            mag = snr_to_app_mag(snr) if model.mode == 2 else None
+            mag = mags[i] if mags is not None else None
             img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
             spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
-            # img = test_ds[i]['img'].unsqueeze(0).float().to(device)
-            # spec = test_ds[i]['spec'].unsqueeze(0).float().to(device)
             fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
             if channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
@@ -953,10 +967,26 @@ def sample_density(
             else:
                 sample = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, sample_id=i)
             samples.append(sample.detach().cpu().numpy())
+            if apply_add_noise_cancellation:
+                img, _, fp = rotate_90_degrees(img, fp=fp)
+                if channels_last:
+                    img = img.contiguous(memory_format=torch.channels_last)
+                    spec = spec.contiguous(memory_format=torch.channels_last)
+                if return_log_prob:
+                    sample, log_prob = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, return_log_prob=True, sample_id=i)
+                    log_probs.append(log_prob.detach().cpu().numpy())
+                else:
+                    sample = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, sample_id=i)
+                samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
+    if apply_add_noise_cancellation:
+        nfeatures = samples.shape[-1]
+        samples = samples.reshape(-1, nsamples, 2, nfeatures)
     snrs = snrs.cpu().numpy()
     if return_log_prob:
         log_probs = np.vstack(log_probs)
+        if apply_add_noise_cancellation:
+            log_probs = log_probs.reshape(-1, nsamples, 2)
         return samples, log_probs, snrs
     return samples, snrs
 

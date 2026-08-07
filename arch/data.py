@@ -186,6 +186,38 @@ def _resolve_handedness_flip_feature_indices(feature_names):
         theta_idx = None
     return g2_idx, theta_idx
 
+def rotate_90_degrees(img, fid=None, fp=None):
+    '''
+    Applies a 90-degree rotation to the datavector (assumes normalized parameters and first dimension is batch):
+    - Rotates the image by 90 degrees counter-clockwise
+    - Flips the sign of g1 and g2 in the fiducial vector and subtract 0.5 from theta_int
+    - If fiber positions are provided, rotate them 90 degrees counter-clockwise
+    '''
+    img_out = torch.rot90(img, k=1, dims=(-2, -1))
+    fid_out = fid.clone() if fid is not None else None
+    if fid_out is not None:
+        fid_out[:, [0, 1]] = -fid_out[:, [0, 1]]
+        fid_out[:, 2] = fid_out[:, 2] - 0.5
+        under = fid_out[:, 2] < -1.0
+        fid_out[:, 2][under] += 2.0
+
+    fp_out = fp.clone() if fp is not None else None
+    if fp_out is not None:
+        fp_out = torch.stack([-fp_out[..., 1], fp_out[..., 0]], dim=-1)
+
+    return img_out, fid_out, fp_out
+
+def rot_90_param_only(fid, reverse=False):
+    angle = np.pi/2 if reverse else -np.pi/2
+    fid_out = fid.copy()
+    fid_out[:2] = -fid_out[:2]
+    fid_out[2] = fid_out[2] + angle
+    if fid_out[2] < -np.pi:
+        fid_out[2] = fid_out[2] + 2*np.pi
+    elif fid_out[2] > np.pi:
+        fid_out[2] = fid_out[2] - 2*np.pi
+    return fid_out
+
 def apply_views(img, spec, img2, spec2):
     # apply random masking to images
     random_masking = transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3))

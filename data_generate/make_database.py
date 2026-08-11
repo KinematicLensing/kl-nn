@@ -12,7 +12,6 @@ import pandas as pd
 import pyxis as px
 from astropy.io import fits
 import matplotlib.pyplot as plt
-import torch
 from argparse import ArgumentParser
 
 parser = ArgumentParser()
@@ -36,24 +35,6 @@ dataset_name = args.d
 shard_idx = args.shard_idx
 num_shards = args.num_shards
 
-def rotate_by_90_degrees(img, spec, fid, fp=None):
-    img_out = np.rot90(img, k=1, axes=(2, 3))
-    spec_out = spec.copy()
-    fid_out = fid.copy()
-    fp_out = fp.copy() if fp is not None else None
-
-    fid_out[:, 0] = -fid_out[:, 0]
-    fid_out[:, 1] = -fid_out[:, 1]
-    fid_out[:, 2] = fid_out[:, 2] - 1/2
-    wrap = np.where(fid_out[:, 2] < -1)[0]
-    fid_out[wrap, 2] = fid_out[wrap, 2] + 2
-
-    if fp_out is not None:
-        if fp_out.shape[1] < 5:
-            raise ValueError("fp must include 5 fiber positions to swap minor-axis fibers")
-        fp_out = fp_out[:, [3, 4, 2, 1, 0], :]
-
-    return img_out, spec_out, fid_out, fp_out
 
 def normalize(form, data, pars=None):
     if form == 'std': 

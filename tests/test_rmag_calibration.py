@@ -15,14 +15,18 @@ def test_generate_snr_rmag_uses_fitted_relation(tmp_path, monkeypatch):
         model="rmag = a * log10(SNR) + b",
     )
     monkeypatch.setattr(train.config, "rmag_snr_fit_path", str(fit_path), raising=False)
-    monkeypatch.setattr(np.random, "power", lambda power, size=None: np.array([0.0, 0.5, 1.0], dtype=float))
+    expected_rmag = np.array([16.0, 18.0, 20.0], dtype=float)
+    monkeypatch.setattr(
+        train,
+        "sample_magnitudes",
+        lambda size, m_min, m_max, rng=None: expected_rmag,
+    )
 
-    trainer = train.CNNTrainer.__new__(train.CNNTrainer)
+    trainer = train.Trainer.__new__(train.Trainer)
     trainer.device = torch.device("cpu")
 
     out = trainer.generate_snr(3, mode="rmag", min=16, max=20)
 
-    expected_rmag = np.array([16.0, 18.0, 20.0], dtype=float)
     expected_snr = 10 ** ((expected_rmag - 8.0) / -2.0)
 
     assert out.shape == (3,)

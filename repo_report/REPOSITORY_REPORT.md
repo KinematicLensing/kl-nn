@@ -18,6 +18,12 @@ an eight-dimensional posterior over:
 
 `g1, g2, theta_int, sini, v0, vcirc, rscale, hlr`.
 
+Although shear is the final measurement of interest, this is intentionally a
+joint posterior estimator rather than a shear-only regressor. The kinematic
+parameters and spatially resolved radial-velocity information are meant to
+constrain the galaxy's intrinsic ellipticity, reduce shape noise, and separate
+intrinsic shape from applied shear.
+
 The active architecture is `KLNPE`, not `ForkCNN`. It combines a deep residual
 image CNN with a spectral CNN and fiber coordinates, yielding a 1024-element
 context. Mode 0 produces an MSE point estimate; mode 1 uses a 12-layer
@@ -38,6 +44,10 @@ The repository is strongly coupled to PSC Bridges/Ocean paths, Slurm, CUDA,
 Pyxis, and adjacent `kl-tools`/`kl_pipe` installations. It is not packaged and
 has no committed environment or dependency lockfile. The README describes the
 broad intent but is behind the implementation in several important places.
+
+TNG support is deferred. The immediate priority is a model that performs well
+on the project's own forward-modelled parametric simulations; TNG questions
+should not drive near-term architecture or schema work.
 
 ## End-to-end mental model
 
@@ -194,20 +204,34 @@ configuration/schema or be transformed before use with the default model.
 
 ### Fiber and symmetry conventions
 
-The intended fiber order is:
+The current fiber order is:
 
 `(+major, -major, center, +minor, -minor)`.
 
-For the identity orientation, positive major points toward image +x. A 90-degree
-augmentation rotates the image and fiber coordinates, negates both shear
-components, and wraps the normalized position angle. Reflections negate `g2`
-and `theta_int` and swap the two minor-axis spectra. The D4 scripts encode eight
-image transforms and explicit fiber-coordinate/spectrum behavior.
+The signs on the major axis are physical radial-velocity signs: `major +` is
+the side with positive radial velocity and `major -` the negative side.
+`minor +` is 90 degrees counterclockwise from `major +`; `minor -` is 90
+degrees counterclockwise from `major -`. The spectra are therefore attached to
+physical locations/roles on the galaxy, not merely arbitrary array slots. The
+arrangement is provisional and may later be optimized experimentally.
+
+`theta_int` uses the opposite sign from ordinary NumPy/PyTorch image rotation:
+increasing physical `theta_int` rotates the galaxy clockwise, while positive
+`rot90` operations rotate the array counterclockwise. A 90-degree augmentation
+rotates the image and fiber coordinates, negates both shear components, and
+updates/wraps the normalized position angle with this sign difference in mind.
+Reflections negate `g2` and `theta_int` and swap the two minor-axis spectra. The
+D4 scripts encode eight image transforms and explicit fiber-coordinate/spectrum
+behavior.
 
 There are multiple implementations of rotation/permutation logic
 (`make_database.py`, `data.py`, `d4_diffs.py`, and notebooks), and they are not
 obviously identical. This is a high-value area for a single canonical API and
 property tests.
+
+Physical parameters remain in physical units/ranges in the simulator, sample
+CSVs, and plots. Any fiducial parameter presented to or emitted by the model is
+normalized to `[-1,1]`; denormalization belongs at the model/analysis boundary.
 
 ## Model architecture
 
@@ -239,9 +263,14 @@ some callers checking whether `fib_pos` exists, passing `None` will fail at
   marginal `vcirc` density with a batch KDE, and importance-resamples toward a
   magnitude/SNR-dependent lognormal TF prior.
 
-The mode-2 procedure is a custom reweighting scheme rather than a flow trained
-directly against a formally derived posterior objective. Its statistical target
-and calibration should be documented and validated explicitly.
+Physically, the TF prior is intended to constrain intrinsic shape: the prior on
+rotation velocity is combined with the radial-velocity information in the five
+fiber spectra to infer intrinsic ellipticity, which should make the residual
+ellipticity attributable to shear. The model is not yet learning this
+relationship effectively. The current mode-2 procedure is a custom reweighting
+scheme rather than a flow trained directly against a formally derived posterior
+objective, so its statistical target and calibration still need explicit
+documentation and validation against that physical intent.
 
 ### Pretraining
 
@@ -251,6 +280,8 @@ and calibration should be documented and validated explicitly.
   weights and contrasts projected embeddings.
 - Default configuration names CCL pretraining and freezes the pretrained
   feature extractor for downstream `KLNPE` training.
+- Pretraining is recent and still experimental. Current empirical results are
+  better when the feature extractor remains frozen than when it is unfrozen.
 - Alternative ViT and spectral RNN classes exist but are not active defaults.
 
 ## Training behavior
@@ -269,6 +300,11 @@ ReduceLROnPlateau, per-epoch checkpoints, and a final CSV loss history.
 Noise amplitude is estimated from a thresholded source segmentation and the
 requested total SNR. A coarse pass estimates background RMS, then a refined
 segmentation determines the final scale. Per-sample maxima can be cached.
+
+Image and spectral data currently receive the same nominal SNR because a
+realistic spectral-noise model has not yet been selected from the literature.
+This is a provisional modelling assumption, not a claim that the two observing
+channels have identical real noise properties.
 
 Operationally, the entire training set is expected to fit in aggregate GPU
 memory, and shapes are hard-coded to one 48×48 image, five 64-bin spectra, and
@@ -353,71 +389,67 @@ These are observations, not changes.
    does not exist. The project mostly avoids this by adding `arch/` to
    `sys.path` and importing modules as top-level names.
 
-7. **Calibration scripts reference a missing module.** Both calibration entry
-   scripts import `train_cali`, but no such file exists in the repository.
-
-8. **Configuration is captured in default arguments.** Several network
+7. **Configuration is captured in default arguments.** Several network
    constructors use `config.*` values as function defaults, which are evaluated
    at module import. Calling `config.set_model_config` later does not update
    those defaults. This is especially risky when loading archived configs.
 
-9. **Feature order remains partly positional.** Although
+8. **Feature order remains partly positional.** Although
    `resolve_feature_index` is used in newer TF/flip code, training slices labels
    by position, rotation assumes shear/angle are columns 0/1/2, and TF SNR
    generation assumes `vcirc` is column 5.
 
-10. **Mode-2 documentation and interface disagree.** Docstrings mention a
-    required `vcirc_mu`, but current sampling derives the prior from `mag` and
-    `snr`; the public helper still accepts an unused `vcirc_mu` argument.
+9. **Mode-2 documentation and interface disagree.** Docstrings mention a
+   required `vcirc_mu`, but current sampling derives the prior from `mag` and
+   `snr`; the public helper still accepts an unused `vcirc_mu` argument.
 
-11. **Destructive shard merge.** `make_database.py --merge` deletes every shard
-    after copying it. It logs but skips missing shards, so an incomplete master
-    database can be finalized and the available shards then deleted.
+10. **Destructive shard merge.** `make_database.py --merge` deletes every shard
+   after copying it. It logs but skips missing shards, so an incomplete master
+   database can be finalized and the available shards then deleted.
 
-12. **Scientific transforms are duplicated.** Rotation, reflection, angle-sign,
-    and fiber-permutation conventions are distributed across scripts and
-    notebooks. Comments already note that the simulator's angle sign differs
-    from NumPy, making silent drift particularly hazardous.
+11. **Scientific transforms are duplicated.** Rotation, reflection, angle-sign,
+   and fiber-permutation conventions are distributed across scripts and
+   notebooks. Comments already note that the simulator's angle sign differs
+   from NumPy, making silent drift particularly hazardous.
 
-13. **Hard-coded infrastructure and personal paths.** Shared roots, account
-    paths, email addresses, model names, dataset sizes, GPU type/count, and
-    environment names are embedded in code and jobs. Reproducibility outside
-    the current cluster is low.
+12. **Hard-coded infrastructure and personal paths.** Shared roots, account
+   paths, email addresses, model names, dataset sizes, GPU type/count, and
+   environment names are embedded in code and jobs. Reproducibility outside
+   the current cluster is low.
 
-14. **No dependency/environment record.** The code depends on PyTorch,
-    torchvision, nflows, normflows, timm, Pyxis, Astropy, SciPy, pandas,
-    matplotlib, JAX, `kl_tools`, and `kl_pipe`, but compatible versions are not
-    recorded here.
+13. **No dependency/environment record.** The code depends on PyTorch,
+   torchvision, nflows, normflows, timm, Pyxis, Astropy, SciPy, pandas,
+   matplotlib, JAX, `kl_tools`, and `kl_pipe`, but compatible versions are not
+   recorded here.
 
-15. **Dirty working tree.** At review time many source, notebook, job, and
-    bytecode files were already modified. Those changes were preserved and may
-    explain some mismatches between guidance, tests, and implementation.
+14. **Dirty working tree.** At review time many source, notebook, job, and
+   bytecode files were already modified. Those changes were preserved and may
+   explain some mismatches between guidance, tests, and implementation.
 
-## Scientific questions that need an owner answer
+## Remaining scientific questions
 
-1. Is the intended production target shear only, the current eight-parameter
-   joint posterior, or both as separately supported configurations?
-2. For TNG, should the fourth label be inclination `i`, `sin(i)`, or `cos(i)`?
-   The current synthetic and TNG schemas disagree.
-3. Is TNG intended only for out-of-distribution evaluation, or should it train
-   the same network? The answer determines whether `hlr` and exact fiber
-   coordinates must be added.
-4. What posterior is mode 2 intended to represent mathematically? In
+TNG schema and usage questions are deliberately deferred until the
+forward-modelled simulation baseline performs well.
+
+1. What posterior is mode 2 intended to represent mathematically? In
    particular, is the TF relation a training-population reweighting, an
    observational likelihood/prior applied only at inference, or both?
-5. Should the five spectra remain fixed under 90-degree rotation because their
-   array slots represent major/minor roles, or should slots follow physical
-   fiber coordinates? The codebase contains multiple permutation conventions.
-6. Which `theta_int` sign/range is canonical at each boundary: simulator, CSV,
-   normalized database, augmentation, and plotting?
-7. Are image and spectral noise meant to share the same nominal SNR and
-   independent draws, despite different pixel counts and signal morphology?
-8. Is freezing the complete pretrained feature extractor during flow training
-   intentional, or should it eventually be fine-tuned?
-9. Which existing model/checkpoint and dataset pair should be treated as the
-   reference baseline for regression tests?
-10. Are the calibration scripts intentionally retired, or is `train_cali.py`
-    stored elsewhere?
+2. What image and spectral noise distributions/SNR relationship best represent
+   the intended surveys and instruments?
+3. Which alternative fiber layouts, if any, provide more information about
+   intrinsic shape and shear than the current five-point cross?
+
+## Current experimental baseline
+
+- Most promising checkpoint: `CNN-CNN-flow_pretrained_CCL196` (promising, but
+  still well short of the desired scientific performance).
+- Main training dataset: `train_1m` (1,000,000 samples).
+- Main validation dataset: `valid_1m` (100,000 samples; the name is potentially
+  misleading because it is not one million samples).
+- Small bug/sanity configuration: train on `valid_1m`, validate on `small_1m`
+  (10,000 samples).
+- Pretraining strategy under test: CCL with a frozen downstream feature
+  extractor currently outperforms unfreezing.
 
 ## Suggested stabilization sequence (for a later change request)
 
@@ -425,14 +457,14 @@ These are observations, not changes.
 2. Define versioned dataset schemas, including names, order, units, ranges, and
    required/optional fields; validate them on dataset open.
 3. Decide and test the exact D4/fiber/angle convention in one module.
-4. Make TNG output conform to a declared schema or explicitly mark it as an
-   evaluation-only adapter.
-5. Update inference scripts and notebooks to the current config/model APIs.
-6. Add a small local fixture that exercises CSV/FITS-like input through model
+4. Update inference scripts and notebooks to the current config/model APIs.
+5. Add a small local fixture that exercises CSV/FITS-like input through model
    loss and posterior sampling without cluster storage.
-7. Add a reproducible environment and package/import structure.
-8. Parameterize cluster paths and jobs only after the scientific/data contracts
+6. Add a reproducible environment and package/import structure.
+7. Parameterize cluster paths and jobs only after the scientific/data contracts
    are stable.
+8. Revisit and reconcile the TNG adapter only after the forward-modelled
+   simulation baseline is scientifically useful.
 
 ## Practical entrypoints
 

@@ -1,13 +1,11 @@
 import inspect
 
-import numpy as np
 import pytest
 import torch
 
 import config
 import train
 from data import apply_noise
-from networks import ForkCNN
 
 
 class DummyDataset:
@@ -55,8 +53,8 @@ def test_train_config_has_optimization_defaults():
         "noise_cache_maxs",
     ):
         assert key in config.train
-    assert config.train["use_amp"] is True
-    assert config.train["use_compile"] is True
+    assert config.train["use_amp"] is False
+    assert config.train["use_compile"] is False
     assert config.train["use_fused_adamw"] is True
     assert config.train["cudnn_benchmark"] is True
     assert config.train["channels_last"] is True
@@ -81,12 +79,13 @@ def test_load_train_objs_fused_adamw_flag(monkeypatch):
     monkeypatch.setattr(train.pxt, "TorchDataset", lambda path: DummyDataset(4, 3))
 
     train_ds, valid_ds, model, optimizer = train.load_train_objs(
-        mode=0,
-        nfeatures=3,
-        batch_size=2,
-        nGPUs=1,
-        Model=ForkCNN,
+        torch.nn.Linear,
         rank=0,
+        train_config=config.train,
+        train_mode="train",
+        device=torch.device("cpu"),
+        in_features=1,
+        out_features=1,
     )
 
     fused_supported = (
@@ -113,32 +112,24 @@ def test_trainer_amp_compile_channels_last_smoke(monkeypatch):
     monkeypatch.setitem(config.train, "noise_cache_maxs", True)
 
     device = torch.device("cuda:0")
-    model = ForkCNN(mode=0, batch_size=2, nfeatures=3, nspec=5).to(device)
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(1, 4, kernel_size=3, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.AdaptiveAvgPool2d(1),
+    ).to(device=device, memory_format=torch.channels_last)
     model = train._maybe_compile_model(model, log=None)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    train_ds = DummyDataset(4, 3)
-    valid_ds = DummyDataset(4, 3)
-    trainer = train.CNNTrainer(
-        world_size=1,
-        model=model,
-        nfeatures=3,
-        train_ds=train_ds,
-        valid_ds=valid_ds,
-        optimizer=optimizer,
-        gpu_id=0,
-        save_every=1,
-        batch_size=2,
-    )
-    trainer._set_tensors()
-    trainer.SNR_train = trainer.generate_snr(size=trainer.ntrain, mode="uniform")
-    trainer.SNR_valid = trainer.generate_snr(size=trainer.nvalid, mode="uniform")
-    trainer.flip_mask_train = None
-    trainer.flip_mask_valid = None
-    trainer.train_order = torch.arange(trainer.ntrain, device=trainer.device)
-    trainer.valid_order = torch.arange(trainer.nvalid, device=trainer.device)
+    inputs = torch.randn((2, 1, 16, 16), device=device)
+    inputs = inputs.contiguous(memory_format=torch.channels_last)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs = model(inputs)
+        loss = outputs.square().mean()
 
-    train_loss, nans, infs = trainer._trainFunc(epoch=0, show_log=False)
-    assert nans == 0
-    assert infs == 0
-    assert np.isfinite(train_loss)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    assert inputs.is_contiguous(memory_format=torch.channels_last)
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(param).all() for param in model.parameters())

@@ -1,4 +1,5 @@
 import sys,time,os
+import random
 from os.path import join
 import logging
 import numpy as np
@@ -33,10 +34,55 @@ from data import (
 import config
 from model_registry import infer_model_name_from_checkpoint_path, load_networks_module_for_model
 
-"""
-Module that manages all the trainer classes and testing functions. 
-Need to create a wrapper trainer class eventually
-"""
+RNG_STREAM_IDS = {
+    "ambient": 0,
+    "train_order": 1,
+    "valid_order": 2,
+    "train_snr": 3,
+    "valid_snr": 4,
+    "train_img_noise": 5,
+    "train_spec_noise": 6,
+    "valid_img_noise": 7,
+    "valid_spec_noise": 8,
+    "train_numpy": 9,
+    "valid_numpy": 10,
+}
+
+
+def derive_stream_seed(base_seed, rank=0, epoch=0, stream="ambient"):
+    """Derive a stable seed without relying on randomized Python hashes."""
+    if stream not in RNG_STREAM_IDS:
+        raise ValueError(f"Unknown RNG stream '{stream}'")
+    modulus = 2**63 - 1
+    return int(
+        (
+            int(base_seed)
+            + 1_000_003 * int(rank)
+            + 10_007 * int(epoch)
+            + 97 * RNG_STREAM_IDS[stream]
+        )
+        % modulus
+    )
+
+
+def seed_everything(seed, deterministic=False):
+    """Seed ambient Python, NumPy, Torch CPU, and Torch CUDA RNGs."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.use_deterministic_algorithms(bool(deterministic))
+
 
 def _resolve_amp_dtype(value: str) -> torch.dtype:
     normalized = value.strip().lower()
@@ -130,6 +176,9 @@ class Trainer:
         gpu_id: int,
         save_every: int,
         batch_size: int,
+        *,
+        seed: int | None = None,
+        deterministic: bool | None = None,
     ) -> None:
         
         self.model_name = config.train['model_name']
@@ -143,6 +192,12 @@ class Trainer:
         self.save_every = save_every
         self.model = model
         self.batch_size = batch_size
+        self.base_seed = int(config.train.get('seed', 20260810) if seed is None else seed)
+        self.deterministic = bool(
+            config.train.get('deterministic', False)
+            if deterministic is None
+            else deterministic
+        )
         self.ntrain = len(train_ds)//world_size
         self.nvalid = len(valid_ds)//world_size
         self.nbatch_train = self.ntrain//self.batch_size
@@ -158,6 +213,49 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.use_channels_last = bool(config.train.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.train.get('noise_cache_maxs', False))
+
+    def _make_epoch_generator(self, epoch, stream):
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(
+            derive_stream_seed(self.base_seed, self.gpu_id, epoch, stream)
+        )
+        return generator
+
+    def _reset_epoch_rngs(self, epoch):
+        """Reset independent rank/epoch streams used by the training loop."""
+        seed_everything(
+            derive_stream_seed(
+                self.base_seed,
+                rank=self.gpu_id,
+                epoch=epoch,
+                stream="ambient",
+            ),
+            deterministic=self.deterministic,
+        )
+        self.epoch_generators = {
+            stream: self._make_epoch_generator(epoch, stream)
+            for stream in (
+                "train_order",
+                "valid_order",
+                "train_snr",
+                "valid_snr",
+                "train_img_noise",
+                "train_spec_noise",
+                "valid_img_noise",
+                "valid_spec_noise",
+            )
+        }
+        self.epoch_numpy_generators = {
+            split: np.random.default_rng(
+                derive_stream_seed(
+                    self.base_seed,
+                    rank=self.gpu_id,
+                    epoch=epoch,
+                    stream=f"{split}_numpy",
+                )
+            )
+            for split in ("train", "valid")
+        }
     
     def _set_tensors(self):
         '''
@@ -244,7 +342,7 @@ class Trainer:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
             
-    def _apply_noise(self, data, snr, maxs=None):
+    def _apply_noise(self, data, snr, maxs=None, randgen=None):
         if snr is None:
             return data
         output = apply_noise(
@@ -253,22 +351,42 @@ class Trainer:
             device=self.device,
             use_iterative=True,
             maxs=maxs,
+            randgen=randgen,
         )
         if self.use_channels_last:
             output = output.contiguous(memory_format=torch.channels_last)
         return output
     
     def _run_epoch(self, epoch, show_log=True):
-        
+        self._reset_epoch_rngs(epoch)
+
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Starting epoch {epoch+1}')
             
         # Generate the permutation arrays BEFORE building the corresponding SNRs
-        self.train_order = torch.randperm(self.ntrain, device=self.device)
-        self.valid_order = torch.randperm(self.nvalid, device=self.device)
+        self.train_order = torch.randperm(
+            self.ntrain,
+            device=self.device,
+            generator=self.epoch_generators["train_order"],
+        )
+        self.valid_order = torch.randperm(
+            self.nvalid,
+            device=self.device,
+            generator=self.epoch_generators["valid_order"],
+        )
             
-        self.SNR_train = self.generate_snr(size=self.ntrain, mode='log_uniform')
-        self.SNR_valid = self.generate_snr(size=self.nvalid, mode='log_uniform')
+        self.SNR_train = self.generate_snr(
+            size=self.ntrain,
+            mode='log_uniform',
+            generator=self.epoch_generators["train_snr"],
+            np_rng=self.epoch_numpy_generators["train"],
+        )
+        self.SNR_valid = self.generate_snr(
+            size=self.nvalid,
+            mode='log_uniform',
+            generator=self.epoch_generators["valid_snr"],
+            np_rng=self.epoch_numpy_generators["valid"],
+        )
         
         if self.gpu_id == self.log_rank:
             self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
@@ -321,32 +439,49 @@ class Trainer:
             losses.to_csv(join(losses_dir, f'losses_{self.model_name}.csv'), index=False)
             self.logger.info("Loss history saved successfully. Training cycle complete.")
     
-    def generate_snr(self, size, mode='uniform', **kwargs):
+    def generate_snr(
+        self,
+        size,
+        mode='uniform',
+        generator=None,
+        np_rng=None,
+        **kwargs,
+    ):
         if mode == 'none':
             return None
         if mode == 'uniform':
             min_snr = kwargs.get('min', 5)
             max_snr = kwargs.get('max', 1000)
-            return torch.rand((size,), device=self.device)* (max_snr - min_snr) + min_snr
+            return torch.rand(
+                (size,),
+                device=self.device,
+                generator=generator,
+            ) * (max_snr - min_snr) + min_snr
         elif mode == 'log_uniform':
             min_log_snr = kwargs.get('min', 0)
             max_log_snr = kwargs.get('max', 4)
-            log_snr = torch.rand((size,), device=self.device) * (max_log_snr - min_log_snr) + min_log_snr
+            log_snr = torch.rand(
+                (size,),
+                device=self.device,
+                generator=generator,
+            ) * (max_log_snr - min_log_snr) + min_log_snr
             return 10**log_snr
         elif mode == 'tf':
             tf_calc = TFCalculator(slope=config.tf['slope'], intercept=config.tf['intercept'], scatter=config.tf['scatter'])
             if size == self.ntrain:
-                vcirc_norm = self.fid_train[self.train_order][:, 5]
+                vcirc_norm = self.fid_train[:, 5]
             elif size == self.nvalid:
-                vcirc_norm = self.fid_valid[self.valid_order][:, 5]
+                vcirc_norm = self.fid_valid[:, 5]
             vcirc_min = config.par_ranges['vcirc'][0]
             vcirc_max = config.par_ranges['vcirc'][1]
             vcirc_mu = ((vcirc_norm + 1)/2 * (vcirc_max - vcirc_min) + vcirc_min).cpu().numpy()
-            mag = tf_calc.sample_mag_from_vcirc(vcirc_mu)
+            mag = tf_calc.sample_mag_from_vcirc(vcirc_mu, rng=np_rng)
             snr = app_mag_to_snr(mag)
             return torch.from_numpy(snr).float().to(self.device)
         elif mode == 'rmag':
-            rmag = sample_magnitudes(size, m_min=15, m_max=23)
+            min_rmag = kwargs.get('min', 15)
+            max_rmag = kwargs.get('max', 23)
+            rmag = sample_magnitudes(size, m_min=min_rmag, m_max=max_rmag, rng=np_rng)
             a, b = _load_rmag_snr_relation()
             log_snr = (rmag - b) / a
             snr = 10**log_snr
@@ -369,16 +504,45 @@ class FETrainer(Trainer):
         gpu_id: int,
         save_every: int,
         batch_size: int,
+        *,
+        seed: int | None = None,
+        deterministic: bool | None = None,
     ) -> None:
         
-        super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
+        super().__init__(
+            world_size, model, train_ds, valid_ds, optimizer, gpu_id,
+            save_every, batch_size,
+            seed=config.pretrain.get("seed", 20260810) if seed is None else seed,
+            deterministic=(
+                config.pretrain.get("deterministic", False)
+                if deterministic is None
+                else deterministic
+            ),
+        )
         
         self.model_name = config.pretrain['model_name']
         self.return_components = False
-        warmup_epochs = 5
-        lin_scheduler = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-        cos_scheduler = CosineAnnealingLR(self.optimizer, T_max=config.pretrain['epoch_number']-warmup_epochs, eta_min=1e-6)
-        self.scheduler = SequentialLR(self.optimizer, schedulers=[lin_scheduler, cos_scheduler], milestones=[warmup_epochs])
+        total_epochs = int(config.pretrain['epoch_number'])
+        warmup_epochs = min(5, max(0, total_epochs - 1))
+        if warmup_epochs:
+            lin_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cos_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, total_epochs - warmup_epochs),
+                eta_min=1e-6,
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[lin_scheduler, cos_scheduler],
+                milestones=[warmup_epochs],
+            )
+        else:
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=1, eta_min=1e-6)
         self.use_amp = bool(config.pretrain.get('use_amp', False)) and torch.cuda.is_available()
         self.amp_dtype = _resolve_amp_dtype(config.pretrain.get('amp_dtype', 'float16'))
         if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -390,8 +554,15 @@ class FETrainer(Trainer):
     
     def _run_batch(self, img, spec, fp, img2=None, spec2=None, fp2=None, fid=None):
         self.optimizer.zero_grad(set_to_none=True)
+        diagnostics = {}
         if img2 is None or spec2 is None or fp2 is None:
-            all_loss = self.model(img, spec, fp, labels=fid)
+            output = self.model(
+                img, spec, fp, labels=fid, return_diagnostics=True
+            )
+            if isinstance(output, tuple) and len(output) == 2 and isinstance(output[1], dict):
+                all_loss, diagnostics = output
+            else:
+                all_loss, diagnostics = output, {}
             loss = all_loss
         else:
             all_loss = self.model(img, spec, fp, img2, spec2, fp2, return_components=self.return_components)
@@ -400,11 +571,52 @@ class FETrainer(Trainer):
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.module.parameters(), max_norm=1.0)
             self.optimizer.step()
-        return all_loss
+        return all_loss, diagnostics
+
+    @staticmethod
+    def _accumulate_ccl_diagnostics(totals, *diagnostics):
+        valid = [item for item in diagnostics if item]
+        if not valid:
+            return False
+        common_keys = set.intersection(*(set(item) for item in valid))
+        if not common_keys:
+            return False
+        for key in common_keys:
+            value = torch.stack([item[key] for item in valid]).mean()
+            totals[key] = totals.get(key, torch.zeros_like(value)) + value
+        return True
+
+    def _log_ccl_diagnostics(self, split, epoch, totals, count, show_log):
+        if not count or not show_log or self.gpu_id != self.log_rank:
+            return
+        means = {key: (value / count).item() for key, value in totals.items()}
+        self.logger.info(
+            "[%s_CCL] Epoch: %d TargetEntropy: %.6f UniformBaseline: %.6f "
+            "ExcessLoss: %.6f EffectivePositives: %.3f TargetMass: %.6f",
+            split,
+            epoch + 1,
+            means["target_entropy"],
+            means["uniform_baseline"],
+            means["excess_loss"],
+            means["effective_positives"],
+            means["target_mass"],
+        )
+        if "shear_loss" in means:
+            self.logger.info(
+                "[%s_SHEAR] Epoch: %d ShearLoss: %.6f "
+                "WeightedShearLoss: %.6f TotalLoss: %.6f",
+                split,
+                epoch + 1,
+                means["shear_loss"],
+                means["weighted_shear_loss"],
+                means["total_loss"],
+            )
     
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
         losses = []
+        ccl_diagnostic_totals = {}
+        ccl_diagnostic_batches = 0
         if self.return_components:
             sim_losses = []
             var_losses = []
@@ -413,16 +625,24 @@ class FETrainer(Trainer):
             eff_dim_spec_list = []
         epoch_start = time.time()
 
-        self.SNR_train_2 = self.generate_snr(size=self.ntrain, mode='tf')
-        
         for i in range(self.nbatch_train):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
             img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
-            img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
-            spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
+            img = self._apply_noise(
+                self.img_train[batch_ids],
+                snr,
+                maxs=img_maxs,
+                randgen=self.epoch_generators["train_img_noise"],
+            )
+            spec = self._apply_noise(
+                self.spec_train[batch_ids],
+                snr,
+                maxs=spec_maxs,
+                randgen=self.epoch_generators["train_spec_noise"],
+            )
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
             img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
@@ -432,16 +652,27 @@ class FETrainer(Trainer):
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
                 img_90 = img_90.contiguous(memory_format=torch.channels_last)
-            all_loss = self._run_batch(img, spec, fp, fid=fid)
-            all_loss_90 = self._run_batch(img_90, spec, fp_90, fid=fid_90)
+            all_loss, diagnostics = self._run_batch(img, spec, fp, fid=fid)
+            all_loss_90, diagnostics_90 = self._run_batch(img_90, spec, fp_90, fid=fid_90)
             loss = (all_loss + all_loss_90) / 2
             if torch.isfinite(loss):
                 losses.append(loss.item())
+            if self._accumulate_ccl_diagnostics(
+                ccl_diagnostic_totals, diagnostics, diagnostics_90
+            ):
+                ccl_diagnostic_batches += 1
 
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                 self.logger.info(f"Batch {i} complete")
 
         epoch_loss = sum(losses) / len(losses)
+        self._log_ccl_diagnostics(
+            "TRAIN",
+            epoch,
+            ccl_diagnostic_totals,
+            ccl_diagnostic_batches,
+            show_log,
+        )
         if self.return_components:
             epoch_sim_loss = sum(sim_losses) / len(sim_losses)
             epoch_var_loss = sum(var_losses) / len(var_losses)
@@ -461,6 +692,8 @@ class FETrainer(Trainer):
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
         losses = []
+        ccl_diagnostic_totals = {}
+        ccl_diagnostic_batches = 0
         if self.return_components:
             sim_losses = []
             var_losses = []
@@ -469,8 +702,6 @@ class FETrainer(Trainer):
             eff_dim_spec_list = []
         epoch_start = time.time()
 
-        self.SNR_valid_2 = self.generate_snr(size=self.nvalid, mode='tf')
-
         with torch.no_grad():
             for i in range(self.nbatch_valid):
                 start = i*self.batch_size
@@ -478,8 +709,18 @@ class FETrainer(Trainer):
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
                 img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
-                img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
-                spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
+                img = self._apply_noise(
+                    self.img_valid[batch_ids],
+                    snr,
+                    maxs=img_maxs,
+                    randgen=self.epoch_generators["valid_img_noise"],
+                )
+                spec = self._apply_noise(
+                    self.spec_valid[batch_ids],
+                    snr,
+                    maxs=spec_maxs,
+                    randgen=self.epoch_generators["valid_spec_noise"],
+                )
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
                 img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
@@ -489,16 +730,31 @@ class FETrainer(Trainer):
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
                     img_90 = img_90.contiguous(memory_format=torch.channels_last)
-                all_loss = self.model(img, spec, fp, labels=fid)
-                all_loss_90 = self.model(img_90, spec, fp_90, labels=fid_90)
+                all_loss, diagnostics = self.model(
+                    img, spec, fp, labels=fid, return_diagnostics=True
+                )
+                all_loss_90, diagnostics_90 = self.model(
+                    img_90, spec, fp_90, labels=fid_90, return_diagnostics=True
+                )
                 loss = (all_loss + all_loss_90) / 2
                 if torch.isfinite(loss):
                     losses.append(loss.item())
 
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
+                if self._accumulate_ccl_diagnostics(
+                    ccl_diagnostic_totals, diagnostics, diagnostics_90
+                ):
+                    ccl_diagnostic_batches += 1
 
         epoch_loss = sum(losses) / len(losses)
+        self._log_ccl_diagnostics(
+            "VALID",
+            epoch,
+            ccl_diagnostic_totals,
+            ccl_diagnostic_batches,
+            show_log,
+        )
         if self.return_components:
             epoch_sim_loss = sum(sim_losses) / len(sim_losses)
             epoch_var_loss = sum(var_losses) / len(var_losses)
@@ -535,9 +791,17 @@ class NPETrainer(Trainer):
         gpu_id: int,
         save_every: int,
         batch_size: int,
+        *,
+        seed: int | None = None,
+        deterministic: bool | None = None,
     ) -> None:
         
-        super().__init__(world_size, model, train_ds, valid_ds, optimizer, gpu_id, save_every, batch_size)
+        super().__init__(
+            world_size, model, train_ds, valid_ds, optimizer, gpu_id,
+            save_every, batch_size,
+            seed=seed,
+            deterministic=deterministic,
+        )
         
         self.model_name = config.train['model_name']
         self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
@@ -591,8 +855,18 @@ class NPETrainer(Trainer):
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
             img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
             spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
-            img = self._apply_noise(self.img_train[batch_ids], snr, maxs=img_maxs)
-            spec = self._apply_noise(self.spec_train[batch_ids], snr, maxs=spec_maxs)
+            img = self._apply_noise(
+                self.img_train[batch_ids],
+                snr,
+                maxs=img_maxs,
+                randgen=self.epoch_generators["train_img_noise"],
+            )
+            spec = self._apply_noise(
+                self.spec_train[batch_ids],
+                snr,
+                maxs=spec_maxs,
+                randgen=self.epoch_generators["train_spec_noise"],
+            )
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
             img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
@@ -633,8 +907,18 @@ class NPETrainer(Trainer):
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
                 img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
                 spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
-                img = self._apply_noise(self.img_valid[batch_ids], snr, maxs=img_maxs)
-                spec = self._apply_noise(self.spec_valid[batch_ids], snr, maxs=spec_maxs)
+                img = self._apply_noise(
+                    self.img_valid[batch_ids],
+                    snr,
+                    maxs=img_maxs,
+                    randgen=self.epoch_generators["valid_img_noise"],
+                )
+                spec = self._apply_noise(
+                    self.spec_valid[batch_ids],
+                    snr,
+                    maxs=spec_maxs,
+                    randgen=self.epoch_generators["valid_spec_noise"],
+                )
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
                 img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
@@ -672,16 +956,25 @@ class NPETrainer(Trainer):
 #------------------#
 
 def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer,
-             save_every=1, train_mode='pretrain'):
+             save_every=1, train_mode='pretrain', model_config_payload=None):
     '''
     Main function to train any network.
     '''
+    if model_config_payload is not None:
+        config.set_model_config(config.ModelConfig.from_dict(model_config_payload))
+
     if train_mode == 'pretrain':
         train_config = config.pretrain
     elif train_mode == 'train':
         train_config = config.train
     else:
         raise ValueError(f"Invalid train_mode '{train_mode}'. Must be 'pretrain' or 'train'.")
+
+    base_seed = int(train_config.get('seed', 20260810))
+    deterministic = bool(train_config.get('deterministic', False))
+    os.environ["PYTHONHASHSEED"] = str(base_seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     # Set parameters based on stage
     total_epochs = train_config['epoch_number']
@@ -692,10 +985,12 @@ def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer
     log = logging.getLogger('Setup')
     if rank == 0:
         log.info('Initializing')
+        log.info(f'Run seed={base_seed}; deterministic={deterministic}')
     
     ddp_setup(rank, world_size)
     log.info(f'[rank: {rank}] Successfully set up device')
-    torch.backends.cudnn.benchmark = bool(train_config.get('cudnn_benchmark', False))
+    torch.backends.cudnn.benchmark = bool(train_config.get('cudnn_benchmark', False)) and not deterministic
+    seed_everything(base_seed, deterministic=deterministic)
 
     device = torch.device(f"cuda:{rank}")
     train_ds, valid_ds, model, optimizer = load_train_objs(
@@ -724,10 +1019,17 @@ def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer
         ddp_kwargs.pop("static_graph", None)
         ddp_kwargs.pop("gradient_as_bucket_view", None)
         model = DDP(model, **ddp_kwargs)
+    seed_everything(
+        derive_stream_seed(base_seed, rank=rank, epoch=0, stream="ambient"),
+        deterministic=deterministic,
+    )
     log.info(f'[rank: {rank}] Successfully loaded training objects')
     
     os.makedirs(join(train_config['model_path'], train_config['model_name']), exist_ok=True)
-    trainer = Trainer(world_size, model, train_ds, valid_ds, optimizer, rank, save_every, batch_size)
+    trainer = Trainer(
+        world_size, model, train_ds, valid_ds, optimizer, rank, save_every,
+        batch_size, seed=base_seed, deterministic=deterministic,
+    )
     log.info(f'[rank: {rank}] Successfully initialized Trainer')
     torch.distributed.barrier()
     trainer.train(total_epochs)
@@ -740,8 +1042,8 @@ def ddp_setup(rank, world_size):
         rank: Unique identifier of each process
         world_size: Total number of processes
     """
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12356"
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "12356")
     torch.cuda.set_device(rank)
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
@@ -921,6 +1223,22 @@ def point_estimate(
     snrs = snrs.cpu().numpy()
     return preds, trues, snrs
 
+def pair_rotation_branches(values):
+    """Pair interleaved original/rotated outputs along a branch axis.
+
+    ``sample_density`` appends ``original, rotated`` for each galaxy. This
+    converts ``(2 * N, S, ...)`` to ``(N, S, 2, ...)``, with branch 0 original
+    and branch 1 rotated.
+    """
+    values = np.asarray(values)
+    if values.ndim < 2:
+        raise ValueError("rotation-paired values need at least two dimensions")
+    if values.shape[0] % 2:
+        raise ValueError("rotation-paired values need an even leading dimension")
+    paired = values.reshape(values.shape[0] // 2, 2, *values.shape[1:])
+    return np.moveaxis(paired, 1, 2)
+
+
 def sample_density(
     model,
     test_ds,
@@ -933,6 +1251,8 @@ def sample_density(
     return_log_prob=False,
     device='cpu',
     channels_last: bool | None = None,
+    matched_group_size: int = 1,
+    noise_seed: int = 42,
     progress=None,
 ):
     '''
@@ -955,8 +1275,13 @@ def sample_density(
         for i in iterator:
             snr = snrs[i]
             mag = mags[i] if mags is not None else None
-            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
-            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=randgen, device=device)
+            noise_gen = randgen
+            if matched_group_size > 1:
+                noise_gen = torch.Generator(device=device).manual_seed(
+                    noise_seed + i // matched_group_size
+                )
+            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=noise_gen, device=device)
+            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=noise_gen, device=device)
             fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
             if channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
@@ -980,13 +1305,12 @@ def sample_density(
                 samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     if apply_add_noise_cancellation:
-        nfeatures = samples.shape[-1]
-        samples = samples.reshape(-1, nsamples, 2, nfeatures)
+        samples = pair_rotation_branches(samples)
     snrs = snrs.cpu().numpy()
     if return_log_prob:
         log_probs = np.vstack(log_probs)
         if apply_add_noise_cancellation:
-            log_probs = log_probs.reshape(-1, nsamples, 2)
+            log_probs = pair_rotation_branches(log_probs)
         return samples, log_probs, snrs
     return samples, snrs
 

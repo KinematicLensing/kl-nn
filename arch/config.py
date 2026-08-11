@@ -42,6 +42,15 @@ class PretrainConfig:
     ddp_gradient_as_bucket_view: bool = True
     ddp_broadcast_buffers: bool = False
     noise_cache_maxs: bool = True
+    ccl_temperature: float = 0.1
+    ccl_sigma_label: float = 0.15
+    ccl_d_cutoff: float = 0.40
+    ccl_label_scales: dict[str, float] = field(default_factory=dict)
+    ccl_distance_reduction: str = "mean"
+    ccl_objective: str = "ccl"
+    ccl_shear_loss_weight: float = 1.0
+    seed: int = 42
+    deterministic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,6 +83,8 @@ class TrainConfig:
     ddp_gradient_as_bucket_view: bool = True
     ddp_broadcast_buffers: bool = False
     noise_cache_maxs: bool = True
+    seed: int = 42
+    deterministic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -179,7 +190,7 @@ def _default_model_config() -> ModelConfig:
             model_name="CNN-CNN_CCL_rot90",
             use_amp=False,
             amp_dtype="float16",
-            use_compile=True,
+            use_compile=False,
             compile_mode="default",
             compile_backend=None,
             use_fused_adamw=True,

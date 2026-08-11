@@ -168,6 +168,25 @@ def parse_args():
         default=None,
         help='Path to .npy file containing pre-saved SNR values to use instead of generating new ones.',
     )
+    parser.add_argument(
+        '--mode',
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help='Sampling mode: 1 is raw flow; 2 applies inference-time TF replacement.',
+    )
+    parser.add_argument(
+        '--cache-tag',
+        type=str,
+        default='',
+        help='Optional suffix for the output dataset cache name (for experiment isolation).',
+    )
+    parser.add_argument(
+        '--matched-group-size',
+        type=int,
+        default=1,
+        help='Reuse scalar SNR and injected-noise realization within consecutive groups.',
+    )
     return parser.parse_args()
 
 
@@ -294,6 +313,8 @@ def main():
     dataset_name = os.path.basename(os.path.normpath(data_dir))
     if args.conform_to_tf:
         dataset_name += '_tf_conformed'
+    if args.cache_tag:
+        dataset_name += f'_{args.cache_tag.strip("_")}'
     total_partitions = infer_total_partitions(args)
     partition_label = build_partition_label(args.i, total_partitions)
     nfeatures = config.train['feature_number']
@@ -303,6 +324,8 @@ def main():
         raise ValueError(
             f"config.train['feature_names'] length {len(feature_names)} does not match feature_number {nfeatures}."
         )
+    if args.matched_group_size < 1 or args.ngals % args.matched_group_size:
+        raise ValueError('matched-group-size must be positive and divide ngals')
 
     fig_dir = join(BASE_SHARED_DIR, 'figures')
     model_dir = join(BASE_SHARED_DIR, 'models', stem)
@@ -398,6 +421,7 @@ def main():
         logging.info('Timing: prep vcirc/truth took %.2fs', time.perf_counter() - start)
     
     rng_seed = 42
+    app_mag = None
     if args.conform_to_tf:
         logging.info('Conforming dataset to TF prior')
         from data import TFCalculator, app_mag_to_snr
@@ -408,21 +432,23 @@ def main():
     elif args.cached_snrs_path is not None:
         if not os.path.exists(args.cached_snrs_path):
             raise FileNotFoundError(f'Cached SNRs file not found: {args.cached_snrs_path}')
-        snrs = []
-        for i in range(total_partitions):
-            snr_path = os.path.join(args.cached_snrs_path, f'part{i}of{total_partitions}.npy')
-            if not os.path.exists(snr_path):
-                raise FileNotFoundError(f'Cached SNRs file for partition not found: {snr_path}')
-            snrs.append(np.load(snr_path))
-        snr_shared = torch.from_numpy(np.concatenate(snrs)).to(device)
+        if os.path.isdir(args.cached_snrs_path):
+            snr_path = os.path.join(args.cached_snrs_path, f'{partition_label}.npy')
+        else:
+            snr_path = args.cached_snrs_path
+        if not os.path.exists(snr_path):
+            raise FileNotFoundError(f'Cached SNR partition not found: {snr_path}')
+        snr_shared = torch.from_numpy(np.load(snr_path)).to(device)
         if snr_shared.shape != (args.ngals,):
             raise ValueError(f'Cached SNRs shape {snr_shared.shape} does not match expected ({args.ngals},)')
     else:
         snr_gen = torch.Generator(device=device).manual_seed(rng_seed)
-        snr_shared = torch.rand(args.ngals, generator=snr_gen, device=device) * 995 + 5
+        group_count = args.ngals // args.matched_group_size
+        group_snr = torch.rand(group_count, generator=snr_gen, device=device) * 995 + 5
+        snr_shared = torch.repeat_interleave(group_snr, args.matched_group_size)
         app_mag = None
 
-    modes = [2] # 1: no TF prior, 2: TF prior
+    modes = [args.mode] # 1: raw flow, 2: inference-time TF replacement
     sample_list = np.empty((len(modes), args.ngals, args.nsamples, nfeatures), dtype=np.float32)
     log_prob_list = np.empty((len(modes), args.ngals, args.nsamples), dtype=np.float32)
     if args.cancel_add_noise:
@@ -454,6 +480,8 @@ def main():
                 apply_add_noise_cancellation=args.cancel_add_noise,
                 device=device,
                 channels_last=channels_last,
+                matched_group_size=args.matched_group_size,
+                noise_seed=rng_seed + args.i * args.ngals,
                 progress=sampling_progress_fn,
             )
             if profile:
@@ -508,13 +536,16 @@ def main():
             if args.cancel_add_noise:
                 samples_rot90 = sample_list_rot90[j, i]
                 log_probs_rot90 = log_prob_list_rot90[j, i]
+                counter_samples = rot_90_param_only(samples_rot90, reverse=True)
 
             # MAP estimate
             if args.cancel_add_noise:
                 map_idx = np.argmax(log_probs)
                 map_idx_rot90 = np.argmax(log_probs_rot90)
-                counter_sample = rot_90_param_only(samples_rot90[map_idx_rot90], reverse=True) # rotate best fit back to original orientation
-                map_estimates[j, i] = 0.5 * (samples[map_idx] + counter_sample)
+                map_estimates[j, i] = samples[map_idx]
+                map_estimates[j, i, :2] = 0.5 * (
+                    samples[map_idx, :2] + counter_samples[map_idx_rot90, :2]
+                )
             else:
                 map_idx = np.argmax(log_probs)
                 map_estimates[j, i] = samples[map_idx]
@@ -523,6 +554,13 @@ def main():
             mean_estimates[j, i, 0] = np.percentile(samples, 16, axis=0) # low bound
             mean_estimates[j, i, 1] = np.mean(samples, axis=0) # mean
             mean_estimates[j, i, 2] = np.percentile(samples, 84, axis=0) # high bound
+            if args.cancel_add_noise:
+                shear_samples = np.concatenate(
+                    [samples[:, :2], counter_samples[:, :2]], axis=0
+                )
+                mean_estimates[j, i, 0, :2] = np.percentile(shear_samples, 16, axis=0)
+                mean_estimates[j, i, 1, :2] = np.mean(shear_samples, axis=0)
+                mean_estimates[j, i, 2, :2] = np.percentile(shear_samples, 84, axis=0)
     
     map_path = get_cache_path(cache_dir, model_name, dataset_name, 'map_estimates', f'{partition_label}.npy')
     np.save(map_path, map_estimates)
@@ -553,6 +591,11 @@ def main():
             'stem': args.stem,
             'dataset': args.dataset,
             'sample_set': args.sample_set,
+            'mode': args.mode,
+            'cache_tag': args.cache_tag,
+            'cached_snrs_path': args.cached_snrs_path,
+            'matched_group_size': args.matched_group_size,
+            'cancel_add_noise': args.cancel_add_noise,
         },
     }
     manifest_path = get_cache_path(cache_dir, model_name, dataset_name, 'meta', f'{partition_label}.json')

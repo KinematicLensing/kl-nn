@@ -583,85 +583,320 @@ class VICRegLoss(nn.Module):
             return total_loss
 
 class CCLPretrain(nn.Module):
+    OBJECTIVES = ("ccl", "ccl_shear")
+
     def __init__(self, backbone=None, projector_dim=128):
         super().__init__()
 
         self.backbone = FeatureExtractor() if backbone is None else backbone
-        
+
         # Get feature dimensions dynamically
         dim_in = 1024
-        
+
         # Projector networks mapping onto a common high-dimensional space
-        self.projector = MLP([dim_in, 2048, 512, projector_dim], use_batchnorm=True, use_dropout=False)
-        
-        self.ccl_loss = ContinuousContrastiveLoss(temperature=0.1, sigma_label=0.5, d_cutoff=2.0)
+        self.projector = MLP(
+            [dim_in, 2048, 512, projector_dim],
+            use_batchnorm=True,
+            use_dropout=False,
+        )
 
-    def forward(self, x, y, fp, labels):
-        z = self.backbone.forward(x, y, fp)
-        z = self.projector(z)
+        feature_names = list(config.train["feature_names"])
+        configured_scales = config.pretrain.get("ccl_label_scales", {})
+        label_scales = [
+            float(configured_scales.get(name, 1.0)) for name in feature_names
+        ]
+        theta_idx = resolve_feature_index(feature_names, "theta_int")
+        self.ccl_loss = ContinuousContrastiveLoss(
+            temperature=float(config.pretrain.get("ccl_temperature", 0.1)),
+            sigma_label=float(config.pretrain.get("ccl_sigma_label", 0.15)),
+            d_cutoff=float(config.pretrain.get("ccl_d_cutoff", 0.40)),
+            label_scales=label_scales,
+            theta_idx=theta_idx,
+            distance_reduction=config.pretrain.get(
+                "ccl_distance_reduction", "mean"
+            ),
+        )
 
-        if not dist.is_initialized():
-            # 3. Compute loss
-            loss = self.ccl_loss(z, labels)
-            return loss
+        self.ccl_objective = config.pretrain.get("ccl_objective", "ccl")
+        if self.ccl_objective not in self.OBJECTIVES:
+            raise ValueError(
+                f"ccl_objective must be one of {self.OBJECTIVES}; "
+                f"got {self.ccl_objective!r}"
+            )
+        self.ccl_shear_loss_weight = float(
+            config.pretrain.get("ccl_shear_loss_weight", 1.0)
+        )
+        if (
+            not math.isfinite(self.ccl_shear_loss_weight)
+            or self.ccl_shear_loss_weight < 0
+        ):
+            raise ValueError(
+                "ccl_shear_loss_weight must be non-negative and finite"
+            )
+
+        # Keep the original objective state dict unchanged. The shear modules
+        # exist only for the explicitly selected auxiliary objective.
+        self.shear_indices = None
+        self.shear_head = None
+        self.shear_loss = None
+        if self.ccl_objective == "ccl_shear":
+            self.shear_indices = [
+                resolve_feature_index(feature_names, "g1"),
+                resolve_feature_index(feature_names, "g2"),
+            ]
+            self.shear_head = nn.Linear(dim_in, 2)
+            self.shear_loss = NormalizedShearMSELoss(normalization=3.0)
+
+    def _compute_ccl_loss(self, projected_features, labels, return_diagnostics):
+        if dist.is_initialized():
+            projected_features = torch.cat(all_gather(projected_features), dim=0)
+            labels = torch.cat(all_gather(labels), dim=0)
+        return self.ccl_loss(
+            projected_features,
+            labels,
+            return_diagnostics=return_diagnostics,
+        )
+
+    def _ccl_objective(
+        self,
+        backbone_features,
+        projected_features,
+        labels,
+        return_diagnostics,
+    ):
+        del backbone_features
+        return self._compute_ccl_loss(
+            projected_features,
+            labels,
+            return_diagnostics,
+        )
+
+    def _ccl_shear_objective(
+        self,
+        backbone_features,
+        projected_features,
+        labels,
+        return_diagnostics,
+    ):
+        ccl_output = self._compute_ccl_loss(
+            projected_features,
+            labels,
+            return_diagnostics,
+        )
+        if return_diagnostics:
+            ccl_value, diagnostics = ccl_output
+            diagnostics = dict(diagnostics)
         else:
-            # 3. Gather features across distributed processes
-            z_gathered = torch.cat(all_gather(z), dim=0)
-            labels_gathered = torch.cat(all_gather(labels), dim=0)
+            ccl_value = ccl_output
+            diagnostics = None
 
-            # 4. Compute loss on gathered features
-            loss = self.ccl_loss(z_gathered, labels_gathered)
-            return loss
-        
+        shear_prediction = self.shear_head(backbone_features)
+        shear_target = labels[:, self.shear_indices]
+        shear_value = self.shear_loss(shear_prediction, shear_target)
+        weighted_shear_value = self.ccl_shear_loss_weight * shear_value
+        total_value = ccl_value + weighted_shear_value
+
+        if diagnostics is None:
+            return total_value
+
+        diagnostics["ccl_loss"] = ccl_value.detach()
+        diagnostics["shear_loss"] = shear_value.detach()
+        diagnostics["weighted_shear_loss"] = weighted_shear_value.detach()
+        diagnostics["total_loss"] = total_value.detach()
+        return total_value, diagnostics
+
+    def forward(self, x, y, fp, labels, return_diagnostics=False):
+        backbone_features = self.backbone.forward(x, y, fp)
+        projected_features = self.projector(backbone_features)
+        objective = (
+            self._ccl_shear_objective
+            if self.ccl_objective == "ccl_shear"
+            else self._ccl_objective
+        )
+        return objective(
+            backbone_features,
+            projected_features,
+            labels,
+            return_diagnostics,
+        )
+
     def extract_features(self, x, y, fp):
-        z = self.backbone.forward(x, y, fp)
-        return z
+        return self.backbone.forward(x, y, fp)
 
 class ContinuousContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.1, sigma_label=0.5, d_cutoff=2.0):
-        """
-        temperature: Controls scaling in embedding space.
-        sigma_label: Physical scale parameter (e.g., delta_g = 0.02 controls kernel falloff).
-        """
+    """Continuous contrastive loss with fixed normalized parameter geometry."""
+
+    def __init__(
+        self,
+        temperature=0.1,
+        sigma_label=0.15,
+        d_cutoff=0.40,
+        label_scales=None,
+        theta_idx=None,
+        distance_reduction="mean",
+    ):
         super().__init__()
-        self.temperature = temperature
-        self.sigma_label = sigma_label
-        self.delta_bg = torch.exp(torch.tensor(-(d_cutoff ** 2) / (2 * (sigma_label ** 2))))
+        for name, value in (
+            ("temperature", temperature),
+            ("sigma_label", sigma_label),
+            ("d_cutoff", d_cutoff),
+        ):
+            if not math.isfinite(float(value)) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if theta_idx is not None and type(theta_idx) is not int:
+            raise TypeError("theta_idx must be an integer or None")
+        if distance_reduction not in ("mean", "sum"):
+            raise ValueError("distance_reduction must be 'mean' or 'sum'")
 
-    def forward(self, z, labels):
-        # 1. L2-normalize feature representations
-        z = F.normalize(z, dim=1)
-        batch_size = z.shape[0]
+        scales = torch.as_tensor(
+            [1.0] if label_scales is None else label_scales,
+            dtype=torch.float32,
+        )
+        if (
+            scales.ndim != 1
+            or torch.any(~torch.isfinite(scales))
+            or torch.any(scales <= 0)
+        ):
+            raise ValueError(
+                "label_scales must be a 1D sequence of positive finite values"
+            )
 
-        # 2. Standardize labels on-the-fly
-        labels_std = (labels - labels.mean(dim=0, keepdim=True)) / (labels.std(dim=0, keepdim=True) + 1e-6)
+        self.temperature = float(temperature)
+        self.sigma_label = float(sigma_label)
+        self.theta_idx = theta_idx
+        self.distance_reduction = distance_reduction
+        self.register_buffer("label_scales", scales)
+        self.register_buffer(
+            "delta_bg",
+            torch.exp(
+                torch.tensor(
+                    -(d_cutoff ** 2) / (2 * (sigma_label ** 2)),
+                    dtype=torch.float32,
+                )
+            ),
+        )
 
-        # 3. Pairwise distances in standardized label space
-        label_diff = labels_std.unsqueeze(1) - labels_std.unsqueeze(0)
-        label_dist_sq = torch.sum(label_diff ** 2, dim=-1)
+    def pairwise_label_distance_sq(self, labels):
+        """Return fixed-scale pairwise distances for normalized KL labels."""
+        if labels.ndim != 2:
+            raise ValueError("labels must have shape (batch, nfeatures)")
+        if self.label_scales.numel() not in (1, labels.shape[1]):
+            raise ValueError(
+                "label_scales must contain one value or one value per label feature"
+            )
+        if self.theta_idx is not None and not 0 <= self.theta_idx < labels.shape[1]:
+            raise ValueError("theta_idx is outside the label feature dimension")
 
-        # 4. Target weights
+        label_diff = labels.unsqueeze(1) - labels.unsqueeze(0)
+        if self.theta_idx is not None:
+            theta_delta = label_diff[..., self.theta_idx]
+            theta_delta = torch.atan2(
+                torch.sin(math.pi * theta_delta),
+                torch.cos(math.pi * theta_delta),
+            ) / math.pi
+            label_diff = label_diff.clone()
+            label_diff[..., self.theta_idx] = theta_delta
+
+        scaled_diff_sq = (label_diff / self.label_scales) ** 2
+        if self.distance_reduction == "mean":
+            return torch.mean(scaled_diff_sq, dim=-1)
+        return torch.sum(scaled_diff_sq, dim=-1)
+
+    def _target_distribution(self, labels):
+        batch_size = labels.shape[0]
+        if batch_size < 2:
+            raise ValueError("continuous contrastive loss requires at least two rows")
+        label_dist_sq = self.pairwise_label_distance_sq(labels).float()
         weights = torch.exp(-label_dist_sq / (2 * (self.sigma_label ** 2)))
 
-        # 5. Mask out self-contrast (diagonal)
-        mask = torch.eye(batch_size, dtype=torch.bool, device=z.device)
+        mask = torch.eye(batch_size, dtype=torch.bool, device=labels.device)
         weights_masked = weights.masked_fill(mask, 0.0)
+        row_sum = torch.sum(weights_masked, dim=1, keepdim=True)
+        delta_bg = self.delta_bg.to(device=labels.device, dtype=weights.dtype)
+        target_mass = row_sum / (row_sum + delta_bg)
+        positive_probs = weights_masked / row_sum.clamp_min(
+            torch.finfo(weights.dtype).tiny
+        )
+        weights_norm = positive_probs * target_mass
+        return mask, weights_norm, positive_probs, target_mass.squeeze(1)
 
-        # 6. Row-normalize WITH DISTANCE FLOOR (delta_bg)
-        # If all weights in a row are tiny (< delta_bg), the target probabilities go to ~0
-        delta = self.delta_bg.to(z.device)
-        weights_norm = weights_masked / (torch.sum(weights_masked, dim=1, keepdim=True) + delta)
+    @staticmethod
+    def _target_statistics(positive_probs, target_mass):
+        row_entropy = -torch.sum(
+            torch.special.xlogy(positive_probs, positive_probs), dim=1
+        )
+        concentration = torch.sum(positive_probs.square(), dim=1)
+        effective_positives = concentration.clamp_min(
+            torch.finfo(concentration.dtype).tiny
+        ).reciprocal()
+        effective_positives = torch.where(
+            target_mass > 0, effective_positives, torch.zeros_like(concentration)
+        )
+        uniform_baseline = target_mass * math.log(positive_probs.shape[1] - 1)
+        return {
+            "target_entropy": torch.mean(target_mass * row_entropy).detach(),
+            "uniform_baseline": torch.mean(uniform_baseline).detach(),
+            "effective_positives": torch.mean(effective_positives).detach(),
+            "target_mass": torch.mean(target_mass).detach(),
+        }
 
-        # 7. Latent similarities and cross-entropy
+    def target_statistics(self, labels):
+        """Return batch-level diagnostics for the soft-positive target only."""
+        _, _, positive_probs, target_mass = self._target_distribution(labels)
+        return self._target_statistics(positive_probs, target_mass)
+
+    def forward(self, z, labels, return_diagnostics=False):
+        z = F.normalize(z, dim=1)
+        batch_size = z.shape[0]
+        if batch_size < 2:
+            raise ValueError("continuous contrastive loss requires at least two rows")
+        if labels.shape[0] != batch_size:
+            raise ValueError("z and labels must have the same batch dimension")
+
+        mask, weights_norm, positive_probs, target_mass = (
+            self._target_distribution(labels)
+        )
+
         sim_matrix = torch.matmul(z, z.T) / self.temperature
-        sim_matrix_masked = sim_matrix.masked_fill(mask, -1e9)
-        exp_sim = torch.exp(sim_matrix_masked)
-        prob_sim = exp_sim / (torch.sum(exp_sim, dim=1, keepdim=True) + 1e-8)
+        log_prob_sim = F.log_softmax(
+            sim_matrix.masked_fill(mask, -torch.inf),
+            dim=1,
+        )
+        # Avoid the undefined 0 * -inf diagonal contribution.
+        log_prob_sim = log_prob_sim.masked_fill(mask, 0.0)
 
-        # 8. Cross-entropy loss
-        loss = -torch.sum(weights_norm * torch.log(prob_sim + 1e-8), dim=1).mean()
-        
-        return loss
+        loss = -torch.sum(weights_norm * log_prob_sim, dim=1).mean()
+        if not return_diagnostics:
+            return loss
+
+        diagnostics = self._target_statistics(positive_probs, target_mass)
+        diagnostics["excess_loss"] = (
+            loss.detach() - diagnostics["target_entropy"]
+        )
+        return loss, diagnostics
+
+
+class NormalizedShearMSELoss(nn.Module):
+    """MSE for normalized g1/g2 labels with an interpretable baseline scale."""
+
+    def __init__(self, normalization=3.0):
+        super().__init__()
+        normalization = float(normalization)
+        if not math.isfinite(normalization) or normalization <= 0:
+            raise ValueError("normalization must be positive and finite")
+        self.normalization = normalization
+
+    def forward(self, prediction, target):
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "shear prediction and target must have identical shapes; "
+                f"got {tuple(prediction.shape)} and {tuple(target.shape)}"
+            )
+        if prediction.ndim != 2 or prediction.shape[1] != 2:
+            raise ValueError(
+                "shear prediction and target must have shape (batch, 2)"
+            )
+        return self.normalization * F.mse_loss(prediction, target)
     
 class MLP(nn.Module):
     '''

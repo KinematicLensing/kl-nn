@@ -1,8 +1,8 @@
 #!/bin/bash
 
 MODEL_ROOT="/ocean/projects/phy250048p/shared/models"
-MODEL_NAME=${MODEL_NAME:-"ViT-CNN-flow_pretrained_unif_noises"}
-KEEP_EPOCHS=${KEEP_EPOCHS:-"238"}
+MODEL_NAME=${MODEL_NAME:-"CNN-CNN-flow_pretrained_CCL"}
+KEEP_EPOCHS=${KEEP_EPOCHS:-"196"}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-"250"}
 
 # Delete all epochs except the ones specified in KEEP_EPOCHS

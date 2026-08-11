@@ -10,8 +10,7 @@ class _DummyDataset:
         return 4
 
     def __getitem__(self, idx):
-        # CNNTrainer probes dataset[0] during init to infer fib_pos availability.
-        # Return a minimal sample shape compatible with that check.
+        # The base Trainer only needs length here; keep a realistic sample.
         return {
             "img": torch.zeros((1, 48, 48), dtype=torch.float32),
             "spec": torch.zeros((1, 5, 64), dtype=torch.float32),
@@ -26,10 +25,9 @@ def test_trainer_apply_noise_delegates_to_shared_function(monkeypatch):
     model = nn.Linear(1, 1)
     optimizer = optim.SGD(model.parameters(), lr=0.1)
 
-    trainer = train.CNNTrainer(
+    trainer = train.Trainer(
         world_size=1,
         model=model,
-        nfeatures=2,
         train_ds=train_ds,
         valid_ds=valid_ds,
         optimizer=optimizer,
@@ -46,16 +44,19 @@ def test_trainer_apply_noise_delegates_to_shared_function(monkeypatch):
         calls["snr"] = snr
         calls["device"] = device
         calls["use_iterative"] = use_iterative
+        calls["randgen"] = randgen
         return expected
 
     monkeypatch.setattr(train, "apply_noise", _fake_apply_noise)
 
     data = torch.ones((2, 1, 4, 4))
     snr = torch.full((2,), 80.0)
-    out = trainer._apply_noise(data, snr)
+    generator = torch.Generator().manual_seed(123)
+    out = trainer._apply_noise(data, snr, randgen=generator)
 
     assert torch.equal(out, expected)
     assert calls["device"] == trainer.device
     assert calls["use_iterative"] is True
+    assert calls["randgen"] is generator
     assert torch.equal(calls["data"], data)
     assert torch.equal(calls["snr"], snr)

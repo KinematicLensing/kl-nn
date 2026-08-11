@@ -41,9 +41,9 @@ class TFCalculator:
         else:
             return 10.0 ** ((mag - self.intercept) / self.slope)
         
-    def sample_mag_from_vcirc(self, vcirc):
+    def sample_mag_from_vcirc(self, vcirc, rng=None):
         """
-        Sample a physically consistent apparent magnitude given a vcirc value, 
+        Sample a physically consistent apparent magnitude given a vcirc value,
         incorporating intrinsic astrophysical scatter.
         Compatible with scalars, numpy arrays, and PyTorch tensors.
         """
@@ -55,11 +55,17 @@ class TFCalculator:
         sigma_m_intrinsic = abs(self.slope) * self.scatter
 
         if isinstance(vcirc, torch.Tensor):
-            return m_mean + torch.randn_like(m_mean) * sigma_m_intrinsic
-        elif isinstance(vcirc, np.ndarray):
-            return m_mean + np.random.normal(0.0, sigma_m_intrinsic, size=m_mean.shape)
-        else:
-            return m_mean + np.random.normal(0.0, sigma_m_intrinsic)
+            noise = torch.randn(
+                m_mean.shape,
+                device=m_mean.device,
+                dtype=m_mean.dtype,
+                generator=rng,
+            )
+            return m_mean + noise * sigma_m_intrinsic
+
+        normal = np.random.normal if rng is None else rng.normal
+        size = m_mean.shape if isinstance(vcirc, np.ndarray) else None
+        return m_mean + normal(0.0, sigma_m_intrinsic, size=size)
 
 def abs_mag_to_snr(abs_mag, z, band='r'):
     band_depths = {
@@ -186,36 +192,194 @@ def _resolve_handedness_flip_feature_indices(feature_names):
         theta_idx = None
     return g2_idx, theta_idx
 
-def rotate_90_degrees(img, fid=None, fp=None):
-    '''
-    Applies a 90-degree rotation to the datavector (assumes normalized parameters and first dimension is batch):
-    - Rotates the image by 90 degrees counter-clockwise
-    - Flips the sign of g1 and g2 in the fiducial vector and subtract 0.5 from theta_int
-    - If fiber positions are provided, rotate them 90 degrees counter-clockwise
-    '''
-    img_out = torch.rot90(img, k=1, dims=(-2, -1))
+D4_ELEMENTS = ("e", "r90", "r180", "r270", "v", "t", "h", "hvt")
+"""Canonical D4 element names, retained for compatibility with d4_diffs.py."""
+
+_D4_ACTIONS = {
+    # First apply k array rotations, then optionally reflect the row/y axis.
+    "e": (0, False),
+    "r90": (1, False),
+    "r180": (2, False),
+    "r270": (3, False),
+    "v": (0, True),
+    "t": (1, True),
+    "h": (2, True),
+    "hvt": (3, True),
+}
+_D4_ALIASES = {
+    "identity": "e",
+    "flip_y": "v",
+    "transpose": "t",
+    "flip_x": "h",
+    "flip_anti_diagonal": "hvt",
+}
+D4_INVERSES = {
+    "e": "e",
+    "r90": "r270",
+    "r180": "r180",
+    "r270": "r90",
+    "v": "v",
+    "t": "t",
+    "h": "h",
+    "hvt": "hvt",
+}
+D4_REFLECTION_FIBER_PERMUTATION = (0, 1, 2, 4, 3)
+
+
+def _canonical_d4_element(element):
+    key = str(element).strip().lower()
+    key = _D4_ALIASES.get(key, key)
+    if key not in _D4_ACTIONS:
+        valid = ", ".join(D4_ELEMENTS)
+        raise ValueError(f"Unknown D4 element '{element}'. Expected one of: {valid}")
+    return key
+
+
+def _wrap_normalized_angle(theta):
+    """Wrap theta_int normalized by pi to [-1, 1)."""
+    return torch.remainder(theta + 1.0, 2.0) - 1.0
+
+
+def _rotate_array_coordinates(fp, k):
+    """Rotate (..., 2) coordinates consistently with torch.rot90."""
+    k = int(k) % 4
+    x = fp[..., 0]
+    y = fp[..., 1]
+    if k == 0:
+        return fp.clone()
+    if k == 1:
+        return torch.stack((y, -x), dim=-1)
+    if k == 2:
+        return torch.stack((-x, -y), dim=-1)
+    return torch.stack((-y, x), dim=-1)
+
+
+def _swap_reflected_minor_fibers(values, fiber_dim):
+    if values.shape[fiber_dim] < 5:
+        raise ValueError("D4 reflections require all five canonical fiber entries")
+    permutation = list(range(values.shape[fiber_dim]))
+    permutation[3], permutation[4] = permutation[4], permutation[3]
+    index = torch.tensor(permutation, device=values.device)
+    return torch.index_select(values, fiber_dim, index)
+
+
+def _reflect_row_axis_datavector(
+    img,
+    spec=None,
+    fid=None,
+    fp=None,
+    g2_idx=None,
+    theta_idx=None,
+):
+    """Apply the authoritative row/y-axis reflection to a datavector."""
+    img_out = torch.flip(img, dims=(-2,))
+    spec_out = spec.clone() if spec is not None else None
+    fid_out = fid.clone() if fid is not None else None
+    fp_out = fp.clone() if fp is not None else None
+
+    if fid_out is not None:
+        if g2_idx is None:
+            raise ValueError("g2_idx is required when reflecting parameters")
+        fid_out[..., g2_idx] = -fid_out[..., g2_idx]
+        if theta_idx is not None:
+            fid_out[..., theta_idx] = _wrap_normalized_angle(
+                -fid_out[..., theta_idx]
+            )
+
+    if fp_out is not None:
+        fp_out = torch.stack((fp_out[..., 0], -fp_out[..., 1]), dim=-1)
+
+    if spec_out is not None:
+        spec_out = _swap_reflected_minor_fibers(spec_out, fiber_dim=-2)
+    if fp_out is not None:
+        fp_out = _swap_reflected_minor_fibers(fp_out, fiber_dim=-2)
+
+    return img_out, spec_out, fid_out, fp_out
+
+
+def apply_d4_to_datavector(
+    img,
+    spec=None,
+    fid=None,
+    fp=None,
+    element="e",
+    feature_names=None,
+):
+    """Apply one D4 element to a complete normalized KL datavector.
+
+    Images use their final two axes as (row, column). Fiber positions use the
+    matching array-coordinate convention, so r90 maps (x, y) to (y, -x).
+    Spectra remain attached to the same directed fibers under rotations.
+    Reflections reverse handedness and therefore swap minor+ with minor- in
+    both the spectrum and fiber-position arrays.
+
+    Parameters are normalized to [-1, 1], with theta_int normalized by pi.
+    Parameters other than g1, g2, and theta_int are D4 scalars.
+    """
+    element = _canonical_d4_element(element)
+    k, reflected = _D4_ACTIONS[element]
+
+    img_out = torch.rot90(img, k=k, dims=(-2, -1)) if k else img.clone()
+    spec_out = spec.clone() if spec is not None else None
+    fp_out = _rotate_array_coordinates(fp, k) if fp is not None else None
+
+    g2_idx = None
+    theta_idx = None
     fid_out = fid.clone() if fid is not None else None
     if fid_out is not None:
-        fid_out[:, [0, 1]] = -fid_out[:, [0, 1]]
-        fid_out[:, 2] = fid_out[:, 2] - 0.5
-        under = fid_out[:, 2] < -1.0
-        fid_out[:, 2][under] += 2.0
+        names = list(
+            feature_names
+            if feature_names is not None
+            else config.train.get(
+                "feature_names",
+                ["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
+            )
+        )
+        g1_idx = resolve_feature_index(names, "g1")
+        g2_idx = resolve_feature_index(names, "g2")
+        theta_idx = resolve_feature_index(names, "theta_int")
 
-    fp_out = fp.clone() if fp is not None else None
-    if fp_out is not None:
-        fp_out = torch.stack([-fp_out[..., 1], fp_out[..., 0]], dim=-1)
+        if k % 2:
+            fid_out[..., [g1_idx, g2_idx]] = -fid_out[..., [g1_idx, g2_idx]]
+        fid_out[..., theta_idx] = _wrap_normalized_angle(
+            fid_out[..., theta_idx] - 0.5 * k
+        )
 
+    if reflected:
+        img_out, spec_out, fid_out, fp_out = _reflect_row_axis_datavector(
+            img_out,
+            spec_out,
+            fid_out,
+            fp_out,
+            g2_idx=g2_idx,
+            theta_idx=theta_idx,
+        )
+
+    return img_out, spec_out, fid_out, fp_out
+
+def rotate_90_degrees(img, fid=None, fp=None):
+    """Backward-compatible wrapper for the canonical r90 action."""
+    img_out, _, fid_out, fp_out = apply_d4_to_datavector(
+        img=img,
+        fid=fid,
+        fp=fp,
+        element="r90",
+    )
     return img_out, fid_out, fp_out
 
 def rot_90_param_only(fid, reverse=False):
+    """Rotate physical parameter vectors by 90 degrees.
+
+    Supports a single ``(P,)`` vector or arrays shaped ``(..., P)``. The first
+    two parameters are the spin-2 shear components and the third is
+    ``theta_int`` in radians.
+    """
     angle = np.pi/2 if reverse else -np.pi/2
-    fid_out = fid.copy()
-    fid_out[:2] = -fid_out[:2]
-    fid_out[2] = fid_out[2] + angle
-    if fid_out[2] < -np.pi:
-        fid_out[2] = fid_out[2] + 2*np.pi
-    elif fid_out[2] > np.pi:
-        fid_out[2] = fid_out[2] - 2*np.pi
+    fid_out = np.asarray(fid).copy()
+    if fid_out.shape[-1] < 3:
+        raise ValueError("parameter vectors must contain g1, g2, and theta_int")
+    fid_out[..., :2] = -fid_out[..., :2]
+    fid_out[..., 2] = (fid_out[..., 2] + angle + np.pi) % (2*np.pi) - np.pi
     return fid_out
 
 def apply_views(img, spec, img2, spec2):
@@ -250,17 +414,26 @@ def random_mask_spec(spec):
 
     return spec * mask
 
-def make_exact_half_flip_mask(size, device):
+def make_exact_half_flip_mask(size, device, generator=None):
     mask = torch.zeros((size,), dtype=torch.bool, device=device)
     nflip = size // 2
     if nflip == 0:
         return mask
-    flip_ids = torch.randperm(size, device=device)[:nflip]
+    flip_ids = torch.randperm(size, device=device, generator=generator)[:nflip]
     mask[flip_ids] = True
     return mask
 
 
-def apply_handedness_flip(img, spec, fid, fp=None, flip_mask=None, g2_idx=None, theta_idx=None):
+def apply_handedness_flip(
+    img,
+    spec,
+    fid,
+    fp=None,
+    flip_mask=None,
+    g2_idx=None,
+    theta_idx=None,
+):
+    """Reflect selected rows using the same action as D4 element v."""
     if flip_mask is None:
         return img, spec, fid, fp
     if flip_mask.dtype != torch.bool:
@@ -274,26 +447,26 @@ def apply_handedness_flip(img, spec, fid, fp=None, flip_mask=None, g2_idx=None, 
     if not torch.any(flip_mask):
         return img, spec, fid, fp
 
+    reflected = _reflect_row_axis_datavector(
+        img[flip_mask],
+        spec[flip_mask] if spec is not None else None,
+        fid[flip_mask],
+        fp[flip_mask] if fp is not None else None,
+        g2_idx=g2_idx,
+        theta_idx=theta_idx,
+    )
+
     img_out = img.clone()
     spec_out = spec.clone() if spec is not None else None
     fid_out = fid.clone()
     fp_out = fp.clone() if fp is not None else None
 
-    img_out[flip_mask] = torch.flip(img_out[flip_mask], dims=(-2,))
-    fid_out[flip_mask, g2_idx] = -fid_out[flip_mask, g2_idx]
-    if theta_idx is not None:
-        fid_out[flip_mask, theta_idx] = -fid_out[flip_mask, theta_idx]
-
+    img_out[flip_mask] = reflected[0]
     if spec_out is not None:
-        if spec_out.shape[-2] < 5:
-            raise ValueError("spec must include 5 fiber spectra to swap minor-axis fibers")
-        spec_out[flip_mask] = spec_out[flip_mask][:, :, [0, 1, 2, 4, 3], :]
-
+        spec_out[flip_mask] = reflected[1]
+    fid_out[flip_mask] = reflected[2]
     if fp_out is not None:
-        if fp_out.shape[1] < 5:
-            raise ValueError("fp must include 5 fiber positions to swap minor-axis fibers")
-        fp_out[flip_mask] = fp_out[flip_mask][:, [0, 1, 2, 4, 3], :]
-        fp_out[flip_mask, :, 1] = -fp_out[flip_mask, :, 1]
+        fp_out[flip_mask] = reflected[3]
 
     return img_out, spec_out, fid_out, fp_out
 
@@ -349,8 +522,9 @@ def apply_noise(
     return data + noise * factor_refined.view(-1, 1, 1, 1)
 
 
-def sample_magnitudes(n_samples, m_min, m_max):
-    u = np.random.uniform(0, 1, n_samples)
+def sample_magnitudes(n_samples, m_min, m_max, rng=None):
+    uniform = np.random.uniform if rng is None else rng.uniform
+    u = uniform(0, 1, n_samples)
     val_min = 10 ** (0.6 * m_min)
     val_max = 10 ** (0.6 * m_max)
     m = (5 / 3) * np.log10(u * (val_max - val_min) + val_min)

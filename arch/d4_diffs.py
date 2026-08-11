@@ -24,6 +24,7 @@ from train import (
     _resolve_amp_dtype,
 )
 import config
+from data import D4_ELEMENTS, apply_d4_to_datavector
 from model_registry import load_model_config
 
 BASE_SHARED_DIR = '/ocean/projects/phy250048p/shared'
@@ -38,17 +39,7 @@ DATA_TYPES = (
     'meta',
 )
 
-D4_TRANS = ['e', 'r90', 'r180', 'r270', 'v', 't', 'h', 'hvt']
-D4_SPEC_PERM = {
-    'e': [0, 1, 2, 3, 4],
-    'r90': [0, 1, 2, 3, 4],
-    'r180': [0, 1, 2, 3, 4],
-    'r270': [0, 1, 2, 3, 4],
-    'v': [0, 1, 2, 4, 3],
-    't': [0, 1, 2, 4, 3],
-    'h': [0, 1, 2, 4, 3],
-    'hvt': [0, 1, 2, 4, 3],
-}
+D4_TRANS = list(D4_ELEMENTS)
 
 
 def parse_args():
@@ -257,82 +248,25 @@ def now_utc_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def apply_d4_transform(image, transform_id):
-    """Applies D4 transformation to an image (H, W, C) or (H, W)."""
-    if transform_id == 'e':
-        return image
-    if transform_id == 'r90':
-        return torch.rot90(image, k=1)
-    if transform_id == 'r180':
-        return torch.rot90(image, k=2)
-    if transform_id == 'r270':
-        return torch.rot90(image, k=3)
-    if transform_id == 'v':
-        return torch.flip(image, dims=[0])
-    if transform_id == 't':
-        return torch.transpose(image, 1, 0)
-    if transform_id == 'h':
-        return torch.flip(image, dims=[1])
-    if transform_id == 'hvt':
-        return torch.flip(torch.transpose(image, 0, 1), dims=[0, 1])
-    return image
-
-
-def d4_fib_pos(fp, transform_id):
-    """Applies D4 transformation to fiber positions."""
-    ref = torch.from_numpy(np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.float32))
-    if transform_id == 'e':
-        return fp
-    if transform_id == 'r90':
-        return fp[[3, 4, 2, 1, 0]]
-    if transform_id == 'r180':
-        return fp[[1, 0, 2, 4, 3]]
-    if transform_id == 'r270':
-        return fp[[4, 3, 2, 0, 1]]
-    if transform_id == 'v':
-        return fp[[0, 1, 2, 4, 3]] @ ref
-    if transform_id == 't':
-        return fp[[4, 3, 2, 1, 0]] @ ref
-    if transform_id == 'h':
-        return fp[[1, 0, 2, 3, 4]] @ ref
-    if transform_id == 'hvt':
-        return fp[[3, 4, 2, 0, 1]] @ ref
-    return fp
-
-
 def build_d4_datavector_set(gal):
-    theta = gal['fid_pars'][2].item() * np.pi
-    d4_shear = [(-1) ** i for i in range(8)]
-    d4_rot = [
-        0,
-        -np.pi / 2,
-        -np.pi,
-        -3 * np.pi / 2,
-        -2 * theta,
-        -2 * theta - np.pi / 2,
-        -2 * theta - np.pi,
-        -2 * theta - 3 * np.pi / 2,
-    ]
-    d4_set = [copy.deepcopy(gal) for _ in range(8)]
+    """Build the complete D4 orbit using data.py as the source of truth."""
+    d4_set = []
+    for element in D4_ELEMENTS:
+        transformed = copy.deepcopy(gal)
+        img, spec, fid, fp = apply_d4_to_datavector(
+            img=torch.clone(gal['img']),
+            spec=torch.clone(gal['spec']),
+            fid=torch.clone(gal['fid_pars']),
+            fp=torch.clone(gal['fib_pos'].float()),
+            element=element,
+        )
+        transformed['img'] = img
+        transformed['spec'] = spec
+        transformed['fid_pars'] = fid
+        transformed['fib_pos'] = fp
+        d4_set.append(transformed)
 
-    for i, g in enumerate(d4_set):
-        t = D4_TRANS[i]
-        g2_neg = -1 if i > 3 else 1
-
-        g['img'][0] = apply_d4_transform(torch.clone(g['img'][0]), t)
-        g['spec'][0] = g['spec'][0][D4_SPEC_PERM[t]]
-        g['fib_pos'] = d4_fib_pos(torch.clone(g['fib_pos'].float()), t)
-
-        g['fid_pars'][0] *= d4_shear[i]
-        g['fid_pars'][1] *= d4_shear[i] * g2_neg
-        g['fid_pars'][2] = g['fid_pars'][2] * np.pi + d4_rot[i]
-        if g['fid_pars'][2] > np.pi:
-            g['fid_pars'][2] -= 2 * np.pi
-        elif g['fid_pars'][2] < -np.pi:
-            g['fid_pars'][2] += 2 * np.pi
-        g['fid_pars'][2] /= np.pi
-
-    return d4_set, D4_TRANS.copy()
+    return d4_set, list(D4_ELEMENTS)
 
 
 def to_numpy(value):

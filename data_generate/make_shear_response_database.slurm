@@ -1,0 +1,31 @@
+#!/bin/bash
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_shear_response_db_%A_%a.out
+#SBATCH --partition=RM-shared
+#SBATCH --time=1:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --array=1-10
+
+set -euo pipefail
+module load anaconda3
+source ~/.bashrc
+conda activate kl-nn
+
+SAMPLE=${SAMPLE:-shear_response_5k}
+DATASET=${DATASET:-shear_response_5k}
+NBASE=${NBASE:-1000}
+NFOLDERS=100
+NSHARDS=10
+TOTAL=$((5 * NBASE))
+if (( TOTAL % NFOLDERS != 0 )); then
+  echo "5*NBASE must be divisible by ${NFOLDERS}; got ${TOTAL}" >&2
+  exit 2
+fi
+CHUNK=$((TOTAL / NFOLDERS))
+SHARD_INDEX=$((SLURM_ARRAY_TASK_ID - 1))
+
+python make_database.py -s="${SAMPLE}" -d="${DATASET}" \
+  -N="${NFOLDERS}" -n="${CHUNK}" --nspec=5 \
+  --shard_idx="${SHARD_INDEX}" --num_shards="${NSHARDS}"

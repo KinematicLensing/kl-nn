@@ -17,7 +17,6 @@ SIGMA_TAG="${SIGMA/./p}"
 
 export CCL_SIGMA_LABEL="${SIGMA}"
 export CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
-export CCL_OBJECTIVE="ccl"
 export EPOCHS="${EPOCHS:-15}"
 export SEED="${SEED:-42}"
 export MODEL_NAME="${MODEL_NAME_PREFIX:-CNN-CNN_CCL_fixedgeo_rot90_bw}_sig${SIGMA_TAG}_s${SEED}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"

@@ -29,6 +29,8 @@ class PretrainConfig:
     save_model: bool
     model_path: str
     model_name: str
+    backbone_type: str = "legacy"
+    use_rot90_counterpart: bool = True
     use_amp: bool = True
     amp_dtype: str = "float16"
     use_compile: bool = True
@@ -47,8 +49,6 @@ class PretrainConfig:
     ccl_d_cutoff: float = 0.40
     ccl_label_scales: dict[str, float] = field(default_factory=dict)
     ccl_distance_reduction: str = "mean"
-    ccl_objective: str = "ccl"
-    ccl_shear_loss_weight: float = 1.0
     seed: int = 42
     deterministic: bool = False
 
@@ -70,6 +70,9 @@ class TrainConfig:
     use_pretrain: bool
     pretrained_name: str
     pretrain_from: int
+    backbone_type: str = "legacy"
+    posterior_symmetry: str = "none"
+    use_rot90_counterpart: bool = True
     use_amp: bool = True
     amp_dtype: str = "float16"
     use_compile: bool = True
@@ -94,6 +97,10 @@ class TrainConfig:
 class FlowConfig:
     num_layers: int
     mlp: list[int] = field(default_factory=lambda: [1, 128, 64, 2])
+    # ``affine`` preserves the historical Euclidean NPE. ``circular_rqs``
+    # treats theta_int as a genuine periodic coordinate on [-1, 1).
+    flow_type: str = "affine"
+    num_bins: int = 8
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,13 +131,26 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ModelConfig":
+        pretrain_payload = dict(payload["pretrain"])
+        archived_objective = pretrain_payload.pop("ccl_objective", None)
+        archived_shear_weight = pretrain_payload.pop("ccl_shear_loss_weight", None)
+        pretrain_config = PretrainConfig(**pretrain_payload)
+        # Archived network snapshots for the retired auxiliary experiment still
+        # read these legacy dictionary keys. Dynamic attributes keep those old
+        # checkpoints loadable without serializing retired options in new configs.
+        if archived_objective not in (None, "ccl"):
+            pretrain_config._archived_ccl_objective = archived_objective
+            pretrain_config._archived_ccl_shear_loss_weight = (
+                1.0 if archived_shear_weight is None else archived_shear_weight
+            )
+
         return cls(
             rmag_snr_source_path=payload["rmag_snr_source_path"],
             rmag_snr_fit_path=payload["rmag_snr_fit_path"],
             data=DatasetConfig(**payload["data"]),
             test=DatasetConfig(**payload["test"]),
             par_ranges={k: [float(v[0]), float(v[1])] for k, v in payload["par_ranges"].items()},
-            pretrain=PretrainConfig(**payload["pretrain"]),
+            pretrain=pretrain_config,
             train=TrainConfig(**payload["train"]),
             flow=FlowConfig(**payload["flow"]),
             tf=TFConfig(**payload["tf"])
@@ -174,10 +194,10 @@ def _default_model_config() -> ModelConfig:
             "vcirc": [60.0, 540.0],
             "rscale": [0.1, 2.0],
             "hlr": [0.1, 3.0],
-            "dx_disk": [-0.5, 0.5],
-            "dy_disk": [-0.5, 0.5],
-            "dx_spec": [-0.5, 0.5],
-            "dy_spec": [-0.5, 0.5],
+            # "dx_disk": [-0.5, 0.5],
+            # "dy_disk": [-0.5, 0.5],
+            # "dx_spec": [-0.5, 0.5],
+            # "dy_spec": [-0.5, 0.5],
         },
         pretrain=PretrainConfig(
             epoch_number=100,
@@ -247,6 +267,16 @@ def _sync_legacy_globals(model_config: ModelConfig) -> None:
     test = model_config.test.to_dict()
     par_ranges = model_config.par_ranges.copy()
     pretrain = model_config.pretrain.to_dict()
+    archived_objective = getattr(
+        model_config.pretrain, "_archived_ccl_objective", None
+    )
+    if archived_objective is not None:
+        pretrain["ccl_objective"] = archived_objective
+        pretrain["ccl_shear_loss_weight"] = getattr(
+            model_config.pretrain,
+            "_archived_ccl_shear_loss_weight",
+            1.0,
+        )
     train = model_config.train.to_dict()
     flow = model_config.flow.to_dict()
     tf = model_config.tf.to_dict()

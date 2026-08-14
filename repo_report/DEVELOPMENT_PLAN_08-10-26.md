@@ -111,6 +111,18 @@ The first training run occurs after this stage.
 
 ## Stage 3 — Shared spectral encoder and permutation-aware fusion
 
+Status: implemented and trained on 2026-08-11. The controlled MLP probe found
+roughly unchanged shear recovery, modestly mixed changes in the scalar
+parameters, and worse `theta_int` recovery. This stage is retained as a
+structural improvement in how spectra, fiber positions, and their association
+are represented rather than as a demonstrated prediction improvement.
+
+The implementation is selected with the persisted `backbone_type=stage3` so
+legacy checkpoints/configurations retain their original feature extractor. It
+keeps the 1024-dimensional downstream context and treats all five current
+fibers as observed by default, while supporting explicit Boolean masks and
+variable fiber counts internally.
+
 Replace 2D convolution across the semantic fiber axis with a shared 1D
 spectral encoder:
 
@@ -132,6 +144,39 @@ each fiber coordinate and append that local feature to its fiber token.
 Run the small train/validation experiment after this stage.
 
 ## Stage 4 — Full multimodal D4 equivariance
+
+Status: the exactly equivariant multimodal backbone was implemented and
+trained on 2026-08-12. Its controlled raw-MLP probe retained essentially the
+same shear information as Stage 3 and the legacy baseline. The exact D4
+posterior loss, inference density, sampler, and first-run launchers are now
+implemented; the first frozen-backbone NPE run is pending.
+
+The implemented 1024-dimensional representation allocates 512 scalar
+channels, 256 directed spin-1 channels, and 256 spin-2 channels. Every forward
+evaluates all eight transformed multimodal views together in one shared
+backbone call, which keeps the existing image BatchNorm statistics orbit
+closed. The inverse group action aligns the eight outputs before averaging.
+This makes the frozen feature extractor exactly D4-equivariant for any learned
+weights. The Stage 4 CCL projection head also respects these blocks: scalar
+channels use a scalar MLP, while spin-1 and spin-2 pairs use bias-free shared
+multiplicity mixing. Consequently a common D4 action preserves projected
+cosine geometry and cannot introduce a preferred spin direction during
+pretraining. The current implementation intentionally assumes the canonical
+five-fiber layout; variable-fiber D4 support remains future work.
+
+The D4 posterior evaluates the expensive frozen orbit backbone once per
+datavector. It derives all eight raw contexts by the known feature action and
+applies LayerNorm separately after each action. Training averages the eight
+branch log probabilities for each galaxy before applying its single invariant
+TF weight. Inference uses their log-sum-exp mixture. Sampling draws a balanced
+number from all eight branches, maps each sample back to the input frame, and
+only then applies the existing TF replacement. The older rot90 cancellation
+estimator is rejected for this model because it is redundant with the exact
+posterior and can recreate the near-zero-shear failure mode.
+
+The current affine flow still treats normalized `theta_int` on the real line.
+The D4 action is exact on the canonical `[-1, 1)` coordinate, but globally
+periodic posterior normalization remains a Stage 5 requirement.
 
 D4 must act on the complete multimodal datavector, not only `ImgCNN`.
 Following the full-orbit idea in D4CNN x AnaCal, evaluate a shared multimodal
@@ -234,6 +279,17 @@ architecture.
 Response calibration remains a last resort rather than a target part of this
 development path.
 
+## Additive-bias data control
+
+A direct stack of all simulated galaxy images shows detector-frame
+anisotropies orders of magnitude below `1e-4`, and the simulator uses a
+circular PSF. This strongly disfavors the input image population and PSF as
+the dominant source of the observed additive shear bias. Stage 4 therefore
+targets estimator-induced detector-frame spin structure. Exact D4 symmetry
+removes a fixed spin axis from the architecture, but the final `|c| < 1e-4`
+claim still requires posterior-level bias tests because selection, noise,
+training, and density-estimation effects can contribute residual bias.
+
 ## First-run handoff criterion
 
 The first training run is ready when:
@@ -245,4 +301,11 @@ The first training run is ready when:
 5. the small-run Slurm script fixes train/validation paths, GPU count,
    deterministic settings, and all effective configuration overrides;
 6. the focused CPU test suite passes.
+
+As of 2026-08-12 all six criteria pass. The full local suite reports 142
+passing tests and one skipped CUDA-only test. The Stage 4 launcher keeps the
+Stage 2/3 CCL global batch geometry, disables the now-redundant external rot90
+training branch, and records deterministic run settings. Its first GPU batch
+is also the empirical memory/determinism gate for the eight-view production
+backbone.
 

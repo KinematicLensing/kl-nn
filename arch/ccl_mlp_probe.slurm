@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/ccl_mlp_probe_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -20,7 +20,7 @@ source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 set -u
 
-MODEL_NAME="${MODEL_NAME:-CNN-CNN_CCL_fixedgeo_rot90_s42_43352269}"
+MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4_CCL_stage4_fixedgeo_s42_43420237}"
 CHECKPOINT_SUFFIX="${CHECKPOINT_SUFFIX:-latest}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-20000}"
 VALID_SAMPLES="${VALID_SAMPLES:-10000}"

@@ -220,31 +220,37 @@ def add_blobs(img, nblobs, avg_amp, avg_size):
     return new_img, blob_img
 
 def img_to_gal_axis(g1, g2, theta):
-    '''
-    Convert from (g1, g2) to (g_plus, g_cross) given position angle theta.
-    '''
+    """Convert image-frame shear to the galaxy frame.
+
+    ``theta`` follows the simulator's image-array convention: positive angles
+    rotate clockwise on a displayed image (the row/y coordinate increases
+    downward). Consequently, a positive ``g2`` shear is aligned with a galaxy
+    at ``theta = pi / 4``. The spin-2 basis is rotated by ``2 * theta``.
+    """
     # check if numpy array or torch tensor
     if isinstance(g1, torch.Tensor):
-        g_plus = g1 * torch.cos(2*theta) - g2 * torch.sin(2*theta)
-        g_cross = g1 * torch.sin(2*theta) + g2 * torch.cos(2*theta)
+        g_plus = g1 * torch.cos(2*theta) + g2 * torch.sin(2*theta)
+        g_cross = -g1 * torch.sin(2*theta) + g2 * torch.cos(2*theta)
         return g_plus, g_cross
     else:
-        g_plus = g1 * np.cos(2*theta) - g2 * np.sin(2*theta)
-        g_cross = g1 * np.sin(2*theta) + g2 * np.cos(2*theta)
+        g_plus = g1 * np.cos(2*theta) + g2 * np.sin(2*theta)
+        g_cross = -g1 * np.sin(2*theta) + g2 * np.cos(2*theta)
     return g_plus, g_cross
 
 def gal_to_img_axis(g_plus, g_cross, theta):
-    '''
-    Convert from (g_plus, g_cross) to (g1, g2) given position angle theta.
-    '''
+    """Convert galaxy-frame shear to the image frame.
+
+    This is the inverse of :func:`img_to_gal_axis`; ``theta`` is positive
+    clockwise in the simulator's image-array convention.
+    """
     # check if numpy array or torch tensor
     if isinstance(g_plus, torch.Tensor):
-        g1 = g_plus * torch.cos(2*theta) + g_cross * torch.sin(2*theta)
-        g2 = -g_plus * torch.sin(2*theta) + g_cross * torch.cos(2*theta)
+        g1 = g_plus * torch.cos(2*theta) - g_cross * torch.sin(2*theta)
+        g2 = g_plus * torch.sin(2*theta) + g_cross * torch.cos(2*theta)
         return g1, g2
     else:
-        g1 = g_plus * np.cos(2*theta) + g_cross * np.sin(2*theta)
-        g2 = -g_plus * np.sin(2*theta) + g_cross * np.cos(2*theta)
+        g1 = g_plus * np.cos(2*theta) - g_cross * np.sin(2*theta)
+        g2 = g_plus * np.sin(2*theta) + g_cross * np.cos(2*theta)
     return g1, g2
 
 

@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=kl_ccl_stage1
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/pretrain_ccl_stage1_%j.out
+#SBATCH --job-name=kl_ccl_stage3
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/pretrain_ccl_stage3_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
-#SBATCH --time=2:00:00
+#SBATCH --time=0:30:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
@@ -23,15 +23,10 @@ EPOCHS="${EPOCHS:-15}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 CCL_SIGMA_LABEL="${CCL_SIGMA_LABEL:-0.15}"
 CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
-CCL_OBJECTIVE="${CCL_OBJECTIVE:-ccl_shear}"
-CCL_SHEAR_LOSS_WEIGHT="${CCL_SHEAR_LOSS_WEIGHT:-1.0}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-if [[ "${CCL_OBJECTIVE}" == "ccl_shear" ]]; then
-    MODEL_PREFIX="CNN-CNN_CCL_shear_fixedgeo_rot90"
-else
-    MODEL_PREFIX="CNN-CNN_CCL_fixedgeo_rot90"
-fi
+MODEL_PREFIX="CNN-SetAttn_CCL_stage3_fixedgeo_rot90"
 MODEL_NAME="${MODEL_NAME:-${MODEL_PREFIX}_s${SEED}_${JOB_TAG}}"
+PRETRAIN_FROM="$((EPOCHS - 1))"
 TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m/}"
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m/}"
 TRAIN_SIZE="${TRAIN_SIZE:-100000}"
@@ -48,13 +43,12 @@ export PYTHONHASHSEED="${SEED}"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MASTER_PORT
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1
+export TORCH_FR_BUFFER_SIZE=1
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 echo "model=${MODEL_NAME}"
-echo "seed=${SEED} epochs=${EPOCHS} batch_size=${BATCH_SIZE}"
+echo "backbone=stage3 seed=${SEED} epochs=${EPOCHS} batch_size=${BATCH_SIZE}"
 echo "ccl_sigma_label=${CCL_SIGMA_LABEL} ccl_d_cutoff=${CCL_D_CUTOFF}"
-echo "ccl_objective=${CCL_OBJECTIVE} ccl_shear_loss_weight=${CCL_SHEAR_LOSS_WEIGHT}"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "gpu_count=${SLURM_GPUS_ON_NODE:-4}"
@@ -65,10 +59,13 @@ cd /jet/home/xwang30/kl-nn/arch
 python '[scr]_train_model.py' \
     --model CCLPretrain \
     --trainer FETrainer \
+    --backbone-type stage3 \
     --train-type pretrain \
     --train-data "${TRAIN_DATA}" \
     --valid-data "${VALID_DATA}" \
     --model-name "${MODEL_NAME}" \
+    --pretrained-name "${MODEL_NAME}" \
+    --pretrain-from "${PRETRAIN_FROM}" \
     --train-size "${TRAIN_SIZE}" \
     --valid-size "${VALID_SIZE}" \
     --epochs "${EPOCHS}" \

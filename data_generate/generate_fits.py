@@ -100,25 +100,25 @@ Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
 ### Calculate fiber offsets due to shear and inclination
-cosi = np.sqrt(1-sini**2)
-A = np.array([[1+g1, g2],
-              [g2, 1-g1]])
-R = np.array([[np.cos(theta_int), -np.sin(theta_int)],
-              [np.sin(theta_int), np.cos(theta_int)]])
-P = np.array([[1, 0],
-              [0, cosi]])
-T = np.matmul(A, np.matmul(R, P))
-U, S, Vh = np.linalg.svd(T)
-v_ref = T @ np.array([1, 0])
-if np.dot(U[:, 0], v_ref) < 0:
-    U *= -1
+# cosi = np.sqrt(1-sini**2)
+# A = np.array([[1+g1, g2],
+#               [g2, 1-g1]])
+# R = np.array([[np.cos(theta_int), -np.sin(theta_int)],
+#               [np.sin(theta_int), np.cos(theta_int)]])
+# P = np.array([[1, 0],
+#               [0, cosi]])
+# T = np.matmul(A, np.matmul(R, P))
+# U, S, Vh = np.linalg.svd(T)
+# v_ref = T @ np.array([1, 0])
+# if np.dot(U[:, 0], v_ref) < 0:
+#     U *= -1
 offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
            (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
            (0,0),
            (fiber_offset*np.cos(np.pi/2), fiber_offset*np.sin(np.pi/2)),
            (fiber_offset*np.cos(3*np.pi/2), fiber_offset*np.sin(3*np.pi/2))]
-offsets = np.matmul(offsets, U)
-offsets = np.asarray(offsets)[fiber_perm]
+# offsets = np.matmul(offsets, U)
+# offsets = np.asarray(offsets)[fiber_perm]
 OFFSETX = 1
 
 ### Choose fiber configurations

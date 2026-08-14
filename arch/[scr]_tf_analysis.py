@@ -21,6 +21,7 @@ from train import (
     load_model,
     sample_density,
     _resolve_amp_dtype,
+    seed_everything,
 )
 from networks import KLNPE
 import config
@@ -163,6 +164,12 @@ def parse_args():
         help='Log timing for key phases.',
     )
     parser.add_argument(
+        '--network-source',
+        choices=('archived', 'current'),
+        default='archived',
+        help='Instantiate the checkpoint with its archived source or the current repository source.',
+    )
+    parser.add_argument(
         '--cached-snrs-path',
         type=str,
         default=None,
@@ -186,6 +193,12 @@ def parse_args():
         type=int,
         default=1,
         help='Reuse scalar SNR and injected-noise realization within consecutive groups.',
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base seed for SNR, noise, TF, and posterior sampling draws.",
     )
     return parser.parse_args()
 
@@ -233,6 +246,20 @@ def build_partition_label(partition_idx, total_partitions):
             f'Partition index {partition_idx} out of range for total partitions {total_partitions}.'
         )
     return f'part{partition_idx}of{total_partitions}'
+
+
+def resolve_partition_range(partition_idx, galaxies_per_partition, dataset_size):
+    '''Return the half-open dataset range for one deterministic partition.'''
+    if galaxies_per_partition <= 0:
+        raise ValueError('ngals must be positive')
+    galaxy_start = partition_idx * galaxies_per_partition
+    galaxy_end = galaxy_start + galaxies_per_partition
+    if galaxy_end > dataset_size:
+        raise ValueError(
+            f'Partition range [{galaxy_start}, {galaxy_end}) exceeds dataset '
+            f'size {dataset_size}.'
+        )
+    return galaxy_start, galaxy_end
 
 
 def get_cache_path(cache_root, model_name, dataset_name, data_type, file_name):
@@ -298,6 +325,32 @@ def sampling_progress(iterable, mode, **kwargs):
     cleaned.pop("desc", None)
     return tqdm(iterable, desc=f"Sampling mode {mode}", **cleaned)
 
+def summarize_posterior_samples(samples, feature_names):
+    """Return 16th, mean, and 84th estimates with circular theta handling."""
+    values = np.asarray(samples)
+    if values.ndim != 2 or values.shape[1] != len(feature_names):
+        raise ValueError("samples must have shape (samples, len(feature_names))")
+    summary = np.stack(
+        (
+            np.percentile(values, 16, axis=0),
+            np.mean(values, axis=0),
+            np.percentile(values, 84, axis=0),
+        ),
+        axis=0,
+    )
+    if "theta_int" in feature_names:
+        theta_idx = feature_names.index("theta_int")
+        theta = values[:, theta_idx]
+        center = np.arctan2(np.sin(theta).mean(), np.cos(theta).mean())
+        residual = np.arctan2(np.sin(theta - center), np.cos(theta - center))
+        residual_bounds = np.percentile(residual, (16, 84))
+        circular = np.array(
+            (center + residual_bounds[0], center, center + residual_bounds[1])
+        )
+        summary[:, theta_idx] = (circular + np.pi) % (2.0 * np.pi) - np.pi
+    return summary
+
+
 def main():
     setup_logging()
     args = parse_args()
@@ -317,6 +370,11 @@ def main():
         dataset_name += f'_{args.cache_tag.strip("_")}'
     total_partitions = infer_total_partitions(args)
     partition_label = build_partition_label(args.i, total_partitions)
+    rng_seed = (int(args.seed) + 1_000_003 * int(args.i)) % (2**32)
+    seed_everything(
+        rng_seed,
+        deterministic=bool(config.train.get("deterministic", False)),
+    )
     nfeatures = config.train['feature_number']
     feature_names = config.train['feature_names']
 
@@ -368,7 +426,7 @@ def main():
             return models[mode]
         if profile:
             _sync_cuda(device)
-            start = time.perf_counter()
+            profile_start = time.perf_counter()
         model = load_model(
             train_config=config.train,
             Model=KLNPE,
@@ -381,25 +439,42 @@ def main():
             compile_mode=compile_mode,
             compile_backend=compile_backend,
             channels_last=channels_last,
+            use_archived_networks=args.network_source == 'archived',
         )
         if profile:
             _sync_cuda(device)
-            logging.info('Timing: load model mode %s took %.2fs', mode, time.perf_counter() - start)
+            logging.info(
+                'Timing: load model mode %s took %.2fs',
+                mode,
+                time.perf_counter() - profile_start,
+            )
+        logging.info(
+            'Loaded checkpoint using %s network source',
+            args.network_source,
+        )
         models[mode] = model
         return model
 
     if not use_separate_models:
         get_model_for_mode(2)
 
+    posterior_symmetry = config.train.get("posterior_symmetry", "none")
+    if posterior_symmetry == "d4" and args.cancel_add_noise:
+        raise ValueError(
+            "--cancel-add-noise is redundant and incompatible with the exact D4 posterior"
+        )
+    if posterior_symmetry == "d4" and (nsamples <= 0 or nsamples % 8):
+        raise ValueError("D4 posterior sampling requires --nsamples divisible by 8")
+
     # Get data loader
     test_ds = pxt.TorchDataset(data_dir)
-    start = args.i * args.ngals
-    end = start + args.ngals
-    if end > len(test_ds):
-        raise ValueError(
-            f'Partition range [{start}, {end}) exceeds dataset size {len(test_ds)} for partition {partition_label}.'
+    try:
+        galaxy_start, galaxy_end = resolve_partition_range(
+            args.i, args.ngals, len(test_ds)
         )
-    subset = Subset(test_ds, np.arange(start, end))
+    except ValueError as exc:
+        raise ValueError(f'{exc} Partition: {partition_label}.') from exc
+    subset = Subset(test_ds, np.arange(galaxy_start, galaxy_end))
 
     vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
     vcirc_name = feature_names[vcirc_idx]
@@ -408,7 +483,7 @@ def main():
     # Collect true vcirc values in normalized space and convert to km/s center of prior.
     if profile:
         _sync_cuda(device)
-        start = time.perf_counter()
+        profile_start = time.perf_counter()
     vcirc_true = torch.zeros((args.ngals), dtype=torch.float32, device=device)
     vcirc_iter = tqdm(range(args.ngals), desc="Collect vcirc") if args.ngals else range(0)
     for i in vcirc_iter:
@@ -418,9 +493,11 @@ def main():
     truth = build_truth_array(subset, feature_names, progress=tqdm)
     if profile:
         _sync_cuda(device)
-        logging.info('Timing: prep vcirc/truth took %.2fs', time.perf_counter() - start)
+        logging.info(
+            'Timing: prep vcirc/truth took %.2fs',
+            time.perf_counter() - profile_start,
+        )
     
-    rng_seed = 42
     app_mag = None
     if args.conform_to_tf:
         logging.info('Conforming dataset to TF prior')
@@ -466,7 +543,7 @@ def main():
             noise_gen = torch.Generator(device=device).manual_seed(rng_seed)
             if profile:
                 _sync_cuda(device)
-                start = time.perf_counter()
+                profile_start = time.perf_counter()
             sampling_progress_fn = functools.partial(sampling_progress, mode=mode)
             samples, log_probs, SNR = sample_density(
                 model,
@@ -486,7 +563,11 @@ def main():
             )
             if profile:
                 _sync_cuda(device)
-                logging.info('Timing: sample_density mode %s took %.2fs', mode, time.perf_counter() - start)
+                logging.info(
+                    'Timing: sample_density mode %s took %.2fs',
+                    mode,
+                    time.perf_counter() - profile_start,
+                )
             post_iter = tqdm(range(args.ngals), desc=f"Postprocess mode {mode}") if args.ngals else range(0)
             post_start = time.perf_counter() if profile else None
             for i in post_iter:
@@ -551,9 +632,9 @@ def main():
                 map_estimates[j, i] = samples[map_idx]
 
             # Mean estimate with bounds
-            mean_estimates[j, i, 0] = np.percentile(samples, 16, axis=0) # low bound
-            mean_estimates[j, i, 1] = np.mean(samples, axis=0) # mean
-            mean_estimates[j, i, 2] = np.percentile(samples, 84, axis=0) # high bound
+            mean_estimates[j, i] = summarize_posterior_samples(
+                samples, feature_names
+            )
             if args.cancel_add_noise:
                 shear_samples = np.concatenate(
                     [samples[:, :2], counter_samples[:, :2]], axis=0
@@ -580,7 +661,7 @@ def main():
         'partition_label': partition_label,
         'ngals': args.ngals,
         'nsamples': args.nsamples,
-        'galaxy_range': {'start': start, 'end': end},
+        'galaxy_range': {'start': galaxy_start, 'end': galaxy_end},
         'paths': {
             key: os.path.relpath(path, join(cache_dir, model_name, dataset_name))
             for key, path in saved_files.items()
@@ -589,12 +670,17 @@ def main():
         'created_at_utc': now_utc_iso(),
         'args': {
             'stem': args.stem,
+            'epoch': args.epoch,
             'dataset': args.dataset,
             'sample_set': args.sample_set,
             'mode': args.mode,
+            'conform_to_tf': args.conform_to_tf,
             'cache_tag': args.cache_tag,
             'cached_snrs_path': args.cached_snrs_path,
             'matched_group_size': args.matched_group_size,
+            "seed": args.seed,
+            "partition_seed": rng_seed,
+            "posterior_symmetry": posterior_symmetry,
             'cancel_add_noise': args.cancel_add_noise,
         },
     }

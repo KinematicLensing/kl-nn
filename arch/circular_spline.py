@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from nflows.transforms.autoregressive import AutoregressiveTransform
@@ -96,8 +97,13 @@ def rational_quadratic_spline(
         c = -input_delta * (inputs - input_cumheights)
 
         discriminant = b.pow(2) - 4 * a * c
-        if torch.any(discriminant < 0):
+        # Roundoff can make an analytically non-negative discriminant slightly
+        # negative. Reject a materially invalid inverse, but clamp roundoff.
+        scale = torch.maximum(b.pow(2).abs(), (4 * a * c).abs()).clamp_min(1.0)
+        tolerance = 100 * torch.finfo(discriminant.dtype).eps * scale
+        if torch.any(discriminant < -tolerance):
             raise ValueError("Spline inversion failed: negative discriminant")
+        discriminant = discriminant.clamp_min(0.0)
 
         root = (2 * c) / (-b - torch.sqrt(discriminant))
         outputs = root * input_bin_widths + input_cumwidths
@@ -330,13 +336,25 @@ class CircularAutoregressiveRationalQuadraticSpline(
         activation=F.relu,
         dropout_probability=0.0,
         random_mask=False,
+        identity_init=True,
         use_batch_norm=False,
     ):
         if num_input_channels <= 0:
             raise ValueError("num_input_channels must be positive")
         if not isinstance(ind_circ, (list, tuple)):
             raise ValueError("ind_circ must be a list or tuple of indices")
+        if any(type(index) is not int for index in ind_circ):
+            raise TypeError("circular indices must be integers")
+        if len(set(ind_circ)) != len(ind_circ):
+            raise ValueError("circular indices must be unique")
+        if any(index < 0 or index >= num_input_channels for index in ind_circ):
+            raise ValueError("circular index is out of bounds")
+        if not np.isfinite(tail_bound) or float(tail_bound) != 1.0:
+            raise ValueError(
+                "theta_int is normalized by pi, so circular tail_bound must equal 1.0"
+            )
         ind_circ = list(ind_circ)
+        self.ind_circ = tuple(ind_circ)
         if len(ind_circ) == 0:
             tails = "linear"
         else:
@@ -358,3 +376,47 @@ class CircularAutoregressiveRationalQuadraticSpline(
             dropout_probability=dropout_probability,
             use_batch_norm=use_batch_norm,
         )
+        if identity_init:
+            self._initialize_identity()
+
+    def _canonicalize_circular(self, values):
+        if not self.ind_circ:
+            return values
+        canonical = values.clone()
+        circular_indices = list(self.ind_circ)
+        bound = float(self.tail_bound)
+        period = 2.0 * bound
+        circular = canonical[..., circular_indices]
+        outside = torch.isfinite(circular) & (
+            (circular < -bound) | (circular >= bound)
+        )
+        wrapped = torch.remainder(circular + bound, period) - bound
+        canonical[..., circular_indices] = torch.where(
+            outside, wrapped, circular
+        )
+        return canonical
+
+    def _elementwise(self, inputs, autoregressive_params, inverse=False):
+        """Apply the spline in the canonical circular coordinate chart.
+
+        ``+tail_bound`` and ``-tail_bound`` are the same point. Floating-point
+        spline arithmetic can land a few ulps across that seam. Canonicalizing
+        both inputs and outputs prevents such a representative from entering
+        the identity-tail branch of a later layer. This is modulo arithmetic,
+        not clipping, and has unit Jacobian almost everywhere.
+        """
+        inputs = self._canonicalize_circular(inputs)
+        outputs, logabsdet = super()._elementwise(
+            inputs, autoregressive_params, inverse=inverse
+        )
+        return self._canonicalize_circular(outputs), logabsdet
+
+    def _initialize_identity(self):
+        """Start at the identity map, including unit boundary derivatives."""
+        final_layer = self.autoregressive_net.final_layer
+        nn.init.zeros_(final_layer.weight)
+        nn.init.zeros_(final_layer.bias)
+        derivative_value = np.log(np.expm1(1.0 - self.min_derivative))
+        with torch.no_grad():
+            bias = final_layer.bias.view(-1, self._output_dim_multiplier())
+            bias[:, 2 * self.num_bins :] = derivative_value

@@ -240,6 +240,55 @@ def _wrap_normalized_angle(theta):
     return torch.remainder(theta + 1.0, 2.0) - 1.0
 
 
+def transform_d4_parameters(parameters, element="e", feature_names=None):
+    """Apply the canonical D4 action to normalized KL parameter vectors.
+
+    The last axis may use any feature order. ``g1``/``g2`` are a spin-2 pair,
+    ``theta_int`` is a directed angle normalized by pi, and every other KL
+    parameter is a D4 scalar. The angle is always canonicalized to ``[-1, 1)``.
+    The action is measure preserving on the canonical coordinate domain.
+    """
+    if not torch.is_tensor(parameters):
+        raise TypeError("parameters must be a torch tensor")
+    if parameters.ndim < 1:
+        raise ValueError("parameters must have a final feature dimension")
+    element = _canonical_d4_element(element)
+    if feature_names is None:
+        names = list(
+            config.train.get(
+                "feature_names",
+                ["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
+            )
+        )
+        if parameters.shape[-1] <= len(names):
+            names = names[: parameters.shape[-1]]
+    else:
+        names = list(feature_names)
+    if parameters.shape[-1] != len(names):
+        raise ValueError(
+            "parameter feature dimension must match feature_names; "
+            f"got {parameters.shape[-1]} and {len(names)}"
+        )
+    g1_idx = resolve_feature_index(names, "g1")
+    g2_idx = resolve_feature_index(names, "g2")
+    theta_idx = resolve_feature_index(names, "theta_int")
+    k, reflected = _D4_ACTIONS[element]
+
+    transformed = parameters.clone()
+    if k % 2:
+        transformed[..., g1_idx] = -transformed[..., g1_idx]
+        transformed[..., g2_idx] = -transformed[..., g2_idx]
+    transformed[..., theta_idx] = _wrap_normalized_angle(
+        transformed[..., theta_idx] - 0.5 * k
+    )
+    if reflected:
+        transformed[..., g2_idx] = -transformed[..., g2_idx]
+        transformed[..., theta_idx] = _wrap_normalized_angle(
+            -transformed[..., theta_idx]
+        )
+    return transformed
+
+
 def _rotate_array_coordinates(fp, k):
     """Rotate (..., 2) coordinates consistently with torch.rot90."""
     k = int(k) % 4
@@ -323,39 +372,92 @@ def apply_d4_to_datavector(
     spec_out = spec.clone() if spec is not None else None
     fp_out = _rotate_array_coordinates(fp, k) if fp is not None else None
 
-    g2_idx = None
-    theta_idx = None
-    fid_out = fid.clone() if fid is not None else None
-    if fid_out is not None:
-        names = list(
-            feature_names
-            if feature_names is not None
-            else config.train.get(
-                "feature_names",
-                ["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
-            )
-        )
-        g1_idx = resolve_feature_index(names, "g1")
-        g2_idx = resolve_feature_index(names, "g2")
-        theta_idx = resolve_feature_index(names, "theta_int")
-
-        if k % 2:
-            fid_out[..., [g1_idx, g2_idx]] = -fid_out[..., [g1_idx, g2_idx]]
-        fid_out[..., theta_idx] = _wrap_normalized_angle(
-            fid_out[..., theta_idx] - 0.5 * k
-        )
+    fid_out = (
+        transform_d4_parameters(fid, element, feature_names=feature_names)
+        if fid is not None
+        else None
+    )
 
     if reflected:
-        img_out, spec_out, fid_out, fp_out = _reflect_row_axis_datavector(
+        img_out, spec_out, _, fp_out = _reflect_row_axis_datavector(
             img_out,
             spec_out,
-            fid_out,
+            None,
             fp_out,
-            g2_idx=g2_idx,
-            theta_idx=theta_idx,
         )
 
     return img_out, spec_out, fid_out, fp_out
+
+
+def transform_d4_fiber_mask(fiber_mask, element="e"):
+    """Transform a Boolean fiber-observation mask with the canonical D4 action."""
+    if fiber_mask.dtype != torch.bool:
+        raise TypeError("fiber_mask must be a bool tensor")
+    if fiber_mask.ndim < 1:
+        raise ValueError("fiber_mask must have a fiber dimension")
+    element = _canonical_d4_element(element)
+    _, reflected = _D4_ACTIONS[element]
+    if not reflected:
+        return fiber_mask.clone()
+    return _swap_reflected_minor_fibers(fiber_mask, fiber_dim=-1)
+
+
+def transform_d4_feature_blocks(
+    features,
+    element="e",
+    *,
+    scalar_channels,
+    spin1_channels,
+    spin2_channels,
+):
+    """Apply D4 actions to scalar, directed spin-1, and spin-2 blocks.
+
+    The final feature axis is laid out as ``[scalars, spin1 pairs, spin2
+    pairs]``. Spin-1 follows the directed ``(cos(theta), sin(theta))`` and
+    array-coordinate convention. Spin-2 follows ``(g1, g2)``.
+    """
+    channel_counts = (scalar_channels, spin1_channels, spin2_channels)
+    if any(type(value) is not int or value < 0 for value in channel_counts):
+        raise ValueError("D4 feature channel counts must be non-negative integers")
+    if spin1_channels % 2 or spin2_channels % 2:
+        raise ValueError("spin-1 and spin-2 channel counts must be even")
+    if sum(channel_counts) != features.shape[-1]:
+        raise ValueError(
+            "D4 feature channel counts must sum to the final feature dimension"
+        )
+
+    element = _canonical_d4_element(element)
+    k, reflected = _D4_ACTIONS[element]
+    scalar_end = scalar_channels
+    spin1_end = scalar_end + spin1_channels
+    scalars = features[..., :scalar_end].clone()
+
+    spin1 = features[..., scalar_end:spin1_end].reshape(
+        *features.shape[:-1], spin1_channels // 2, 2
+    )
+    spin1 = _rotate_array_coordinates(spin1, k)
+    if reflected:
+        spin1 = torch.stack((spin1[..., 0], -spin1[..., 1]), dim=-1)
+
+    spin2 = features[..., spin1_end:].reshape(
+        *features.shape[:-1], spin2_channels // 2, 2
+    )
+    rotation_sign = -1.0 if k % 2 else 1.0
+    spin2_x = rotation_sign * spin2[..., 0]
+    spin2_y = rotation_sign * spin2[..., 1]
+    if reflected:
+        spin2_y = -spin2_y
+    spin2 = torch.stack((spin2_x, spin2_y), dim=-1)
+
+    return torch.cat(
+        (
+            scalars,
+            spin1.reshape(*features.shape[:-1], spin1_channels),
+            spin2.reshape(*features.shape[:-1], spin2_channels),
+        ),
+        dim=-1,
+    )
+
 
 def rotate_90_degrees(img, fid=None, fp=None):
     """Backward-compatible wrapper for the canonical r90 action."""

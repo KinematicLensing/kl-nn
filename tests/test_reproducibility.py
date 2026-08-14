@@ -79,6 +79,35 @@ def test_explicit_torch_and_numpy_streams_repeat_independently():
     np.testing.assert_array_equal(rmag_1, rmag_2)
 
 
+
+
+def test_archived_auxiliary_config_is_readable_but_not_reserialized():
+    original = copy.deepcopy(config.MODEL_CONFIG)
+    payload = copy.deepcopy(original.to_dict())
+    payload["pretrain"]["ccl_objective"] = "ccl_shear"
+    payload["pretrain"]["ccl_shear_loss_weight"] = 1.25
+
+    restored = config.ModelConfig.from_dict(payload)
+    serialized = restored.to_dict()
+    try:
+        config.set_model_config(restored)
+        assert config.pretrain["ccl_objective"] == "ccl_shear"
+        assert config.pretrain["ccl_shear_loss_weight"] == 1.25
+        assert "ccl_objective" not in serialized["pretrain"]
+        assert "ccl_shear_loss_weight" not in serialized["pretrain"]
+    finally:
+        config.set_model_config(original)
+
+def test_old_model_config_without_backbone_selector_defaults_to_legacy():
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["pretrain"].pop("backbone_type")
+    payload["train"].pop("backbone_type")
+
+    restored = config.ModelConfig.from_dict(payload)
+
+    assert restored.pretrain.backbone_type == "legacy"
+    assert restored.train.backbone_type == "legacy"
+
 def test_training_cli_overrides_are_serializable_to_spawned_workers():
     entrypoint_path = (
         Path(__file__).resolve().parents[1] / "arch" / "[scr]_train_model.py"
@@ -96,6 +125,8 @@ def test_training_cli_overrides_are_serializable_to_spawned_workers():
             [
                 "--train-type",
                 "pretrain",
+                "--backbone-type",
+                "stage3",
                 "--train-data",
                 "/tmp/train_lmdb",
                 "--valid-data",
@@ -106,6 +137,10 @@ def test_training_cli_overrides_are_serializable_to_spawned_workers():
                 "10",
                 "--model-name",
                 "seed-test",
+                "--pretrained-name",
+                "stage3-pretrain",
+                "--pretrain-from",
+                "8",
                 "--epochs",
                 "9",
                 "--batch-size",
@@ -114,10 +149,6 @@ def test_training_cli_overrides_are_serializable_to_spawned_workers():
                 "0.15",
                 "--ccl-d-cutoff",
                 "0.4",
-                "--ccl-objective",
-                "ccl_shear",
-                "--ccl-shear-loss-weight",
-                "1.25",
                 "--seed",
                 "31415",
                 "--deterministic",
@@ -131,12 +162,14 @@ def test_training_cli_overrides_are_serializable_to_spawned_workers():
         assert stage.deterministic is True
         assert stage.use_compile is False
         assert restored.pretrain.model_name == "seed-test"
+        assert restored.pretrain.backbone_type == "stage3"
+        assert restored.train.backbone_type == "stage3"
+        assert restored.train.pretrained_name == "stage3-pretrain"
+        assert restored.train.pretrain_from == 8
         assert restored.pretrain.epoch_number == 9
         assert restored.pretrain.batch_size == 7
         assert restored.pretrain.ccl_sigma_label == 0.15
         assert restored.pretrain.ccl_d_cutoff == 0.4
-        assert restored.pretrain.ccl_objective == "ccl_shear"
-        assert restored.pretrain.ccl_shear_loss_weight == 1.25
         assert restored.data.data_dir == "/tmp/train_lmdb"
         assert restored.test.data_dir == "/tmp/valid_lmdb"
         assert restored.data.size == 100

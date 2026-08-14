@@ -7,14 +7,137 @@ from torch.distributed.nn.functional import all_gather
 import math
 import normflows as nf
 from nflows.flows.base import Flow
+from nflows.distributions.base import Distribution
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
-from nflows.transforms.permutations import ReversePermutation, RandomPermutation
+from nflows.transforms.permutations import Permutation, ReversePermutation
+from nflows.utils import torchutils
+
+from circular_spline import CircularAutoregressiveRationalQuadraticSpline
 
 import config
 from utils import resolve_feature_index
-from data import TFCalculator
+from data import (
+    D4_ELEMENTS,
+    D4_INVERSES,
+    TFCalculator,
+    apply_d4_to_datavector,
+    transform_d4_feature_blocks,
+    transform_d4_fiber_mask,
+    transform_d4_parameters,
+)
+
+FLOW_TYPES = ("affine", "circular_rqs")
+
+
+class ConditionalNormalWithCircularTheta(Distribution):
+    """Conditional Gaussian base on R^(D-1) times Uniform(S1).
+
+    The circular coordinate is the final feature and is represented on the
+    canonical normalized interval [-1, 1). Its density is exactly 1/2 with
+    respect to that coordinate. This is a proper compact latent base, unlike
+    drawing theta from a Gaussian and wrapping the result afterward.
+    """
+
+    def __init__(self, features, context_encoder):
+        super().__init__()
+        if type(features) is not int or features < 2:
+            raise ValueError("features must be an integer of at least two")
+        self.features = features
+        self.linear_features = features - 1
+        self.context_encoder = context_encoder
+        self.register_buffer(
+            "_normal_log_z",
+            torch.tensor(
+                0.5 * self.linear_features * math.log(2.0 * math.pi),
+                dtype=torch.float64,
+            ),
+            persistent=False,
+        )
+
+    def _compute_params(self, context):
+        if context is None:
+            raise ValueError("Context cannot be None for the conditional base")
+        params = self.context_encoder(context)
+        expected = 2 * self.linear_features
+        if params.shape != (context.shape[0], expected):
+            raise RuntimeError(
+                "Circular base context encoder must return shape "
+                f"({context.shape[0]}, {expected}); got {tuple(params.shape)}"
+            )
+        return params.chunk(2, dim=-1)
+
+    def _log_prob(self, inputs, context):
+        if inputs.ndim != 2 or inputs.shape[1] != self.features:
+            raise ValueError(
+                f"Expected inputs with shape (batch, {self.features}); "
+                f"got {tuple(inputs.shape)}"
+            )
+        means, log_stds = self._compute_params(context)
+        linear = inputs[:, :-1]
+        normalized = (linear - means) * torch.exp(-log_stds)
+        log_prob = -0.5 * normalized.square().sum(dim=-1)
+        log_prob -= log_stds.sum(dim=-1)
+        log_prob -= self._normal_log_z.to(dtype=inputs.dtype)
+        log_prob -= math.log(2.0)
+        theta = inputs[:, -1]
+        on_circle = torch.isfinite(theta) & (theta >= -1.0) & (theta < 1.0)
+        return torch.where(
+            on_circle,
+            log_prob,
+            torch.full_like(log_prob, -torch.inf),
+        )
+
+    def _sample(self, num_samples, context):
+        means, log_stds = self._compute_params(context)
+        context_size = context.shape[0]
+        means = torchutils.repeat_rows(means, num_samples)
+        stds = torchutils.repeat_rows(torch.exp(log_stds), num_samples)
+        linear = means + stds * torch.randn_like(means)
+        theta = 2.0 * torch.rand(
+            context_size * num_samples,
+            1,
+            device=context.device,
+            dtype=linear.dtype,
+        ) - 1.0
+        samples = torch.cat((linear, theta), dim=-1)
+        return torchutils.split_leading_dim(
+            samples, [context_size, num_samples]
+        )
+
+    def _mean(self, context):
+        means, _ = self._compute_params(context)
+        return torch.cat((means, means.new_zeros(means.shape[0], 1)), dim=-1)
+
+
+class PeriodicThetaFlow(Flow):
+    """Flow whose public theta coordinate is canonicalized on the circle."""
+
+    def __init__(self, transform, distribution, theta_index):
+        super().__init__(transform, distribution)
+        self.theta_index = int(theta_index)
+
+    def _canonicalize_theta(self, inputs):
+        canonical = inputs.clone()
+        theta = canonical[..., self.theta_index]
+        outside = torch.isfinite(theta) & ((theta < -1.0) | (theta >= 1.0))
+        wrapped = torch.remainder(theta + 1.0, 2.0) - 1.0
+        canonical[..., self.theta_index] = torch.where(
+            outside, wrapped, theta
+        )
+        return canonical
+
+    def _sample(self, num_samples, context):
+        return self._canonicalize_theta(super()._sample(num_samples, context))
+
+    def _log_prob(self, inputs, context):
+        return super()._log_prob(self._canonicalize_theta(inputs), context)
+
+    def transform_to_noise(self, inputs, context=None):
+        return super().transform_to_noise(
+            self._canonicalize_theta(inputs), context=context
+        )
 
 ### Main Network ###
 class KLNPE(nn.Module):
@@ -32,11 +155,29 @@ class KLNPE(nn.Module):
                  vcirc_dex=config.tf['scatter'],   # scatter in dex; fixed, represents TF relation scatter
                  vcirc_min=config.par_ranges.get('vcirc', [60.0, 540.0])[0],
                  vcirc_max=config.par_ranges.get('vcirc', [60.0, 540.0])[1],
-                 vcirc_idx=None):
+                 vcirc_idx=None,
+                 backbone_type=None,
+                 posterior_symmetry=None):
 
         self.bs = batch_size
         self.nfeatures = nfeatures
         self.nspecs = nspec
+        self.feature_names = tuple(
+            config.train.get(
+                'feature_names',
+                ["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
+            )
+        )
+        if len(self.feature_names) != self.nfeatures:
+            raise ValueError(
+                "feature_names length must equal nfeatures; "
+                f"got {len(self.feature_names)} and {self.nfeatures}"
+            )
+        if posterior_symmetry is None:
+            posterior_symmetry = config.train.get("posterior_symmetry", "none")
+        self.posterior_symmetry = str(posterior_symmetry).lower()
+        if self.posterior_symmetry not in ("none", "d4"):
+            raise ValueError("posterior_symmetry must be 'none' or 'd4'")
         if mode in (0, 1, 2):
             self.mode = mode
         else:
@@ -53,10 +194,9 @@ class KLNPE(nn.Module):
         self.vcirc_max = float(vcirc_max)
         self.vcirc_jac = 0.5 * (self.vcirc_max - self.vcirc_min)  # |dv/dx| for x in [-1, 1]
         if vcirc_idx is None:
-            feature_names = config.train.get('feature_names', None)
-            if feature_names is None:
-                raise ValueError("config.train['feature_names'] is required to infer vcirc_idx")
-            vcirc_idx = resolve_feature_index(feature_names, 'vcirc', aliases=('v_circ',))
+            vcirc_idx = resolve_feature_index(
+                self.feature_names, 'vcirc', aliases=('v_circ',)
+            )
         self.vcirc_idx = int(vcirc_idx)
         if self.vcirc_idx < 0 or self.vcirc_idx >= self.nfeatures:
             raise ValueError(
@@ -65,7 +205,21 @@ class KLNPE(nn.Module):
 
         super(KLNPE, self).__init__()
 
-        self.feature_extractor = FeatureExtractor(nspec=self.nspecs) if feature_extractor is None else feature_extractor
+        if backbone_type is None:
+            backbone_type = config.train.get("backbone_type", "legacy")
+        self.feature_extractor = (
+            build_feature_extractor(backbone_type, nspec=self.nspecs)
+            if feature_extractor is None
+            else feature_extractor
+        )
+        if self.posterior_symmetry == "d4":
+            if self.mode == 0:
+                raise ValueError("D4 posterior symmetry requires density mode 1 or 2")
+            if not callable(getattr(self.feature_extractor, "transform_features", None)):
+                raise ValueError(
+                    "D4 posterior symmetry requires an equivariant feature extractor "
+                    "with transform_features(features, element)"
+                )
 
         # Define point estimate or density estimate layers
         if self.mode == 0:
@@ -76,7 +230,12 @@ class KLNPE(nn.Module):
             # Normalizing flow for density estimation
             self.layer_norm = nn.LayerNorm(1024)
             self.setup_flows()
-            self.flow = Flow(self.transform, self.base)
+            if self.flow_type == "circular_rqs":
+                self.flow = PeriodicThetaFlow(
+                    self.transform, self.base, theta_index=self.theta_idx
+                )
+            else:
+                self.flow = Flow(self.transform, self.base)
 
     
     def forward(self, x, y, true, fp, mag=None, snr=None):
@@ -86,24 +245,101 @@ class KLNPE(nn.Module):
         true: target tensor of shape (batch, nfeatures)
         fp: fiber position tensor of shape (batch, nspecs, 2)
         '''
-        z = self.feature_extractor(x, y, fp)
+        raw_features = self.feature_extractor(x, y, fp)
 
-        # Point/density estimate
         if self.mode == 0:
-            z = self.fully_connected_layer(z)
-            loss = self.loss(z, true)
-        else:
-            z = self.layer_norm(z)
-            log_prob = self.flow.log_prob(true, context=z)
-            if self.mode == 2:
-                # Calculate importance weights to weight each batch element's loss contribution
-                weights = self._compute_tf_weights(true, mag, snr)
-                loss = -(weights * log_prob).mean()
-            else:
-                loss = -log_prob.mean()
+            prediction = self.fully_connected_layer(raw_features)
+            return self.loss(prediction, true)
 
-        return loss
+        if self.posterior_symmetry == "d4":
+            branch_log_prob = self._d4_branch_log_prob_from_features(
+                raw_features, true
+            )
+            per_galaxy_log_prob = branch_log_prob.mean(dim=1)
+        else:
+            context = self.layer_norm(raw_features)
+            per_galaxy_log_prob = self.flow.log_prob(true, context=context)
+
+        if self.mode == 2:
+            # TF quantities are D4 scalars. Compute one weight per galaxy and
+            # apply it only after averaging that galaxy's eight branch scores.
+            weights = self._compute_tf_weights(true, mag, snr)
+            return -(weights * per_galaxy_log_prob).mean()
+        return -per_galaxy_log_prob.mean()
+
+    def _d4_contexts_from_features(self, raw_features):
+        """Build group-major flow contexts as LN(rho_g(raw_features))."""
+        if self.posterior_symmetry != "d4":
+            raise RuntimeError("D4 contexts require posterior_symmetry='d4'")
+        if raw_features.ndim != 2 or raw_features.shape[-1] != 1024:
+            raise ValueError("raw feature tensor must have shape (batch, 1024)")
+        return torch.stack(
+            tuple(
+                self.layer_norm(
+                    self.feature_extractor.transform_features(raw_features, element)
+                )
+                for element in D4_ELEMENTS
+            ),
+            dim=0,
+        )
+
+    def _d4_branch_log_prob_from_features(self, raw_features, parameters):
+        """Return the eight branch log densities with shape (batch, group)."""
+        if parameters.ndim != 2 or parameters.shape[0] != raw_features.shape[0]:
+            raise ValueError("parameters must have shape (batch, nfeatures)")
+        contexts = self._d4_contexts_from_features(raw_features)
+        transformed_parameters = torch.stack(
+            tuple(
+                transform_d4_parameters(
+                    parameters,
+                    element,
+                    feature_names=self.feature_names,
+                )
+                for element in D4_ELEMENTS
+            ),
+            dim=0,
+        )
+        group_count, batch_size = transformed_parameters.shape[:2]
+        log_prob = self.flow.log_prob(
+            transformed_parameters.reshape(group_count * batch_size, self.nfeatures),
+            context=contexts.reshape(group_count * batch_size, -1),
+        )
+        return log_prob.reshape(group_count, batch_size).transpose(0, 1)
+
+    def _d4_mixture_log_prob_from_features(self, raw_features, parameters):
+        branch_log_prob = self._d4_branch_log_prob_from_features(
+            raw_features, parameters
+        )
+        return torch.logsumexp(branch_log_prob, dim=1) - math.log(len(D4_ELEMENTS))
+
+    def posterior_log_prob(self, x, y, parameters, fp):
+        """Evaluate the configured conditional posterior at normalized parameters."""
+        if self.mode == 0:
+            raise RuntimeError("posterior_log_prob requires density mode 1 or 2")
+        raw_features = self.feature_extractor(x, y, fp)
+        if self.posterior_symmetry == "d4":
+            return self._d4_mixture_log_prob_from_features(raw_features, parameters)
+        context = self.layer_norm(raw_features)
+        return self.flow.log_prob(parameters, context=context)
     
+    def posterior_mean(self, samples):
+        """Return an equivariant posterior mean from normalized sample clouds.
+
+        Scalars and shear use arithmetic means. ``theta_int`` uses its directed
+        circular mean on the normalized ``[-1, 1)`` coordinate.
+        """
+        if samples.ndim < 2 or samples.shape[-1] != self.nfeatures:
+            raise ValueError("samples must have shape (..., samples, nfeatures)")
+        mean = samples.mean(dim=-2)
+        theta_idx = resolve_feature_index(self.feature_names, "theta_int")
+        theta = samples[..., theta_idx]
+        theta_mean = torch.atan2(
+            torch.sin(math.pi * theta).mean(dim=-1),
+            torch.cos(math.pi * theta).mean(dim=-1),
+        ) / math.pi
+        mean[..., theta_idx] = torch.remainder(theta_mean + 1.0, 2.0) - 1.0
+        return mean
+
     def point_estimate(self, x, y, fp):
         '''
         Run through feature extraction and return point estimate of parameters
@@ -236,28 +472,286 @@ class KLNPE(nn.Module):
         return torch.logsumexp(log_kernel, dim=1) - torch.log(torch.tensor(float(n), device=values.device, dtype=values.dtype))
 
     def setup_flows(self):
-        '''
-        Set up normalizing flows for density estimation
-        '''
-        # Define flows
-        num_layers = config.flow['num_layers']
+        """Set up the selected conditional posterior flow.
+
+        The circular construction moves ``theta_int`` to the final
+        autoregressive coordinate once. Every later permutation leaves it
+        there, so Euclidean coordinates never condition on an unwrapped angle,
+        while theta can still condition on all seven Euclidean parameters.
+        """
+        num_layers = int(config.flow['num_layers'])
+        if num_layers <= 0:
+            raise ValueError("flow num_layers must be positive")
         hidden_units = 256
         num_blocks = 2
         context_size = 1024
-        
-        # Set base distribution
-        self.base = ConditionalDiagonalNormal(shape=[self.nfeatures], 
-                                              context_encoder=MLP([context_size, 128, 64, self.nfeatures*2]))
 
-        transforms = []
-        for i in range(num_layers):
-            transforms.append(ReversePermutation(features=self.nfeatures))
-            transforms.append(MaskedAffineAutoregressiveTransform(features=self.nfeatures, 
-                                                                hidden_features=hidden_units, 
-                                                                num_blocks=num_blocks,
-                                                                context_features=context_size))
+        self.flow_type = str(config.flow.get('flow_type', 'affine')).lower()
+        if self.flow_type not in FLOW_TYPES:
+            raise ValueError(
+                f"flow_type must be one of {FLOW_TYPES}; got {self.flow_type!r}"
+            )
+        self.theta_idx = resolve_feature_index(self.feature_names, "theta_int")
 
+        if self.flow_type == "affine":
+            # Preserve the historical architecture and state-dict layout.
+            self.base = ConditionalDiagonalNormal(
+                shape=[self.nfeatures],
+                context_encoder=MLP(
+                    [context_size, 128, 64, self.nfeatures * 2]
+                ),
+            )
+            transforms = []
+            for _ in range(num_layers):
+                transforms.append(ReversePermutation(features=self.nfeatures))
+                transforms.append(
+                    MaskedAffineAutoregressiveTransform(
+                        features=self.nfeatures,
+                        hidden_features=hidden_units,
+                        num_blocks=num_blocks,
+                        context_features=context_size,
+                    )
+                )
+            self.transform = CompositeTransform(transforms)
+            return
+
+        if self.nfeatures < 2:
+            raise ValueError("circular_rqs requires at least two parameters")
+        num_bins = config.flow.get('num_bins', 8)
+        if type(num_bins) is not int or num_bins < 2:
+            raise ValueError("flow num_bins must be an integer of at least two")
+
+        non_theta = [
+            index for index in range(self.nfeatures) if index != self.theta_idx
+        ]
+        canonical_order = non_theta + [self.theta_idx]
+        internal_theta_idx = self.nfeatures - 1
+        scalar_reverse = list(reversed(range(internal_theta_idx))) + [
+            internal_theta_idx
+        ]
+        self.circular_internal_theta_idx = internal_theta_idx
+        self.circular_boundary_permutation = tuple(canonical_order)
+        self.circular_layer_permutation = tuple(scalar_reverse)
+
+        transforms = [
+            Permutation(torch.tensor(canonical_order, dtype=torch.long))
+        ]
+        for _ in range(num_layers):
+            # Unlike the old implementation, this permutation cannot move
+            # theta away from the index declared circular in the spline.
+            transforms.append(
+                Permutation(torch.tensor(scalar_reverse, dtype=torch.long))
+            )
+            transforms.append(
+                CircularAutoregressiveRationalQuadraticSpline(
+                    num_input_channels=self.nfeatures,
+                    num_blocks=num_blocks,
+                    num_hidden_channels=hidden_units,
+                    ind_circ=[internal_theta_idx],
+                    num_context_channels=context_size,
+                    num_bins=num_bins,
+                    tail_bound=1.0,
+                    identity_init=True,
+                )
+            )
+
+        self.base = ConditionalNormalWithCircularTheta(
+            features=self.nfeatures,
+            context_encoder=MLP(
+                [context_size, 128, 64, 2 * (self.nfeatures - 1)]
+            ),
+        )
         self.transform = CompositeTransform(transforms)
+
+    def _draw_flow_samples(
+        self,
+        num_samples,
+        context,
+        *,
+        sample_id=None,
+        canonical_theta=False,
+    ):
+        """Draw finite samples for every context row, with bounded-coordinate safety."""
+        max_tries = 5
+        bad_samples_tolerance = 0.75
+        theta_idx = getattr(
+            self,
+            "theta_idx",
+            resolve_feature_index(self.feature_names, "theta_int"),
+        )
+        last_bad = None
+        for attempt in range(max_tries):
+            samples = self.flow.sample(num_samples, context=context)
+            is_circular = (
+                getattr(self, "flow_type", "affine") == "circular_rqs"
+            )
+            if is_circular:
+                # A circular sample is an equivalence class modulo two in the
+                # theta/pi coordinate. Always return its canonical [-1, 1)
+                # representative; unlike clipping, this preserves the angle.
+                samples = samples.clone()
+                theta = samples[..., theta_idx]
+                outside = torch.isfinite(theta) & (
+                    (theta < -1.0) | (theta >= 1.0)
+                )
+                wrapped = torch.remainder(theta + 1.0, 2.0) - 1.0
+                samples[..., theta_idx] = torch.where(outside, wrapped, theta)
+            if canonical_theta:
+                samples = samples.clone()
+                nonperiodic = [index for index in range(self.nfeatures) if index != theta_idx]
+                samples[..., nonperiodic] = samples[..., nonperiodic].clamp(-1.5, 1.5)
+                if not is_circular:
+                    samples[..., theta_idx] = torch.remainder(
+                        samples[..., theta_idx] + 1.0, 2.0
+                    ) - 1.0
+            else:
+                samples = samples.clone()
+                nonperiodic = [index for index in range(self.nfeatures) if index != theta_idx]
+                samples[..., nonperiodic] = samples[..., nonperiodic].clamp(-1.5, 1.5)
+                if not is_circular:
+                    samples[..., theta_idx] = samples[..., theta_idx].clamp(-1.5, 1.5)
+
+            finite = torch.isfinite(samples).all(dim=-1)
+            bad_count = int((~finite).sum().item())
+            total_count = finite.numel()
+            last_bad = (bad_count, total_count)
+            if bad_count / total_count > bad_samples_tolerance:
+                logging.warning(
+                    "Sampling for %s produced %d/%d non-finite samples; "
+                    "retrying (remaining=%d)",
+                    sample_id,
+                    bad_count,
+                    total_count,
+                    max_tries - attempt - 1,
+                )
+                continue
+            if bad_count:
+                repaired = samples.clone()
+                repair_failed = False
+                for context_index in range(samples.shape[0]):
+                    valid_indices = torch.nonzero(
+                        finite[context_index], as_tuple=False
+                    ).flatten()
+                    invalid_indices = torch.nonzero(
+                        ~finite[context_index], as_tuple=False
+                    ).flatten()
+                    if invalid_indices.numel() and not valid_indices.numel():
+                        repair_failed = True
+                        break
+                    if invalid_indices.numel():
+                        choices = valid_indices[
+                            torch.randint(
+                                valid_indices.numel(),
+                                (invalid_indices.numel(),),
+                                device=samples.device,
+                            )
+                        ]
+                        repaired[context_index, invalid_indices] = samples[
+                            context_index, choices
+                        ]
+                if repair_failed:
+                    continue
+                samples = repaired
+            return samples
+        raise RuntimeError(
+            f"Sampling for {sample_id} failed after {max_tries} attempts; "
+            f"last non-finite count was {last_bad}"
+        )
+
+    def _apply_tf_resampling(self, samples, mag, snr):
+        """Apply the existing per-galaxy TF replacement to a candidate bank."""
+        if samples.shape[0] != 1:
+            raise ValueError("TF inference resampling currently requires batch size 1")
+        if mag is None or snr is None:
+            raise ValueError("mode 2 sampling requires both mag and snr")
+        candidates = samples[0]
+        v_circ = self._norm_to_vcirc(candidates[:, self.vcirc_idx])
+        mag_tensor = torch.as_tensor(
+            mag, device=candidates.device, dtype=candidates.dtype
+        ).reshape(-1)
+        snr_tensor = torch.as_tensor(
+            snr, device=candidates.device, dtype=candidates.dtype
+        ).reshape(-1)
+        vcirc_mu, sigma_total_ln = self._get_tf_prior_params(mag_tensor, snr_tensor)
+        prior = torch.distributions.LogNormal(
+            loc=torch.log(vcirc_mu[0]),
+            scale=torch.full_like(v_circ, sigma_total_ln[0]),
+        )
+        tf_log_p_v = prior.log_prob(v_circ)
+        flow_log_p_v = self._kde_log_density_1d(v_circ)
+        log_w = tf_log_p_v - flow_log_p_v
+        safe_log_w = log_w.float()
+        finite = torch.isfinite(safe_log_w)
+        fallback = not bool(finite.any())
+        if not fallback:
+            safe_log_w = torch.where(
+                finite,
+                safe_log_w,
+                torch.full_like(safe_log_w, -torch.inf),
+            )
+            maximum = safe_log_w.max()
+            fallback = not bool(torch.isfinite(maximum))
+        if not fallback:
+            weights = torch.softmax(safe_log_w - maximum, dim=0)
+            fallback = not bool(torch.isfinite(weights).all()) or not bool(weights.sum() > 0)
+        if fallback:
+            logging.warning(
+                "Mode 2 sampling: invalid log-weights; falling back to uniform resampling."
+            )
+            weights = torch.full(
+                (candidates.shape[0],),
+                1.0 / candidates.shape[0],
+                device=candidates.device,
+                dtype=torch.float32,
+            )
+            log_w = torch.zeros_like(log_w)
+        else:
+            log_w = torch.where(
+                torch.isfinite(log_w),
+                log_w,
+                torch.full_like(log_w, -torch.inf),
+            )
+        indices = torch.multinomial(
+            weights, num_samples=candidates.shape[0], replacement=True
+        )
+        return candidates[indices].unsqueeze(0), log_w[indices]
+
+    def _d4_sample_from_features(self, raw_features, num_samples, sample_id=None):
+        if raw_features.shape[0] != 1:
+            raise ValueError("D4 posterior sampling currently requires one galaxy")
+        if num_samples <= 0 or num_samples % len(D4_ELEMENTS):
+            raise ValueError("num_samples must be positive and divisible by 8")
+        contexts = self._d4_contexts_from_features(raw_features)[:, 0]
+        per_component = num_samples // len(D4_ELEMENTS)
+        branch_samples = self._draw_flow_samples(
+            per_component,
+            contexts,
+            sample_id=sample_id,
+            canonical_theta=True,
+        )
+        aligned = tuple(
+            transform_d4_parameters(
+                branch_samples[index],
+                D4_INVERSES[element],
+                feature_names=self.feature_names,
+            )
+            for index, element in enumerate(D4_ELEMENTS)
+        )
+        return torch.cat(aligned, dim=0).unsqueeze(0)
+
+    def _d4_sample_log_prob(self, raw_features, samples, chunk_size=256):
+        if raw_features.shape[0] != 1 or samples.shape[0] != 1:
+            raise ValueError("D4 sample scoring currently requires one galaxy")
+        scores = []
+        for start in range(0, samples.shape[1], chunk_size):
+            candidates = samples[0, start : start + chunk_size]
+            candidate_features = raw_features.expand(candidates.shape[0], -1)
+            scores.append(
+                self._d4_mixture_log_prob_from_features(
+                    candidate_features, candidates
+                )
+            )
+        return torch.cat(scores, dim=0)
 
     def sample(
         self,
@@ -271,139 +765,54 @@ class KLNPE(nn.Module):
         log_context=None,
         sample_id=None,
     ):
-        '''
-        Sample from the conditional distribution p(params | x, y)
-        num_samples: number of samples to draw per galaxy
-        vcirc_mu: per-galaxy prior center, shape (1,), units km/s (linear).
-                  Required when mode == 2. Each galaxy's N samples share the same mu.
-        '''
-        z = self.feature_extractor(x, y, fp)
-        z = self.layer_norm(z)
+        """Sample one galaxy's configured conditional posterior.
 
-        # Sample from flow
-        max_tries = 5
-        bad_samples_tolerance = 0.75  # allow up to 75% bad samples before giving up
-        while max_tries > 0:
-            samples = self.flow.sample(num_samples, context=z)  # (1, num_samples, nfeatures)
-            samples = samples.clamp(min=-1.5, max=1.5)
-            finite_samples = torch.isfinite(samples).all(dim=2)
-            total_samples = int(samples.shape[1])
-            bad_samples = int((~finite_samples).sum().item())
-            if bad_samples / total_samples > bad_samples_tolerance:
-                logging.warning(
-                    'Sampling for %d produced %d/%d non-finite samples; retrying (max_tries=%d)',
-                    sample_id,
-                    bad_samples,
-                    total_samples,
-                    max_tries - 1,
-                )
-                max_tries -= 1
-            else:
-                if bad_samples > 0:
-                    logging.warning(
-                        'Sampling for %d produced %d/%d non-finite samples; dropping bad samples.',
-                        sample_id,
-                        bad_samples,
-                        total_samples,
-                    )
-                    # Fill bad samples with resampled finite samples to maintain num_samples
-                    finite_samples_mask = finite_samples.squeeze(0)
-                    if finite_samples_mask.any():
-                        finite_samples = samples[0, finite_samples_mask]
-                        num_finite = finite_samples.shape[0]
-                        if num_finite < num_samples:
-                            resample_indices = torch.randint(num_finite, (num_samples - num_finite,), device=samples.device)
-                            resampled_finite_samples = finite_samples[resample_indices]
-                            samples[0, ~finite_samples_mask] = resampled_finite_samples
-                        else:
-                            samples = samples[:, finite_samples_mask][:, :num_samples, :]
-                break
+        The D4 posterior uses a balanced eight-component mixture. Samples drawn
+        in each transformed frame are mapped back to the input frame before TF
+        replacement and before returning. ``log_context`` is retained only for
+        backward call compatibility.
+        """
+        del log_context
+        if self.mode == 0:
+            raise RuntimeError("sample requires density mode 1 or 2")
+        if x.shape[0] != 1:
+            raise ValueError("sample currently requires a single-galaxy batch")
+        raw_features = self.feature_extractor(x, y, fp)
 
-        if self.mode == 2:
-            assert mag is not None and snr is not None, 'mag (per-galaxy apparent magnitude) must be provided for mode 2'
-            z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)
-
-            # Importance-resample flow samples so vcirc follows TF prior at inference time.
-            candidates = samples[0]  # (num_samples, nfeatures)
-            v_norm = candidates[:, self.vcirc_idx]
-            v_circ = self._norm_to_vcirc(v_norm)
-
-            # Ensure mag is a tensor of compatible dtype and device
-            if not isinstance(mag, torch.Tensor):
-                mag_tensor = torch.tensor([float(mag)], device=candidates.device, dtype=candidates.dtype)
-            else:
-                mag_tensor = mag.to(device=candidates.device, dtype=candidates.dtype).view(-1)
-            if not isinstance(snr, torch.Tensor):
-                snr_tensor = torch.tensor([float(snr)], device=candidates.device, dtype=candidates.dtype)
-            else:
-                snr_tensor = snr.to(device=candidates.device, dtype=candidates.dtype).view(-1)
-            
-            # Fetch dynamically computed prior parameters matching the forward pass
-            vcirc_mu, sigma_total_ln = self._get_tf_prior_params(mag_tensor, snr_tensor)
-            mu_val = vcirc_mu[0]
-            sigma_val = sigma_total_ln[0]
-
-            # Setup the physical LogNormal distribution
-            prior = torch.distributions.LogNormal(
-                loc=torch.log(mu_val),
-                scale=torch.full_like(v_circ, sigma_val)
+        if self.posterior_symmetry == "d4":
+            samples = self._d4_sample_from_features(
+                raw_features, num_samples, sample_id=sample_id
+            )
+        else:
+            context = self.layer_norm(raw_features)
+            samples = self._draw_flow_samples(
+                num_samples,
+                context,
+                sample_id=sample_id,
+                canonical_theta=False,
             )
 
-            # Calculate the physical log prob and apply Jacobian change of variables
-            tf_log_p_v = prior.log_prob(v_circ)
-            flow_log_p_v = self._kde_log_density_1d(v_circ)
+        tf_log_correction = None
+        if self.mode == 2:
+            samples, tf_log_correction = self._apply_tf_resampling(
+                samples, mag, snr
+            )
 
-            log_w = tf_log_p_v - flow_log_p_v
-            log_w_for_weights = log_w.float()
-            finite_mask = torch.isfinite(log_w_for_weights)
-            fallback = False
-            if not finite_mask.any():
-                fallback = True
-            else:
-                safe_log_w = torch.where(
-                    finite_mask,
-                    log_w_for_weights,
-                    torch.full_like(log_w_for_weights, -torch.inf),
-                )
-                max_log_w = safe_log_w.max()
-                if not torch.isfinite(max_log_w):
-                    fallback = True
-                else:
-                    weights = torch.softmax(safe_log_w - max_log_w, dim=0)
-                    if not torch.isfinite(weights).all() or weights.sum() <= 0:
-                        fallback = True
-            if fallback:
-                logging.warning(
-                    'Mode 2 sampling: invalid log-weights; falling back to uniform resampling.'
-                )
-                weights = torch.full(
-                    (log_w_for_weights.numel(),),
-                    1.0 / log_w_for_weights.numel(),
-                    device=log_w_for_weights.device,
-                    dtype=torch.float32,
-                )
-                log_w = torch.zeros_like(log_w)
-            elif not torch.isfinite(log_w).all():
-                log_w = torch.where(
-                    torch.isfinite(log_w),
-                    log_w,
-                    torch.full_like(log_w, -torch.inf),
-                )
+        if not return_log_prob:
+            return samples.reshape(1, num_samples, self.nfeatures)
 
-            resample_idx = torch.multinomial(weights, num_samples=num_samples, replacement=True)
-            samples = candidates[resample_idx].unsqueeze(0)
+        if self.posterior_symmetry == "d4":
+            flow_log_prob = self._d4_sample_log_prob(raw_features, samples)
+        else:
+            context = self.layer_norm(raw_features).expand(num_samples, -1)
+            flow_log_prob = self.flow.log_prob(
+                samples.reshape(num_samples, self.nfeatures),
+                context=context,
+            )
+        if tf_log_correction is not None:
+            flow_log_prob = flow_log_prob + tf_log_correction
+        return samples.reshape(1, num_samples, self.nfeatures), flow_log_prob
 
-        if return_log_prob:
-            z_rep = torch.repeat_interleave(z, repeats=num_samples, dim=0)
-            flow_log_prob = self.flow.log_prob(samples.view(num_samples, -1), context=z_rep)
-            
-            # For mode 2, compute TF-adjusted posterior log_prob
-            if self.mode == 2:
-                flow_log_prob = flow_log_prob + log_w[resample_idx]
-            
-            return samples.view(1, num_samples, -1), flow_log_prob
-        return samples.view(1, num_samples, -1)
-    
     def evaluate_conditional_2d(
         self,
         x,
@@ -487,11 +896,542 @@ class FeatureExtractor(nn.Module):
 
         return z
     
+
+BACKBONE_TYPES = ("legacy", "stage3", "stage4_d4")
+
+
+class DivisibleMeanPool1d(nn.Module):
+    """Deterministic adaptive-mean equivalent for evenly divisible bins."""
+
+    def __init__(self, output_size):
+        super().__init__()
+        if output_size <= 0:
+            raise ValueError("output_size must be positive")
+        self.output_size = int(output_size)
+
+    def forward(self, inputs):
+        input_size = inputs.shape[-1]
+        if input_size < self.output_size or input_size % self.output_size:
+            raise ValueError(
+                "spectral feature length must be a positive multiple of "
+                f"{self.output_size}; got {input_size}"
+            )
+        bin_size = input_size // self.output_size
+        return inputs.reshape(
+            *inputs.shape[:-1], self.output_size, bin_size
+        ).mean(dim=-1)
+
+
+class SharedSpecCNN(nn.Module):
+    """Encode every fiber spectrum with the same wavelength-aware Conv1d network."""
+
+    def __init__(self, embedding_dim=128, pooled_length=8):
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
+        if pooled_length <= 0:
+            raise ValueError("pooled_length must be positive")
+        self.embedding_dim = int(embedding_dim)
+        self.pooled_length = int(pooled_length)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, padding=3, bias=False),
+            nn.GroupNorm(4, 32),
+            nn.GELU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            # For the 64-bin spectra this maps 16 -> 8 exactly like adaptive
+            # average pooling, but its CUDA backward is deterministic.
+            DivisibleMeanPool1d(self.pooled_length),
+        )
+        # Flattening the reduced wavelength axis, rather than globally averaging it,
+        # preserves absolute line-position information needed for radial velocity.
+        self.projection = nn.Sequential(
+            nn.Flatten(start_dim=1),
+            nn.Linear(128 * self.pooled_length, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, spectra):
+        if spectra.ndim != 4 or spectra.shape[1] != 1:
+            raise ValueError("spectra must have shape (batch, 1, fibers, wavelength)")
+        batch_size, _, fiber_count, wavelength_count = spectra.shape
+        if wavelength_count < 4:
+            raise ValueError("spectra must contain at least four wavelength samples")
+        shared_input = spectra[:, 0].reshape(
+            batch_size * fiber_count, 1, wavelength_count
+        )
+        encoded = self.projection(self.encoder(shared_input))
+        return encoded.reshape(batch_size, fiber_count, self.embedding_dim)
+
+
+class FiberSetAttention(nn.Module):
+    """Position-free self-attention over a set of physical fiber tokens."""
+
+    def __init__(self, token_dim=128, num_heads=4, feedforward_dim=256):
+        super().__init__()
+        if token_dim <= 0 or token_dim % num_heads:
+            raise ValueError("token_dim must be positive and divisible by num_heads")
+        if feedforward_dim <= 0:
+            raise ValueError("feedforward_dim must be positive")
+        self.self_attention = nn.MultiheadAttention(
+            token_dim,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(token_dim)
+        self.feedforward = nn.Sequential(
+            nn.Linear(token_dim, feedforward_dim),
+            nn.GELU(),
+            nn.Linear(feedforward_dim, token_dim),
+        )
+        self.feedforward_norm = nn.LayerNorm(token_dim)
+
+    def forward(self, tokens, observed_mask, key_padding_mask=None):
+        if tokens.ndim != 3:
+            raise ValueError("tokens must have shape (batch, fibers, token_dim)")
+        if observed_mask.shape != tokens.shape[:2]:
+            raise ValueError("observed_mask shape must match the token batch and fibers")
+        if observed_mask.dtype != torch.bool:
+            raise TypeError("observed_mask must be a bool tensor")
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != observed_mask.shape:
+                raise ValueError("key_padding_mask shape must match observed_mask")
+            if key_padding_mask.dtype != torch.bool:
+                raise TypeError("key_padding_mask must be a bool tensor")
+
+        attended, _ = self.self_attention(
+            tokens,
+            tokens,
+            tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        observed = observed_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        tokens = self.attention_norm(tokens + attended) * observed
+        tokens = self.feedforward_norm(tokens + self.feedforward(tokens)) * observed
+        return tokens
+
+
+class Stage3FeatureExtractor(nn.Module):
+    """Permutation-aware image/spectra fusion for the Stage 3 CCL experiment."""
+
+    output_dim = 1024
+
+    def __init__(
+        self,
+        nspec=config.data['nspec'],
+        spectral_embedding_dim=128,
+        token_dim=128,
+        num_heads=4,
+        fiber_position_scale=1.5,
+        img_net=None,
+    ):
+        super().__init__()
+        if nspec <= 0:
+            raise ValueError("nspec must be positive")
+        if fiber_position_scale <= 0 or not math.isfinite(fiber_position_scale):
+            raise ValueError("fiber_position_scale must be positive and finite")
+        self.nspecs = int(nspec)
+        self.fiber_position_scale = float(fiber_position_scale)
+        self.img_net = ImgCNN() if img_net is None else img_net
+        self.spec_net = SharedSpecCNN(embedding_dim=spectral_embedding_dim)
+
+        # Coordinates contain spin-1 (x,y), scalar (r^2), and spin-2
+        # (x^2-y^2,2xy) components. There is deliberately no storage-index
+        # embedding: physical positions, spectra, and masks define each token.
+        coordinate_dim = 5
+        spectral_strength_dim = 1
+        observation_dim = 1
+        self.token_projection = nn.Sequential(
+            nn.Linear(
+                spectral_embedding_dim
+                + coordinate_dim
+                + spectral_strength_dim
+                + observation_dim,
+                token_dim,
+            ),
+            nn.LayerNorm(token_dim),
+            nn.GELU(),
+        )
+        self.fiber_set_encoder = FiberSetAttention(
+            token_dim=token_dim,
+            num_heads=num_heads,
+            feedforward_dim=2 * token_dim,
+        )
+        self.image_query = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, token_dim),
+        )
+        self.image_fiber_attention = nn.MultiheadAttention(
+            token_dim,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.attended_norm = nn.LayerNorm(token_dim)
+        self.fiber_projection = nn.Sequential(
+            nn.Linear(token_dim, 512),
+            nn.GELU(),
+            nn.LayerNorm(512),
+        )
+        self.fusion_norm = nn.LayerNorm(self.output_dim)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.output_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, self.output_dim),
+        )
+        self.output_norm = nn.LayerNorm(self.output_dim)
+
+    @staticmethod
+    def _validate_inputs(image, spectra, fiber_positions, fiber_mask):
+        if image.ndim != 4 or image.shape[1] != 1:
+            raise ValueError("image must have shape (batch, 1, height, width)")
+        if spectra.ndim != 4 or spectra.shape[1] != 1:
+            raise ValueError("spectra must have shape (batch, 1, fibers, wavelength)")
+        if fiber_positions.ndim != 3 or fiber_positions.shape[-1] != 2:
+            raise ValueError("fiber_positions must have shape (batch, fibers, 2)")
+        if image.shape[0] != spectra.shape[0] or image.shape[0] != fiber_positions.shape[0]:
+            raise ValueError("image, spectra, and fiber_positions batch sizes must match")
+        if spectra.shape[2] != fiber_positions.shape[1]:
+            raise ValueError("spectra and fiber_positions must have the same fiber count")
+        if fiber_mask is not None:
+            if fiber_mask.dtype != torch.bool:
+                raise TypeError("fiber_mask must be a bool tensor")
+            if fiber_mask.shape != spectra.shape[:1] + spectra.shape[2:3]:
+                raise ValueError("fiber_mask must have shape (batch, fibers)")
+
+    @staticmethod
+    def _coordinate_features(fiber_positions):
+        x_coord, y_coord = fiber_positions.unbind(dim=-1)
+        return torch.stack(
+            (
+                x_coord,
+                y_coord,
+                x_coord.square() + y_coord.square(),
+                x_coord.square() - y_coord.square(),
+                2.0 * x_coord * y_coord,
+            ),
+            dim=-1,
+        )
+
+    @staticmethod
+    def _relative_spectral_strength(spectra):
+        """Return per-fiber L2 norms relative to the full spectral datavector."""
+        fiber_norms = torch.linalg.vector_norm(spectra, dim=-1, keepdim=True)
+        total_norm = torch.linalg.vector_norm(fiber_norms, dim=2, keepdim=True)
+        return fiber_norms / total_norm.clamp_min(torch.finfo(spectra.dtype).tiny)
+
+    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
+        self._validate_inputs(image, spectra, fiber_positions, fiber_mask)
+        batch_size, _, fiber_count, _ = spectra.shape
+        explicit_fiber_mask = fiber_mask is not None
+        if fiber_mask is None:
+            fiber_mask = torch.ones(
+                (batch_size, fiber_count),
+                dtype=torch.bool,
+                device=spectra.device,
+            )
+        else:
+            fiber_mask = fiber_mask.to(device=spectra.device)
+            # Explicit variable-fiber batches require at least one real token.
+            # The all-observed training path skips this host-visible check.
+            if torch.any(~fiber_mask.any(dim=1)):
+                raise ValueError("every sample must contain at least one observed fiber")
+        key_padding_mask = ~fiber_mask if explicit_fiber_mask else None
+
+        spectral_mask = fiber_mask[:, None, :, None]
+        position_mask = fiber_mask.unsqueeze(-1)
+        spectra = torch.where(spectral_mask, spectra, torch.zeros_like(spectra))
+        fiber_positions = torch.where(
+            position_mask,
+            fiber_positions,
+            torch.zeros_like(fiber_positions),
+        )
+
+        image = F.normalize(image, dim=(-2, -1))
+        # Per-fiber normalization isolates line shape, while the relative norm
+        # retains all amplitude information present under the legacy global
+        # spectral normalization.
+        relative_spectral_strength = self._relative_spectral_strength(spectra)
+        spectra = F.normalize(spectra, dim=-1)
+        normalized_positions = fiber_positions / self.fiber_position_scale
+
+        image_features = self.img_net(image).reshape(batch_size, -1)
+        if image_features.shape[1] != 512:
+            raise ValueError(
+                f"image encoder must return 512 features; got {image_features.shape[1]}"
+            )
+        spectral_features = self.spec_net(spectra)
+        coordinate_features = self._coordinate_features(normalized_positions)
+        spectral_strength_feature = relative_spectral_strength[:, 0].to(
+            spectral_features.dtype
+        )
+        observation_feature = fiber_mask.unsqueeze(-1).to(spectral_features.dtype)
+        fiber_tokens = self.token_projection(
+            torch.cat(
+                (
+                    spectral_features,
+                    coordinate_features,
+                    spectral_strength_feature,
+                    observation_feature,
+                ),
+                dim=-1,
+            )
+        )
+        fiber_tokens = fiber_tokens * observation_feature
+        fiber_tokens = self.fiber_set_encoder(
+            fiber_tokens,
+            fiber_mask,
+            key_padding_mask=key_padding_mask,
+        )
+
+        image_query = self.image_query(image_features).unsqueeze(1)
+        attended_fibers, _ = self.image_fiber_attention(
+            image_query,
+            fiber_tokens,
+            fiber_tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        attended_fibers = self.attended_norm(attended_fibers.squeeze(1))
+        fiber_features = self.fiber_projection(attended_fibers)
+
+        joint_features = torch.cat((image_features, fiber_features), dim=-1)
+        fused_features = joint_features + self.fusion_mlp(
+            self.fusion_norm(joint_features)
+        )
+        return self.output_norm(fused_features)
+
+
+class D4OrbitFeatureExtractor(nn.Module):
+    """Exactly D4-equivariant multimodal features from a shared orbit backbone.
+
+    The raw 1024 channels are interpreted as scalar, directed spin-1, and
+    spin-2 blocks. Every forward pass evaluates all eight complete datavector
+    views in one shared-backbone batch, maps each output back to the input
+    frame, and averages the aligned orbit.
+    """
+
+    output_dim = 1024
+    default_scalar_channels = 512
+    default_spin1_channels = 256
+    default_spin2_channels = 256
+
+    def __init__(
+        self,
+        nspec=config.data['nspec'],
+        base_backbone=None,
+        scalar_channels=default_scalar_channels,
+        spin1_channels=default_spin1_channels,
+        spin2_channels=default_spin2_channels,
+    ):
+        super().__init__()
+        channel_counts = (scalar_channels, spin1_channels, spin2_channels)
+        if any(type(value) is not int or value < 0 for value in channel_counts):
+            raise ValueError("D4 feature channel counts must be non-negative integers")
+        if spin1_channels % 2 or spin2_channels % 2:
+            raise ValueError("spin-1 and spin-2 channel counts must be even")
+        if sum(channel_counts) != self.output_dim:
+            raise ValueError(
+                f"D4 feature channel counts must sum to {self.output_dim}"
+            )
+        self.nspecs = int(nspec)
+        self.scalar_channels = scalar_channels
+        self.spin1_channels = spin1_channels
+        self.spin2_channels = spin2_channels
+        self.base_backbone = (
+            Stage3FeatureExtractor(nspec=self.nspecs)
+            if base_backbone is None
+            else base_backbone
+        )
+
+    def transform_features(self, features, element):
+        """Express equivariant features in the frame transformed by ``element``."""
+        return transform_d4_feature_blocks(
+            features,
+            element,
+            scalar_channels=self.scalar_channels,
+            spin1_channels=self.spin1_channels,
+            spin2_channels=self.spin2_channels,
+        )
+
+    def _build_orbit_batch(self, image, spectra, fiber_positions, fiber_mask=None):
+        image_views = []
+        spectrum_views = []
+        position_views = []
+        mask_views = []
+        for element in D4_ELEMENTS:
+            view_image, view_spectra, _, view_positions = apply_d4_to_datavector(
+                image,
+                spectra,
+                fp=fiber_positions,
+                element=element,
+            )
+            image_views.append(view_image)
+            spectrum_views.append(view_spectra)
+            position_views.append(view_positions)
+            if fiber_mask is not None:
+                mask_views.append(transform_d4_fiber_mask(fiber_mask, element))
+
+        orbit_image = torch.cat(image_views, dim=0)
+        orbit_spectra = torch.cat(spectrum_views, dim=0)
+        orbit_positions = torch.cat(position_views, dim=0)
+        orbit_mask = torch.cat(mask_views, dim=0) if mask_views else None
+        if image.is_contiguous(memory_format=torch.channels_last):
+            orbit_image = orbit_image.contiguous(memory_format=torch.channels_last)
+        if spectra.is_contiguous(memory_format=torch.channels_last):
+            orbit_spectra = orbit_spectra.contiguous(memory_format=torch.channels_last)
+        return orbit_image, orbit_spectra, orbit_positions, orbit_mask
+
+    def aligned_orbit_features(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        fiber_mask=None,
+    ):
+        """Return all eight raw orbit features aligned to the input frame."""
+        if fiber_positions is None:
+            raise ValueError("fiber_positions are required for the D4 orbit backbone")
+        batch_size = image.shape[0]
+        orbit = self._build_orbit_batch(
+            image,
+            spectra,
+            fiber_positions,
+            fiber_mask=fiber_mask,
+        )
+        if orbit[3] is None:
+            raw_features = self.base_backbone(orbit[0], orbit[1], orbit[2])
+        else:
+            raw_features = self.base_backbone(*orbit)
+        expected_shape = (len(D4_ELEMENTS) * batch_size, self.output_dim)
+        if raw_features.shape != expected_shape:
+            raise ValueError(
+                "D4 base backbone must return shape "
+                f"{expected_shape}; got {tuple(raw_features.shape)}"
+            )
+        raw_features = raw_features.reshape(
+            len(D4_ELEMENTS), batch_size, self.output_dim
+        )
+        return torch.stack(
+            tuple(
+                self.transform_features(raw_features[index], D4_INVERSES[element])
+                for index, element in enumerate(D4_ELEMENTS)
+            ),
+            dim=0,
+        )
+
+    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
+        return self.aligned_orbit_features(
+            image,
+            spectra,
+            fiber_positions,
+            fiber_mask=fiber_mask,
+        ).mean(dim=0)
+
+
+
+class _D4PairLinear(nn.Module):
+    """Bias-free multiplicity mixing that preserves a two-component irrep."""
+
+    def __init__(self, input_channels, output_channels):
+        super().__init__()
+        if input_channels % 2 or output_channels % 2:
+            raise ValueError("D4 pair-linear channel counts must be even")
+        self.input_pairs = input_channels // 2
+        self.output_pairs = output_channels // 2
+        self.weight = nn.Parameter(torch.empty(self.output_pairs, self.input_pairs))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, features):
+        pairs = features.reshape(*features.shape[:-1], self.input_pairs, 2)
+        projected = torch.einsum("...ic,oi->...oc", pairs, self.weight)
+        return projected.reshape(*features.shape[:-1], 2 * self.output_pairs)
+
+
+class D4EquivariantCCLProjector(nn.Module):
+    """Projection head whose scalar/spin blocks obey the D4 feature action."""
+
+    def __init__(
+        self,
+        scalar_channels=512,
+        spin1_channels=256,
+        spin2_channels=256,
+        output_dim=128,
+    ):
+        super().__init__()
+        if output_dim <= 0 or output_dim % 8:
+            raise ValueError("D4 CCL projector output_dim must be divisible by 8")
+        self.scalar_channels = int(scalar_channels)
+        self.spin1_channels = int(spin1_channels)
+        self.spin2_channels = int(spin2_channels)
+        self.output_scalar_channels = output_dim // 2
+        self.output_spin1_channels = output_dim // 4
+        self.output_spin2_channels = output_dim // 4
+        hidden_channels = max(128, 4 * self.output_scalar_channels)
+        self.scalar_projector = nn.Sequential(
+            nn.Linear(self.scalar_channels, hidden_channels),
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, self.output_scalar_channels),
+        )
+        self.spin1_projector = _D4PairLinear(
+            self.spin1_channels, self.output_spin1_channels
+        )
+        self.spin2_projector = _D4PairLinear(
+            self.spin2_channels, self.output_spin2_channels
+        )
+
+    def forward(self, features):
+        expected = self.scalar_channels + self.spin1_channels + self.spin2_channels
+        if features.shape[-1] != expected:
+            raise ValueError(
+                f"D4 CCL projector expected {expected} features; "
+                f"got {features.shape[-1]}"
+            )
+        scalar_end = self.scalar_channels
+        spin1_end = scalar_end + self.spin1_channels
+        return torch.cat(
+            (
+                self.scalar_projector(features[..., :scalar_end]),
+                self.spin1_projector(features[..., scalar_end:spin1_end]),
+                self.spin2_projector(features[..., spin1_end:]),
+            ),
+            dim=-1,
+        )
+
+
+def build_feature_extractor(backbone_type, nspec=config.data['nspec']):
+    if backbone_type == "legacy":
+        return FeatureExtractor(nspec=nspec)
+    if backbone_type == "stage3":
+        return Stage3FeatureExtractor(nspec=nspec)
+    if backbone_type == "stage4_d4":
+        return D4OrbitFeatureExtractor(nspec=nspec)
+    raise ValueError(
+        f"backbone_type must be one of {BACKBONE_TYPES}; got {backbone_type!r}"
+    )
+
 class VICRegPretrain(nn.Module):
     def __init__(self, backbone=None, projector_dim=128):
         super().__init__()
 
-        self.backbone = FeatureExtractor() if backbone is None else backbone
+        self.backbone = (
+            build_feature_extractor(
+                config.pretrain.get("backbone_type", "legacy"),
+                nspec=config.data["nspec"],
+            )
+            if backbone is None
+            else backbone
+        )
         
         # Get feature dimensions dynamically
         dim_in = 1024
@@ -583,22 +1523,38 @@ class VICRegLoss(nn.Module):
             return total_loss
 
 class CCLPretrain(nn.Module):
-    OBJECTIVES = ("ccl", "ccl_shear")
-
     def __init__(self, backbone=None, projector_dim=128):
         super().__init__()
 
-        self.backbone = FeatureExtractor() if backbone is None else backbone
+        self.backbone = (
+            build_feature_extractor(
+                config.pretrain.get("backbone_type", "legacy"),
+                nspec=config.data["nspec"],
+            )
+            if backbone is None
+            else backbone
+        )
 
         # Get feature dimensions dynamically
         dim_in = 1024
 
-        # Projector networks mapping onto a common high-dimensional space
-        self.projector = MLP(
-            [dim_in, 2048, 512, projector_dim],
-            use_batchnorm=True,
-            use_dropout=False,
-        )
+        # Stage 4 keeps the contrastive head equivariant too. Its spin blocks
+        # use bias-free multiplicity mixing, while scalar channels may use an
+        # unrestricted scalar MLP. Legacy/Stage 3 checkpoints retain the
+        # original projection head exactly.
+        if isinstance(self.backbone, D4OrbitFeatureExtractor):
+            self.projector = D4EquivariantCCLProjector(
+                scalar_channels=self.backbone.scalar_channels,
+                spin1_channels=self.backbone.spin1_channels,
+                spin2_channels=self.backbone.spin2_channels,
+                output_dim=projector_dim,
+            )
+        else:
+            self.projector = MLP(
+                [dim_in, 2048, 512, projector_dim],
+                use_batchnorm=True,
+                use_dropout=False,
+            )
 
         feature_names = list(config.train["feature_names"])
         configured_scales = config.pretrain.get("ccl_label_scales", {})
@@ -617,36 +1573,6 @@ class CCLPretrain(nn.Module):
             ),
         )
 
-        self.ccl_objective = config.pretrain.get("ccl_objective", "ccl")
-        if self.ccl_objective not in self.OBJECTIVES:
-            raise ValueError(
-                f"ccl_objective must be one of {self.OBJECTIVES}; "
-                f"got {self.ccl_objective!r}"
-            )
-        self.ccl_shear_loss_weight = float(
-            config.pretrain.get("ccl_shear_loss_weight", 1.0)
-        )
-        if (
-            not math.isfinite(self.ccl_shear_loss_weight)
-            or self.ccl_shear_loss_weight < 0
-        ):
-            raise ValueError(
-                "ccl_shear_loss_weight must be non-negative and finite"
-            )
-
-        # Keep the original objective state dict unchanged. The shear modules
-        # exist only for the explicitly selected auxiliary objective.
-        self.shear_indices = None
-        self.shear_head = None
-        self.shear_loss = None
-        if self.ccl_objective == "ccl_shear":
-            self.shear_indices = [
-                resolve_feature_index(feature_names, "g1"),
-                resolve_feature_index(feature_names, "g2"),
-            ]
-            self.shear_head = nn.Linear(dim_in, 2)
-            self.shear_loss = NormalizedShearMSELoss(normalization=3.0)
-
     def _compute_ccl_loss(self, projected_features, labels, return_diagnostics):
         if dist.is_initialized():
             projected_features = torch.cat(all_gather(projected_features), dim=0)
@@ -657,64 +1583,10 @@ class CCLPretrain(nn.Module):
             return_diagnostics=return_diagnostics,
         )
 
-    def _ccl_objective(
-        self,
-        backbone_features,
-        projected_features,
-        labels,
-        return_diagnostics,
-    ):
-        del backbone_features
-        return self._compute_ccl_loss(
-            projected_features,
-            labels,
-            return_diagnostics,
-        )
-
-    def _ccl_shear_objective(
-        self,
-        backbone_features,
-        projected_features,
-        labels,
-        return_diagnostics,
-    ):
-        ccl_output = self._compute_ccl_loss(
-            projected_features,
-            labels,
-            return_diagnostics,
-        )
-        if return_diagnostics:
-            ccl_value, diagnostics = ccl_output
-            diagnostics = dict(diagnostics)
-        else:
-            ccl_value = ccl_output
-            diagnostics = None
-
-        shear_prediction = self.shear_head(backbone_features)
-        shear_target = labels[:, self.shear_indices]
-        shear_value = self.shear_loss(shear_prediction, shear_target)
-        weighted_shear_value = self.ccl_shear_loss_weight * shear_value
-        total_value = ccl_value + weighted_shear_value
-
-        if diagnostics is None:
-            return total_value
-
-        diagnostics["ccl_loss"] = ccl_value.detach()
-        diagnostics["shear_loss"] = shear_value.detach()
-        diagnostics["weighted_shear_loss"] = weighted_shear_value.detach()
-        diagnostics["total_loss"] = total_value.detach()
-        return total_value, diagnostics
-
     def forward(self, x, y, fp, labels, return_diagnostics=False):
         backbone_features = self.backbone.forward(x, y, fp)
         projected_features = self.projector(backbone_features)
-        objective = (
-            self._ccl_shear_objective
-            if self.ccl_objective == "ccl_shear"
-            else self._ccl_objective
-        )
-        return objective(
-            backbone_features,
+        return self._compute_ccl_loss(
             projected_features,
             labels,
             return_diagnostics,
@@ -722,6 +1594,7 @@ class CCLPretrain(nn.Module):
 
     def extract_features(self, x, y, fp):
         return self.backbone.forward(x, y, fp)
+
 
 class ContinuousContrastiveLoss(nn.Module):
     """Continuous contrastive loss with fixed normalized parameter geometry."""
@@ -876,28 +1749,7 @@ class ContinuousContrastiveLoss(nn.Module):
         return loss, diagnostics
 
 
-class NormalizedShearMSELoss(nn.Module):
-    """MSE for normalized g1/g2 labels with an interpretable baseline scale."""
 
-    def __init__(self, normalization=3.0):
-        super().__init__()
-        normalization = float(normalization)
-        if not math.isfinite(normalization) or normalization <= 0:
-            raise ValueError("normalization must be positive and finite")
-        self.normalization = normalization
-
-    def forward(self, prediction, target):
-        if prediction.shape != target.shape:
-            raise ValueError(
-                "shear prediction and target must have identical shapes; "
-                f"got {tuple(prediction.shape)} and {tuple(target.shape)}"
-            )
-        if prediction.ndim != 2 or prediction.shape[1] != 2:
-            raise ValueError(
-                "shear prediction and target must have shape (batch, 2)"
-            )
-        return self.normalization * F.mse_loss(prediction, target)
-    
 class MLP(nn.Module):
     '''
     A simple MLP with Linear and ReLU

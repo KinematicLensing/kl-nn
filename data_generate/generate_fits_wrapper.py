@@ -31,7 +31,7 @@ nsamps = len(df)
 chunk = np.array(df.iloc[i:j]) if j < nsamps else np.array(df.iloc[i:])
 
 for row in chunk:
-    ID, g1, g2, theta_int, sini, v0, vcirc, rscale, hlr, dx_disk, dy_disk, dx_spec, dy_spec = row[:13]
-    # dx_disk, dy_disk, dx_spec, dy_spec = 0., 0., 0., 0.
+    # ID, g1, g2, theta_int, sini, v0, vcirc, rscale, hlr, dx_disk, dy_disk, dx_spec, dy_spec = row[:13]
+    ID, g1, g2, theta_int, sini, v0, vcirc, rscale, hlr = row[:9]
     ID = int(ID)
-    os.system(f"python {join(SCR_DIR, 'generate_fits.py')} -n={n} -d={d} -ID={ID} -g1={g1} -g2={g2} -theta_int={theta_int} -sini={sini} -v0={v0} -vcirc={vcirc} -rscale={rscale} -hlr={hlr} -dx_disk={dx_disk} -dy_disk={dy_disk} -dx_spec={dx_spec} -dy_spec={dy_spec} {low_psf_str}")
+    os.system(f"python {join(SCR_DIR, 'generate_fits.py')} -n={n} -d={d} -ID={ID} -g1={g1} -g2={g2} -theta_int={theta_int} -sini={sini} -v0={v0} -vcirc={vcirc} -rscale={rscale} -hlr={hlr} {low_psf_str}")

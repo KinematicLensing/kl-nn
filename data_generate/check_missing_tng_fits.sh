@@ -2,11 +2,11 @@
 
 set -u
 
-DATASET=${DATASET:-pretrain_5m}
+DATASET=${DATASET:-small_1m_fixedfiber}
 FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/${DATASET}}
-NGAL=${NGAL:-1000}
-ROWSPERGAL=${ROWSPERGAL:-5000}
-IDSTRIDE=${IDSTRIDE:-5000}
+NGAL=${NGAL:-5}
+ROWSPERGAL=${ROWSPERGAL:-2000}
+IDSTRIDE=${IDSTRIDE:-2000}
 OUTFILE=${1:-missing_fits_${DATASET}.txt}
 PREVFILE=${2:-missing_fits_${DATASET}.txt}
 
@@ -45,7 +45,7 @@ echo "[INFO] Checking FITS under ${FITS_ROOT}" | tee -a "${OUTFILE}"
 echo "[INFO] Expected galaxies: ${NGAL}, rows per galaxy: ${ROWSPERGAL}, id stride: ${IDSTRIDE}" | tee -a "${OUTFILE}"
 
 for gal in "${GALAXIES_TO_SCAN[@]}"; do
-  gal=$((${gal}+640))
+  gal=$((${gal}))
   pid=$((${gal}+1))
   gal_dir="${FITS_ROOT}/part_${pid}"
   start_id=$((gal * IDSTRIDE))

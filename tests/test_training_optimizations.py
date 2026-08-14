@@ -2,6 +2,7 @@ import inspect
 
 import pytest
 import torch
+from torch import nn
 
 import config
 import train
@@ -98,6 +99,32 @@ def test_load_train_objs_fused_adamw_flag(monkeypatch):
     assert len(train_ds) == 4
     assert len(valid_ds) == 4
     assert model is not None
+
+
+def test_load_model_can_explicitly_use_current_source(tmp_path, monkeypatch):
+    class CurrentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2))
+
+    expected = CurrentModel()
+    with torch.no_grad():
+        expected.weight.copy_(torch.tensor([1.25, -0.5]))
+    checkpoint = tmp_path / "model" / "model0"
+    checkpoint.parent.mkdir()
+    torch.save(expected.state_dict(), checkpoint)
+
+    def archived_loader_should_not_run(*args, **kwargs):
+        raise AssertionError("archived source was unexpectedly loaded")
+
+    monkeypatch.setattr(train, "load_networks_module_for_model", archived_loader_should_not_run)
+    restored = train.load_model(
+        config.train,
+        Model=CurrentModel,
+        path=str(checkpoint),
+        use_archived_networks=False,
+    )
+    torch.testing.assert_close(restored.weight, expected.weight)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for training smoke test")

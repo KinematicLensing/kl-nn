@@ -26,6 +26,7 @@ from data import (
     _load_rmag_snr_relation,
     apply_views,
     apply_noise,
+    apply_d4_to_datavector,
     sample_magnitudes,
     app_mag_to_snr,
     snr_to_app_mag,
@@ -82,6 +83,56 @@ def seed_everything(seed, deterministic=False):
         torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = bool(deterministic)
     torch.use_deterministic_algorithms(bool(deterministic))
+
+
+def make_ccl_pretrain_views(
+    img,
+    spec,
+    fid,
+    fp,
+    *,
+    use_rot90_counterpart,
+):
+    """Return the canonical CCL training branches for one noisy batch."""
+    original = (img, spec, fid, fp)
+    if not use_rot90_counterpart:
+        return (original,)
+    img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
+    rotated = (
+        img_90,
+        spec,
+        fid_90.contiguous(),
+        fp_90.contiguous(),
+    )
+    return original, rotated
+
+
+def make_npe_training_batch(
+    img,
+    spec,
+    fid,
+    fp,
+    snr,
+    *,
+    use_rot90_counterpart,
+):
+    """Build the legacy NPE batch or keep the exact-D4 batch unduplicated."""
+    if not use_rot90_counterpart:
+        return img, spec, fid, fp, snr
+    img_90, spec_90, fid_90, fp_90 = apply_d4_to_datavector(
+        img,
+        spec,
+        fid,
+        fp,
+        element="r90",
+    )
+    return (
+        torch.cat((img, img_90), dim=0),
+        torch.cat((spec, spec_90), dim=0),
+        torch.cat((fid, fid_90), dim=0),
+        torch.cat((fp, fp_90), dim=0),
+        torch.cat((snr, snr), dim=0) if snr is not None else None,
+    )
 
 
 def _resolve_amp_dtype(value: str) -> torch.dtype:
@@ -551,6 +602,9 @@ class FETrainer(Trainer):
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.use_channels_last = bool(config.pretrain.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.pretrain.get('noise_cache_maxs', False))
+        self.use_rot90_counterpart = bool(
+            config.pretrain.get('use_rot90_counterpart', True)
+        )
     
     def _run_batch(self, img, spec, fp, img2=None, spec2=None, fp2=None, fid=None):
         self.optimizer.zero_grad(set_to_none=True)
@@ -624,6 +678,8 @@ class FETrainer(Trainer):
             eff_dim_img_list = []
             eff_dim_spec_list = []
         epoch_start = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
 
         for i in range(self.nbatch_train):
             start = i*self.batch_size
@@ -645,20 +701,36 @@ class FETrainer(Trainer):
             )
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
-            img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
-            fid_90 = fid_90.contiguous()
-            fp_90 = fp_90.contiguous()
-            if self.use_channels_last:
-                img = img.contiguous(memory_format=torch.channels_last)
-                spec = spec.contiguous(memory_format=torch.channels_last)
-                img_90 = img_90.contiguous(memory_format=torch.channels_last)
-            all_loss, diagnostics = self._run_batch(img, spec, fp, fid=fid)
-            all_loss_90, diagnostics_90 = self._run_batch(img_90, spec, fp_90, fid=fid_90)
-            loss = (all_loss + all_loss_90) / 2
+            branches = make_ccl_pretrain_views(
+                img,
+                spec,
+                fid,
+                fp,
+                use_rot90_counterpart=self.use_rot90_counterpart,
+            )
+            branch_losses = []
+            branch_diagnostics = []
+            for view_img, view_spec, view_fid, view_fp in branches:
+                if self.use_channels_last:
+                    view_img = view_img.contiguous(
+                        memory_format=torch.channels_last
+                    )
+                    view_spec = view_spec.contiguous(
+                        memory_format=torch.channels_last
+                    )
+                branch_loss, diagnostics = self._run_batch(
+                    view_img,
+                    view_spec,
+                    view_fp,
+                    fid=view_fid,
+                )
+                branch_losses.append(branch_loss)
+                branch_diagnostics.append(diagnostics)
+            loss = sum(branch_losses) / len(branch_losses)
             if torch.isfinite(loss):
                 losses.append(loss.item())
             if self._accumulate_ccl_diagnostics(
-                ccl_diagnostic_totals, diagnostics, diagnostics_90
+                ccl_diagnostic_totals, *branch_diagnostics
             ):
                 ccl_diagnostic_batches += 1
 
@@ -687,6 +759,14 @@ class FETrainer(Trainer):
             self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
+            if torch.cuda.is_available():
+                gib = 1024 ** 3
+                self.logger.info(
+                    "[TRAIN] Epoch: %d Peak CUDA allocated: %.2f GiB; reserved: %.2f GiB",
+                    epoch + 1,
+                    torch.cuda.max_memory_allocated(self.device) / gib,
+                    torch.cuda.max_memory_reserved(self.device) / gib,
+                )
         return epoch_loss
 
     def _validFunc(self,epoch,show_log=True):
@@ -723,27 +803,40 @@ class FETrainer(Trainer):
                 )
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
-                img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
-                fid_90 = fid_90.contiguous()
-                fp_90 = fp_90.contiguous()
-                if self.use_channels_last:
-                    img = img.contiguous(memory_format=torch.channels_last)
-                    spec = spec.contiguous(memory_format=torch.channels_last)
-                    img_90 = img_90.contiguous(memory_format=torch.channels_last)
-                all_loss, diagnostics = self.model(
-                    img, spec, fp, labels=fid, return_diagnostics=True
+                branches = make_ccl_pretrain_views(
+                    img,
+                    spec,
+                    fid,
+                    fp,
+                    use_rot90_counterpart=self.use_rot90_counterpart,
                 )
-                all_loss_90, diagnostics_90 = self.model(
-                    img_90, spec, fp_90, labels=fid_90, return_diagnostics=True
-                )
-                loss = (all_loss + all_loss_90) / 2
+                branch_losses = []
+                branch_diagnostics = []
+                for view_img, view_spec, view_fid, view_fp in branches:
+                    if self.use_channels_last:
+                        view_img = view_img.contiguous(
+                            memory_format=torch.channels_last
+                        )
+                        view_spec = view_spec.contiguous(
+                            memory_format=torch.channels_last
+                        )
+                    branch_loss, diagnostics = self.model(
+                        view_img,
+                        view_spec,
+                        view_fp,
+                        labels=view_fid,
+                        return_diagnostics=True,
+                    )
+                    branch_losses.append(branch_loss)
+                    branch_diagnostics.append(diagnostics)
+                loss = sum(branch_losses) / len(branch_losses)
                 if torch.isfinite(loss):
                     losses.append(loss.item())
 
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
                 if self._accumulate_ccl_diagnostics(
-                    ccl_diagnostic_totals, diagnostics, diagnostics_90
+                    ccl_diagnostic_totals, *branch_diagnostics
                 ):
                     ccl_diagnostic_batches += 1
 
@@ -805,6 +898,9 @@ class NPETrainer(Trainer):
         
         self.model_name = config.train['model_name']
         self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
+        self.use_rot90_counterpart = bool(
+            config.train.get('use_rot90_counterpart', True)
+        )
 
     def _run_batch(self, img, spec, fid, mode, fp=None, snr=None):
         if mode == 'train':
@@ -869,12 +965,14 @@ class NPETrainer(Trainer):
             )
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
-            img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
-            img = torch.cat([img, img_90], dim=0)
-            spec = torch.cat([spec, spec], dim=0)  # Spectrum remains unchanged under rotation
-            fid = torch.cat([fid, fid_90], dim=0)
-            fp = torch.cat([fp, fp_90], dim=0)
-            snr = torch.cat([snr, snr], dim=0) if snr is not None else None
+            img, spec, fid, fp, snr = make_npe_training_batch(
+                img,
+                spec,
+                fid,
+                fp,
+                snr,
+                use_rot90_counterpart=self.use_rot90_counterpart,
+            )
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
@@ -921,12 +1019,14 @@ class NPETrainer(Trainer):
                 )
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
-                img_90, fid_90, fp_90 = rotate_90_degrees(img, fid, fp)
-                img = torch.cat([img, img_90], dim=0)
-                spec = torch.cat([spec, spec], dim=0)
-                fid = torch.cat([fid, fid_90], dim=0)
-                fp = torch.cat([fp, fp_90], dim=0)
-                snr = torch.cat([snr, snr], dim=0) if snr is not None else None
+                img, spec, fid, fp, snr = make_npe_training_batch(
+                    img,
+                    spec,
+                    fid,
+                    fp,
+                    snr,
+                    use_rot90_counterpart=self.use_rot90_counterpart,
+                )
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
@@ -987,54 +1087,57 @@ def train_nn(rank: int, world_size: int, Model=VICRegPretrain, Trainer=FETrainer
         log.info('Initializing')
         log.info(f'Run seed={base_seed}; deterministic={deterministic}')
     
-    ddp_setup(rank, world_size)
-    log.info(f'[rank: {rank}] Successfully set up device')
-    torch.backends.cudnn.benchmark = bool(train_config.get('cudnn_benchmark', False)) and not deterministic
-    seed_everything(base_seed, deterministic=deterministic)
-
-    device = torch.device(f"cuda:{rank}")
-    train_ds, valid_ds, model, optimizer = load_train_objs(
-        Model,
-        rank,
-        train_config,
-        train_mode=train_mode,
-        epoch=pretrain_epoch,
-        log=log,
-        device=device,
-    )
-    if train_config.get('channels_last', False):
-        model = model.to(memory_format=torch.channels_last)
-    model = _maybe_compile_model(model, log=log, use_compile=train_config.get('use_compile', False),)
-    ddp_kwargs = {
-        "device_ids": [rank],
-        "find_unused_parameters": bool(train_config.get('ddp_find_unused_parameters', False)),
-        "broadcast_buffers": bool(train_config.get('ddp_broadcast_buffers', False)),
-        "gradient_as_bucket_view": bool(train_config.get('ddp_gradient_as_bucket_view', True)),
-    }
-    if train_config.get('ddp_static_graph', False):
-        ddp_kwargs["static_graph"] = True
     try:
-        model = DDP(model, **ddp_kwargs)
-    except TypeError:
-        ddp_kwargs.pop("static_graph", None)
-        ddp_kwargs.pop("gradient_as_bucket_view", None)
-        model = DDP(model, **ddp_kwargs)
-    seed_everything(
-        derive_stream_seed(base_seed, rank=rank, epoch=0, stream="ambient"),
-        deterministic=deterministic,
-    )
-    log.info(f'[rank: {rank}] Successfully loaded training objects')
+        ddp_setup(rank, world_size)
+        log.info(f'[rank: {rank}] Successfully set up device')
+        torch.backends.cudnn.benchmark = bool(train_config.get('cudnn_benchmark', False)) and not deterministic
+        seed_everything(base_seed, deterministic=deterministic)
+
+        device = torch.device(f"cuda:{rank}")
+        train_ds, valid_ds, model, optimizer = load_train_objs(
+            Model,
+            rank,
+            train_config,
+            train_mode=train_mode,
+            epoch=pretrain_epoch,
+            log=log,
+            device=device,
+        )
+        if train_config.get('channels_last', False):
+            model = model.to(memory_format=torch.channels_last)
+        model = _maybe_compile_model(model, log=log, use_compile=train_config.get('use_compile', False),)
+        ddp_kwargs = {
+            "device_ids": [rank],
+            "find_unused_parameters": bool(train_config.get('ddp_find_unused_parameters', False)),
+            "broadcast_buffers": bool(train_config.get('ddp_broadcast_buffers', False)),
+            "gradient_as_bucket_view": bool(train_config.get('ddp_gradient_as_bucket_view', True)),
+        }
+        if train_config.get('ddp_static_graph', False):
+            ddp_kwargs["static_graph"] = True
+        try:
+            model = DDP(model, **ddp_kwargs)
+        except TypeError:
+            ddp_kwargs.pop("static_graph", None)
+            ddp_kwargs.pop("gradient_as_bucket_view", None)
+            model = DDP(model, **ddp_kwargs)
+        seed_everything(
+            derive_stream_seed(base_seed, rank=rank, epoch=0, stream="ambient"),
+            deterministic=deterministic,
+        )
+        log.info(f'[rank: {rank}] Successfully loaded training objects')
     
-    os.makedirs(join(train_config['model_path'], train_config['model_name']), exist_ok=True)
-    trainer = Trainer(
-        world_size, model, train_ds, valid_ds, optimizer, rank, save_every,
-        batch_size, seed=base_seed, deterministic=deterministic,
-    )
-    log.info(f'[rank: {rank}] Successfully initialized Trainer')
-    torch.distributed.barrier()
-    trainer.train(total_epochs)
-    torch.distributed.barrier()
-    destroy_process_group()
+        os.makedirs(join(train_config['model_path'], train_config['model_name']), exist_ok=True)
+        trainer = Trainer(
+            world_size, model, train_ds, valid_ds, optimizer, rank, save_every,
+            batch_size, seed=base_seed, deterministic=deterministic,
+        )
+        log.info(f'[rank: {rank}] Successfully initialized Trainer')
+        torch.distributed.barrier()
+        trainer.train(total_epochs)
+        torch.distributed.barrier()
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            destroy_process_group()
     
 def ddp_setup(rank, world_size):
     """
@@ -1113,11 +1216,8 @@ def load_train_objs(
         except TypeError:
             if use_fused and log is not None:
                 log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
-            optimizer = optim.AdamW(
-                optimizer_diff,
-                lr=train_config['initial_learning_rate'],
-                weight_decay=train_config['weight_decay'],
-            )
+            optimizer_kwargs.pop("fused", None)
+            optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
 
     return train_ds, valid_ds, model, optimizer
 
@@ -1135,10 +1235,12 @@ def load_model(
     compile_mode: str | None = None,
     compile_backend: str | None = None,
     channels_last: bool | None = None,
+    use_archived_networks: bool = True,
 ):
 
+    model_cls = Model
     resolved_name = None
-    if path is not None:
+    if path is not None and use_archived_networks:
         resolved_name = model_name or infer_model_name_from_checkpoint_path(path)
         if resolved_name:
             try:
@@ -1159,8 +1261,6 @@ def load_model(
                         f"Archived networks module for '{resolved_name}' "
                         f"does not define {Model.__name__}."
                     ) from exc
-    else:
-        model_cls = Model
     model = model_cls()
     model.to(device)
     if channels_last is None:
@@ -1258,6 +1358,13 @@ def sample_density(
     '''
     Run this function to sample from trained density estimation models
     '''
+    posterior_owner = getattr(model, "_orig_mod", model)
+    posterior_symmetry = getattr(posterior_owner, "posterior_symmetry", "none")
+    if posterior_symmetry == "d4" and apply_add_noise_cancellation:
+        raise ValueError(
+            "apply_add_noise_cancellation is redundant and incompatible with "
+            "an exactly D4-symmetrized posterior"
+        )
     if channels_last is None:
         channels_last = bool(config.train.get('channels_last', False))
     if snr is None and randgen is not None:

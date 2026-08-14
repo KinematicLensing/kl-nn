@@ -17,6 +17,22 @@ def parse_args(argv=None):
     parser.add_argument("--model", default="VICRegPretrain", help="Model architecture to use")
     parser.add_argument("--trainer", default="FETrainer", help="Trainer class to use")
     parser.add_argument(
+        "--backbone-type",
+        choices=BACKBONE_TYPES,
+        help="Feature-extractor architecture (recorded for pretraining and NPE)",
+    )
+    parser.add_argument(
+        "--rot90-counterpart",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train a separate rot90 counterpart (disabled for exact D4 backbones)",
+    )
+    parser.add_argument(
+        "--posterior-symmetry",
+        choices=("none", "d4"),
+        help="Posterior symmetry used during NPE training and inference",
+    )
+    parser.add_argument(
         "--train-type",
         "--train_type",
         dest="train_type",
@@ -40,8 +56,30 @@ def parse_args(argv=None):
     parser.add_argument("--train-size", type=int, help="Recorded training-set size")
     parser.add_argument("--valid-size", type=int, help="Recorded validation-set size")
     parser.add_argument("--model-name", help="Output model and artifact name")
+    parser.add_argument(
+        "--pretrained-name",
+        help="Pretraining model name recorded for downstream NPE construction",
+    )
+    parser.add_argument(
+        "--pretrain-from",
+        type=int,
+        help="Pretraining checkpoint epoch recorded for downstream NPE construction",
+    )
     parser.add_argument("--epochs", type=int, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, help="Per-rank batch size")
+    parser.add_argument("--mode", type=int, choices=(0, 1, 2), help="NPE mode")
+    parser.add_argument(
+        "--flow-type",
+        choices=("affine", "circular_rqs"),
+        help="NPE flow family (legacy affine or periodic theta_int RQS)",
+    )
+    parser.add_argument(
+        "--flow-num-bins",
+        type=int,
+        help="Number of rational-quadratic spline bins for circular_rqs",
+    )
+    parser.add_argument("--initial-learning-rate", type=float, help="Optimizer learning rate")
+    parser.add_argument("--weight-decay", type=float, help="Optimizer weight decay")
     parser.add_argument(
         "--ccl-sigma-label",
         type=float,
@@ -51,16 +89,6 @@ def parse_args(argv=None):
         "--ccl-d-cutoff",
         type=float,
         help="CCL background cutoff in normalized RMS parameter distance",
-    )
-    parser.add_argument(
-        "--ccl-objective",
-        choices=("ccl", "ccl_shear"),
-        help="Use the original CCL objective or CCL plus a backbone shear head",
-    )
-    parser.add_argument(
-        "--ccl-shear-loss-weight",
-        type=float,
-        help="Weight of the normalized g1/g2 MSE in the ccl_shear objective",
     )
     parser.add_argument(
         "--compile",
@@ -89,6 +117,31 @@ def apply_overrides(args):
         config.MODEL_CONFIG.data.size = args.train_size
     if args.valid_size is not None:
         config.MODEL_CONFIG.test.size = args.valid_size
+    if args.backbone_type is not None:
+        config.MODEL_CONFIG.pretrain.backbone_type = args.backbone_type
+        config.MODEL_CONFIG.train.backbone_type = args.backbone_type
+    if args.posterior_symmetry is not None:
+        if args.train_type != "train":
+            raise ValueError("--posterior-symmetry is only valid for NPE training")
+        config.MODEL_CONFIG.train.posterior_symmetry = args.posterior_symmetry
+    elif args.train_type == "train" and stage_config.backbone_type == "stage4_d4":
+        config.MODEL_CONFIG.train.posterior_symmetry = "d4"
+
+    if args.rot90_counterpart is not None:
+        stage_config.use_rot90_counterpart = args.rot90_counterpart
+    elif stage_config.backbone_type == "stage4_d4":
+        stage_config.use_rot90_counterpart = False
+    if args.pretrained_name is not None:
+        config.MODEL_CONFIG.train.pretrained_name = args.pretrained_name
+    if args.pretrain_from is not None:
+        config.MODEL_CONFIG.train.pretrain_from = args.pretrain_from
+    if args.flow_type is not None or args.flow_num_bins is not None:
+        if args.train_type != "train":
+            raise ValueError("flow options are only valid for NPE training")
+        if args.flow_type is not None:
+            config.MODEL_CONFIG.flow.flow_type = args.flow_type
+        if args.flow_num_bins is not None:
+            config.MODEL_CONFIG.flow.num_bins = args.flow_num_bins
 
     overrides = {
         "model_name": args.model_name,
@@ -97,6 +150,9 @@ def apply_overrides(args):
         "seed": args.seed,
         "deterministic": args.deterministic,
         "use_compile": args.use_compile,
+        "mode": args.mode,
+        "initial_learning_rate": args.initial_learning_rate,
+        "weight_decay": args.weight_decay,
     }
     for name, value in overrides.items():
         if value is not None:
@@ -105,8 +161,6 @@ def apply_overrides(args):
     ccl_overrides = {
         "ccl_sigma_label": args.ccl_sigma_label,
         "ccl_d_cutoff": args.ccl_d_cutoff,
-        "ccl_objective": args.ccl_objective,
-        "ccl_shear_loss_weight": args.ccl_shear_loss_weight,
     }
     if any(value is not None for value in ccl_overrides.values()):
         if args.train_type != "pretrain":
@@ -122,21 +176,47 @@ def apply_overrides(args):
         raise ValueError("--train-size must be positive")
     if config.MODEL_CONFIG.test.size <= 0:
         raise ValueError("--valid-size must be positive")
+    if config.MODEL_CONFIG.train.pretrain_from < 0:
+        raise ValueError("--pretrain-from must be non-negative")
     if not 0 <= stage_config.seed <= 2**32 - 1:
         raise ValueError("--seed must be between 0 and 2**32 - 1")
+    if stage_config.initial_learning_rate <= 0 or not math.isfinite(stage_config.initial_learning_rate):
+        raise ValueError("--initial-learning-rate must be positive and finite")
+    if stage_config.weight_decay < 0 or not math.isfinite(stage_config.weight_decay):
+        raise ValueError("--weight-decay must be non-negative and finite")
 
     if args.train_type == "pretrain":
+        is_d4_backbone = stage_config.backbone_type == "stage4_d4"
+        if is_d4_backbone == bool(stage_config.use_rot90_counterpart):
+            expected = "disabled" if is_d4_backbone else "enabled"
+            raise ValueError(
+                "rot90 counterpart must be " + expected
+                + f" for backbone_type={stage_config.backbone_type!r}"
+            )
         if not math.isfinite(stage_config.ccl_sigma_label) or stage_config.ccl_sigma_label <= 0:
             raise ValueError("--ccl-sigma-label must be positive and finite")
         if not math.isfinite(stage_config.ccl_d_cutoff) or stage_config.ccl_d_cutoff <= 0:
             raise ValueError("--ccl-d-cutoff must be positive and finite")
-        if stage_config.ccl_objective not in ("ccl", "ccl_shear"):
-            raise ValueError("--ccl-objective must be 'ccl' or 'ccl_shear'")
-        if (
-            not math.isfinite(stage_config.ccl_shear_loss_weight)
-            or stage_config.ccl_shear_loss_weight < 0
-        ):
-            raise ValueError("--ccl-shear-loss-weight must be non-negative and finite")
+    else:
+        if config.MODEL_CONFIG.flow.flow_type not in ("affine", "circular_rqs"):
+            raise ValueError("--flow-type must be 'affine' or 'circular_rqs'")
+        if config.MODEL_CONFIG.flow.num_bins < 2:
+            raise ValueError("--flow-num-bins must be at least 2")
+        is_d4_backbone = stage_config.backbone_type == "stage4_d4"
+        is_d4_posterior = stage_config.posterior_symmetry == "d4"
+        if stage_config.posterior_symmetry not in ("none", "d4"):
+            raise ValueError("posterior symmetry must be 'none' or 'd4'")
+        if is_d4_backbone != is_d4_posterior:
+            raise ValueError(
+                "D4 posterior symmetry requires backbone_type='stage4_d4', "
+                "and the Stage 4 backbone requires D4 posterior symmetry"
+            )
+        if is_d4_posterior == bool(stage_config.use_rot90_counterpart):
+            expected = "disabled" if is_d4_posterior else "enabled"
+            raise ValueError(
+                "rot90 counterpart must be " + expected
+                + f" for posterior_symmetry={stage_config.posterior_symmetry!r}"
+            )
 
     config.set_model_config(config.MODEL_CONFIG)
 
@@ -164,14 +244,17 @@ if __name__ == "__main__":
         "Effective run: "
         f"seed={effective_seed}, deterministic={deterministic}, "
         f"compile={train_config.use_compile}, "
+        f"backbone={train_config.backbone_type}, "
+        f"posterior_symmetry={getattr(train_config, 'posterior_symmetry', None)}, "
+        f"rot90_counterpart={getattr(train_config, 'use_rot90_counterpart', None)}, "
+        f"flow_type={config.MODEL_CONFIG.flow.flow_type}, "
+        f"flow_num_bins={config.MODEL_CONFIG.flow.num_bins}, "
         f"train={config.MODEL_CONFIG.data.data_dir} "
         f"(size={config.MODEL_CONFIG.data.size}), "
         f"valid={config.MODEL_CONFIG.test.data_dir} "
         f"(size={config.MODEL_CONFIG.test.size}), "
         f"ccl_sigma={getattr(train_config, 'ccl_sigma_label', None)}, "
-        f"ccl_cutoff={getattr(train_config, 'ccl_d_cutoff', None)}, "
-        f"ccl_objective={getattr(train_config, 'ccl_objective', None)}, "
-        f"ccl_shear_weight={getattr(train_config, 'ccl_shear_loss_weight', None)}"
+        f"ccl_cutoff={getattr(train_config, 'ccl_d_cutoff', None)}"
     )
 
     os.makedirs(join(train_config.model_path, train_config.model_name), exist_ok=True)

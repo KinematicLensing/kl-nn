@@ -70,13 +70,93 @@ def parse_args(argv=None):
     parser.add_argument("--mode", type=int, choices=(0, 1, 2), help="NPE mode")
     parser.add_argument(
         "--flow-type",
-        choices=("affine", "circular_rqs"),
-        help="NPE flow family (legacy affine or periodic theta_int RQS)",
+        choices=(
+            "affine",
+            "circular_rqs",
+            "hybrid_circular",
+            "bounded_hybrid_circular",
+        ),
+        help=(
+            "NPE flow family (affine, joint RQS, affine + circular theta, "
+            "or bounded RQS + circular theta)"
+        ),
+    )
+    parser.add_argument(
+        "--flow-num-layers",
+        type=int,
+        help="Number of transforms in the non-theta flow branch",
     )
     parser.add_argument(
         "--flow-num-bins",
         type=int,
-        help="Number of rational-quadratic spline bins for circular_rqs",
+        help="Number of rational-quadratic spline bins",
+    )
+    parser.add_argument(
+        "--theta-num-layers",
+        type=int,
+        help="Number of conditional circular theta spline layers",
+    )
+    parser.add_argument(
+        "--theta-logit-limit",
+        type=float,
+        help="Symmetric conditioner-logit limit for the circular theta spline",
+    )
+    parser.add_argument(
+        "--bounded-logit-limit",
+        type=float,
+        help="Symmetric conditioner-logit limit for the bounded RQS marginal",
+    )
+    parser.add_argument(
+        "--affine-learning-rate",
+        type=float,
+        help="Optional learning rate for the non-theta hybrid posterior branch",
+    )
+    parser.add_argument(
+        "--theta-learning-rate",
+        type=float,
+        help="Optional learning rate for the circular theta branch",
+    )
+    parser.add_argument(
+        "--scheduler-type",
+        choices=("plateau", "cosine", "warmup_cosine"),
+        help="NPE learning-rate schedule",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        help="Number of linear learning-rate warmup epochs",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        help="Minimum learning rate used by the scheduler",
+    )
+    parser.add_argument(
+        "--fixed-validation-streams",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Reuse identical validation SNR and noise streams every epoch",
+    )
+    parser.add_argument(
+        "--context-norm-trainable",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow affine scale and bias updates in the context normalization layer",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        help="Stop after this many epochs without sufficient validation improvement",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        help="Minimum validation-loss improvement counted by early stopping",
+    )
+    parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        help="Global gradient-norm clipping threshold",
     )
     parser.add_argument("--initial-learning-rate", type=float, help="Optimizer learning rate")
     parser.add_argument("--weight-decay", type=float, help="Optimizer weight decay")
@@ -135,13 +215,20 @@ def apply_overrides(args):
         config.MODEL_CONFIG.train.pretrained_name = args.pretrained_name
     if args.pretrain_from is not None:
         config.MODEL_CONFIG.train.pretrain_from = args.pretrain_from
-    if args.flow_type is not None or args.flow_num_bins is not None:
+    flow_overrides = {
+        "flow_type": args.flow_type,
+        "num_layers": args.flow_num_layers,
+        "num_bins": args.flow_num_bins,
+        "theta_num_layers": args.theta_num_layers,
+        "theta_logit_limit": args.theta_logit_limit,
+        "bounded_logit_limit": args.bounded_logit_limit,
+    }
+    if any(value is not None for value in flow_overrides.values()):
         if args.train_type != "train":
             raise ValueError("flow options are only valid for NPE training")
-        if args.flow_type is not None:
-            config.MODEL_CONFIG.flow.flow_type = args.flow_type
-        if args.flow_num_bins is not None:
-            config.MODEL_CONFIG.flow.num_bins = args.flow_num_bins
+        for name, value in flow_overrides.items():
+            if value is not None:
+                setattr(config.MODEL_CONFIG.flow, name, value)
 
     overrides = {
         "model_name": args.model_name,
@@ -158,6 +245,24 @@ def apply_overrides(args):
         if value is not None:
             setattr(stage_config, name, value)
 
+    npe_overrides = {
+        "affine_learning_rate": args.affine_learning_rate,
+        "theta_learning_rate": args.theta_learning_rate,
+        "scheduler_type": args.scheduler_type,
+        "warmup_epochs": args.warmup_epochs,
+        "min_learning_rate": args.min_learning_rate,
+        "fixed_validation_streams": args.fixed_validation_streams,
+        "context_norm_trainable": args.context_norm_trainable,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+        "gradient_clip_norm": args.gradient_clip_norm,
+    }
+    if any(value is not None for value in npe_overrides.values()):
+        if args.train_type != "train":
+            raise ValueError("NPE optimizer options are only valid for NPE training")
+        for name, value in npe_overrides.items():
+            if value is not None:
+                setattr(config.MODEL_CONFIG.train, name, value)
     ccl_overrides = {
         "ccl_sigma_label": args.ccl_sigma_label,
         "ccl_d_cutoff": args.ccl_d_cutoff,
@@ -198,10 +303,75 @@ def apply_overrides(args):
         if not math.isfinite(stage_config.ccl_d_cutoff) or stage_config.ccl_d_cutoff <= 0:
             raise ValueError("--ccl-d-cutoff must be positive and finite")
     else:
-        if config.MODEL_CONFIG.flow.flow_type not in ("affine", "circular_rqs"):
-            raise ValueError("--flow-type must be 'affine' or 'circular_rqs'")
-        if config.MODEL_CONFIG.flow.num_bins < 2:
+        flow_config = config.MODEL_CONFIG.flow
+        hybrid_flow_types = ("hybrid_circular", "bounded_hybrid_circular")
+        if flow_config.flow_type not in (
+            "affine",
+            "circular_rqs",
+            *hybrid_flow_types,
+        ):
+            raise ValueError(
+                "--flow-type must be 'affine', 'circular_rqs', "
+                "'hybrid_circular', or 'bounded_hybrid_circular'"
+            )
+        if flow_config.num_layers < 1:
+            raise ValueError("--flow-num-layers must be at least 1")
+        if flow_config.num_bins < 2:
             raise ValueError("--flow-num-bins must be at least 2")
+        if flow_config.theta_num_layers < 1:
+            raise ValueError("--theta-num-layers must be at least 1")
+        if not math.isfinite(flow_config.theta_logit_limit) or flow_config.theta_logit_limit <= 0:
+            raise ValueError("--theta-logit-limit must be positive and finite")
+        if (
+            not math.isfinite(flow_config.bounded_logit_limit)
+            or flow_config.bounded_logit_limit <= 0
+        ):
+            raise ValueError("--bounded-logit-limit must be positive and finite")
+        if stage_config.scheduler_type not in ("plateau", "cosine", "warmup_cosine"):
+            raise ValueError("--scheduler-type must be 'plateau', 'cosine', or 'warmup_cosine'")
+        if stage_config.warmup_epochs < 0:
+            raise ValueError("--warmup-epochs must be non-negative")
+        if (
+            not math.isfinite(stage_config.min_learning_rate)
+            or stage_config.min_learning_rate < 0
+        ):
+            raise ValueError("--min-learning-rate must be non-negative and finite")
+        for name in ("affine_learning_rate", "theta_learning_rate"):
+            branch_lr = getattr(stage_config, name)
+            if branch_lr is not None and (
+                not math.isfinite(branch_lr) or branch_lr <= 0
+            ):
+                raise ValueError(f"--{name.replace('_', '-')} must be positive and finite")
+        if (
+            stage_config.affine_learning_rate is not None
+            and flow_config.flow_type not in hybrid_flow_types
+        ):
+            raise ValueError(
+                "--affine-learning-rate requires --flow-type hybrid_circular "
+                "or bounded_hybrid_circular"
+            )
+        if (
+            stage_config.theta_learning_rate is not None
+            and flow_config.flow_type not in hybrid_flow_types
+        ):
+            raise ValueError(
+                "--theta-learning-rate requires --flow-type hybrid_circular "
+                "or bounded_hybrid_circular"
+            )
+        if stage_config.scheduler_type in ("cosine", "warmup_cosine"):
+            active_lrs = [
+                stage_config.initial_learning_rate,
+                stage_config.affine_learning_rate or stage_config.initial_learning_rate,
+                stage_config.theta_learning_rate or stage_config.initial_learning_rate,
+            ]
+            if stage_config.min_learning_rate > min(active_lrs):
+                raise ValueError("--min-learning-rate cannot exceed an active learning rate")
+        if stage_config.early_stopping_patience is not None and stage_config.early_stopping_patience < 1:
+            raise ValueError("--early-stopping-patience must be positive")
+        if not math.isfinite(stage_config.early_stopping_min_delta) or stage_config.early_stopping_min_delta < 0:
+            raise ValueError("--early-stopping-min-delta must be non-negative and finite")
+        if not math.isfinite(stage_config.gradient_clip_norm) or stage_config.gradient_clip_norm <= 0:
+            raise ValueError("--gradient-clip-norm must be positive and finite")
         is_d4_backbone = stage_config.backbone_type == "stage4_d4"
         is_d4_posterior = stage_config.posterior_symmetry == "d4"
         if stage_config.posterior_symmetry not in ("none", "d4"):
@@ -248,7 +418,22 @@ if __name__ == "__main__":
         f"posterior_symmetry={getattr(train_config, 'posterior_symmetry', None)}, "
         f"rot90_counterpart={getattr(train_config, 'use_rot90_counterpart', None)}, "
         f"flow_type={config.MODEL_CONFIG.flow.flow_type}, "
+        f"flow_num_layers={config.MODEL_CONFIG.flow.num_layers}, "
         f"flow_num_bins={config.MODEL_CONFIG.flow.num_bins}, "
+        f"theta_num_layers={config.MODEL_CONFIG.flow.theta_num_layers}, "
+        f"theta_logit_limit={config.MODEL_CONFIG.flow.theta_logit_limit}, "
+        f"bounded_logit_limit={config.MODEL_CONFIG.flow.bounded_logit_limit}, "
+        f"initial_lr={train_config.initial_learning_rate}, "
+        f"affine_lr={getattr(train_config, 'affine_learning_rate', None)}, "
+        f"theta_lr={getattr(train_config, 'theta_learning_rate', None)}, "
+        f"scheduler={getattr(train_config, 'scheduler_type', None)}, "
+        f"warmup_epochs={getattr(train_config, 'warmup_epochs', None)}, "
+        f"min_lr={getattr(train_config, 'min_learning_rate', None)}, "
+        f"fixed_validation={getattr(train_config, 'fixed_validation_streams', None)}, "
+        f"context_norm_trainable={getattr(train_config, 'context_norm_trainable', None)}, "
+        f"early_stop_patience={getattr(train_config, 'early_stopping_patience', None)}, "
+        f"early_stop_min_delta={getattr(train_config, 'early_stopping_min_delta', None)}, "
+        f"gradient_clip_norm={getattr(train_config, 'gradient_clip_norm', None)}, "
         f"train={config.MODEL_CONFIG.data.data_dir} "
         f"(size={config.MODEL_CONFIG.data.size}), "
         f"valid={config.MODEL_CONFIG.test.data_dir} "

@@ -10,11 +10,19 @@ from nflows.flows.base import Flow
 from nflows.distributions.base import Distribution
 from nflows.distributions.normal import ConditionalDiagonalNormal
 from nflows.transforms.base import CompositeTransform
-from nflows.transforms.autoregressive import MaskedAffineAutoregressiveTransform
+from nflows.transforms.autoregressive import (
+    MaskedAffineAutoregressiveTransform,
+    MaskedPiecewiseRationalQuadraticAutoregressiveTransform,
+)
 from nflows.transforms.permutations import Permutation, ReversePermutation
+from nflows.transforms.standard import PointwiseAffineTransform
 from nflows.utils import torchutils
 
-from circular_spline import CircularAutoregressiveRationalQuadraticSpline
+from circular_spline import (
+    DEFAULT_MIN_DERIVATIVE,
+    CircularAutoregressiveRationalQuadraticSpline,
+    unconstrained_rational_quadratic_spline,
+)
 
 import config
 from utils import resolve_feature_index
@@ -28,7 +36,12 @@ from data import (
     transform_d4_parameters,
 )
 
-FLOW_TYPES = ("affine", "circular_rqs")
+FLOW_TYPES = (
+    "affine",
+    "circular_rqs",
+    "hybrid_circular",
+    "bounded_hybrid_circular",
+)
 
 
 class ConditionalNormalWithCircularTheta(Distribution):
@@ -139,6 +152,796 @@ class PeriodicThetaFlow(Flow):
             self._canonicalize_theta(inputs), context=context
         )
 
+
+class ConditionalCircularThetaTransform(nn.Module):
+    """One-dimensional circular RQS conditioned on Euclidean parameters.
+
+    The conditioner sees the image/spectrum context and all seven non-angular
+    parameters. Consequently this models p(theta | x_non_theta, context),
+    rather than an independent theta density. Only theta enters an RQS.
+    """
+
+    def __init__(
+        self,
+        condition_features,
+        *,
+        num_layers=1,
+        num_bins=8,
+        hidden_features=128,
+        logit_limit=10.0,
+        tail_bound=1.0,
+    ):
+        super().__init__()
+        if type(condition_features) is not int or condition_features <= 0:
+            raise ValueError("condition_features must be a positive integer")
+        if type(num_layers) is not int or num_layers <= 0:
+            raise ValueError("num_layers must be a positive integer")
+        if type(num_bins) is not int or num_bins < 2:
+            raise ValueError("num_bins must be an integer of at least two")
+        if not math.isfinite(float(logit_limit)) or float(logit_limit) <= 0:
+            raise ValueError("logit_limit must be finite and positive")
+        if float(tail_bound) != 1.0:
+            raise ValueError(
+                "theta_int is normalized by pi, so tail_bound must equal 1.0"
+            )
+
+        self.condition_features = condition_features
+        self.num_layers = num_layers
+        self.num_bins = num_bins
+        self.logit_limit = float(logit_limit)
+        self.tail_bound = float(tail_bound)
+        self.min_derivative = DEFAULT_MIN_DERIVATIVE
+        self.conditioners = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(condition_features, hidden_features),
+                    nn.SiLU(),
+                    nn.Linear(hidden_features, hidden_features),
+                    nn.SiLU(),
+                    nn.Linear(hidden_features, 3 * num_bins),
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self._initialize_identity()
+
+    @staticmethod
+    def _canonicalize_public(theta):
+        """Select a half-open representative for every finite circle value."""
+        if not torch.isfinite(theta).all():
+            raise FloatingPointError("theta_int contains a non-finite value")
+        outside = (theta < -1.0) | (theta >= 1.0)
+        wrapped = torch.remainder(theta + 1.0, 2.0) - 1.0
+        return torch.where(outside, wrapped, theta)
+
+    @staticmethod
+    def _canonicalize_internal(theta, *, operation):
+        """Canonicalize every finite circular representative modulo two."""
+        if not torch.isfinite(theta).all():
+            raise FloatingPointError(
+                f"non-finite theta_int produced during circular {operation}"
+            )
+        outside = (theta < -1.0) | (theta >= 1.0)
+        wrapped = torch.remainder(theta + 1.0, 2.0) - 1.0
+        return torch.where(outside, wrapped, theta)
+
+    def _bounded_parameters(self, conditioner, condition):
+        raw = conditioner(condition)
+        bounded = self.logit_limit * torch.tanh(raw / self.logit_limit)
+        widths = bounded[..., : self.num_bins].unsqueeze(-2)
+        heights = bounded[..., self.num_bins : 2 * self.num_bins].unsqueeze(-2)
+        derivatives = bounded[..., 2 * self.num_bins :].unsqueeze(-2)
+        return raw, widths, heights, derivatives
+
+    def _apply_layer(self, theta, condition, conditioner, *, inverse):
+        raw, widths, heights, derivatives = self._bounded_parameters(
+            conditioner, condition
+        )
+        transformed, logabsdet = unconstrained_rational_quadratic_spline(
+            inputs=theta.unsqueeze(-1),
+            unnormalized_widths=widths,
+            unnormalized_heights=heights,
+            unnormalized_derivatives=derivatives,
+            inverse=inverse,
+            tails="circular",
+            tail_bound=self.tail_bound,
+        )
+        transformed = transformed.squeeze(-1)
+        wrap_mask = torch.isfinite(transformed) & (
+            (transformed < -1.0) | (transformed >= 1.0)
+        )
+        wrap_excursion = torch.maximum(
+            (-1.0 - transformed).clamp_min(0.0),
+            (transformed - 1.0).clamp_min(0.0),
+        )
+        transformed = self._canonicalize_internal(
+            transformed,
+            operation="inverse" if inverse else "forward",
+        )
+        return (
+            transformed,
+            logabsdet.squeeze(-1),
+            raw,
+            wrap_mask.sum(),
+            wrap_excursion.max(),
+        )
+
+    def forward(self, theta, condition):
+        if theta.ndim != 1:
+            raise ValueError("theta must have shape (batch,)")
+        if condition.shape != (theta.shape[0], self.condition_features):
+            raise ValueError(
+                "condition must have shape "
+                f"({theta.shape[0]}, {self.condition_features})"
+            )
+        value = self._canonicalize_public(theta)
+        total_logabsdet = torch.zeros_like(value)
+        raw_max = value.new_zeros(())
+        bounded_max = value.new_zeros(())
+        derivative_min = value.new_tensor(torch.inf)
+        derivative_max = value.new_tensor(-torch.inf)
+        wrap_count = value.new_zeros(())
+        max_wrap_excursion = value.new_zeros(())
+        for conditioner in self.conditioners:
+            value, logabsdet, raw, layer_wrap_count, layer_wrap_excursion = self._apply_layer(
+                value, condition, conditioner, inverse=False
+            )
+            total_logabsdet = total_logabsdet + logabsdet
+            raw_max = torch.maximum(raw_max, raw.detach().abs().max())
+            bounded = self.logit_limit * torch.tanh(
+                raw.detach() / self.logit_limit
+            )
+            bounded_max = torch.maximum(bounded_max, bounded.abs().max())
+            derivatives = self.min_derivative + F.softplus(
+                bounded[..., 2 * self.num_bins :]
+            )
+            derivative_min = torch.minimum(
+                derivative_min, derivatives.min()
+            )
+            derivative_max = torch.maximum(
+                derivative_max, derivatives.max()
+            )
+            wrap_count = wrap_count + layer_wrap_count
+            max_wrap_excursion = torch.maximum(
+                max_wrap_excursion, layer_wrap_excursion
+            )
+        self.last_diagnostics = {
+            "theta_raw_logit_abs_max": raw_max.detach(),
+            "theta_bounded_logit_abs_max": bounded_max.detach(),
+            "theta_derivative_min": derivative_min.detach(),
+            "theta_derivative_max": derivative_max.detach(),
+            "theta_wrap_count": wrap_count.detach(),
+            "theta_max_wrap_excursion": max_wrap_excursion.detach(),
+            "theta_logdet_min": total_logabsdet.detach().min(),
+            "theta_logdet_max": total_logabsdet.detach().max(),
+        }
+        return value, total_logabsdet
+
+    def inverse(self, latent_theta, condition):
+        if latent_theta.ndim != 1:
+            raise ValueError("latent_theta must have shape (batch,)")
+        if condition.shape != (
+            latent_theta.shape[0],
+            self.condition_features,
+        ):
+            raise ValueError(
+                "condition must have shape "
+                f"({latent_theta.shape[0]}, {self.condition_features})"
+            )
+        value = self._canonicalize_public(latent_theta)
+        total_logabsdet = torch.zeros_like(value)
+        for conditioner in reversed(self.conditioners):
+            value, logabsdet, _, _, _ = self._apply_layer(
+                value, condition, conditioner, inverse=True
+            )
+            total_logabsdet = total_logabsdet + logabsdet
+        return value, total_logabsdet
+
+    def diagnostics(self, theta, condition):
+        """Return detached spline-health diagnostics for a training batch."""
+        value = self._canonicalize_public(theta)
+        raw_max = value.new_zeros(())
+        bounded_max = value.new_zeros(())
+        logdet_min = value.new_tensor(torch.inf)
+        logdet_max = value.new_tensor(-torch.inf)
+        for conditioner in self.conditioners:
+            raw, widths, heights, derivatives = self._bounded_parameters(
+                conditioner, condition
+            )
+            bounded_max = torch.maximum(
+                bounded_max,
+                torch.stack(
+                    (
+                        widths.abs().max(),
+                        heights.abs().max(),
+                        derivatives.abs().max(),
+                    )
+                ).max(),
+            )
+            raw_max = torch.maximum(raw_max, raw.abs().max())
+            value, logdet, _, _, _ = self._apply_layer(
+                value, condition, conditioner, inverse=False
+            )
+            logdet_min = torch.minimum(logdet_min, logdet.min())
+            logdet_max = torch.maximum(logdet_max, logdet.max())
+        return {
+            "theta_raw_logit_abs_max": raw_max.detach(),
+            "theta_bounded_logit_abs_max": bounded_max.detach(),
+            "theta_logdet_min": logdet_min.detach(),
+            "theta_logdet_max": logdet_max.detach(),
+        }
+
+    def _initialize_identity(self):
+        target = math.log(math.expm1(1.0 - self.min_derivative))
+        if abs(target) >= self.logit_limit:
+            raise ValueError("logit_limit is too small for identity initialization")
+        raw_derivative_bias = self.logit_limit * math.atanh(
+            target / self.logit_limit
+        )
+        for conditioner in self.conditioners:
+            final = conditioner[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+            with torch.no_grad():
+                final.bias[2 * self.num_bins :] = raw_derivative_bias
+
+
+class ConditionalUnitBox(Distribution):
+    """Uniform distribution on ``[0, 1]^D`` with nflows context semantics.
+
+    The density itself does not depend on context, but accepting context is
+    essential: :class:`nflows.flows.base.Flow` uses it to determine the
+    leading batch dimension of conditional samples.
+    """
+
+    def __init__(self, features):
+        super().__init__()
+        if type(features) is not int or features <= 0:
+            raise ValueError("features must be a positive integer")
+        self.features = features
+        self.register_buffer("_reference", torch.zeros(features))
+
+    def _validate_inputs(self, inputs):
+        if inputs.ndim != 2 or inputs.shape[-1] != self.features:
+            raise ValueError(
+                f"Expected inputs with shape (batch, {self.features}); "
+                f"got {tuple(inputs.shape)}"
+            )
+
+    def _log_prob(self, inputs, context):
+        self._validate_inputs(inputs)
+        on_support = (
+            torch.isfinite(inputs)
+            & (inputs >= 0.0)
+            & (inputs <= 1.0)
+        ).all(dim=-1)
+        zeros = inputs.new_zeros(inputs.shape[0])
+        return torch.where(
+            on_support,
+            zeros,
+            torch.full_like(zeros, -torch.inf),
+        )
+
+    def _sample(self, num_samples, context):
+        if context is None:
+            return torch.rand(
+                num_samples,
+                self.features,
+                device=self._reference.device,
+                dtype=self._reference.dtype,
+            )
+        return torch.rand(
+            context.shape[0],
+            num_samples,
+            self.features,
+            device=context.device,
+            dtype=context.dtype,
+        )
+
+    def _mean(self, context):
+        if context is None:
+            return self._reference.new_full((self.features,), 0.5)
+        return context.new_full((context.shape[0], self.features), 0.5)
+
+
+class IdentityBoundedRationalQuadraticAutoregressiveTransform(
+    MaskedPiecewiseRationalQuadraticAutoregressiveTransform
+):
+    """Compact autoregressive RQS with bounded logits and identity start.
+
+    ``tails=None`` in nflows defines the spline exactly on the unit interval.
+    The MADE output is initialized so widths and heights are uniform and every
+    knot derivative is one. Tanh-bounding the logits prevents a conditioner
+    excursion from collapsing bins or driving derivatives arbitrarily large.
+    """
+
+    def __init__(
+        self,
+        *,
+        features,
+        hidden_features,
+        context_features=None,
+        num_bins=8,
+        num_blocks=2,
+        logit_limit=10.0,
+        min_bin_width=1e-3,
+        min_bin_height=1e-3,
+        min_derivative=1e-3,
+    ):
+        if not math.isfinite(float(logit_limit)) or float(logit_limit) <= 0:
+            raise ValueError("logit_limit must be finite and positive")
+        self.logit_limit = float(logit_limit)
+        super().__init__(
+            features=features,
+            hidden_features=hidden_features,
+            context_features=context_features,
+            num_bins=num_bins,
+            tails=None,
+            num_blocks=num_blocks,
+            min_bin_width=min_bin_width,
+            min_bin_height=min_bin_height,
+            min_derivative=min_derivative,
+        )
+        self._initialize_identity()
+        self.last_diagnostics = {}
+
+    def _initialize_identity(self):
+        target = math.log(math.expm1(1.0 - self.min_derivative))
+        if abs(target) >= self.logit_limit:
+            raise ValueError(
+                "logit_limit is too small for identity initialization"
+            )
+        raw_derivative_bias = self.logit_limit * math.atanh(
+            target / self.logit_limit
+        )
+        final = self.autoregressive_net.final_layer
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+        multiplier = self._output_dim_multiplier()
+        with torch.no_grad():
+            bias = final.bias.view(-1, multiplier)
+            bias[:, 2 * self.num_bins :] = raw_derivative_bias
+
+    def _elementwise(self, inputs, autoregressive_params, inverse=False):
+        raw = autoregressive_params
+        bounded = self.logit_limit * torch.tanh(
+            raw / self.logit_limit
+        )
+        # Stock nflows 0.14 can lose a few 1e-5 near a compact boundary while
+        # solving the inverse quadratic in float32.  In a stack, that tiny
+        # excursion becomes an out-of-domain input to the next spline.  The
+        # mathematical inverse is inside [0, 1], so evaluate only the small
+        # elementwise inverse solve in float64 and cast its in-support result
+        # back to the public dtype.  Conditioner networks and forward training
+        # remain in their configured precision.
+        use_precise_inverse = inverse and inputs.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
+        spline_inputs = inputs.double() if use_precise_inverse else inputs
+        spline_parameters = (
+            bounded.double() if use_precise_inverse else bounded
+        )
+        outputs, logabsdet = super()._elementwise(
+            spline_inputs, spline_parameters, inverse=inverse
+        )
+        if use_precise_inverse:
+            outputs = outputs.to(dtype=inputs.dtype)
+            logabsdet = logabsdet.to(dtype=inputs.dtype)
+        shaped = bounded.view(
+            bounded.shape[0],
+            inputs.shape[1],
+            self._output_dim_multiplier(),
+        )
+        derivatives = self.min_derivative + F.softplus(
+            shaped[..., 2 * self.num_bins :]
+        )
+        self.last_diagnostics = {
+            "raw_logit_abs_max": raw.detach().abs().max(),
+            "bounded_logit_abs_max": bounded.detach().abs().max(),
+            "derivative_min": derivatives.detach().min(),
+            "derivative_max": derivatives.detach().max(),
+            "logdet_min": logabsdet.detach().min(),
+            "logdet_max": logabsdet.detach().max(),
+        }
+        return outputs, logabsdet
+
+
+class HybridAffineCircularFlow(nn.Module):
+    """Affine seven-parameter marginal and correlated circular theta factor.
+
+    The factorization q(x, theta | context) =
+    q_affine(x | context) q_circular(theta | x, context) retains the complete
+    dependence between theta and every other inferred parameter.
+    """
+
+    def __init__(
+        self,
+        *,
+        features,
+        theta_index,
+        context_features,
+        num_affine_layers=12,
+        num_theta_layers=1,
+        num_bins=8,
+        hidden_features=256,
+        num_blocks=2,
+        theta_hidden_features=128,
+        logit_limit=10.0,
+    ):
+        super().__init__()
+        if type(features) is not int or features < 2:
+            raise ValueError("features must be an integer of at least two")
+        if type(theta_index) is not int or not 0 <= theta_index < features:
+            raise ValueError("theta_index is out of bounds")
+        if type(context_features) is not int or context_features <= 0:
+            raise ValueError("context_features must be a positive integer")
+        if type(num_affine_layers) is not int or num_affine_layers <= 0:
+            raise ValueError("num_affine_layers must be a positive integer")
+
+        self.features = features
+        self.theta_index = theta_index
+        self.context_features = context_features
+        self.non_theta_indices = tuple(
+            index for index in range(features) if index != theta_index
+        )
+        self.linear_features = features - 1
+
+        affine_base = ConditionalDiagonalNormal(
+            shape=[self.linear_features],
+            context_encoder=MLP(
+                [context_features, 128, 64, 2 * self.linear_features]
+            ),
+        )
+        affine_transforms = []
+        for _ in range(num_affine_layers):
+            affine_transforms.append(
+                ReversePermutation(features=self.linear_features)
+            )
+            affine_transforms.append(
+                MaskedAffineAutoregressiveTransform(
+                    features=self.linear_features,
+                    hidden_features=hidden_features,
+                    num_blocks=num_blocks,
+                    context_features=context_features,
+                )
+            )
+        self.affine_flow = Flow(
+            CompositeTransform(affine_transforms), affine_base
+        )
+        self.theta_transform = ConditionalCircularThetaTransform(
+            context_features + self.linear_features,
+            num_layers=num_theta_layers,
+            num_bins=num_bins,
+            hidden_features=theta_hidden_features,
+            logit_limit=logit_limit,
+        )
+
+    def _validate_context(self, context, batch_size):
+        if context is None:
+            raise ValueError("context cannot be None for a conditional flow")
+        if context.shape != (batch_size, self.context_features):
+            raise ValueError(
+                "context must have shape "
+                f"({batch_size}, {self.context_features}); got {tuple(context.shape)}"
+            )
+
+    def _split_inputs(self, inputs):
+        if inputs.ndim != 2 or inputs.shape[-1] != self.features:
+            raise ValueError(
+                f"inputs must have shape (batch, {self.features}); "
+                f"got {tuple(inputs.shape)}"
+            )
+        return (
+            inputs[:, list(self.non_theta_indices)],
+            inputs[:, self.theta_index],
+        )
+
+    def _assemble(self, non_theta, theta):
+        output = non_theta.new_empty((*non_theta.shape[:-1], self.features))
+        output[..., list(self.non_theta_indices)] = non_theta
+        output[..., self.theta_index] = theta
+        return output
+
+    def component_log_prob(self, inputs, context):
+        non_theta, theta = self._split_inputs(inputs)
+        self._validate_context(context, inputs.shape[0])
+        affine_log_prob = self.affine_flow.log_prob(
+            non_theta, context=context
+        )
+        condition = torch.cat((context, non_theta), dim=-1)
+        _, theta_logabsdet = self.theta_transform(theta, condition)
+        theta_log_prob = theta_logabsdet - math.log(2.0)
+        self.last_component_diagnostics = {
+            "affine_log_prob_mean": affine_log_prob.detach().mean(),
+            "theta_log_prob_mean": theta_log_prob.detach().mean(),
+        }
+        return affine_log_prob, theta_log_prob
+
+    def log_prob(self, inputs, context=None):
+        affine_log_prob, theta_log_prob = self.component_log_prob(
+            inputs, context
+        )
+        return affine_log_prob + theta_log_prob
+
+    def sample(self, num_samples, context=None):
+        if type(num_samples) is not int or num_samples <= 0:
+            raise ValueError("num_samples must be a positive integer")
+        if context is None or context.ndim != 2:
+            raise ValueError("context must have shape (batch, context_features)")
+        self._validate_context(context, context.shape[0])
+        non_theta = self.affine_flow.sample(num_samples, context=context)
+        batch_size = context.shape[0]
+        expanded_context = context[:, None, :].expand(
+            batch_size, num_samples, self.context_features
+        )
+        condition = torch.cat((expanded_context, non_theta), dim=-1).reshape(
+            batch_size * num_samples, -1
+        )
+        latent_theta = 2.0 * torch.rand(
+            batch_size * num_samples,
+            device=context.device,
+            dtype=non_theta.dtype,
+        ) - 1.0
+        theta, _ = self.theta_transform.inverse(latent_theta, condition)
+        return self._assemble(
+            non_theta, theta.reshape(batch_size, num_samples)
+        )
+
+    def sample_and_log_prob(self, num_samples, context=None):
+        samples = self.sample(num_samples, context=context)
+        batch_size = samples.shape[0]
+        expanded_context = context[:, None, :].expand(
+            batch_size, num_samples, self.context_features
+        )
+        log_prob = self.log_prob(
+            samples.reshape(batch_size * num_samples, self.features),
+            context=expanded_context.reshape(batch_size * num_samples, -1),
+        ).reshape(batch_size, num_samples)
+        return samples, log_prob
+
+    def transform_to_noise(self, inputs, context=None):
+        non_theta, theta = self._split_inputs(inputs)
+        self._validate_context(context, inputs.shape[0])
+        affine_noise = self.affine_flow.transform_to_noise(
+            non_theta, context=context
+        )
+        condition = torch.cat((context, non_theta), dim=-1)
+        theta_noise, _ = self.theta_transform(theta, condition)
+        return self._assemble(affine_noise, theta_noise)
+
+    def theta_diagnostics(self, inputs, context=None):
+        non_theta, theta = self._split_inputs(inputs)
+        self._validate_context(context, inputs.shape[0])
+        condition = torch.cat((context, non_theta), dim=-1)
+        return self.theta_transform.diagnostics(theta, condition)
+
+
+class BoundedHybridCircularFlow(HybridAffineCircularFlow):
+    """Compact seven-parameter marginal and correlated circular theta.
+
+    Public non-angular coordinates live on ``[-1, 1]``. A fixed affine map
+    moves them to ``[0, 1]`` before compact autoregressive splines and a unit
+    box base. The angular factor remains
+    ``q(theta_int | x_non_theta, context)``, so bounding the scalar marginal
+    does not remove any theta correlations.
+    """
+
+    def __init__(
+        self,
+        *,
+        features,
+        theta_index,
+        context_features,
+        num_bounded_layers=12,
+        num_theta_layers=1,
+        num_bins=8,
+        hidden_features=256,
+        num_blocks=2,
+        theta_hidden_features=128,
+        logit_limit=10.0,
+        bounded_logit_limit=10.0,
+    ):
+        nn.Module.__init__(self)
+        if type(features) is not int or features < 2:
+            raise ValueError("features must be an integer of at least two")
+        if type(theta_index) is not int or not 0 <= theta_index < features:
+            raise ValueError("theta_index is out of bounds")
+        if type(context_features) is not int or context_features <= 0:
+            raise ValueError("context_features must be a positive integer")
+        if type(num_bounded_layers) is not int or num_bounded_layers <= 0:
+            raise ValueError("num_bounded_layers must be a positive integer")
+
+        self.features = features
+        self.theta_index = theta_index
+        self.context_features = context_features
+        self.non_theta_indices = tuple(
+            index for index in range(features) if index != theta_index
+        )
+        self.linear_features = features - 1
+
+        bounded_transforms = [
+            PointwiseAffineTransform(scale=0.5, shift=0.5)
+        ]
+        for _ in range(num_bounded_layers):
+            bounded_transforms.append(
+                ReversePermutation(features=self.linear_features)
+            )
+            bounded_transforms.append(
+                IdentityBoundedRationalQuadraticAutoregressiveTransform(
+                    features=self.linear_features,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                    num_bins=num_bins,
+                    num_blocks=num_blocks,
+                    logit_limit=bounded_logit_limit,
+                )
+            )
+        # Keep this historical attribute name so optimizer grouping continues
+        # to isolate the non-theta marginal without special-case traversal.
+        self.affine_flow = Flow(
+            CompositeTransform(bounded_transforms),
+            ConditionalUnitBox(self.linear_features),
+        )
+        self.theta_transform = ConditionalCircularThetaTransform(
+            context_features + self.linear_features,
+            num_layers=num_theta_layers,
+            num_bins=num_bins,
+            hidden_features=theta_hidden_features,
+            logit_limit=logit_limit,
+        )
+
+    @property
+    def bounded_transforms(self):
+        return tuple(
+            transform
+            for transform in self.affine_flow._transform._transforms
+            if isinstance(
+                transform,
+                IdentityBoundedRationalQuadraticAutoregressiveTransform,
+            )
+        )
+
+    @staticmethod
+    def _support_mask(non_theta):
+        return (
+            torch.isfinite(non_theta)
+            & (non_theta >= -1.0)
+            & (non_theta <= 1.0)
+        ).all(dim=-1)
+
+    @staticmethod
+    def _safe_for_density(non_theta):
+        finite = torch.isfinite(non_theta)
+        clipped = non_theta.clamp(min=-1.0, max=1.0)
+        return torch.where(finite, clipped, torch.zeros_like(non_theta))
+
+    def _assert_support(self, non_theta, *, operation):
+        support = self._support_mask(non_theta)
+        if not bool(support.all()):
+            count = int((~support).sum().item())
+            raise RuntimeError(
+                f"bounded_hybrid_circular produced {count} non-theta rows "
+                f"outside [-1, 1] during {operation}; refusing to clamp"
+            )
+
+    def _bounded_diagnostics(self, support):
+        diagnostics = [
+            transform.last_diagnostics
+            for transform in self.bounded_transforms
+            if transform.last_diagnostics
+        ]
+        output = {
+            "bounded_support_violation_count": (~support)
+            .sum()
+            .detach()
+            .to(dtype=self.affine_flow._distribution._reference.dtype)
+        }
+        if not diagnostics:
+            return output
+        output.update(
+            {
+                "bounded_raw_logit_abs_max": torch.stack(
+                    [item["raw_logit_abs_max"] for item in diagnostics]
+                ).max(),
+                "bounded_logit_abs_max": torch.stack(
+                    [item["bounded_logit_abs_max"] for item in diagnostics]
+                ).max(),
+                "bounded_derivative_min": torch.stack(
+                    [item["derivative_min"] for item in diagnostics]
+                ).min(),
+                "bounded_derivative_max": torch.stack(
+                    [item["derivative_max"] for item in diagnostics]
+                ).max(),
+                "bounded_logdet_min": torch.stack(
+                    [item["logdet_min"] for item in diagnostics]
+                ).min(),
+                "bounded_logdet_max": torch.stack(
+                    [item["logdet_max"] for item in diagnostics]
+                ).max(),
+            }
+        )
+        return output
+
+    def component_log_prob(self, inputs, context):
+        non_theta, theta = self._split_inputs(inputs)
+        self._validate_context(context, inputs.shape[0])
+        support = self._support_mask(non_theta)
+        safe_non_theta = self._safe_for_density(non_theta)
+        bounded_log_prob = self.affine_flow.log_prob(
+            safe_non_theta, context=context
+        )
+        bounded_log_prob = torch.where(
+            support,
+            bounded_log_prob,
+            torch.full_like(bounded_log_prob, -torch.inf),
+        )
+
+        finite_theta = torch.isfinite(theta)
+        safe_theta = torch.where(finite_theta, theta, torch.zeros_like(theta))
+        condition = torch.cat((context, safe_non_theta), dim=-1)
+        _, theta_logabsdet = self.theta_transform(safe_theta, condition)
+        theta_log_prob = theta_logabsdet - math.log(2.0)
+        theta_log_prob = torch.where(
+            finite_theta,
+            theta_log_prob,
+            torch.full_like(theta_log_prob, -torch.inf),
+        )
+        self.last_component_diagnostics = {
+            "affine_log_prob_mean": bounded_log_prob.detach().mean(),
+            "bounded_log_prob_mean": bounded_log_prob.detach().mean(),
+            "theta_log_prob_mean": theta_log_prob.detach().mean(),
+            **self._bounded_diagnostics(support),
+        }
+        return bounded_log_prob, theta_log_prob
+
+    def sample(self, num_samples, context=None):
+        if type(num_samples) is not int or num_samples <= 0:
+            raise ValueError("num_samples must be a positive integer")
+        if context is None or context.ndim != 2:
+            raise ValueError("context must have shape (batch, context_features)")
+        self._validate_context(context, context.shape[0])
+        non_theta = self.affine_flow.sample(num_samples, context=context)
+        self._assert_support(non_theta, operation="sampling")
+        batch_size = context.shape[0]
+        expanded_context = context[:, None, :].expand(
+            batch_size, num_samples, self.context_features
+        )
+        condition = torch.cat((expanded_context, non_theta), dim=-1).reshape(
+            batch_size * num_samples, -1
+        )
+        latent_theta = 2.0 * torch.rand(
+            batch_size * num_samples,
+            device=context.device,
+            dtype=non_theta.dtype,
+        ) - 1.0
+        theta, _ = self.theta_transform.inverse(latent_theta, condition)
+        samples = self._assemble(
+            non_theta, theta.reshape(batch_size, num_samples)
+        )
+        if not torch.isfinite(samples).all():
+            raise RuntimeError(
+                "bounded_hybrid_circular produced non-finite samples"
+            )
+        return samples
+
+    def transform_to_noise(self, inputs, context=None):
+        non_theta, theta = self._split_inputs(inputs)
+        self._validate_context(context, inputs.shape[0])
+        self._assert_support(non_theta, operation="transform_to_noise")
+        if not torch.isfinite(theta).all():
+            raise RuntimeError(
+                "theta_int must be finite during transform_to_noise"
+            )
+        bounded_noise = self.affine_flow.transform_to_noise(
+            non_theta, context=context
+        )
+        condition = torch.cat((context, non_theta), dim=-1)
+        theta_noise, _ = self.theta_transform(theta, condition)
+        return self._assemble(bounded_noise, theta_noise)
+
+
 ### Main Network ###
 class KLNPE(nn.Module):
     '''
@@ -229,12 +1032,17 @@ class KLNPE(nn.Module):
         elif self.mode >= 1:
             # Normalizing flow for density estimation
             self.layer_norm = nn.LayerNorm(1024)
+            if not bool(config.train.get("context_norm_trainable", True)):
+                with torch.no_grad():
+                    self.layer_norm.weight.fill_(1.0)
+                    self.layer_norm.bias.zero_()
+                self.layer_norm.requires_grad_(False)
             self.setup_flows()
             if self.flow_type == "circular_rqs":
                 self.flow = PeriodicThetaFlow(
                     self.transform, self.base, theta_index=self.theta_idx
                 )
-            else:
+            elif self.flow_type == "affine":
                 self.flow = Flow(self.transform, self.base)
 
     
@@ -246,6 +1054,9 @@ class KLNPE(nn.Module):
         fp: fiber position tensor of shape (batch, nspecs, 2)
         '''
         raw_features = self.feature_extractor(x, y, fp)
+        training_diagnostics = {
+            "raw_feature_rms": raw_features.detach().square().mean().sqrt(),
+        }
 
         if self.mode == 0:
             prediction = self.fully_connected_layer(raw_features)
@@ -264,8 +1075,24 @@ class KLNPE(nn.Module):
             # TF quantities are D4 scalars. Compute one weight per galaxy and
             # apply it only after averaging that galaxy's eight branch scores.
             weights = self._compute_tf_weights(true, mag, snr)
-            return -(weights * per_galaxy_log_prob).mean()
-        return -per_galaxy_log_prob.mean()
+            training_diagnostics.update(
+                getattr(self, "last_tf_diagnostics", {})
+            )
+            loss = -(weights * per_galaxy_log_prob).mean()
+        else:
+            loss = -per_galaxy_log_prob.mean()
+        if getattr(self, "flow_type", "affine") in (
+            "hybrid_circular",
+            "bounded_hybrid_circular",
+        ):
+            training_diagnostics.update(
+                getattr(self.flow.theta_transform, "last_diagnostics", {})
+            )
+            training_diagnostics.update(
+                getattr(self.flow, "last_component_diagnostics", {})
+            )
+        self.last_training_diagnostics = training_diagnostics
+        return loss
 
     def _d4_contexts_from_features(self, raw_features):
         """Build group-major flow contexts as LN(rho_g(raw_features))."""
@@ -414,10 +1241,27 @@ class KLNPE(nn.Module):
 
     def _compute_tf_weights(self, true, mag, snr):
         """
-        Computes normalized importance weights based on the TF prior for the batch.
+        Compute TF importance weights normalized over the global DDP batch.
+
+        Rank-local normalization gives different effective objectives on each
+        replica and makes the result depend on the rank partition. The detached
+        log weights are therefore stabilized by a global maximum, then reduced
+        as global sum/sum-of-squares/count statistics. The stored diagnostics
+        make the very peaky effective weighting visible during training.
         """
         if mag is None:
-            return torch.ones(true.size(0), device=true.device, dtype=true.dtype)
+            weights = torch.ones(
+                true.size(0), device=true.device, dtype=true.dtype
+            )
+            global_count = weights.new_tensor(float(weights.numel()))
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+            self.last_tf_diagnostics = {
+                "effective_sample_size": global_count.detach(),
+                "effective_sample_fraction": weights.new_tensor(1.0),
+                "max_normalized_weight": weights.new_tensor(1.0),
+            }
+            return weights
             
         v_norm = true[:, self.vcirc_idx]
         v_circ = self._norm_to_vcirc(v_norm)
@@ -448,9 +1292,54 @@ class KLNPE(nn.Module):
         log_jacobian = math.log(self.vcirc_jac)
         log_prob_tf = log_prob_physical + log_jacobian
         
-        # Convert to importance weights and normalize across the batch elements
-        weights = torch.exp(log_prob_tf).detach()
-        weights = weights / (weights.mean() + 1e-8)
+        # Convert to importance weights without overflow and normalize across
+        # all DDP ranks, not independently within each rank.
+        log_weights = log_prob_tf.detach()
+        log_weights = torch.where(
+            torch.isfinite(log_weights),
+            log_weights,
+            torch.full_like(log_weights, -torch.inf),
+        )
+        global_max = log_weights.max()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+        if not torch.isfinite(global_max):
+            weights = torch.ones_like(log_weights)
+            global_count = weights.new_tensor(float(weights.numel()))
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+            self.last_tf_diagnostics = {
+                "effective_sample_size": global_count.detach(),
+                "effective_sample_fraction": weights.new_tensor(1.0),
+                "max_normalized_weight": weights.new_tensor(1.0),
+            }
+            return weights
+
+        scaled_weights = torch.exp(log_weights - global_max)
+        statistics = torch.stack(
+            (
+                scaled_weights.sum(),
+                scaled_weights.square().sum(),
+                scaled_weights.new_tensor(float(scaled_weights.numel())),
+            )
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        global_sum, global_sum_sq, global_count = statistics
+        global_mean = global_sum / global_count.clamp_min(1.0)
+        weights = scaled_weights / global_mean.clamp_min(
+            torch.finfo(scaled_weights.dtype).tiny
+        )
+        effective_sample_size = global_sum.square() / global_sum_sq.clamp_min(
+            torch.finfo(scaled_weights.dtype).tiny
+        )
+        self.last_tf_diagnostics = {
+            "effective_sample_size": effective_sample_size.detach(),
+            "effective_sample_fraction": (
+                effective_sample_size / global_count.clamp_min(1.0)
+            ).detach(),
+            "max_normalized_weight": (1.0 / global_mean).detach(),
+        }
         return weights
 
     def _kde_log_density_1d(self, values):
@@ -492,6 +1381,45 @@ class KLNPE(nn.Module):
                 f"flow_type must be one of {FLOW_TYPES}; got {self.flow_type!r}"
             )
         self.theta_idx = resolve_feature_index(self.feature_names, "theta_int")
+
+        if self.flow_type == "bounded_hybrid_circular":
+            if self.nfeatures < 2:
+                raise ValueError(
+                    "bounded_hybrid_circular requires at least two parameters"
+                )
+            self.flow = BoundedHybridCircularFlow(
+                features=self.nfeatures,
+                theta_index=self.theta_idx,
+                context_features=context_size,
+                num_bounded_layers=num_layers,
+                num_theta_layers=config.flow.get("theta_num_layers", 1),
+                num_bins=config.flow.get("num_bins", 8),
+                hidden_features=hidden_units,
+                num_blocks=num_blocks,
+                logit_limit=config.flow.get("theta_logit_limit", 10.0),
+                bounded_logit_limit=config.flow.get(
+                    "bounded_logit_limit", 10.0
+                ),
+            )
+            return
+
+        if self.flow_type == "hybrid_circular":
+            if self.nfeatures < 2:
+                raise ValueError(
+                    "hybrid_circular requires at least two parameters"
+                )
+            self.flow = HybridAffineCircularFlow(
+                features=self.nfeatures,
+                theta_index=self.theta_idx,
+                context_features=context_size,
+                num_affine_layers=num_layers,
+                num_theta_layers=config.flow.get("theta_num_layers", 1),
+                num_bins=config.flow.get("num_bins", 8),
+                hidden_features=hidden_units,
+                num_blocks=num_blocks,
+                logit_limit=config.flow.get("theta_logit_limit", 10.0),
+            )
+            return
 
         if self.flow_type == "affine":
             # Preserve the historical architecture and state-dict layout.
@@ -582,8 +1510,14 @@ class KLNPE(nn.Module):
         last_bad = None
         for attempt in range(max_tries):
             samples = self.flow.sample(num_samples, context=context)
-            is_circular = (
-                getattr(self, "flow_type", "affine") == "circular_rqs"
+            is_circular = getattr(self, "flow_type", "affine") in (
+                "circular_rqs",
+                "hybrid_circular",
+                "bounded_hybrid_circular",
+            )
+            is_bounded = (
+                getattr(self, "flow_type", "affine")
+                == "bounded_hybrid_circular"
             )
             if is_circular:
                 # A circular sample is an equivalence class modulo two in the
@@ -596,18 +1530,41 @@ class KLNPE(nn.Module):
                 )
                 wrapped = torch.remainder(theta + 1.0, 2.0) - 1.0
                 samples[..., theta_idx] = torch.where(outside, wrapped, theta)
+            nonperiodic = [
+                index
+                for index in range(self.nfeatures)
+                if index != theta_idx
+            ]
+            if is_bounded:
+                bounded = samples[..., nonperiodic]
+                on_support = (
+                    torch.isfinite(bounded)
+                    & (bounded >= -1.0)
+                    & (bounded <= 1.0)
+                ).all(dim=-1)
+                if not bool(on_support.all()):
+                    count = int((~on_support).sum().item())
+                    raise RuntimeError(
+                        "bounded_hybrid_circular produced "
+                        f"{count} non-theta rows outside [-1, 1] during "
+                        "KLNPE sampling; refusing to clamp"
+                    )
             if canonical_theta:
                 samples = samples.clone()
-                nonperiodic = [index for index in range(self.nfeatures) if index != theta_idx]
-                samples[..., nonperiodic] = samples[..., nonperiodic].clamp(-1.5, 1.5)
+                if not is_bounded:
+                    samples[..., nonperiodic] = samples[
+                        ..., nonperiodic
+                    ].clamp(-1.5, 1.5)
                 if not is_circular:
                     samples[..., theta_idx] = torch.remainder(
                         samples[..., theta_idx] + 1.0, 2.0
                     ) - 1.0
             else:
                 samples = samples.clone()
-                nonperiodic = [index for index in range(self.nfeatures) if index != theta_idx]
-                samples[..., nonperiodic] = samples[..., nonperiodic].clamp(-1.5, 1.5)
+                if not is_bounded:
+                    samples[..., nonperiodic] = samples[
+                        ..., nonperiodic
+                    ].clamp(-1.5, 1.5)
                 if not is_circular:
                     samples[..., theta_idx] = samples[..., theta_idx].clamp(-1.5, 1.5)
 

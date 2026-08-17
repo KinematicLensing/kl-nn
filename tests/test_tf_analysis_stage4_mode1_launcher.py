@@ -9,7 +9,7 @@ def test_stage4_mode1_launcher_is_paired_and_reproducible():
     text = LAUNCHER.read_text()
 
     assert "#SBATCH --array=1-10" in text
-    assert 'MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4-circular-flow_tf_stage5_s42_43518153}"' in text
+    assert 'MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4-hybrid-circular-flow_tf_stage5_fixedfiber_s42_43719758}"' in text
     assert 'EPOCH="${EPOCH:-19}"' in text
     assert 'SEED="${SEED:-42}"' in text
     assert 'NETWORK_SOURCE="${NETWORK_SOURCE:-current}"' in text

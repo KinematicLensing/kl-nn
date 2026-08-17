@@ -1,6 +1,7 @@
 from copy import deepcopy
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -380,3 +381,410 @@ def test_bias_figure_styles_in_support_estimator_without_key_error(monkeypatch):
     finally:
         for figure in figures:
             plt.close(figure)
+
+
+def _write_posterior_part(
+    root,
+    index,
+    total,
+    samples,
+    *,
+    truth=None,
+    cancel_add_noise=False,
+):
+    sample_dir = root / "sample"
+    truth_dir = root / "truth"
+    meta_dir = root / "meta"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    truth_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    label = f"part{index}of{total}"
+    np.save(sample_dir / f"{label}.npy", samples)
+    if truth is None:
+        truth = np.zeros(
+            (samples.shape[1], samples.shape[-1]), dtype=np.float32
+        )
+    np.save(truth_dir / f"{label}.npy", truth)
+    (meta_dir / f"{label}.json").write_text(
+        '{"args": {"cancel_add_noise": '
+        + ("true" if cancel_add_noise else "false")
+        + "}}"
+    )
+
+
+def test_load_shear_pit_values_streams_parts_selects_mode_and_prefix(
+    monkeypatch, tmp_path
+):
+    """Prior-matched ranks stream the selected mode and common case prefix."""
+    root = tmp_path / "model" / "dataset"
+    draws = 5
+    features = 8
+    edges = report.SHEAR_PP_BIN_EDGES
+    truth = np.zeros((6, features), dtype=np.float64)
+    truth[:, :2] = [
+        [-0.1, 0.0],
+        [edges[1], -0.05],
+        [0.0, 0.05],
+        [edges[2], np.nan],
+        [0.1, -0.1],
+        [0.0, 0.0],  # Deliberately beyond the loaded five-galaxy prefix.
+    ]
+    parts = []
+    for _ in range(2):
+        # Mode 0 is an out-of-support sentinel. Selecting it accidentally would
+        # give zero retained draws for every component.
+        values = np.full((2, 3, draws, features), 99.0, dtype=np.float64)
+        parts.append(values)
+
+    # Component-wise filtering is intentional: g1 and g2 use the bin selected
+    # by their own truths and do not require the other component to be in-bin.
+    parts[0][1, 0, :, 0] = [-0.1, -0.09, -0.04, edges[1], np.nan]
+    parts[0][1, 1, :, 0] = [edges[1], -0.02, 0.0, edges[2], np.nan]
+    parts[0][1, 2, :, 0] = [edges[1], -0.01, 0.0, 0.01, edges[2]]
+    parts[1][1, 0, :, 0] = [edges[2], 0.05, 0.1, edges[2] - 1e-6, 0.11]
+    parts[1][1, 1, :, 0] = [edges[2], 0.05, 0.1, np.nan, 0.11]
+
+    # The first galaxy has no middle-bin g2 draws. The fourth has a nonfinite
+    # truth. Both must produce NaN ranks and retained count zero.
+    parts[0][1, 0, :, 1] = [-0.09, -0.05, 0.05, 0.09, np.nan]
+    parts[0][1, 1, :, 1] = [-0.09, -0.05, -0.04, 0.0, np.nan]
+    parts[0][1, 2, :, 1] = [0.04, 0.05, 0.08, 0.0, np.nan]
+    parts[1][1, 0, :, 1] = [0.0, 0.0, 0.0, 0.0, 0.0]
+    parts[1][1, 1, :, 1] = [-0.1, -0.05, -0.04, edges[1], np.nan]
+
+    for index, values in enumerate(parts):
+        start = 3 * index
+        _write_posterior_part(
+            root,
+            index,
+            2,
+            values,
+            truth=truth[start : start + 3],
+        )
+
+    # Five truths deliberately stop in the middle of the second sample part.
+    case = {"root": root, "truth": truth[:5], "case": "model:dataset"}
+    original_load = report.np.load
+    posterior_loads = []
+
+    def audited_load(path, *args, **kwargs):
+        if Path(path).parent.name in {"sample", "truth"}:
+            posterior_loads.append(
+                (Path(path).parent.name, Path(path).name, kwargs.get("mmap_mode"))
+            )
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(report.np, "load", audited_load)
+    pits = report.load_shear_pit_values(case, mode=1, block_size=2)
+
+    # Finite-sample midpoint rank after same-bin filtering:
+    # (n_less + 0.5*n_equal + 0.5) / (n_retained + 1).
+    np.testing.assert_allclose(pits["g1"], [0.25, 0.25, 0.6, 0.25, 0.75])
+    np.testing.assert_array_equal(pits["g1_retained"], [3, 3, 4, 3, 3])
+    assert np.isnan(pits["g2"][[0, 3]]).all()
+    np.testing.assert_allclose(pits["g2"][[1, 2, 4]], [0.5, 0.5, 0.25])
+    np.testing.assert_array_equal(pits["g2_retained"], [0, 3, 3, 0, 3])
+    assert posterior_loads == [
+        ("sample", "part0of2.npy", "r"),
+        ("truth", "part0of2.npy", "r"),
+        ("sample", "part1of2.npy", "r"),
+        ("truth", "part1of2.npy", "r"),
+    ]
+
+
+@pytest.mark.parametrize("metadata", ["missing", "cancelled"])
+def test_load_shear_pit_values_rejects_unverifiable_or_cancelled_samples(
+    metadata, tmp_path
+):
+    root = tmp_path / "model" / "dataset"
+    samples = np.zeros((1, 2, 3, 8), dtype=np.float32)
+    _write_posterior_part(
+        root, 0, 1, samples, cancel_add_noise=(metadata == "cancelled")
+    )
+    if metadata == "missing":
+        (root / "meta" / "part0of1.json").unlink()
+    case = {"root": root, "truth": np.zeros((2, 8)), "case": "model:dataset"}
+
+    with pytest.raises(report.PosteriorPPUnavailable):
+        report.load_shear_pit_values(case, mode=0)
+
+
+def test_quantile_binned_filters_nonfinite_pairs_and_returns_physical_errors():
+    x = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, np.nan])
+    y = 1.0e-4 + 2.0e-5 * x
+    y[-1] = 9.0
+
+    center, mean, error = report.quantile_binned(x, y, bins=2)
+
+    np.testing.assert_allclose(center, [1.5, 5.5])
+    np.testing.assert_allclose(mean, [1.3e-4, 2.1e-4])
+    expected_se = np.std([1.0e-4, 1.2e-4, 1.4e-4, 1.6e-4], ddof=1) / 2.0
+    np.testing.assert_allclose(error, [expected_se, expected_se])
+
+
+def test_nuisance_correlation_figure_is_mean_only_and_uses_physical_residuals(
+    monkeypatch,
+):
+    n = 24
+    truth = np.zeros((n, 8), dtype=float)
+    truth[:, 2] = 0.0  # Image and galaxy-frame components coincide.
+    mean_estimate = truth.copy()
+    map_estimate = truth.copy()
+    nuisance_errors = {
+        "sini": np.linspace(-0.2, 0.2, n),
+        "vcirc": np.linspace(-30.0, 30.0, n),
+        "hlr": np.linspace(0.3, -0.3, n),
+    }
+    for name, values in nuisance_errors.items():
+        mean_estimate[:, report.NUISANCE_INDICES[name]] += values
+        map_estimate[:, report.NUISANCE_INDICES[name]] += 10.0 * values
+    plus_residual = np.linspace(-4.0e-4, 4.0e-4, n)
+    cross_residual = 2.0e-4 * np.cos(np.linspace(0.0, 2.0 * np.pi, n))
+    mean_estimate[:, 0] = plus_residual
+    mean_estimate[:, 1] = cross_residual
+    # A visibly different MAP must not add curves to this Mean-only diagnostic.
+    map_estimate[:, 0] = 0.1
+    map_estimate[:, 1] = -0.1
+    case = {
+        "case": "model:dataset",
+        "truth": truth,
+        "estimates": {"MAP": map_estimate, "Mean": mean_estimate},
+    }
+    figures = []
+    monkeypatch.setattr(
+        report,
+        "fig_data_uri",
+        lambda fig: figures.append(fig) or "data:image/png;base64,test",
+    )
+
+    try:
+        assert (
+            report.nuisance_correlation_figure(case, bins=4)
+            == "data:image/png;base64,test"
+        )
+        assert len(figures[0].axes) == 3
+        for axis, (name, nuisance_error) in zip(
+            figures[0].axes, nuisance_errors.items()
+        ):
+            # ``errorbar`` places its public label on the container rather than
+            # the central Line2D; the first two lines are the g+ and gx curves,
+            # followed by the horizontal and vertical zero references.
+            plotted = axis.lines[:2]
+            assert len(axis.containers) == 2
+            expected_x, expected_plus, expected_plus_se = report.quantile_binned(
+                nuisance_error, plus_residual, bins=4
+            )
+            _, expected_cross, expected_cross_se = report.quantile_binned(
+                nuisance_error, cross_residual, bins=4
+            )
+            np.testing.assert_allclose(plotted[0].get_xdata(), expected_x)
+            np.testing.assert_allclose(plotted[0].get_ydata(), expected_plus)
+            np.testing.assert_allclose(plotted[1].get_xdata(), expected_x)
+            np.testing.assert_allclose(plotted[1].get_ydata(), expected_cross)
+            segments = axis.collections
+            assert len(segments) == 2
+            plus_bounds = np.asarray(
+                [[segment[0, 1], segment[1, 1]] for segment in segments[0].get_segments()]
+            )
+            cross_bounds = np.asarray(
+                [[segment[0, 1], segment[1, 1]] for segment in segments[1].get_segments()]
+            )
+            np.testing.assert_allclose(
+                plus_bounds,
+                np.column_stack(
+                    [expected_plus - expected_plus_se, expected_plus + expected_plus_se]
+                ),
+            )
+            np.testing.assert_allclose(
+                cross_bounds,
+                np.column_stack(
+                    [expected_cross - expected_cross_se, expected_cross + expected_cross_se]
+                ),
+            )
+            assert "estimate - truth" in axis.get_xlabel()
+            assert axis.get_ylabel() == "shear estimate - truth"
+            assert name in axis.get_xlabel()
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
+def test_posterior_pp_figure_shows_prior_matched_bins_and_retention(monkeypatch):
+    edges = np.linspace(-0.1, 0.1, 4)
+    # Include every bin edge exactly, values immediately below the interior
+    # edges, and values outside the plotted shear range. This makes the
+    # half-open/closed boundary convention observable in the plotted curves.
+    g1_truth = np.array(
+        [
+            edges[0],
+            edges[1] - 1.0e-6,
+            edges[1],
+            0.0,
+            edges[2] - 1.0e-6,
+            edges[2],
+            edges[3],
+            edges[0] - 1.0e-3,
+            edges[3] + 1.0e-3,
+        ]
+    )
+    truth = np.zeros((len(g1_truth), 8), dtype=float)
+    truth[:, 0] = g1_truth
+    truth[:, 1] = g1_truth[::-1]
+    pits = {
+        "g1": np.array(
+            [0.12, 0.21, np.nan, 0.44, 0.52, 0.63, 0.78, np.nan, np.nan]
+        ),
+        "g2": np.array(
+            [np.nan, np.nan, 0.73, 0.64, 0.55, 0.46, 0.37, 0.28, np.nan]
+        ),
+        "g1_retained": np.array([5, 7, 0, 9, 11, 13, 15, 0, 0]),
+        "g2_retained": np.array([0, 0, 21, 23, 25, 27, 29, 31, 0]),
+    }
+    figures = []
+    monkeypatch.setattr(
+        report,
+        "fig_data_uri",
+        lambda fig: figures.append(fig) or "data:image/png;base64,test",
+    )
+
+    try:
+        assert (
+            report.posterior_pp_figure(pits, truth)
+            == "data:image/png;base64,test"
+        )
+        axes = figures[0].axes
+        assert len(axes) == 2
+        assert "Prior-matched conditional" in figures[0]._suptitle.get_text()
+        for component_index, (axis, component) in enumerate(
+            zip(axes, ("g1", "g2"))
+        ):
+            component_truth = truth[:, component_index]
+            retained = pits[f"{component}_retained"]
+            masks = [
+                (component_truth >= edges[0]) & (component_truth < edges[1]),
+                (component_truth >= edges[1]) & (component_truth < edges[2]),
+                (component_truth >= edges[2]) & (component_truth <= edges[3]),
+            ]
+            empirical_lines = [
+                line for line in axis.lines if line.get_label() != "Uniform"
+            ]
+            assert len(empirical_lines) == 3
+            assert len(axis.collections) == 3  # one DKW band per shear bin
+            for bin_index, (line, mask) in enumerate(zip(empirical_lines, masks)):
+                finite_rank = mask & np.isfinite(pits[component])
+                expected_x, expected_y, expected_distance = (
+                    report.posterior_pp_curve(pits[component][mask])
+                )
+                np.testing.assert_allclose(line.get_xdata(), expected_x)
+                np.testing.assert_allclose(line.get_ydata(), expected_y)
+                assert f"N={finite_rank.sum():,}" in line.get_label()
+                assert f"KS D={expected_distance:.3f}" in line.get_label()
+                assert f"{edges[bin_index]:.4f}" in line.get_label()
+                assert f"{edges[bin_index + 1]:.4f}" in line.get_label()
+                label = line.get_label().lower()
+                expected_median = np.median(retained[finite_rank])
+                assert f"median retained={expected_median:,.0f}" in label
+                zero_retained = np.count_nonzero(mask & (retained == 0))
+                assert f"zero retained={zero_retained:,}" in label
+
+            assert axis.get_xlim()[0] <= 0.0 and axis.get_xlim()[1] >= 1.0
+            assert axis.get_ylim()[0] <= 0.0 and axis.get_ylim()[1] >= 1.0
+            reference_lines = [
+                line
+                for line in axis.lines
+                if line.get_label() == "Uniform"
+                and np.array_equal(line.get_xdata(), line.get_ydata())
+            ]
+            assert len(reference_lines) == 1
+
+        # Exact interior boundaries go to the bin on their right, while the
+        # outer endpoints are included and out-of-range objects are excluded.
+        assert [
+            np.count_nonzero(
+                (truth[:, 0] >= edges[index])
+                & (
+                    truth[:, 0] <= edges[index + 1]
+                    if index == 2
+                    else truth[:, 0] < edges[index + 1]
+                )
+            )
+            for index in range(3)
+        ] == [2, 3, 2]
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
+def test_main_describes_prior_matched_conditional_pp(monkeypatch, tmp_path):
+    output = tmp_path / "report.html"
+    args = SimpleNamespace(
+        case=["model:dataset"],
+        cache_root=tmp_path,
+        mode=0,
+        max_galaxies=None,
+        low_g=0.02,
+        bins=2,
+        output=output,
+    )
+    truth = np.zeros((2, 8), dtype=float)
+    case = {
+        "case": "model:dataset",
+        "root": tmp_path / "model" / "dataset",
+        "truth": truth,
+        "estimates": {"Mean": truth.copy()},
+        "summaries": {"Mean": np.zeros((2, 3, 8), dtype=float)},
+        "support_retention": None,
+        "support_manifest": None,
+    }
+    pits = {
+        "g1": np.array([0.25, 0.75]),
+        "g2": np.array([0.25, 0.75]),
+        "g1_retained": np.array([10, 10]),
+        "g2_retained": np.array([10, 10]),
+    }
+    monkeypatch.setattr(report, "parse_args", lambda: args)
+    monkeypatch.setattr(report, "load_case", lambda *unused, **also_unused: case)
+    monkeypatch.setattr(report, "compute_metrics", lambda *unused: [])
+    monkeypatch.setattr(
+        report, "galaxy_frame_diagnostics", lambda *unused: ([], [])
+    )
+    monkeypatch.setattr(report, "coverage_metrics", lambda *unused: [])
+    monkeypatch.setattr(report, "load_shear_pit_values", lambda *unused: pits)
+    monkeypatch.setattr(
+        report, "posterior_pp_figure", lambda *unused: "data:image/png;base64,pp"
+    )
+    for function_name in (
+        "bias_figure",
+        "galaxy_frame_figure",
+        "nuisance_correlation_figure",
+    ):
+        monkeypatch.setattr(
+            report,
+            function_name,
+            lambda *unused: "data:image/png;base64,diagnostic",
+        )
+
+    report.main()
+
+    document = output.read_text().lower()
+    assert "prior-matched conditional posterior p-p diagnostic" in document
+    assert "restricted to the same true-shear interval" in document
+    assert "renormal" in document
+    assert "zero retained draws" in document
+    assert "need not be uniform even for an exact bayesian posterior" not in document
+
+
+def test_shear_pp_bin_masks_snap_all_float32_edges_to_right_hand_bins():
+    edges = report.SHEAR_PP_BIN_EDGES.astype(np.float32)
+    true_shear = np.array(
+        [-0.101, edges[0], edges[1], 0.0, edges[2], edges[3], 0.101],
+        dtype=np.float32,
+    )
+
+    masks = report.shear_pp_bin_masks(true_shear)
+
+    assert [np.flatnonzero(mask).tolist() for mask in masks] == [
+        [1],
+        [2, 3],
+        [4, 5],
+    ]

@@ -88,6 +88,18 @@ class TrainConfig:
     noise_cache_maxs: bool = True
     seed: int = 42
     deterministic: bool = False
+    # Keep the historical optimizer/scheduler behavior as defaults so archived
+    # JSON configs load without silently changing their training semantics.
+    scheduler_type: str = "plateau"
+    warmup_epochs: int = 0
+    min_learning_rate: float = 1e-6
+    fixed_validation_streams: bool = False
+    context_norm_trainable: bool = True
+    early_stopping_patience: int | None = None
+    early_stopping_min_delta: float = 0.0
+    gradient_clip_norm: float = 1.0
+    affine_learning_rate: float | None = None
+    theta_learning_rate: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,9 +110,15 @@ class FlowConfig:
     num_layers: int
     mlp: list[int] = field(default_factory=lambda: [1, 128, 64, 2])
     # ``affine`` preserves the historical Euclidean NPE. ``circular_rqs``
-    # treats theta_int as a genuine periodic coordinate on [-1, 1).
+    # applies RQS transforms to the joint vector. ``hybrid_circular`` retains
+    # the affine seven-dimensional flow and adds a conditional circular theta
+    # factor. ``bounded_hybrid_circular`` replaces that affine marginal with a
+    # compact RQS marginal while retaining the correlated circular factor.
     flow_type: str = "affine"
     num_bins: int = 8
+    theta_num_layers: int = 1
+    theta_logit_limit: float = 10.0
+    bounded_logit_limit: float = 10.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

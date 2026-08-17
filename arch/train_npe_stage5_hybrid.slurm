@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=kl_npe_stage5_circ
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_npe_stage5_circular_%j.out
+#SBATCH --job-name=kl_npe_stage5_hybrid
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/train_npe_stage5_hybrid_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
 #SBATCH --time=2:00:00
@@ -18,35 +18,48 @@ source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 set -u
 
-# Stage 5 changes only the posterior flow: theta_int is represented by a
-# periodic rational-quadratic spline. Keep the Stage 4 backbone and all other
-# controlled-run settings fixed so its result is directly comparable.
+# Controlled Stage 5 run: retain the Stage 4 D4 context encoder and the
+# seven-dimensional affine posterior, then condition one circular theta_int
+# spline on both the context and the sampled affine parameters.
 SEED="${SEED:-42}"
 EPOCHS="${EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-50}"
 MODE="${MODE:-2}"
-FLOW_TYPE="${FLOW_TYPE:-circular_rqs}"
+FLOW_TYPE="${FLOW_TYPE:-hybrid_circular}"
 FLOW_NUM_BINS="${FLOW_NUM_BINS:-8}"
-INITIAL_LR="${INITIAL_LR:-0.001}"
+THETA_NUM_LAYERS="${THETA_NUM_LAYERS:-1}"
+THETA_LOGIT_LIMIT="${THETA_LOGIT_LIMIT:-10}"
+INITIAL_LR="${INITIAL_LR:-0.0003}"
+AFFINE_LR="${AFFINE_LR:-0.0003}"
+THETA_LR="${THETA_LR:-0.0001}"
+SCHEDULER_TYPE="${SCHEDULER_TYPE:-warmup_cosine}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-2}"
+MIN_LR="${MIN_LR:-0.00001}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-5}"
+EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.001}"
+GRADIENT_CLIP_NORM="${GRADIENT_CLIP_NORM:-1.0}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.00001}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_PREFIX="CNN-SetAttn-D4-circular-flow_tf_stage5"
+MODEL_PREFIX="CNN-SetAttn-D4-hybrid-circular-flow_tf_stage5_fixedfiber"
 MODEL_NAME="${MODEL_NAME:-${MODEL_PREFIX}_s${SEED}_${JOB_TAG}}"
-PRETRAINED_NAME="${PRETRAINED_NAME:-CNN-SetAttn-D4_CCL_stage4_fixedgeo_s42_43420237}"
+PRETRAINED_NAME="${PRETRAINED_NAME:-CNN-SetAttn-D4_CCL_stage4_fixedgeo_s42_43717396}"
 PRETRAIN_FROM="${PRETRAIN_FROM:-14}"
 CONFIG_PATH="${CONFIG_PATH:-/ocean/projects/phy250048p/shared/configs/cfg_${PRETRAINED_NAME}.json}"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m/}"
+TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m_fixedfiber/}"
+VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m_fixedfiber/}"
 TRAIN_SIZE="${TRAIN_SIZE:-100000}"
 VALID_SIZE="${VALID_SIZE:-10000}"
-CHECKPOINT_SUFFIX="$((EPOCHS - 1))"
 
-if [[ "${FLOW_TYPE}" != "circular_rqs" ]]; then
-    echo "Stage 5 requires FLOW_TYPE=circular_rqs, got ${FLOW_TYPE}" >&2
+if [[ "${FLOW_TYPE}" != "hybrid_circular" ]]; then
+    echo "Stage 5 hybrid run requires FLOW_TYPE=hybrid_circular, got ${FLOW_TYPE}" >&2
     exit 2
 fi
 if (( FLOW_NUM_BINS < 2 )); then
     echo "FLOW_NUM_BINS must be at least 2, got ${FLOW_NUM_BINS}" >&2
+    exit 2
+fi
+if (( THETA_NUM_LAYERS < 1 )); then
+    echo "THETA_NUM_LAYERS must be at least 1, got ${THETA_NUM_LAYERS}" >&2
     exit 2
 fi
 if [[ ! -f "${CONFIG_PATH}" ]]; then
@@ -76,13 +89,14 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 echo "model=${MODEL_NAME}"
 echo "pretrained=${PRETRAINED_NAME} checkpoint=${PRETRAIN_FROM}"
 echo "backbone=stage4_d4 posterior_symmetry=d4 rot90_counterpart=false"
-echo "flow_type=${FLOW_TYPE} flow_num_bins=${FLOW_NUM_BINS}"
+echo "flow_type=${FLOW_TYPE} bins=${FLOW_NUM_BINS} theta_layers=${THETA_NUM_LAYERS} theta_logit_limit=${THETA_LOGIT_LIMIT}"
 echo "mode=${MODE} seed=${SEED} epochs=${EPOCHS} batch_size=${BATCH_SIZE}"
-echo "initial_lr=${INITIAL_LR} weight_decay=${WEIGHT_DECAY}"
+echo "initial_lr=${INITIAL_LR} affine_lr=${AFFINE_LR} theta_lr=${THETA_LR} weight_decay=${WEIGHT_DECAY}"
+echo "scheduler=${SCHEDULER_TYPE} warmup_epochs=${WARMUP_EPOCHS} min_lr=${MIN_LR}"
+echo "fixed_validation=true context_norm_trainable=false early_stop=${EARLY_STOPPING_PATIENCE} min_delta=${EARLY_STOPPING_MIN_DELTA} gradient_clip=${GRADIENT_CLIP_NORM}"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
-echo "gpu_count=${SLURM_GPUS_ON_NODE:-4}"
-echo "master_port=${MASTER_PORT}"
+echo "gpu_count=${SLURM_GPUS_ON_NODE:-4} master_port=${MASTER_PORT}"
 
 cd /jet/home/xwang30/kl-nn/arch
 python '[scr]_train_model.py' \
@@ -95,6 +109,8 @@ python '[scr]_train_model.py' \
     --no-rot90-counterpart \
     --flow-type "${FLOW_TYPE}" \
     --flow-num-bins "${FLOW_NUM_BINS}" \
+    --theta-num-layers "${THETA_NUM_LAYERS}" \
+    --theta-logit-limit "${THETA_LOGIT_LIMIT}" \
     --mode "${MODE}" \
     --train-data "${TRAIN_DATA}" \
     --valid-data "${VALID_DATA}" \
@@ -106,10 +122,20 @@ python '[scr]_train_model.py' \
     --epochs "${EPOCHS}" \
     --batch-size "${BATCH_SIZE}" \
     --initial-learning-rate "${INITIAL_LR}" \
+    --affine-learning-rate "${AFFINE_LR}" \
+    --theta-learning-rate "${THETA_LR}" \
+    --scheduler-type "${SCHEDULER_TYPE}" \
+    --warmup-epochs "${WARMUP_EPOCHS}" \
+    --min-learning-rate "${MIN_LR}" \
+    --fixed-validation-streams \
+    --no-context-norm-trainable \
+    --early-stopping-patience "${EARLY_STOPPING_PATIENCE}" \
+    --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA}" \
+    --gradient-clip-norm "${GRADIENT_CLIP_NORM}" \
     --weight-decay "${WEIGHT_DECAY}" \
     --seed "${SEED}" \
     --deterministic \
     --no-compile
 
-echo "Stage 5 circular-theta posterior training complete. Evaluate raw Mode 1 with:"
-echo "MODEL_NAME=${MODEL_NAME} EPOCH=${CHECKPOINT_SUFFIX} sbatch arch/tf_analysis_stage4_mode1_10k.slurm"
+echo "Stage 5 hybrid circular-theta posterior training complete."
+echo "Use the saved best-checkpoint metadata for downstream Mode 1 analysis."

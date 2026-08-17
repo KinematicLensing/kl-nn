@@ -32,12 +32,12 @@ source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 set -u
 
-MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4-circular-flow_tf_stage5_s42_43518153}"
+MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4-bounded-hybrid-circular-flow_tf_stage6_fixedfiber_s42_43747436}"
 EPOCH="${EPOCH:-19}"
 
 SEED="${SEED:-42}"
 NETWORK_SOURCE="${NETWORK_SOURCE:-current}"
-DATASET="${DATASET:-small_1m}"
+DATASET="${DATASET:-small_1m_fixedfiber}"
 SAMPLE_SET="${SAMPLE_SET:-samples_small_1m.csv}"
 NGALS="${NGALS:-1000}"
 NSAMPLES="${NSAMPLES:-5000}"

@@ -1,4 +1,5 @@
 import sys,time,os
+import json
 import random
 from os.path import join
 import logging
@@ -264,6 +265,75 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.use_channels_last = bool(config.train.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.train.get('noise_cache_maxs', False))
+        self.fixed_validation_streams = bool(
+            config.train.get('fixed_validation_streams', False)
+        )
+        self.gradient_clip_norm = config.train.get('gradient_clip_norm', 1.0)
+        if self.gradient_clip_norm is not None:
+            self.gradient_clip_norm = float(self.gradient_clip_norm)
+        # NPETrainer enables these controls explicitly. Keeping them disabled in
+        # the base class preserves the historical feature-pretraining loop.
+        self.enable_best_checkpoint = False
+        self.early_stopping_patience = None
+        self.early_stopping_min_delta = 0.0
+        self.best_validation_loss = float("inf")
+        self.epochs_without_improvement = 0
+        self.preclip_grad_norm_history = []
+        self.training_diagnostic_history = []
+
+    @staticmethod
+    def _distributed_is_initialized():
+        return (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+
+    def _all_ranks_true(self, value):
+        """Return ``True`` only when every distributed rank reports true."""
+        flag = torch.tensor(
+            [1 if bool(value) else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        return bool(flag.item())
+
+    def _global_mean_from_sum_count(self, local_sum, local_count):
+        """Reduce a metric as a float64 sum/count pair and return its mean."""
+        totals = torch.tensor(
+            [float(local_sum), float(local_count)],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        total_sum, total_count = totals.tolist()
+        if total_count == 0:
+            return float("nan")
+        return total_sum / total_count
+
+    def _global_max(self, value):
+        reduced = torch.tensor(
+            [float(value)], dtype=torch.float64, device=self.device
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.MAX)
+        return float(reduced.item())
+
+    def _global_min(self, value):
+        reduced = torch.tensor(
+            [float(value)], dtype=torch.float64, device=self.device
+        )
+        if self._distributed_is_initialized():
+            torch.distributed.all_reduce(
+                reduced, op=torch.distributed.ReduceOp.MIN
+            )
+        return float(reduced.item())
+
+    def _synchronize_counter(self, value):
+        """Synchronize counters which already represent global batch decisions."""
+        return int(self._global_max(value))
 
     def _make_epoch_generator(self, epoch, stream):
         generator = torch.Generator(device=self.device)
@@ -283,25 +353,36 @@ class Trainer:
             ),
             deterministic=self.deterministic,
         )
-        self.epoch_generators = {
-            stream: self._make_epoch_generator(epoch, stream)
-            for stream in (
-                "train_order",
-                "valid_order",
-                "train_snr",
-                "valid_snr",
-                "train_img_noise",
-                "train_spec_noise",
-                "valid_img_noise",
-                "valid_spec_noise",
+        streams = (
+            "train_order",
+            "valid_order",
+            "train_snr",
+            "valid_snr",
+            "train_img_noise",
+            "train_spec_noise",
+            "valid_img_noise",
+            "valid_spec_noise",
+        )
+        self.epoch_generators = {}
+        for stream in streams:
+            stream_epoch = (
+                0
+                if self.fixed_validation_streams and stream.startswith("valid_")
+                else epoch
             )
-        }
+            self.epoch_generators[stream] = self._make_epoch_generator(
+                stream_epoch, stream
+            )
         self.epoch_numpy_generators = {
             split: np.random.default_rng(
                 derive_stream_seed(
                     self.base_seed,
                     rank=self.gpu_id,
-                    epoch=epoch,
+                    epoch=(
+                        0
+                        if self.fixed_validation_streams and split == "valid"
+                        else epoch
+                    ),
                     stream=f"{split}_numpy",
                 )
             )
@@ -463,6 +544,60 @@ class Trainer:
 
     def _save_checkpoint(self, epoch):
         raise NotImplementedError("Subclasses must implement _save_checkpoint")
+
+    def _save_best_checkpoint(self, epoch, train_loss, valid_loss):
+        raise NotImplementedError(
+            "Subclasses which enable best checkpoints must implement "
+            "_save_best_checkpoint"
+        )
+
+    def _update_training_control(self, valid_loss):
+        """Synchronize best-metric and early-stopping state across all ranks."""
+        distributed = self._distributed_is_initialized()
+        controller = (not distributed) or self.gpu_id == self.log_rank
+        if controller:
+            improved = (
+                np.isfinite(valid_loss)
+                and valid_loss
+                < self.best_validation_loss - self.early_stopping_min_delta
+            )
+            if improved:
+                self.best_validation_loss = float(valid_loss)
+                self.epochs_without_improvement = 0
+            else:
+                self.epochs_without_improvement += 1
+            should_stop = (
+                self.early_stopping_patience is not None
+                and self.epochs_without_improvement
+                >= self.early_stopping_patience
+            )
+            state_values = (
+                float(improved),
+                float(should_stop),
+                self.best_validation_loss,
+                float(self.epochs_without_improvement),
+            )
+        else:
+            state_values = (0.0, 0.0, float("inf"), 0.0)
+
+        state = torch.tensor(
+            state_values, dtype=torch.float64, device=self.device
+        )
+        if distributed:
+            torch.distributed.broadcast(state, src=self.log_rank)
+        improved = bool(state[0].item())
+        should_stop = bool(state[1].item())
+        self.best_validation_loss = float(state[2].item())
+        self.epochs_without_improvement = int(state[3].item())
+        return improved, should_stop
+
+    def _step_scheduler(self, valid_loss):
+        if isinstance(self.scheduler, ReduceLROnPlateau):
+            # NPE validation loss is a globally reduced metric, so every rank
+            # advances the plateau scheduler from the same observation.
+            self.scheduler.step(valid_loss)
+        else:
+            self.scheduler.step()
     
     def train(self, max_epochs: int):
         self._set_tensors()
@@ -472,16 +607,30 @@ class Trainer:
             self.logger.info("Training start")
         for epoch in range(max_epochs):
             train_loss, valid_loss = self._run_epoch(epoch)
-            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                self.scheduler.step(valid_loss)
-            else:
-                self.scheduler.step()
+            self._step_scheduler(valid_loss)
             if self.gpu_id == self.log_rank:
                 self.logger.info(f"Current LR is {self.scheduler.get_last_lr()}")
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
             if self.gpu_id == self.log_rank and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
+
+            should_stop = False
+            if self.enable_best_checkpoint:
+                improved, should_stop = self._update_training_control(valid_loss)
+                if improved and self.gpu_id == self.log_rank:
+                    self._save_best_checkpoint(epoch, train_loss, valid_loss)
+            if should_stop:
+                if self.gpu_id == self.log_rank:
+                    self.logger.info(
+                        "Early stopping after epoch %d: validation loss did not "
+                        "improve by %.6g for %d epochs. Best loss: %.8g",
+                        epoch + 1,
+                        self.early_stopping_min_delta,
+                        self.epochs_without_improvement,
+                        self.best_validation_loss,
+                    )
+                break
 
         if self.gpu_id == self.log_rank:
             losses = pd.DataFrame(np.vstack([train_losses, valid_losses]))
@@ -897,15 +1046,174 @@ class NPETrainer(Trainer):
         )
         
         self.model_name = config.train['model_name']
-        self.scheduler = ReduceLROnPlateau(self.optimizer, 'min', factor=0.5, patience=10)
+        self.scheduler_type = str(
+            config.train.get('scheduler_type', 'plateau')
+        ).lower()
+        self._configure_scheduler(int(config.train['epoch_number']))
+        self.enable_best_checkpoint = True
+        patience = config.train.get('early_stopping_patience', None)
+        self.early_stopping_patience = (
+            None if patience is None else int(patience)
+        )
+        self.early_stopping_min_delta = float(
+            config.train.get('early_stopping_min_delta', 0.0)
+        )
         self.use_rot90_counterpart = bool(
             config.train.get('use_rot90_counterpart', True)
         )
 
+    def _configure_scheduler(self, total_epochs):
+        if self.scheduler_type == 'plateau':
+            # Preserve the historical scheduler exactly when no new scheduler
+            # type is requested.
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer, 'min', factor=0.5, patience=10
+            )
+            return
+        if self.scheduler_type not in ('warmup_cosine', 'cosine'):
+            raise ValueError(
+                "Unsupported scheduler_type "
+                f"'{self.scheduler_type}'. Use 'plateau' or 'warmup_cosine'."
+            )
+
+        warmup_epochs = max(0, int(config.train.get('warmup_epochs', 0)))
+        if self.scheduler_type == 'cosine':
+            warmup_epochs = 0
+        elif warmup_epochs >= total_epochs:
+            raise ValueError(
+                "warmup_epochs must be smaller than epoch_number for "
+                "scheduler_type='warmup_cosine'"
+            )
+        min_lr = float(config.train.get('min_learning_rate', 1e-6))
+        cosine_epochs = max(1, total_epochs - warmup_epochs)
+        if warmup_epochs == 0:
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer, T_max=cosine_epochs, eta_min=min_lr
+            )
+            return
+
+        warmup = LinearLR(
+            self.optimizer,
+            start_factor=float(config.train.get('warmup_start_factor', 0.1)),
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = CosineAnnealingLR(
+            self.optimizer, T_max=cosine_epochs, eta_min=min_lr
+        )
+        self.scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+
+    _DIAGNOSTIC_MEAN_KEYS = (
+        'raw_feature_rms',
+        'effective_sample_size',
+        'effective_sample_fraction',
+        'affine_log_prob_mean',
+        'bounded_log_prob_mean',
+        'theta_log_prob_mean',
+    )
+    _DIAGNOSTIC_MAX_KEYS = (
+        'max_normalized_weight',
+        'theta_raw_logit_abs_max',
+        'theta_bounded_logit_abs_max',
+        'theta_logdet_max',
+        'theta_derivative_max',
+        'theta_wrap_count',
+        'theta_max_wrap_excursion',
+        'bounded_support_violation_count',
+        'bounded_raw_logit_abs_max',
+        'bounded_logit_abs_max',
+        'bounded_logdet_max',
+        'bounded_derivative_max',
+    )
+    _DIAGNOSTIC_MIN_KEYS = (
+        'theta_logdet_min',
+        'theta_derivative_min',
+        'bounded_logdet_min',
+        'bounded_derivative_min',
+    )
+
+    def _reset_training_diagnostics(self):
+        self._diagnostic_sums = {
+            key: 0.0 for key in self._DIAGNOSTIC_MEAN_KEYS
+        }
+        self._diagnostic_counts = {
+            key: 0 for key in self._DIAGNOSTIC_MEAN_KEYS
+        }
+        self._diagnostic_maxima = {
+            key: -float('inf') for key in self._DIAGNOSTIC_MAX_KEYS
+        }
+        self._diagnostic_minima = {
+            key: float('inf') for key in self._DIAGNOSTIC_MIN_KEYS
+        }
+
+    def _capture_training_diagnostics(self):
+        diagnostics = getattr(
+            self.model.module, 'last_training_diagnostics', None
+        )
+        if not diagnostics:
+            return
+        keys = (
+            *self._DIAGNOSTIC_MEAN_KEYS,
+            *self._DIAGNOSTIC_MAX_KEYS,
+            *self._DIAGNOSTIC_MIN_KEYS,
+        )
+        stacked_values = []
+        for key in keys:
+            value = diagnostics.get(key)
+            if value is None:
+                value = torch.full(
+                    (), float('nan'), dtype=torch.float64, device=self.device
+                )
+            else:
+                value = torch.as_tensor(
+                    value, dtype=torch.float64, device=self.device
+                ).reshape(())
+            stacked_values.append(value)
+        # One stacked device-to-host transfer avoids one CUDA synchronization
+        # for every individual diagnostic scalar.
+        scalars = torch.stack(stacked_values).detach().cpu().tolist()
+        values_by_key = dict(zip(keys, scalars))
+
+        for key in self._DIAGNOSTIC_MEAN_KEYS:
+            scalar = values_by_key[key]
+            if np.isfinite(scalar):
+                self._diagnostic_sums[key] += scalar
+                self._diagnostic_counts[key] += 1
+        for key in self._DIAGNOSTIC_MAX_KEYS:
+            scalar = values_by_key[key]
+            if np.isfinite(scalar):
+                self._diagnostic_maxima[key] = max(
+                    self._diagnostic_maxima[key], scalar
+                )
+        for key in self._DIAGNOSTIC_MIN_KEYS:
+            scalar = values_by_key[key]
+            if np.isfinite(scalar):
+                self._diagnostic_minima[key] = min(
+                    self._diagnostic_minima[key], scalar
+                )
+
+    def _finalize_training_diagnostics(self):
+        diagnostics = {}
+        for key in self._DIAGNOSTIC_MEAN_KEYS:
+            diagnostics[key] = self._global_mean_from_sum_count(
+                self._diagnostic_sums[key], self._diagnostic_counts[key]
+            )
+        for key in self._DIAGNOSTIC_MAX_KEYS:
+            value = self._global_max(self._diagnostic_maxima[key])
+            diagnostics[key] = value if np.isfinite(value) else float('nan')
+        for key in self._DIAGNOSTIC_MIN_KEYS:
+            value = self._global_min(self._diagnostic_minima[key])
+            diagnostics[key] = value if np.isfinite(value) else float('nan')
+        return diagnostics
+
     def _run_batch(self, img, spec, fid, mode, fp=None, snr=None):
         if mode == 'train':
             self.optimizer.zero_grad(set_to_none=True)
-        
+
         if self.model.module.mode == 2:
             self.mag = snr_to_app_mag(snr) if snr is not None else None
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
@@ -913,37 +1221,87 @@ class NPETrainer(Trainer):
         else:
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 loss = self.model(img, spec, fid, fp=fp)
+        if mode == 'train':
+            self._capture_training_diagnostics()
 
-        # Check locally if loss is valid
-        valid_loss = torch.isfinite(loss).to(dtype=torch.float32).view(1)
-        
-        # Check globally across all ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(valid_loss, op=torch.distributed.ReduceOp.MIN)
-
-        # Only proceed if EVERY rank has a finite loss
-        if valid_loss.item() == 1.0:
-            if mode == 'train':
-                if self.use_amp:
-                    self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.module.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-        else:
+        # All ranks must make the same backward/step decision; otherwise DDP can
+        # deadlock or silently let the replicas diverge.
+        loss_is_valid = self._all_ranks_true(torch.isfinite(loss).item())
+        self.last_batch_globally_valid = loss_is_valid
+        self.last_batch_step_valid = loss_is_valid
+        self.last_preclip_grad_norm = float("nan")
+        if not loss_is_valid:
             self.invalid_loss_count += 1
-                
+            self.last_batch_step_valid = False
+            return loss
+
+        if mode != 'train':
+            return loss
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            # clip_grad_norm_ must see unscaled gradients. This also registers
+            # AMP's non-finite-gradient check before scaler.step().
+            self.scaler.unscale_(self.optimizer)
+        else:
+            loss.backward()
+
+        parameters = [
+            parameter
+            for parameter in self.model.module.parameters()
+            if parameter.grad is not None
+        ]
+        max_norm = (
+            self.gradient_clip_norm
+            if self.gradient_clip_norm is not None
+            and self.gradient_clip_norm > 0
+            else float("inf")
+        )
+        preclip_norm = nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm=max_norm,
+            error_if_nonfinite=False,
+        )
+        self.last_preclip_grad_norm = float(preclip_norm.detach().item())
+        gradients_are_valid = self._all_ranks_true(
+            torch.isfinite(preclip_norm).item()
+        )
+        self.last_batch_step_valid = gradients_are_valid
+        if gradients_are_valid:
+            self._preclip_grad_norm_sum += self.last_preclip_grad_norm
+            self._preclip_grad_norm_count += 1
+            self._preclip_grad_norm_max = max(
+                self._preclip_grad_norm_max, self.last_preclip_grad_norm
+            )
+            if self.use_amp:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+        else:
+            self.invalid_gradient_count += 1
+            if self.use_amp:
+                # A globally rejected step must also leave every rank with the
+                # same scale. Explicit backoff avoids rank-local scaler drift.
+                current_scale = float(self.scaler.get_scale())
+                backoff = float(self.scaler.get_backoff_factor())
+                self.scaler.update(new_scale=current_scale * backoff)
+
         return loss
 
     def _trainFunc(self, epoch, show_log=True):
         self.model.train()
         if hasattr(self.model.module, 'feature_extractor'):
             self.model.module.feature_extractor.eval()
-        losses = []
+        local_loss_sum = 0.0
+        local_loss_count = 0
         epoch_start = time.time()
         self.invalid_loss_count = 0
+        self.invalid_gradient_count = 0
+        self._preclip_grad_norm_sum = 0.0
+        self._preclip_grad_norm_count = 0
+        self._preclip_grad_norm_max = 0.0
+        self._reset_training_diagnostics()
         
         for i in range(self.nbatch_train):
             start = i*self.batch_size
@@ -977,24 +1335,118 @@ class NPETrainer(Trainer):
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
             loss = self._run_batch(img, spec, fid, 'train', fp=fp, snr=snr)
-            if torch.isfinite(loss):
-                losses.append(loss.item())
+            if self.last_batch_globally_valid:
+                local_loss_sum += float(loss.detach().item())
+                local_loss_count += 1
 
             if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                 self.logger.info(f"Batch {i} complete")
 
-        epoch_loss = sum(losses) / len(losses)
+        epoch_loss = self._global_mean_from_sum_count(
+            local_loss_sum, local_loss_count
+        )
+        self.invalid_loss_count = self._synchronize_counter(
+            self.invalid_loss_count
+        )
+        self.invalid_gradient_count = self._synchronize_counter(
+            self.invalid_gradient_count
+        )
+        mean_grad_norm = self._global_mean_from_sum_count(
+            self._preclip_grad_norm_sum, self._preclip_grad_norm_count
+        )
+        max_grad_norm = self._global_max(self._preclip_grad_norm_max)
+        if not np.isfinite(mean_grad_norm):
+            max_grad_norm = float("nan")
+        self.preclip_grad_norm_history.append(
+            {"epoch": epoch + 1, "mean": mean_grad_norm, "max": max_grad_norm}
+        )
+        training_diagnostics = self._finalize_training_diagnostics()
+        self.training_diagnostic_history.append(
+            {"epoch": epoch + 1, **training_diagnostics}
+        )
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[TRAIN] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
-            self.logger.info(f"Invalid loss count for epoch {epoch+1}: {self.invalid_loss_count}")
+            self.logger.info(
+                "[TRAIN] Epoch: %d InvalidLossSteps: %d "
+                "InvalidGradientSteps: %d PreClipGradNormMean: %.8g "
+                "PreClipGradNormMax: %.8g",
+                epoch + 1,
+                self.invalid_loss_count,
+                self.invalid_gradient_count,
+                mean_grad_norm,
+                max_grad_norm,
+            )
+            if np.isfinite(training_diagnostics['raw_feature_rms']):
+                self.logger.info(
+                    "[TRAIN_FEATURE] Epoch: %d RawFeatureRMS: %.8g",
+                    epoch + 1,
+                    training_diagnostics['raw_feature_rms'],
+                )
+            if np.isfinite(training_diagnostics['effective_sample_size']):
+                self.logger.info(
+                    "[TRAIN_TF] Epoch: %d EffectiveSampleSize: %.6g "
+                    "EffectiveSampleFraction: %.6g MaxNormalizedWeight: %.6g",
+                    epoch + 1,
+                    training_diagnostics['effective_sample_size'],
+                    training_diagnostics['effective_sample_fraction'],
+                    training_diagnostics['max_normalized_weight'],
+                )
+            if np.isfinite(training_diagnostics['affine_log_prob_mean']):
+                self.logger.info(
+                    "[TRAIN_FLOW] Epoch: %d AffineLogProbMean: %.8g "
+                    "ThetaLogProbMean: %.8g",
+                    epoch + 1,
+                    training_diagnostics['affine_log_prob_mean'],
+                    training_diagnostics['theta_log_prob_mean'],
+                )
+            if np.isfinite(
+                training_diagnostics['theta_raw_logit_abs_max']
+            ):
+                self.logger.info(
+                    "[TRAIN_THETA] Epoch: %d RawLogitAbsMax: %.8g "
+                    "BoundedLogitAbsMax: %.8g LogDetMin: %.8g LogDetMax: %.8g "
+                    "DerivativeMin: %.8g DerivativeMax: %.8g "
+                    "WrapCountMax: %.8g MaxWrapExcursion: %.8g",
+                    epoch + 1,
+                    training_diagnostics['theta_raw_logit_abs_max'],
+                    training_diagnostics['theta_bounded_logit_abs_max'],
+                    training_diagnostics['theta_logdet_min'],
+                    training_diagnostics['theta_logdet_max'],
+                    training_diagnostics['theta_derivative_min'],
+                    training_diagnostics['theta_derivative_max'],
+                    training_diagnostics['theta_wrap_count'],
+                    training_diagnostics['theta_max_wrap_excursion'],
+                )
+            if np.isfinite(
+                training_diagnostics['bounded_raw_logit_abs_max']
+            ):
+                self.logger.info(
+                    "[TRAIN_BOUNDED] Epoch: %d NonThetaLogProbMean: %.8g "
+                    "SupportViolationCountMax: %.8g RawLogitAbsMax: %.8g "
+                    "BoundedLogitAbsMax: %.8g LogDetMin: %.8g "
+                    "LogDetMax: %.8g DerivativeMin: %.8g "
+                    "DerivativeMax: %.8g",
+                    epoch + 1,
+                    training_diagnostics['bounded_log_prob_mean'],
+                    training_diagnostics[
+                        'bounded_support_violation_count'
+                    ],
+                    training_diagnostics['bounded_raw_logit_abs_max'],
+                    training_diagnostics['bounded_logit_abs_max'],
+                    training_diagnostics['bounded_logdet_min'],
+                    training_diagnostics['bounded_logdet_max'],
+                    training_diagnostics['bounded_derivative_min'],
+                    training_diagnostics['bounded_derivative_max'],
+                )
         return epoch_loss
 
     def _validFunc(self,epoch,show_log=True):
         self.model.eval()
-        losses = []
+        local_loss_sum = 0.0
+        local_loss_count = 0
         epoch_start = time.time()
         self.invalid_loss_count = 0
 
@@ -1031,25 +1483,75 @@ class NPETrainer(Trainer):
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
                 loss = self._run_batch(img, spec, fid, 'valid', fp=fp, snr=snr)
-                if torch.isfinite(loss):
-                    losses.append(loss.item())
+                if self.last_batch_globally_valid:
+                    local_loss_sum += float(loss.detach().item())
+                    local_loss_count += 1
 
                 if show_log and self.gpu_id == self.log_rank and i%100 == 0:
                     self.logger.info(f"Batch {i} complete")
 
-        epoch_loss = sum(losses) / len(losses)
+        epoch_loss = self._global_mean_from_sum_count(
+            local_loss_sum, local_loss_count
+        )
+        self.invalid_loss_count = self._synchronize_counter(
+            self.invalid_loss_count
+        )
         epoch_time = time.time() - epoch_start
         if show_log and self.gpu_id == self.log_rank:
             self.logger.info("[VALID] Epoch: {} Loss: {} Time: {:.0f}:{:.0f}".format(epoch+1, epoch_loss,
                                                                                     epoch_time // 60, 
                                                                                     epoch_time % 60))
-            self.logger.info(f"Invalid loss count for epoch {epoch+1}: {self.invalid_loss_count}")
+            self.logger.info(
+                "[VALID] Epoch: %d InvalidLossSteps: %d",
+                epoch + 1,
+                self.invalid_loss_count,
+            )
         return epoch_loss
     
     def _save_checkpoint(self, epoch):
         ckp = self.model.module.state_dict()
         PATH = join(config.train['model_path'], config.train['model_name'], config.train['model_name']+str(epoch))
         torch.save(ckp, PATH)
+
+    def _save_best_checkpoint(self, epoch, train_loss, valid_loss):
+        model_dir = join(config.train['model_path'], config.train['model_name'])
+        os.makedirs(model_dir, exist_ok=True)
+        checkpoint_name = f"{config.train['model_name']}best"
+        checkpoint_path = join(model_dir, checkpoint_name)
+        metadata_path = join(model_dir, 'best.json')
+        torch.save(self.model.module.state_dict(), checkpoint_path)
+
+        numeric_checkpoint = f"{config.train['model_name']}{epoch}"
+        metadata = {
+            "model_name": config.train['model_name'],
+            "checkpoint": numeric_checkpoint,
+            "checkpoint_path": join(model_dir, numeric_checkpoint),
+            "checkpoint_suffix": str(epoch),
+            "named_best_checkpoint": checkpoint_name,
+            "named_best_checkpoint_path": checkpoint_path,
+            "named_best_checkpoint_suffix": "best",
+            "epoch": int(epoch + 1),
+            "epoch_index": int(epoch),
+            "train_loss": float(train_loss),
+            "validation_loss": float(valid_loss),
+            "scheduler_type": self.scheduler_type,
+            # Scheduler stepping precedes checkpoint selection in the legacy
+            # loop, so these are the rates prepared for the following epoch.
+            "next_epoch_learning_rates": [
+                float(group['lr']) for group in self.optimizer.param_groups
+            ],
+            "early_stopping_min_delta": self.early_stopping_min_delta,
+            "early_stopping_patience": self.early_stopping_patience,
+        }
+        temporary_path = f"{metadata_path}.tmp.{os.getpid()}"
+        with open(temporary_path, 'w', encoding='utf-8') as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+        os.replace(temporary_path, metadata_path)
+        self.logger.info(
+            "Saved best checkpoint from epoch %d with validation loss %.8g",
+            epoch + 1,
+            valid_loss,
+        )
 
 #------------------#
 # Global functions #
@@ -1151,6 +1653,76 @@ def ddp_setup(rank, world_size):
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.synchronize()
 
+
+def _npe_optimizer_parameters(model, train_config):
+    """Build non-overlapping LR groups for the hybrid posterior.
+
+    Legacy models keep their historical single parameter group. The hybrid
+    factorization gets a lower LR for its circular conditioner while every
+    trainable parameter still appears exactly once.
+    """
+    flow = getattr(model, 'flow', None)
+    affine_flow = getattr(flow, 'affine_flow', None)
+    theta_transform = getattr(flow, 'theta_transform', None)
+    if affine_flow is None or theta_transform is None:
+        return model.parameters()
+
+    trainable = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    affine = [
+        parameter
+        for parameter in affine_flow.parameters()
+        if parameter.requires_grad
+    ]
+    theta = [
+        parameter
+        for parameter in theta_transform.parameters()
+        if parameter.requires_grad
+    ]
+    affine_ids = {id(parameter) for parameter in affine}
+    theta_ids = {id(parameter) for parameter in theta}
+    if affine_ids & theta_ids:
+        raise RuntimeError(
+            "Hybrid affine_flow and theta_transform share optimizer parameters"
+        )
+
+    branch_ids = affine_ids | theta_ids
+    remaining = [
+        parameter for parameter in trainable if id(parameter) not in branch_ids
+    ]
+    grouped_ids = {id(parameter) for parameter in remaining} | branch_ids
+    trainable_ids = {id(parameter) for parameter in trainable}
+    if grouped_ids != trainable_ids or (
+        len(remaining) + len(affine) + len(theta) != len(trainable)
+    ):
+        raise RuntimeError(
+            "Hybrid optimizer parameter grouping omitted or duplicated parameters"
+        )
+
+    base_lr = float(train_config['initial_learning_rate'])
+    affine_lr = train_config.get('affine_learning_rate', None)
+    theta_lr = train_config.get('theta_learning_rate', None)
+    groups = []
+    if remaining:
+        groups.append(
+            {'params': remaining, 'lr': base_lr, 'group_name': 'shared'}
+        )
+    if affine:
+        groups.append({
+            'params': affine,
+            'lr': base_lr if affine_lr is None else float(affine_lr),
+            'group_name': 'affine_flow',
+        })
+    if theta:
+        groups.append({
+            'params': theta,
+            'lr': base_lr if theta_lr is None else float(theta_lr),
+            'group_name': 'theta_transform',
+        })
+    return groups
+
+
 def load_train_objs(
     Model,
     rank,
@@ -1212,12 +1784,18 @@ def load_train_objs(
         if use_fused:
             optimizer_kwargs["fused"] = True
         try:
-            optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
+            optimizer = optim.AdamW(
+                _npe_optimizer_parameters(model, train_config),
+                **optimizer_kwargs,
+            )
         except TypeError:
             if use_fused and log is not None:
                 log.warning("Fused AdamW not supported in this Torch build; falling back to standard AdamW.")
             optimizer_kwargs.pop("fused", None)
-            optimizer = optim.AdamW(model.parameters(), **optimizer_kwargs)
+            optimizer = optim.AdamW(
+                _npe_optimizer_parameters(model, train_config),
+                **optimizer_kwargs,
+            )
 
     return train_ds, valid_ds, model, optimizer
 

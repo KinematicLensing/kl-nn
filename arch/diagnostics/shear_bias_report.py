@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Build a self-contained shear-bias report from compact cached summaries.
+"""Build a self-contained shear-bias report from cached posterior products.
 
-This deliberately reads only truth, SNR, MAP, and posterior-mean arrays. It
-never opens the multi-gigabyte posterior sample or log-probability files.
+Most diagnostics use the compact truth, SNR, MAP, and posterior-summary
+arrays. The shear P-P diagnostic memory-maps posterior sample partitions and
+reduces only g1/g2 in small galaxy blocks; it never concatenates the raw sample
+bank in memory.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import base64
 import html
 import io
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -35,6 +38,7 @@ PART_RE = re.compile(r"part(\d+)of(\d+)\.npy$")
 SINI_CUTS = (0.3, 0.5, 0.7, np.inf)
 ADDITIVE_DISPLAY_SCALE = 1e4
 MULTIPLICATIVE_DISPLAY_SCALE = 1e2
+SHEAR_PP_BIN_EDGES = np.linspace(-0.1, 0.1, 4)
 FEATURE_NAMES = (
     "g1",
     "g2",
@@ -46,11 +50,21 @@ FEATURE_NAMES = (
     "hlr",
 )
 NUISANCE_INDICES = {"sini": 3, "vcirc": 5, "hlr": 7}
+NUISANCE_LABELS = {
+    "sini": "sini estimate - truth",
+    "vcirc": "vcirc estimate - truth [km/s]",
+    "hlr": "hlr estimate - truth [arcsec]",
+}
+GALAXY_COMPONENT_COLORS = {"g+": "tab:red", "gx": "tab:blue"}
 ESTIMATOR_COLORS = {
     "MAP": "tab:blue",
     "Mean": "tab:orange",
     "In-support Mean": "tab:green",
 }
+
+
+class PosteriorPPUnavailable(RuntimeError):
+    """Raised when cached draws cannot represent the reported posterior."""
 
 
 def parse_args():
@@ -176,6 +190,156 @@ def load_case(
             if support_retention is not None
             else None
         ),
+    }
+
+
+def _validate_pp_provenance(root: Path, sample_files: list[Path]) -> None:
+    """Ensure raw draws correspond to the posterior summaries being reported."""
+    meta_dir = root / "meta"
+    flags = []
+    for sample_path in sample_files:
+        meta_path = meta_dir / sample_path.with_suffix(".json").name
+        if not meta_path.is_file():
+            raise PosteriorPPUnavailable(
+                f"P-P plot unavailable: missing provenance file {meta_path}"
+            )
+        try:
+            payload = json.loads(meta_path.read_text())
+            flag = payload["args"]["cancel_add_noise"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PosteriorPPUnavailable(
+                f"P-P plot unavailable: invalid provenance in {meta_path}"
+            ) from exc
+        if not isinstance(flag, bool):
+            raise PosteriorPPUnavailable(
+                f"P-P plot unavailable: cancel_add_noise is not Boolean in {meta_path}"
+            )
+        flags.append(flag)
+    if len(set(flags)) != 1:
+        raise PosteriorPPUnavailable(
+            "P-P plot unavailable: cancel_add_noise differs across partitions"
+        )
+    if flags[0]:
+        raise PosteriorPPUnavailable(
+            "P-P plot unavailable: this legacy cache stores only the original "
+            "draw bank, while its Mean summaries combine original and rotated "
+            "draws for additive-noise cancellation"
+        )
+
+
+def load_shear_pit_values(
+    case: dict, mode: int, block_size: int = 64
+) -> dict[str, np.ndarray]:
+    """Return prior-matched conditional midpoint ranks for g1 and g2.
+
+    For each component, the galaxy's true shear selects one of the fixed
+    intervals in ``SHEAR_PP_BIN_EDGES``. The posterior is then conditioned on
+    the matching restricted prior by retaining only draws of that component in
+    the same interval. The finite-sample rank within those retained draws is
+    ``(n_less + 0.5 * n_equal + 0.5) / (n_retained + 1)``. Raw sample
+    partitions are memory-mapped and only a small block of their two shear
+    columns is materialized at once.
+    """
+    if mode < 0:
+        raise IndexError("mode must be non-negative")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    truth = np.asarray(case["truth"])
+    if truth.ndim != 2 or truth.shape[1] < 2:
+        raise ValueError("case truth must have shape (galaxy, feature>=2)")
+    if not len(truth):
+        raise ValueError("cannot build a P-P plot for zero galaxies")
+
+    root = Path(case["root"])
+    sample_files = partition_files(root / "sample")
+    truth_files = partition_files(root / "truth")
+    if len(sample_files) != len(truth_files):
+        raise ValueError("sample and truth caches have different partition counts")
+    if [path.name for path in sample_files] != [path.name for path in truth_files]:
+        raise ValueError("sample and truth partition labels do not match")
+    _validate_pp_provenance(root, sample_files)
+
+    pit = np.full((len(truth), 2), np.nan, dtype=np.float64)
+    retained = np.zeros((len(truth), 2), dtype=np.int64)
+    offset = 0
+    for sample_path, truth_path in zip(sample_files, truth_files):
+        if offset >= len(truth):
+            break
+        samples = np.load(sample_path, mmap_mode="r")
+        partition_truth = np.load(truth_path, mmap_mode="r")
+        if samples.ndim != 4 or samples.shape[-1] < 2:
+            raise ValueError(
+                f"Expected sample shape (mode, galaxy, draw, feature>=2), got "
+                f"{samples.shape} in {sample_path}"
+            )
+        if partition_truth.ndim != 2 or partition_truth.shape[1] < 2:
+            raise ValueError(f"Invalid truth shape {partition_truth.shape} in {truth_path}")
+        if samples.shape[1] != partition_truth.shape[0]:
+            raise ValueError(f"Galaxy-count mismatch between {sample_path} and {truth_path}")
+        if mode >= samples.shape[0]:
+            raise IndexError(
+                f"Mode {mode} outside [0, {samples.shape[0]}) for {sample_path}"
+            )
+
+        take = min(samples.shape[1], len(truth) - offset)
+        expected_truth = truth[offset : offset + take, :2]
+        stored_truth = np.asarray(partition_truth[:take, :2])
+        if not np.array_equal(stored_truth, expected_truth, equal_nan=True):
+            raise ValueError(
+                f"Truth rows in {truth_path} do not align with the loaded case prefix"
+            )
+
+        for local_start in range(0, take, block_size):
+            local_end = min(take, local_start + block_size)
+            draws = np.asarray(samples[mode, local_start:local_end, :, :2])
+            targets = expected_truth[local_start:local_end]
+            ranks = np.full(targets.shape, np.nan, dtype=np.float64)
+            block_retained = np.zeros(targets.shape, dtype=np.int64)
+            for component in range(2):
+                truth_bins = shear_pp_bin_indices(targets[:, component])
+                draw_bins = shear_pp_bin_indices(draws[:, :, component])
+                for bin_index in range(len(SHEAR_PP_BIN_EDGES) - 1):
+                    galaxy_mask = truth_bins == bin_index
+                    if not np.any(galaxy_mask):
+                        continue
+                    component_draws = draws[galaxy_mask, :, component]
+                    kept = (
+                        np.isfinite(component_draws)
+                        & (draw_bins[galaxy_mask] == bin_index)
+                    )
+                    n_kept = kept.sum(axis=1)
+                    component_targets = targets[galaxy_mask, component]
+                    n_less = (
+                        (component_draws < component_targets[:, None]) & kept
+                    ).sum(axis=1)
+                    n_equal = (
+                        (component_draws == component_targets[:, None]) & kept
+                    ).sum(axis=1)
+                    component_ranks = np.full(
+                        len(component_targets), np.nan, dtype=np.float64
+                    )
+                    valid = np.isfinite(component_targets) & (n_kept > 0)
+                    component_ranks[valid] = (
+                        n_less[valid] + 0.5 * n_equal[valid] + 0.5
+                    ) / (n_kept[valid] + 1.0)
+                    ranks[galaxy_mask, component] = component_ranks
+                    block_retained[galaxy_mask, component] = n_kept
+            start = offset + local_start
+            stop = offset + local_end
+            pit[start:stop] = ranks
+            retained[start:stop] = block_retained
+        offset += take
+        del samples, partition_truth
+
+    if offset != len(truth):
+        raise ValueError(
+            f"Sample cache contains {offset} galaxies, but report case has {len(truth)}"
+        )
+    return {
+        "g1": pit[:, 0],
+        "g2": pit[:, 1],
+        "g1_retained": retained[:, 0],
+        "g2_retained": retained[:, 1],
     }
 
 
@@ -376,6 +540,29 @@ def binned(x: np.ndarray, y: np.ndarray, bins: int):
     return np.asarray(center), np.asarray(mean), np.asarray(error)
 
 
+def quantile_binned(x: np.ndarray, y: np.ndarray, bins: int):
+    """Bin finite pairs into nearly equal-count bins and return mean +/- SEM."""
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.shape != y.shape:
+        raise ValueError("x and y must have matching shapes")
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    if len(x) < 2:
+        return (np.array([], dtype=float),) * 3
+    n_bins = min(bins, len(x) // 2)
+    groups = np.array_split(np.argsort(x, kind="stable"), n_bins)
+    center = np.asarray([np.mean(x[group]) for group in groups])
+    mean = np.asarray([np.mean(y[group]) for group in groups])
+    error = np.asarray(
+        [np.std(y[group], ddof=1) / np.sqrt(len(group)) for group in groups]
+    )
+    return center, mean, error
+
+
 def fig_data_uri(fig) -> str:
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=135, bbox_inches="tight")
@@ -452,6 +639,228 @@ def galaxy_frame_figure(case: dict, bins: int) -> str:
             axis.axhline(0, color="black", ls="--", lw=0.8)
             axis.legend()
     fig.suptitle(f"{case['case']} — clockwise galaxy frame")
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def nuisance_correlation_figure(case: dict, bins: int) -> str:
+    """Plot Mean galaxy-frame shear residuals versus nuisance errors."""
+    try:
+        estimate = case["estimates"]["Mean"]
+    except KeyError as exc:
+        raise ValueError("nuisance plots require the Mean estimator") from exc
+    truth = case["truth"]
+    true_components, estimate_components = galaxy_frame_components(truth, estimate)
+    residuals = tuple(
+        estimated - target
+        for target, estimated in zip(true_components, estimate_components)
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=True)
+    for axis, (nuisance, index) in zip(axes, NUISANCE_INDICES.items()):
+        nuisance_error = estimate[:, index] - truth[:, index]
+        for component, residual, label in zip(
+            ("g+", "gx"),
+            residuals,
+            (r"$g_+$ (E)", r"$g_\times$ (B)"),
+        ):
+            x, y, error = quantile_binned(nuisance_error, residual, bins)
+            errorbar = axis.errorbar(
+                x,
+                y,
+                yerr=error,
+                marker="o",
+                ms=3,
+                lw=1,
+                label="_nolegend_",
+                color=GALAXY_COMPONENT_COLORS[component],
+            )
+            errorbar.lines[0].set_label(label)
+        axis.axhline(0, color="black", ls="--", lw=0.8)
+        axis.axvline(0, color="0.5", ls=":", lw=0.8)
+        axis.set_title(nuisance)
+        axis.set_xlabel(NUISANCE_LABELS[nuisance])
+        axis.set_ylabel("shear estimate - truth")
+        axis.legend()
+    fig.suptitle(
+        f"{case['case']} — Mean galaxy-frame shear residual vs nuisance error"
+    )
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def posterior_pp_curve(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return sorted finite PIT values, their ECDF, and the KS distance."""
+    values = np.asarray(values, dtype=float)
+    values = np.sort(values[np.isfinite(values)])
+    if np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("posterior PIT values must lie in [0, 1]")
+    if not len(values):
+        return values, np.array([], dtype=float), float("nan")
+    empirical = np.arange(1, len(values) + 1, dtype=float) / len(values)
+    lower = np.arange(len(values), dtype=float) / len(values)
+    distance = float(
+        max(np.max(empirical - values), np.max(values - lower))
+    )
+    return values, empirical, distance
+
+
+def shear_pp_bin_indices(
+    values: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
+) -> np.ndarray:
+    """Assign values to half-open shear bins, closing the final interval.
+
+    Values within a few source-dtype ulps of any edge are snapped to that edge
+    before assignment. This keeps float32 cached values and float64 report
+    edges from disagreeing about boundary ownership.
+    """
+    raw_values = np.asarray(values)
+    values = np.asarray(raw_values, dtype=float)
+    edges = np.asarray(edges, dtype=float)
+    if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
+        raise ValueError("shear P-P bin edges must be strictly increasing")
+    dtype_epsilon = (
+        np.finfo(raw_values.dtype).eps
+        if np.issubdtype(raw_values.dtype, np.floating)
+        else np.finfo(float).eps
+    )
+    endpoint_tolerance = 4.0 * dtype_epsilon * max(1.0, np.max(np.abs(edges)))
+    snapped = values.copy()
+    for edge in edges:
+        snapped[np.abs(snapped - edge) <= endpoint_tolerance] = edge
+
+    finite_inside = (
+        np.isfinite(snapped)
+        & (snapped >= edges[0])
+        & (snapped <= edges[-1])
+    )
+    assigned = np.searchsorted(edges, snapped, side="right") - 1
+    assigned[snapped == edges[-1]] = len(edges) - 2
+    valid_assignment = finite_inside & (assigned >= 0) & (assigned < len(edges) - 1)
+    result = np.full(values.shape, -1, dtype=np.int8)
+    result[valid_assignment] = assigned[valid_assignment]
+    return result
+
+
+def shear_pp_bin_masks(
+    truth: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
+) -> list[np.ndarray]:
+    """Return non-overlapping true-shear masks with a closed final interval."""
+    truth = np.asarray(truth)
+    if truth.ndim != 1:
+        raise ValueError("true shear must be one-dimensional")
+    indices = shear_pp_bin_indices(truth, edges)
+    return [indices == index for index in range(len(edges) - 1)]
+
+
+def posterior_pp_figure(pits: dict[str, np.ndarray], truth: np.ndarray) -> str:
+    """Plot prior-matched g1/g2 rank ECDFs in fixed true-shear bins."""
+    truth = np.asarray(truth)
+    if truth.ndim != 2 or truth.shape[1] < 2:
+        raise ValueError("truth must have shape (galaxy, feature>=2)")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharex=True, sharey=True)
+    grid = np.linspace(0.0, 1.0, 501)
+    colors = ("tab:blue", "tab:green", "tab:red")
+    for component_index, (axis, component) in enumerate(zip(axes, ("g1", "g2"))):
+        if component not in pits:
+            raise KeyError(f"Missing posterior PIT values for {component}")
+        component_pits = np.asarray(pits[component], dtype=float)
+        if component_pits.shape != (len(truth),):
+            raise ValueError(
+                f"{component} PIT values must have shape ({len(truth)},)"
+            )
+        retained_key = f"{component}_retained"
+        if retained_key not in pits:
+            raise KeyError(f"Missing retained-draw counts for {component}")
+        component_retained = np.asarray(pits[retained_key])
+        if component_retained.shape != (len(truth),):
+            raise ValueError(
+                f"{component} retained counts must have shape ({len(truth)},)"
+            )
+        curves = []
+        masks = shear_pp_bin_masks(truth[:, component_index])
+        for bin_index, mask in enumerate(masks):
+            values, empirical, distance = posterior_pp_curve(component_pits[mask])
+            retained_in_bin = component_retained[mask]
+            finite_rank = np.isfinite(component_pits[mask])
+            median_retained = (
+                float(np.median(retained_in_bin[finite_rank]))
+                if np.any(finite_rank)
+                else float("nan")
+            )
+            zero_retained = int(np.count_nonzero(retained_in_bin == 0))
+            curves.append(
+                (
+                    bin_index,
+                    values,
+                    empirical,
+                    distance,
+                    int(np.count_nonzero(mask)),
+                    median_retained,
+                    zero_retained,
+                )
+            )
+
+        nonempty_sizes = [
+            len(values) for _, values, _, _, _, _, _ in curves if len(values)
+        ]
+        for (
+            bin_index,
+            values,
+            empirical,
+            distance,
+            total,
+            median_retained,
+            zero_retained,
+        ) in curves:
+            lower = SHEAR_PP_BIN_EDGES[bin_index]
+            upper = SHEAR_PP_BIN_EDGES[bin_index + 1]
+            closing = "]" if bin_index == len(curves) - 1 else ")"
+            interval = f"[{lower:+.4f}, {upper:+.4f}{closing}"
+            n = len(values)
+            label = f"true {component} in {interval}; N={n:,}/{total:,}"
+            if n:
+                label += (
+                    f", median retained={median_retained:,.0f}, "
+                    f"zero retained={zero_retained:,}, KS D={distance:.3f}"
+                )
+                epsilon = np.sqrt(np.log(2.0 / 0.05) / (2.0 * n))
+                axis.fill_between(
+                    grid,
+                    np.maximum(0.0, grid - epsilon),
+                    np.minimum(1.0, grid + epsilon),
+                    color=colors[bin_index],
+                    alpha=0.08,
+                )
+            axis.step(
+                values,
+                empirical,
+                where="post",
+                color=colors[bin_index],
+                lw=1.4,
+                label=label,
+            )
+        if not nonempty_sizes:
+            axis.text(
+                0.5,
+                0.5,
+                "No finite posterior ranks in requested shear range",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+        included = np.logical_or.reduce(masks)
+        excluded = int(np.count_nonzero(np.isfinite(truth[:, component_index]) & ~included))
+        suffix = f"; {excluded} outside range" if excluded else ""
+        axis.set_title(f"{component}{suffix}")
+        axis.plot(grid, grid, color="black", ls="--", lw=0.9, label="Uniform")
+        axis.set_xlim(0.0, 1.0)
+        axis.set_ylim(0.0, 1.0)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_xlabel("Restricted-posterior quantile")
+        axis.legend(loc="upper left", fontsize="x-small")
+    axes[0].set_ylabel("Fraction of truths below quantile")
+    fig.suptitle("Prior-matched conditional posterior P-P diagnostic")
     fig.tight_layout()
     return fig_data_uri(fig)
 
@@ -635,6 +1044,32 @@ def main():
             for row in estimator_rows:
                 row["estimator"] = estimator
             coverage.extend(estimator_rows)
+        try:
+            shear_pits = load_shear_pit_values(case, args.mode)
+            pp_section = (
+                "<h3>Prior-matched conditional posterior P-P diagnostic</h3>"
+                "<p>These curves use the raw posterior draws for the selected "
+                "cache mode. For each component, the truth selects one of three "
+                "equal-width intervals from -0.1 to 0.1, and that component's "
+                "posterior draws are restricted to the same true-shear interval "
+                "and renormalized before computing the finite-sample midpoint "
+                "rank. Other parameters are not restricted. This matches the "
+                "posterior and truth-generating prior within each bin, so an exact "
+                "posterior should follow the diagonal. The legend reports the "
+                "median retained draws per galaxy; a galaxy with zero retained "
+                "draws has no rank and is excluded from its curve. "
+                "Each faint 95% DKW band uses that bin's finite galaxy count and "
+                "represents galaxy-sampling uncertainty only, not posterior Monte "
+                "Carlo error. Exact-D4 draws are balanced across group components "
+                "rather than independent.</p>"
+                f"<img src=\"{posterior_pp_figure(shear_pits, case['truth'])}\" "
+                "alt=\"g1 and g2 posterior P-P calibration\">"
+            )
+        except (PosteriorPPUnavailable, FileNotFoundError) as exc:
+            pp_section = (
+                "<h3>Prior-matched conditional posterior P-P diagnostic</h3>"
+                f"<p class=\"note\">{html.escape(str(exc))}</p>"
+            )
         support_section = ""
         if case["support_retention"] is not None:
             manifest = case["support_manifest"]
@@ -674,14 +1109,19 @@ def main():
             + "<h3>Coupled nuisance-error diagnostic</h3>"
             + "<p>Pearson correlations compare each galaxy-frame shear residual "
             + "with the same estimator's nuisance-parameter error. They are "
-            + "descriptive associations, not evidence of causation.</p>"
+            + "descriptive associations, not evidence of causation. The three "
+            + "plots show only the primary Mean estimator, with equal-count bins "
+            + "and unscaled physical shear residuals.</p>"
             + correlations_table(correlations)
+            + f"<img src=\"{nuisance_correlation_figure(case, args.bins)}\" "
+            + "alt=\"Mean galaxy-frame shear residuals versus nuisance errors\">"
             + "<h3>Posterior interval coverage</h3>"
             + "<p>Coverage uses each available estimator's cached 16th/84th "
             + "percentiles. The theta interval is evaluated circularly across the "
             + "-pi/pi seam. In-support coverage, when present, describes the "
             + "diagnostically truncated draws rather than the original posterior.</p>"
             + coverage_table(coverage)
+            + pp_section
             + "</section>"
         )
     generated = datetime.now(timezone.utc).isoformat()
@@ -697,7 +1137,10 @@ th {{ background: #f1f3f4; }} img {{ max-width: 100%; height: auto; }}
 code {{ overflow-wrap: anywhere; }}
 </style></head><body>
 <h1>KL-NN shear-bias diagnostics</h1>
-<p>Generated {generated}. This report reads only compact truth/SNR/MAP/mean summaries and is designed for a 4 GB CPU job.</p>
+<p>Generated {generated}. Most diagnostics use compact truth/SNR/MAP/mean
+summaries. The P-P diagnostic streams memory-mapped g1/g2 posterior draws
+partition by partition and never concatenates the raw sample bank, keeping the
+report suitable for a 4 GB CPU job.</p>
 <section><h2>Estimator and cache provenance</h2>
 <p>This report evaluates the point estimates and posterior summaries already
 stored in each requested cache. It does not apply an additional symmetry,

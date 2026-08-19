@@ -2,15 +2,16 @@
 """Build a self-contained shear-bias report from cached posterior products.
 
 Most diagnostics use the compact truth, SNR, MAP, and posterior-summary
-arrays. The shear P-P diagnostic memory-maps posterior sample partitions and
-reduces only g1/g2 in small galaxy blocks; it never concatenates the raw sample
-bank in memory.
+arrays. The shear P-P and theta-modality diagnostics memory-map posterior
+sample partitions and reduce small galaxy blocks; they never concatenate the
+raw sample bank in memory.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import html
 import io
 import json
@@ -39,6 +40,11 @@ SINI_CUTS = (0.3, 0.5, 0.7, np.inf)
 ADDITIVE_DISPLAY_SCALE = 1e4
 MULTIPLICATIVE_DISPLAY_SCALE = 1e2
 SHEAR_PP_BIN_EDGES = np.linspace(-0.1, 0.1, 4)
+THETA_HISTOGRAM_BINS = 72
+THETA_BRANCH_HALF_WIDTH = np.pi / 4.0
+THETA_MODE_MIN_HEIGHT_RATIO = 0.10
+THETA_MODE_MIN_PROMINENCE_RATIO = 0.05
+THETA_MODE_PROMINENCE_RADIUS = 4
 FEATURE_NAMES = (
     "g1",
     "g2",
@@ -56,6 +62,7 @@ NUISANCE_LABELS = {
     "hlr": "hlr estimate - truth [arcsec]",
 }
 GALAXY_COMPONENT_COLORS = {"g+": "tab:red", "gx": "tab:blue"}
+SHEAR_COMPONENT_COLORS = {"g1": "tab:blue", "g2": "tab:orange"}
 ESTIMATOR_COLORS = {
     "MAP": "tab:blue",
     "Mean": "tab:orange",
@@ -65,6 +72,10 @@ ESTIMATOR_COLORS = {
 
 class PosteriorPPUnavailable(RuntimeError):
     """Raised when cached draws cannot represent the reported posterior."""
+
+
+class ConditionalDiagnosticUnavailable(RuntimeError):
+    """Raised when a cache lacks metadata required by conditional m/c plots."""
 
 
 def parse_args():
@@ -84,6 +95,18 @@ def parse_args():
     parser.add_argument("--mode", type=int, default=0, help="TF-analysis mode index.")
     parser.add_argument("--low-g", type=float, default=0.02)
     parser.add_argument("--bins", type=int, default=20)
+    parser.add_argument(
+        "--conditional-bins",
+        type=int,
+        default=10,
+        help="Equal-count bins for conditional Mean m/c diagnostics.",
+    )
+    parser.add_argument(
+        "--sample-root",
+        type=Path,
+        default=Path("/ocean/projects/phy250048p/shared/samples"),
+        help="Sample-table root used to recover archived simulator-v2 truths.",
+    )
     parser.add_argument(
         "--max-galaxies",
         type=int,
@@ -190,6 +213,136 @@ def load_case(
             if support_retention is not None
             else None
         ),
+    }
+
+
+def _load_optional_case_array(case: dict, data_type: str) -> np.ndarray | None:
+    directory = Path(case["root"]) / data_type
+    if not directory.is_dir():
+        return None
+    values = np.asarray(load_concat(directory, axis=0))
+    values = values[: len(case["truth"])]
+    if values.shape != (len(case["truth"]),):
+        raise ConditionalDiagnosticUnavailable(
+            f"Cached {data_type} has shape {values.shape}; expected "
+            f"({len(case['truth'])},)"
+        )
+    return values.astype(float, copy=False)
+
+
+def _archived_sample_column(
+    case: dict,
+    sample_root: Path,
+    column: str,
+) -> np.ndarray:
+    """Load one truth column from the exact sample rows named by cache metadata."""
+    root = Path(case["root"])
+    n_galaxies = len(case["truth"])
+    ranges = []
+    sample_sets = set()
+    remaining = n_galaxies
+    for truth_path in partition_files(root / "truth"):
+        if remaining <= 0:
+            break
+        meta_path = root / "meta" / truth_path.with_suffix(".json").name
+        try:
+            payload = json.loads(meta_path.read_text())
+            sample_set = payload["args"]["sample_set"]
+            start = int(payload["galaxy_range"]["start"])
+            end = int(payload["galaxy_range"]["end"])
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConditionalDiagnosticUnavailable(
+                f"Cannot recover {column}: invalid cache metadata {meta_path}"
+            ) from exc
+        if end <= start:
+            raise ConditionalDiagnosticUnavailable(
+                f"Cannot recover {column}: empty galaxy range in {meta_path}"
+            )
+        take = min(end - start, remaining)
+        ranges.append((start, start + take))
+        sample_sets.add(str(sample_set))
+        remaining -= take
+    if remaining:
+        raise ConditionalDiagnosticUnavailable(
+            f"Cannot recover {column}: cache metadata covers only "
+            f"{n_galaxies - remaining} of {n_galaxies} report rows"
+        )
+    if len(sample_sets) != 1:
+        raise ConditionalDiagnosticUnavailable(
+            f"Cannot recover {column}: partitions name multiple sample sets"
+        )
+    sample_path = Path(next(iter(sample_sets)))
+    if not sample_path.is_absolute():
+        sample_path = Path(sample_root) / sample_path
+    if not sample_path.is_file():
+        raise ConditionalDiagnosticUnavailable(
+            f"Cannot recover {column}: sample table not found at {sample_path}"
+        )
+
+    requested = {
+        index
+        for start, end in ranges
+        for index in range(start, end)
+    }
+    rows = {}
+    with sample_path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = set(FEATURE_NAMES) | {column}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ConditionalDiagnosticUnavailable(
+                f"Sample table {sample_path} lacks columns {sorted(missing)}"
+            )
+        for index, row in enumerate(reader):
+            if index in requested:
+                rows[index] = row
+            if len(rows) == len(requested):
+                break
+    missing_rows = requested - set(rows)
+    if missing_rows:
+        raise ConditionalDiagnosticUnavailable(
+            f"Sample table {sample_path} is missing {len(missing_rows)} requested rows"
+        )
+    ordered_indices = [
+        index
+        for start, end in ranges
+        for index in range(start, end)
+    ]
+    archived_truth = np.asarray(
+        [[float(rows[index][name]) for name in FEATURE_NAMES] for index in ordered_indices]
+    )
+    if not np.allclose(
+        archived_truth,
+        np.asarray(case["truth"]),
+        rtol=2e-5,
+        atol=2e-6,
+    ):
+        raise ConditionalDiagnosticUnavailable(
+            f"Sample table {sample_path} does not align with cached truth rows"
+        )
+    return np.asarray([float(rows[index][column]) for index in ordered_indices])
+
+
+def load_conditional_diagnostic_axes(case: dict, sample_root: Path) -> dict:
+    """Return authoritative conditioning variables for the Mean m/c plots."""
+    magnitude = _load_optional_case_array(case, "rmag_true")
+    if magnitude is None:
+        magnitude = _archived_sample_column(case, sample_root, "rmag_true")
+    spectral_snr = _load_optional_case_array(case, "spectral_quality")
+    if spectral_snr is None:
+        raise ConditionalDiagnosticUnavailable(
+            "cache has no spectral_quality array; reference spectral SNR is unavailable"
+        )
+    if not np.all(np.isfinite(magnitude)):
+        raise ConditionalDiagnosticUnavailable("true magnitude contains non-finite values")
+    if not np.all(np.isfinite(spectral_snr) & (spectral_snr > 0.0)):
+        raise ConditionalDiagnosticUnavailable(
+            "reference spectral SNR must be finite and positive"
+        )
+    return {
+        "rmag_true": magnitude,
+        "spectral_snr": spectral_snr,
+        "hlr_true": np.asarray(case["truth"][:, 7], dtype=float),
     }
 
 
@@ -341,6 +494,198 @@ def load_shear_pit_values(
         "g1_retained": retained[:, 0],
         "g2_retained": retained[:, 1],
     }
+
+
+def _smooth_circular_histogram(histogram: np.ndarray) -> np.ndarray:
+    """Smooth a one-dimensional circular histogram without SciPy."""
+    histogram = np.asarray(histogram, dtype=float)
+    if histogram.ndim != 1 or len(histogram) < 9:
+        raise ValueError("circular histogram must be one-dimensional with >=9 bins")
+    smoothed = histogram
+    for _ in range(2):
+        smoothed = (
+            np.roll(smoothed, 2)
+            + 4.0 * np.roll(smoothed, 1)
+            + 6.0 * smoothed
+            + 4.0 * np.roll(smoothed, -1)
+            + np.roll(smoothed, -2)
+        ) / 16.0
+    return smoothed
+
+
+def significant_circular_modes(histogram: np.ndarray) -> np.ndarray:
+    """Return diagnostic peak indices in a smoothed circular histogram.
+
+    A peak must reach ten percent of the tallest peak and rise by five percent
+    of that height above the lowest bin on both sides within four bins. These
+    fixed thresholds reject sampling ripples and nearly uniform posteriors;
+    the resulting count is descriptive, not a formal model-selection test.
+    """
+    smoothed = _smooth_circular_histogram(histogram)
+    maximum = float(np.max(smoothed))
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        return np.array([], dtype=int)
+    candidates = np.flatnonzero(
+        (smoothed > np.roll(smoothed, 1))
+        & (smoothed >= np.roll(smoothed, -1))
+        & (smoothed >= THETA_MODE_MIN_HEIGHT_RATIO * maximum)
+    )
+    selected = []
+    for peak in candidates:
+        left_minimum = min(
+            smoothed[(peak - offset) % len(smoothed)]
+            for offset in range(1, THETA_MODE_PROMINENCE_RADIUS + 1)
+        )
+        right_minimum = min(
+            smoothed[(peak + offset) % len(smoothed)]
+            for offset in range(1, THETA_MODE_PROMINENCE_RADIUS + 1)
+        )
+        prominence = smoothed[peak] - max(left_minimum, right_minimum)
+        if prominence >= THETA_MODE_MIN_PROMINENCE_RATIO * maximum:
+            selected.append(int(peak))
+    return np.asarray(selected, dtype=int)
+
+
+def load_theta_posterior_diagnostics(
+    case: dict,
+    mode: int,
+    block_size: int = 64,
+    histogram_bins: int = THETA_HISTOGRAM_BINS,
+) -> dict:
+    """Stream directed theta bias and posterior-modality diagnostics.
+
+    Theta is treated as a directed spin-1 angle on a 2*pi domain. The opposite
+    branch at theta+pi is deliberately not folded onto the truth. Each galaxy
+    contributes unit total weight to the two-dimensional density.
+    """
+    if block_size <= 0:
+        raise ValueError("theta diagnostic block_size must be positive")
+    if histogram_bins < 9:
+        raise ValueError("theta diagnostic requires at least 9 histogram bins")
+    truth = np.asarray(case["truth"])
+    if truth.ndim != 2 or truth.shape[1] < 3:
+        raise ValueError("case truth must have shape (galaxy, feature>=3)")
+    root = Path(case["root"])
+    sample_files = partition_files(root / "sample")
+    theta_truth = np.asarray(truth[:, 2], dtype=float)
+    n_galaxies = len(theta_truth)
+    result = {
+        "directional_mean": np.full(n_galaxies, np.nan),
+        "axial_mean": np.full(n_galaxies, np.nan),
+        "directional_resultant": np.full(n_galaxies, np.nan),
+        "axial_resultant": np.full(n_galaxies, np.nan),
+        "true_branch_mass": np.full(n_galaxies, np.nan),
+        "opposite_branch_mass": np.full(n_galaxies, np.nan),
+        "middle_mass": np.full(n_galaxies, np.nan),
+        "mode_count": np.zeros(n_galaxies, dtype=np.int16),
+    }
+    aggregate_histogram = np.zeros(histogram_bins, dtype=np.int64)
+    truth_residual_density = np.zeros(
+        (histogram_bins, histogram_bins), dtype=float
+    )
+    angle_edges = np.linspace(-np.pi, np.pi, histogram_bins + 1)
+    offset = 0
+    for sample_path in sample_files:
+        samples = np.load(sample_path, mmap_mode="r")
+        truth_path = root / "truth" / sample_path.name
+        partition_truth = np.load(truth_path, mmap_mode="r")
+        if samples.ndim != 4 or samples.shape[-1] < 3:
+            raise ValueError(
+                f"Unexpected posterior sample shape {samples.shape} in {sample_path}"
+            )
+        if not (0 <= mode < samples.shape[0]):
+            raise IndexError(
+                f"Mode {mode} outside [0, {samples.shape[0]}) in {sample_path}"
+            )
+        take = min(samples.shape[1], n_galaxies - offset)
+        if take <= 0:
+            break
+        if partition_truth.shape[0] < take or not np.allclose(
+            partition_truth[:take, :3], truth[offset : offset + take, :3]
+        ):
+            raise ValueError(
+                f"Truth rows in {truth_path} do not align with the loaded case prefix"
+            )
+        for local_start in range(0, take, block_size):
+            local_stop = min(take, local_start + block_size)
+            start = offset + local_start
+            stop = offset + local_stop
+            theta = np.asarray(
+                samples[mode, local_start:local_stop, :, 2], dtype=float
+            )
+            finite = np.isfinite(theta)
+            counts = finite.sum(axis=1)
+            sin1 = np.where(finite, np.sin(theta), 0.0).sum(axis=1)
+            cos1 = np.where(finite, np.cos(theta), 0.0).sum(axis=1)
+            sin2 = np.where(finite, np.sin(2.0 * theta), 0.0).sum(axis=1)
+            cos2 = np.where(finite, np.cos(2.0 * theta), 0.0).sum(axis=1)
+            valid = counts > 0
+            directional_mean = np.full(local_stop - local_start, np.nan)
+            axial_mean = np.full(local_stop - local_start, np.nan)
+            directional_resultant = np.full(local_stop - local_start, np.nan)
+            axial_resultant = np.full(local_stop - local_start, np.nan)
+            directional_mean[valid] = np.arctan2(sin1[valid], cos1[valid])
+            axial_mean[valid] = 0.5 * np.arctan2(sin2[valid], cos2[valid])
+            directional_resultant[valid] = np.hypot(
+                sin1[valid], cos1[valid]
+            ) / counts[valid]
+            axial_resultant[valid] = np.hypot(
+                sin2[valid], cos2[valid]
+            ) / counts[valid]
+            result["directional_mean"][start:stop] = directional_mean
+            result["axial_mean"][start:stop] = axial_mean
+            result["directional_resultant"][start:stop] = directional_resultant
+            result["axial_resultant"][start:stop] = axial_resultant
+
+            residual = wrap_angle(theta - theta_truth[start:stop, None])
+            finite_residual = np.isfinite(residual)
+            absolute_residual = np.abs(residual)
+            primary = finite_residual & (
+                absolute_residual < THETA_BRANCH_HALF_WIDTH
+            )
+            opposite = finite_residual & (
+                absolute_residual > np.pi - THETA_BRANCH_HALF_WIDTH
+            )
+            middle = finite_residual & ~(primary | opposite)
+            for key, mask in (
+                ("true_branch_mass", primary),
+                ("opposite_branch_mass", opposite),
+                ("middle_mass", middle),
+            ):
+                values = np.full(local_stop - local_start, np.nan)
+                values[valid] = mask.sum(axis=1)[valid] / counts[valid]
+                result[key][start:stop] = values
+
+            for local_index in range(local_stop - local_start):
+                row = residual[local_index, finite_residual[local_index]]
+                if not len(row):
+                    continue
+                histogram = np.histogram(row, bins=angle_edges)[0]
+                galaxy_index = start + local_index
+                result["mode_count"][galaxy_index] = len(
+                    significant_circular_modes(histogram)
+                )
+                aggregate_histogram += histogram
+                truth_bin = np.searchsorted(
+                    angle_edges, theta_truth[galaxy_index], side="right"
+                ) - 1
+                truth_bin = int(np.clip(truth_bin, 0, histogram_bins - 1))
+                truth_residual_density[truth_bin] += histogram / histogram.sum()
+        offset += take
+        del samples, partition_truth
+
+    if offset != n_galaxies:
+        raise ValueError(
+            f"Sample cache contains {offset} galaxies, but report case has "
+            f"{n_galaxies}"
+        )
+    result["aggregate_histogram"] = aggregate_histogram
+    result["aggregate_mode_indices"] = significant_circular_modes(
+        aggregate_histogram
+    )
+    result["truth_residual_density"] = truth_residual_density
+    result["angle_edges"] = angle_edges
+    return result
 
 
 def fit_design(y: np.ndarray, design: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -563,6 +908,124 @@ def quantile_binned(x: np.ndarray, y: np.ndarray, bins: int):
     return center, mean, error
 
 
+def conditional_shear_calibration(
+    case: dict,
+    conditioning: dict,
+    bins: int,
+) -> dict:
+    """Fit residual = c + m*g across the full shear range in condition bins."""
+    if bins <= 0:
+        raise ValueError("conditional bins must be positive")
+    try:
+        estimate = np.asarray(case["estimates"]["Mean"], dtype=float)
+    except KeyError as exc:
+        raise ConditionalDiagnosticUnavailable(
+            "conditional m/c plots require the Mean estimator"
+        ) from exc
+    truth = np.asarray(case["truth"], dtype=float)
+    if estimate.shape != truth.shape or truth.ndim != 2 or truth.shape[1] < 8:
+        raise ValueError("Mean estimates and truth must have matching (N, feature>=8) shapes")
+
+    curves = {}
+    for variable, values in conditioning.items():
+        values = np.asarray(values, dtype=float)
+        if values.shape != (len(truth),):
+            raise ValueError(
+                f"conditioning variable {variable!r} has shape {values.shape}; "
+                f"expected ({len(truth)},)"
+            )
+        component_curves = {}
+        for component, index in (("g1", 0), ("g2", 1)):
+            target = truth[:, index]
+            residual = estimate[:, index] - target
+            finite = np.isfinite(values) & np.isfinite(target) & np.isfinite(residual)
+            order = np.flatnonzero(finite)
+            order = order[np.argsort(values[order], kind="stable")]
+            if len(order) < 3:
+                raise ConditionalDiagnosticUnavailable(
+                    f"too few finite rows for {component} versus {variable}"
+                )
+            groups = np.array_split(order, min(bins, len(order) // 3))
+            rows = []
+            for group in groups:
+                design = np.column_stack(
+                    [np.ones(len(group)), target[group]]
+                )
+                if len(group) < 3 or np.linalg.matrix_rank(design) < 2:
+                    continue
+                coefficient, uncertainty = fit_design(residual[group], design)
+                rows.append(
+                    (
+                        float(np.mean(values[group])),
+                        float(coefficient[1]),
+                        float(uncertainty[1]),
+                        float(coefficient[0]),
+                        float(uncertainty[0]),
+                        len(group),
+                    )
+                )
+            if not rows:
+                raise ConditionalDiagnosticUnavailable(
+                    f"no identifiable bins for {component} versus {variable}"
+                )
+            data = np.asarray(rows, dtype=float)
+            component_curves[component] = {
+                "x": data[:, 0],
+                "m": data[:, 1],
+                "m_se": data[:, 2],
+                "c": data[:, 3],
+                "c_se": data[:, 4],
+                "n": data[:, 5].astype(int),
+            }
+        curves[variable] = component_curves
+    return curves
+
+
+def conditional_shear_calibration_figure(case: dict, curves: dict) -> str:
+    """Plot Mean multiplicative and additive calibration versus three truths."""
+    variables = (
+        ("rmag_true", "true r magnitude", False),
+        ("spectral_snr", "spectral SNR (reference quality)", True),
+        ("hlr_true", "true hlr [arcsec]", False),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    for column, (variable, label, logarithmic) in enumerate(variables):
+        if variable not in curves:
+            raise ValueError(f"missing conditional calibration variable {variable!r}")
+        for component in ("g1", "g2"):
+            curve = curves[variable][component]
+            for row, statistic, uncertainty, scale in (
+                (0, "m", "m_se", MULTIPLICATIVE_DISPLAY_SCALE),
+                (1, "c", "c_se", ADDITIVE_DISPLAY_SCALE),
+            ):
+                container = axes[row, column].errorbar(
+                    curve["x"],
+                    scale * curve[statistic],
+                    yerr=scale * curve[uncertainty],
+                    marker="o",
+                    ms=3,
+                    lw=1,
+                    label=component,
+                    color=SHEAR_COMPONENT_COLORS[component],
+                )
+                container.lines[0].set_label(component)
+        for row in range(2):
+            axes[row, column].axhline(0.0, color="black", ls="--", lw=0.8)
+            axes[row, column].set_xlabel(label)
+            if logarithmic:
+                axes[row, column].set_xscale("log")
+        axes[0, column].set_title(f"m vs {label}")
+        axes[1, column].set_title(f"c vs {label}")
+    axes[0, 0].set_ylabel(r"$10^2 m$")
+    axes[1, 0].set_ylabel(r"$10^4 c$")
+    axes[0, 0].legend()
+    fig.suptitle(
+        f"{case['case']} — Mean conditional full-range shear calibration"
+    )
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
 def fig_data_uri(fig) -> str:
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=135, bbox_inches="tight")
@@ -603,6 +1066,114 @@ def bias_figure(case: dict, bins: int) -> str:
     axes[1, 0].set_xlabel("theta_int [rad]")
     axes[1, 1].set_xlabel("theta_int [rad]")
     fig.suptitle(case["case"])
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def theta_modality_table(diagnostic: dict) -> str:
+    """Summarize directed theta branch masses and diagnostic mode counts."""
+    primary = np.asarray(diagnostic["true_branch_mass"], dtype=float)
+    opposite = np.asarray(diagnostic["opposite_branch_mass"], dtype=float)
+    middle = np.asarray(diagnostic["middle_mass"], dtype=float)
+    modes = np.asarray(diagnostic["mode_count"])
+    finite = np.isfinite(primary) & np.isfinite(opposite) & np.isfinite(middle)
+    if not np.any(finite):
+        return '<p class="note">No finite theta posterior draws.</p>'
+    primary = primary[finite]
+    opposite = opposite[finite]
+    middle = middle[finite]
+    modes = modes[finite]
+    antipodal = (primary >= 0.15) & (opposite >= 0.15)
+    opposite_dominant = opposite > primary
+    aggregate_modes = len(diagnostic["aggregate_mode_indices"])
+    body = (
+        f"<tr><td>{np.median(primary):.3f}</td>"
+        f"<td>{np.median(opposite):.3f}</td>"
+        f"<td>{np.median(middle):.3f}</td>"
+        f"<td>{100.0 * np.mean(antipodal):.1f}%</td>"
+        f"<td>{100.0 * np.mean(opposite_dominant):.1f}%</td>"
+        f"<td>{100.0 * np.mean(modes == 1):.1f}%</td>"
+        f"<td>{100.0 * np.mean(modes == 2):.1f}%</td>"
+        f"<td>{100.0 * np.mean(modes >= 3):.1f}%</td>"
+        f"<td>{100.0 * np.mean(modes == 0):.1f}%</td>"
+        f"<td>{aggregate_modes}</td><td>{len(primary):,}</td></tr>"
+    )
+    return (
+        "<table><thead><tr><th>Median true-branch mass</th>"
+        "<th>Median opposite-branch mass</th><th>Median middle mass</th>"
+        "<th>Both branches ≥15%</th><th>Opposite branch dominant</th>"
+        "<th>1 mode</th><th>2 modes</th><th>≥3 modes</th>"
+        "<th>Unresolved/flat</th><th>Aggregate modes</th><th>N</th>"
+        "</tr></thead><tbody>" + body + "</tbody></table>"
+    )
+
+
+def theta_diagnostic_figure(case: dict, diagnostic: dict) -> str:
+    """Plot directed theta point bias and raw posterior residual structure."""
+    truth = np.asarray(case["truth"][:, 2], dtype=float)
+    edges = np.asarray(diagnostic["angle_edges"], dtype=float)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for axis, estimator in zip(axes[0], ("MAP", "Mean")):
+        estimate = case["estimates"].get(estimator)
+        if estimate is None:
+            axis.text(0.5, 0.5, f"{estimator} unavailable", ha="center", va="center")
+        else:
+            residual = wrap_angle(np.asarray(estimate[:, 2], dtype=float) - truth)
+            histogram, x_edges, y_edges = np.histogram2d(
+                truth, residual, bins=(edges, edges)
+            )
+            axis.pcolormesh(
+                x_edges,
+                y_edges,
+                np.log1p(histogram.T),
+                shading="auto",
+                cmap="viridis",
+            )
+        axis.axhline(0.0, color="white", ls="--", lw=0.8)
+        axis.axhline(np.pi, color="white", ls=":", lw=0.8)
+        axis.axhline(-np.pi, color="white", ls=":", lw=0.8)
+        axis.set_title(f"{estimator}: directed residual density")
+        axis.set_xlabel(r"true $\theta_{\rm int}$ [rad]")
+        axis.set_ylabel(r"wrap$_{2\pi}(\hat\theta-\theta)$ [rad]")
+        axis.set_xlim(-np.pi, np.pi)
+        axis.set_ylim(-np.pi, np.pi)
+
+    density = np.asarray(diagnostic["truth_residual_density"], dtype=float)
+    axes[1, 0].pcolormesh(
+        edges,
+        edges,
+        np.log1p(density.T),
+        shading="auto",
+        cmap="magma",
+    )
+    axes[1, 0].axhline(0.0, color="white", ls="--", lw=0.8)
+    axes[1, 0].set_title("Raw posterior: equal galaxy weight")
+    axes[1, 0].set_xlabel(r"true $\theta_{\rm int}$ [rad]")
+    axes[1, 0].set_ylabel(r"wrap$_{2\pi}(\theta^{(s)}-\theta_{\rm true})$ [rad]")
+    axes[1, 0].set_xlim(-np.pi, np.pi)
+    axes[1, 0].set_ylim(-np.pi, np.pi)
+
+    histogram = np.asarray(diagnostic["aggregate_histogram"], dtype=float)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    smoothed = _smooth_circular_histogram(histogram)
+    if smoothed.sum() > 0:
+        smoothed = smoothed / np.trapz(smoothed, centers)
+    axes[1, 1].plot(centers, smoothed, color="black", lw=1.5)
+    for index, peak in enumerate(diagnostic["aggregate_mode_indices"]):
+        axes[1, 1].axvline(
+            centers[peak],
+            color="tab:red",
+            ls="--",
+            lw=0.9,
+            label="significant aggregate mode" if index == 0 else "_nolegend_",
+        )
+    axes[1, 1].axvline(0.0, color="0.4", ls=":", lw=0.8, label="truth branch")
+    axes[1, 1].set_title("Truth-centered posterior residual density")
+    axes[1, 1].set_xlabel("directed theta residual [rad]")
+    axes[1, 1].set_ylabel("density")
+    axes[1, 1].set_xlim(-np.pi, np.pi)
+    axes[1, 1].legend(fontsize="small")
+    fig.suptitle(f"{case['case']} — directed theta bias and modality")
     fig.tight_layout()
     return fig_data_uri(fig)
 
@@ -1037,13 +1608,37 @@ def main():
     sections = []
     for case in cases:
         metrics = compute_metrics(case, args.low_g)
-        galaxy_metrics, correlations = galaxy_frame_diagnostics(case, args.low_g)
+        galaxy_metrics, _ = galaxy_frame_diagnostics(case, args.low_g)
         coverage = []
         for estimator, summary in case["summaries"].items():
             estimator_rows = coverage_metrics(case["truth"], summary)
             for row in estimator_rows:
                 row["estimator"] = estimator
             coverage.extend(estimator_rows)
+        try:
+            theta_diagnostic = load_theta_posterior_diagnostics(case, args.mode)
+            theta_section = (
+                "<h3>Directed theta_int bias and posterior modality</h3>"
+                "<p>This diagnostic treats <code>theta_int</code> as a directed "
+                "spin-1 angle on a 2-pi domain. Residuals are wrapped only at "
+                "+/-pi, so posterior mass at theta+pi remains visible rather "
+                "than being folded onto the truth. The true and opposite "
+                "branches are the +/-pi/4 neighborhoods around residual 0 and "
+                "pi. A galaxy is flagged as antipodally bimodal when each branch "
+                "contains at least 15% of its finite draws. Mode counts come from "
+                "a twice-smoothed 72-bin circular histogram; peaks must reach "
+                "10% of the tallest peak with 5% local prominence. These are "
+                "fixed descriptive thresholds, not formal evidence ratios.</p>"
+                + theta_modality_table(theta_diagnostic)
+                + f"<img src=\"{theta_diagnostic_figure(case, theta_diagnostic)}\" "
+                + "alt=\"directed theta bias and posterior modality\">"
+            )
+        except (FileNotFoundError, IndexError, ValueError) as exc:
+            theta_section = (
+                "<h3>Directed theta_int bias and posterior modality</h3>"
+                f"<p class=\"note\">Theta diagnostic unavailable: "
+                f"{html.escape(str(exc))}</p>"
+            )
         try:
             shear_pits = load_shear_pit_values(case, args.mode)
             pp_section = (
@@ -1089,6 +1684,34 @@ def main():
                 + "</p>"
                 + retention_table(case["support_retention"])
             )
+        try:
+            conditioning = load_conditional_diagnostic_axes(case, args.sample_root)
+            conditional_curves = conditional_shear_calibration(
+                case,
+                conditioning,
+                args.conditional_bins,
+            )
+            conditional_section = (
+                "<h3>Conditional Mean shear calibration</h3>"
+                "<p>Galaxies are divided into equal-count bins of true r-band "
+                "magnitude, cached spectral reference quality, and true "
+                "<code>hlr</code>. Within every bin and detector component, the "
+                "full-range fit is <code>g_hat - g = c + m g</code>; points and "
+                "error bars show the fitted coefficient and its standard error "
+                "for the primary posterior Mean. The spectral x-axis is the "
+                "independently drawn reference SNR-like quality that fixes the "
+                "Gaussian spectral noise level. It is not the achieved H-alpha "
+                "matched-filter SNR, which also depends on line flux and aperture "
+                "throughput.</p>"
+                f"<img src=\"{conditional_shear_calibration_figure(case, conditional_curves)}\" "
+                "alt=\"conditional multiplicative and additive shear calibration\">"
+            )
+        except (ConditionalDiagnosticUnavailable, FileNotFoundError, ValueError) as exc:
+            conditional_section = (
+                "<h3>Conditional Mean shear calibration</h3>"
+                f"<p class=\"note\">Conditional m/c diagnostic unavailable: "
+                f"{html.escape(str(exc))}</p>"
+            )
         sections.append(
             f"<section><h2>{html.escape(case['case'])}</h2>"
             f"<p><b>N:</b> {len(case['truth']):,}; <b>mode index:</b> {args.mode}; "
@@ -1098,6 +1721,8 @@ def main():
             + "<h3>Inclination-cut diagnostic</h3>"
             + cuts_table(metrics)
             + f"<img src=\"{bias_figure(case, args.bins)}\" alt=\"bias diagnostics\">"
+            + conditional_section
+            + theta_section
             + "<h3>Clockwise galaxy-frame E/B diagnostic</h3>"
             + "<p>The transform uses the true <code>theta_int</code>, whose positive "
             + "direction is clockwise in this repository. A nonzero E residual can "
@@ -1106,15 +1731,6 @@ def main():
             + galaxy_metrics_table(galaxy_metrics)
             + f"<img src=\"{galaxy_frame_figure(case, args.bins)}\" "
             + "alt=\"clockwise galaxy-frame residuals versus inclination\">"
-            + "<h3>Coupled nuisance-error diagnostic</h3>"
-            + "<p>Pearson correlations compare each galaxy-frame shear residual "
-            + "with the same estimator's nuisance-parameter error. They are "
-            + "descriptive associations, not evidence of causation. The three "
-            + "plots show only the primary Mean estimator, with equal-count bins "
-            + "and unscaled physical shear residuals.</p>"
-            + correlations_table(correlations)
-            + f"<img src=\"{nuisance_correlation_figure(case, args.bins)}\" "
-            + "alt=\"Mean galaxy-frame shear residuals versus nuisance errors\">"
             + "<h3>Posterior interval coverage</h3>"
             + "<p>Coverage uses each available estimator's cached 16th/84th "
             + "percentiles. The theta interval is evaluated circularly across the "
@@ -1138,9 +1754,9 @@ code {{ overflow-wrap: anywhere; }}
 </style></head><body>
 <h1>KL-NN shear-bias diagnostics</h1>
 <p>Generated {generated}. Most diagnostics use compact truth/SNR/MAP/mean
-summaries. The P-P diagnostic streams memory-mapped g1/g2 posterior draws
-partition by partition and never concatenates the raw sample bank, keeping the
-report suitable for a 4 GB CPU job.</p>
+summaries. The P-P and theta-modality diagnostics stream memory-mapped
+posterior draws partition by partition and never concatenate the raw sample
+bank, keeping the report suitable for a 4 GB CPU job.</p>
 <section><h2>Estimator and cache provenance</h2>
 <p>This report evaluates the point estimates and posterior summaries already
 stored in each requested cache. It does not apply an additional symmetry,

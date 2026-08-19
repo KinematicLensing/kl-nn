@@ -12,6 +12,53 @@ import kl_tools.priors as priors
 from kl_tools.parameters import Pars
 from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
 
+try:
+    from .observation_schema import (
+        FITS_CENTER_EXPOSURE_KEY,
+        FITS_CENTER_FIBER_INDEX_KEY,
+        FITS_FIBER_LAYOUT_KEY,
+        FITS_HALPHA_FLUX_TRUE_KEY,
+        FITS_IMAGE_PIXEL_SCALE_KEY,
+        FITS_IMAGE_PSF_FWHM_KEY,
+        FITS_OBSERVATION_MODEL_VERSION_KEY,
+        FITS_OFFSET_EXPOSURE_KEY,
+        FITS_PHOTOMETRY_BAND_KEY,
+        FITS_RMAG_TRUE_KEY,
+        FITS_SPECTRAL_UNITS_KEY,
+        FITS_TARGET_LINE_KEY,
+        PHOTOMETRY_BAND,
+        SPECTRAL_UNITS,
+        TARGET_EMISSION_LINE,
+        compute_fiber_offsets,
+        configure_sed,
+        resolve_halpha_flux,
+        resolve_observation_model,
+        validate_fiber_layout,
+    )
+except ImportError:  # Support direct execution from data_generate/.
+    from observation_schema import (
+        FITS_CENTER_EXPOSURE_KEY,
+        FITS_CENTER_FIBER_INDEX_KEY,
+        FITS_FIBER_LAYOUT_KEY,
+        FITS_HALPHA_FLUX_TRUE_KEY,
+        FITS_IMAGE_PIXEL_SCALE_KEY,
+        FITS_IMAGE_PSF_FWHM_KEY,
+        FITS_OBSERVATION_MODEL_VERSION_KEY,
+        FITS_OFFSET_EXPOSURE_KEY,
+        FITS_PHOTOMETRY_BAND_KEY,
+        FITS_RMAG_TRUE_KEY,
+        FITS_SPECTRAL_UNITS_KEY,
+        FITS_TARGET_LINE_KEY,
+        PHOTOMETRY_BAND,
+        SPECTRAL_UNITS,
+        TARGET_EMISSION_LINE,
+        compute_fiber_offsets,
+        configure_sed,
+        resolve_halpha_flux,
+        resolve_observation_model,
+        validate_fiber_layout,
+    )
+
 ########################### Parsing arguments ##################################
 parser = ArgumentParser()
 parser.add_argument('-n', type=int, default=1, help='folder id')
@@ -32,6 +79,20 @@ parser.add_argument('-dy_spec', type=float, default=0, help='spec offset in y')
 parser.add_argument('-n_s', type=float, default=1, help='sersic index')
 parser.add_argument('--fiber_perm', type=str, default='0,1,2,3,4',
                     help='comma-separated permutation for the 5 fiber order')
+parser.add_argument('--rmag-true', type=float,
+                    help='true r-band magnitude used by observation model v2')
+parser.add_argument(
+    '--halpha-flux-true',
+    type=float,
+    help=(
+        'integrated observed-frame H-alpha flux in erg/s/cm^2 used by '
+        'observation model v2'
+    ),
+)
+parser.add_argument('--observation-model-version', type=int, choices=(1, 2),
+                    help='versioned observation model (default: legacy v1)')
+parser.add_argument('--fiber-layout', choices=('image_axis', 'galaxy_axis'),
+                    help='fiber cross coordinates (default: image_axis)')
 parser.add_argument('--low_psf', action='store_true', help='if set, use low PSF FWHM of 0.5 arcsec; otherwise use 1.0 arcsec')
 args = parser.parse_args()
 n = args.n
@@ -51,6 +112,15 @@ dx_spec = args.dx_spec
 dy_spec = args.dy_spec
 n_s = args.n_s
 low_psf = args.low_psf
+observation_model_version, rmag_true = resolve_observation_model(
+    args.observation_model_version,
+    args.rmag_true,
+)
+halpha_flux_true = resolve_halpha_flux(
+    observation_model_version,
+    args.halpha_flux_true,
+)
+fiber_layout = validate_fiber_layout(args.fiber_layout)
 fiber_perm = [int(x.strip()) for x in args.fiber_perm.split(',')]
 if len(fiber_perm) != 5 or sorted(fiber_perm) != [0, 1, 2, 3, 4]:
     raise ValueError(f'Invalid --fiber_perm={args.fiber_perm}; expected permutation of 0,1,2,3,4')
@@ -99,26 +169,24 @@ spec_mask = np.array([int(bit) for bit in spec_mask_str])
 Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
-### Calculate fiber offsets due to shear and inclination
-# cosi = np.sqrt(1-sini**2)
-# A = np.array([[1+g1, g2],
-#               [g2, 1-g1]])
-# R = np.array([[np.cos(theta_int), -np.sin(theta_int)],
-#               [np.sin(theta_int), np.cos(theta_int)]])
-# P = np.array([[1, 0],
-#               [0, cosi]])
-# T = np.matmul(A, np.matmul(R, P))
-# U, S, Vh = np.linalg.svd(T)
-# v_ref = T @ np.array([1, 0])
-# if np.dot(U[:, 0], v_ref) < 0:
-#     U *= -1
-offsets = [(fiber_offset*np.cos(0),         fiber_offset*np.sin(0)),
-           (fiber_offset*np.cos(np.pi),   fiber_offset*np.sin(np.pi)),
-           (0,0),
-           (fiber_offset*np.cos(np.pi/2), fiber_offset*np.sin(np.pi/2)),
-           (fiber_offset*np.cos(3*np.pi/2), fiber_offset*np.sin(3*np.pi/2))]
-# offsets = np.matmul(offsets, U)
-# offsets = np.asarray(offsets)[fiber_perm]
+### Calculate fiber offsets in the explicitly selected coordinate system.
+offsets = compute_fiber_offsets(
+    fiber_layout=fiber_layout,
+    fiber_offset=fiber_offset,
+    g1=g1,
+    g2=g2,
+    theta_int=theta_int,
+    sini=sini,
+    fiber_permutation=fiber_perm,
+)
+center_fiber_indices = np.flatnonzero(
+    np.all(np.isclose(offsets, 0.0, atol=1e-12), axis=1)
+)
+if center_fiber_indices.size != 1:
+    raise RuntimeError(
+        "Expected exactly one on-axis fiber after applying the permutation"
+    )
+center_fiber_index = int(center_fiber_indices[0])
 OFFSETX = 1
 
 ### Choose fiber configurations
@@ -138,6 +206,7 @@ for i in range(len(emlines)):
 
 ### Photometry observations
 photometry_band = ['r', 'g', 'z']
+R_BANDPASS = join(KL_TOOLS_DATA_DIR, "Bandpass", "CTIO", "DECam.r.dat")
 sky_levels = [44.54, 19.02, 168.66]
 LS_DR9_exptime = [60, 100, 80]
 PHOT_MASK = 4
@@ -206,6 +275,37 @@ def main():
     sampled_pars_std=np.array([sampled_pars_std_dict[k] for k in sampled_pars])
     sampled_pars_std /= 1000
 
+    base_sed = {
+        'z': redshift,
+        'continuum_type': 'temp',
+        'restframe_temp': join(KL_TOOLS_DATA_DIR, "Simulation", "GSB2.spec"),
+        'temp_wave_type': 'Ang',
+        'temp_flux_type': 'flambda',
+        'cont_norm_method': 'flux',
+        'obs_cont_norm_wave': 850,
+        'obs_cont_norm_flam': 3.0e-17,
+        # Integrated observed-frame line flux [erg s^-1 cm^-2]. V2 replaces
+        # this legacy fixed value with the independently sampled metadata.
+        'em_Ha_flux': 1.2e-16,
+        'em_Ha_sigma': 0.065,
+        'em_O2_flux': 8.8e-17,
+        'em_O2_sigma': [0.065, 0.065],
+        'em_O2_share': [0.45, 0.55],
+        'em_O3_1_flux': 2.4e-17,
+        'em_O3_1_sigma': 0.065,
+        'em_O3_2_flux': 2.8e-17,
+        'em_O3_2_sigma': 0.065,
+        'em_Hb_flux': 1.2e-17,
+        'em_Hb_sigma': 0.065,
+    }
+    sed_config = configure_sed(
+        base_sed,
+        version=observation_model_version,
+        rmag_true=rmag_true,
+        halpha_flux_true=halpha_flux_true,
+        r_bandpass=R_BANDPASS,
+    )
+
     meta_pars = {
         ### priors
         'priors': {
@@ -266,28 +366,8 @@ def main():
             'lambda_unit': 'nm',
         },
         ### SED model
-        # typical values: cont 4e-16, emline 1e-16-1e-15 erg/s/cm2/nm
-        'sed':{
-            'z': redshift,
-            'continuum_type': 'temp',
-            'restframe_temp': join(KL_TOOLS_DATA_DIR, "Simulation", "GSB2.spec"),
-            'temp_wave_type': 'Ang',
-            'temp_flux_type': 'flambda',
-            'cont_norm_method': 'flux',
-            'obs_cont_norm_wave': 850,
-            'obs_cont_norm_flam': 3.0e-17,
-            'em_Ha_flux': 1.2e-16,
-            'em_Ha_sigma': 0.065,
-            'em_O2_flux': 8.8e-17,
-            'em_O2_sigma': [0.065, 0.065],
-            'em_O2_share': [0.45, 0.55],
-            'em_O3_1_flux': 2.4e-17,
-            'em_O3_1_sigma': 0.065,
-            'em_O3_2_flux': 2.8e-17,
-            'em_O3_2_sigma': 0.065,
-            'em_Hb_flux': 1.2e-17,
-            'em_Hb_sigma': 0.065,
-        },
+        # V2 normalizes this continuum by rmag_true and zeroes non-Ha lines.
+        'sed': sed_config,
         ### observation configurations
         'obs_conf': default_obs_conf,
     }
@@ -295,6 +375,26 @@ def main():
      
     fiberlike = FiberLikelihood(pars, None, sampled_theta_fid=sampled_pars_value, pickle_cubes=False)
     datavector = get_GlobalDataVector(0)
+    datavector.header[FITS_OBSERVATION_MODEL_VERSION_KEY] = observation_model_version
+    datavector.header[FITS_PHOTOMETRY_BAND_KEY] = PHOTOMETRY_BAND
+    datavector.header[FITS_TARGET_LINE_KEY] = TARGET_EMISSION_LINE
+    datavector.header[FITS_FIBER_LAYOUT_KEY] = fiber_layout
+    datavector.header[FITS_SPECTRAL_UNITS_KEY] = SPECTRAL_UNITS
+    datavector.header[FITS_CENTER_FIBER_INDEX_KEY] = center_fiber_index
+    datavector.header[FITS_CENTER_EXPOSURE_KEY] = float(
+        default_fiber_conf['EXPTIME']
+    )
+    datavector.header[FITS_OFFSET_EXPOSURE_KEY] = float(
+        exptime_offset * OFFSETX
+    )
+    datavector.header[FITS_IMAGE_PSF_FWHM_KEY] = float(atm_psf_fwhm)
+    datavector.header[FITS_IMAGE_PIXEL_SCALE_KEY] = float(
+        default_photo_conf['PIXSCALE']
+    )
+    if rmag_true is not None:
+        datavector.header[FITS_RMAG_TRUE_KEY] = rmag_true
+    if halpha_flux_true is not None:
+        datavector.header[FITS_HALPHA_FLUX_TRUE_KEY] = halpha_flux_true
     print(f'Dataset {d} #{ID} generated')
     datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)
     

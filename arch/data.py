@@ -98,16 +98,19 @@ def snr_to_abs_mag(snr, z, band='r'):
     abs_mag = app_mag - mu
     return abs_mag
 
-def app_mag_to_snr(app_mag, band='r'):
+def app_mag_to_snr(app_mag, band='r', depth_5sigma_mag=None):
+    """Convert apparent magnitude to the flux SNR at a stated 5-sigma depth."""
     band_depths = {
         'g': 24.0,
         'r': 23.4,
         'z': 22.5,
         }
     assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
-    depth = band_depths[band]
+    depth = band_depths[band] if depth_5sigma_mag is None else float(depth_5sigma_mag)
     if isinstance(app_mag, torch.Tensor):
-        C = depth + 2.5 * torch.log10(torch.tensor(5.0, device=app_mag.device))
+        C = depth + 2.5 * torch.log10(
+            torch.tensor(5.0, device=app_mag.device, dtype=app_mag.dtype)
+        )
         log_snr = (C - app_mag) / 2.5
         return 10 ** log_snr
     else:
@@ -115,16 +118,18 @@ def app_mag_to_snr(app_mag, band='r'):
         log_snr = (C - app_mag) / 2.5
         return 10 ** log_snr
 
-def snr_to_app_mag(snr, band='r'):
+def snr_to_app_mag(snr, band='r', depth_5sigma_mag=None):
     band_depths = {
         'g': 24.0,
         'r': 23.4,
         'z': 22.5,
         }
     assert band in band_depths, f"Band '{band}' not recognized. Valid bands: {list(band_depths.keys())}"
-    depth = band_depths[band]
+    depth = band_depths[band] if depth_5sigma_mag is None else float(depth_5sigma_mag)
     if isinstance(snr, torch.Tensor):
-        C = depth + 2.5 * torch.log10(torch.tensor(5.0, device=snr.device))
+        C = depth + 2.5 * torch.log10(
+            torch.tensor(5.0, device=snr.device, dtype=snr.dtype)
+        )
         log_snr = torch.log10(snr)
         app_mag = C - 2.5 * log_snr
         return app_mag
@@ -133,6 +138,20 @@ def snr_to_app_mag(snr, band='r'):
         log_snr = np.log10(snr)
         app_mag = C - 2.5 * log_snr
         return app_mag
+
+
+def magnitude_uncertainty_from_snr(snr):
+    """First-order AB-magnitude uncertainty for a positive flux SNR."""
+    coefficient = 2.5 / np.log(10.0)
+    if isinstance(snr, torch.Tensor):
+        if bool((~torch.isfinite(snr) | (snr <= 0)).any()):
+            raise ValueError("snr must contain finite positive values")
+        return coefficient / snr
+    values = np.asarray(snr)
+    if np.any(~np.isfinite(values) | (values <= 0)):
+        raise ValueError("snr must contain finite positive values")
+    return coefficient / values
+
 
 def tf_vcirc_to_mag(vcirc, a, b):
     log_vcirc = np.log10(vcirc)
@@ -589,6 +608,125 @@ def _estimate_noise_rms(noise, seg, eps=1e-8):
     return torch.where(bkg_count > eps, bkg_rms, full_rms)
 
 
+def gaussian_psf_noise_equivalent_pixels(
+    psf_fwhm_arcsec=1.0,
+    pixel_scale_arcsec=0.2637,
+):
+    """Return the noise-equivalent area of a Gaussian reference PSF in pixels.
+
+    For a unit-flux circular Gaussian template, ``N_eff = 1 / sum(P**2)``.
+    In the well-sampled continuous limit this is ``4 pi sigma_pix**2``. This is
+    only the fixed reference used to interpret a quoted five-sigma depth; it
+    does not assert that the simulator's Airy-FWHM rendering is Gaussian.
+    """
+    fwhm = float(psf_fwhm_arcsec)
+    pixel_scale = float(pixel_scale_arcsec)
+    if not np.isfinite(fwhm) or fwhm <= 0:
+        raise ValueError("psf_fwhm_arcsec must be finite and positive")
+    if not np.isfinite(pixel_scale) or pixel_scale <= 0:
+        raise ValueError("pixel_scale_arcsec must be finite and positive")
+    sigma_pixels = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)) * pixel_scale)
+    return 4.0 * np.pi * sigma_pixels**2
+
+
+def depth_scaled_total_image_flux(data, rmag_true, depth_5sigma_mag):
+    """Scale each clean image's total rendered flux to a common depth magnitude.
+
+    The returned vector is intended only for a dataset-global calibration. It
+    must not be used as a per-object noise scale or supplied to the posterior.
+    """
+    if not isinstance(data, torch.Tensor) or not data.is_floating_point():
+        raise TypeError("data must be a floating-point torch.Tensor")
+    if data.ndim < 2 or data.shape[0] == 0:
+        raise ValueError("data must have a non-empty leading batch dimension")
+    magnitude = torch.as_tensor(
+        rmag_true, device=data.device, dtype=torch.float64
+    )
+    if magnitude.ndim != 1 or magnitude.shape[0] != data.shape[0]:
+        raise ValueError("rmag_true must be one-dimensional and match batch size")
+    depth = float(depth_5sigma_mag)
+    if not np.isfinite(depth):
+        raise ValueError("depth_5sigma_mag must be finite")
+    if bool((~torch.isfinite(magnitude)).any()):
+        raise ValueError("rmag_true must contain only finite values")
+
+    # Accumulate in float64 without materializing a full float64 copy of a
+    # million-image training tensor on the GPU.
+    total_flux = data.sum(
+        dim=tuple(range(1, data.ndim)), dtype=torch.float64
+    )
+    if bool((~torch.isfinite(total_flux) | (total_flux <= 0)).any()):
+        raise ValueError("clean image total flux must be finite and positive")
+    to_depth = torch.pow(
+        total_flux.new_tensor(10.0),
+        -0.4 * (total_flux.new_tensor(depth) - magnitude),
+    )
+    depth_flux = total_flux * to_depth
+    if bool((~torch.isfinite(depth_flux) | (depth_flux <= 0)).any()):
+        raise ValueError("depth-scaled image flux must be finite and positive")
+    return depth_flux
+
+
+def fixed_image_noise_sigma_from_depth_fluxes(
+    depth_scaled_fluxes,
+    noise_equivalent_pixels,
+):
+    """Calibrate one homoscedastic pixel RMS from depth-scaled image fluxes."""
+    fluxes = torch.as_tensor(depth_scaled_fluxes)
+    if not fluxes.is_floating_point():
+        fluxes = fluxes.to(torch.get_default_dtype())
+    if fluxes.ndim != 1 or fluxes.numel() == 0:
+        raise ValueError("depth_scaled_fluxes must be a non-empty vector")
+    if bool((~torch.isfinite(fluxes) | (fluxes <= 0)).any()):
+        raise ValueError(
+            "depth_scaled_fluxes must contain finite positive values"
+        )
+    n_eff = float(noise_equivalent_pixels)
+    if not np.isfinite(n_eff) or n_eff <= 0:
+        raise ValueError("noise_equivalent_pixels must be finite and positive")
+    reference_flux = deterministic_lower_median(fluxes)
+    return reference_flux / (5.0 * np.sqrt(n_eff))
+
+
+def estimate_fixed_image_noise_sigma(
+    data,
+    rmag_true,
+    *,
+    depth_5sigma_mag=23.4,
+    psf_fwhm_arcsec=1.0,
+    pixel_scale_arcsec=0.2637,
+):
+    """Estimate the single v2 image-noise RMS for a training population."""
+    depth_fluxes = depth_scaled_total_image_flux(
+        data, rmag_true, depth_5sigma_mag
+    )
+    n_eff = gaussian_psf_noise_equivalent_pixels(
+        psf_fwhm_arcsec, pixel_scale_arcsec
+    )
+    return fixed_image_noise_sigma_from_depth_fluxes(depth_fluxes, n_eff)
+
+
+def apply_fixed_gaussian_image_noise(data, noise_sigma, randgen=None):
+    """Add v2 homoscedastic Gaussian image noise with one scalar pixel RMS."""
+    if not isinstance(data, torch.Tensor) or not data.is_floating_point():
+        raise TypeError("data must be a floating-point torch.Tensor")
+    sigma = torch.as_tensor(
+        noise_sigma, device=data.device, dtype=data.dtype
+    )
+    if sigma.numel() != 1:
+        raise ValueError("noise_sigma must be a single global scalar")
+    sigma = sigma.reshape(())
+    if not bool(torch.isfinite(sigma) & (sigma > 0)):
+        raise ValueError("noise_sigma must be finite and positive")
+    noise = torch.randn(
+        data.shape,
+        device=data.device,
+        dtype=data.dtype,
+        generator=randgen,
+    )
+    return data + noise * sigma
+
+
 def apply_noise(
     data,
     snr,
@@ -599,7 +737,9 @@ def apply_noise(
     threshold_sigma=1.5,
     eps=1e-8,
     maxs=None,
+    return_scale=False,
 ):
+    """Add the historical homoscedastic Gaussian noise realization."""
     if randgen is None:
         noise = torch.randn(data.size(), device=device)
     else:
@@ -614,14 +754,196 @@ def apply_noise(
     factor_coarse = _noise_scale_from_seg(data, snr, seg_coarse, eps=eps)
 
     if not use_iterative:
-        return data + noise * factor_coarse.view(-1, 1, 1, 1)
+        output = data + noise * factor_coarse.view(-1, 1, 1, 1)
+        return (output, factor_coarse) if return_scale else output
 
     coarse_noise = noise * factor_coarse.view(-1, 1, 1, 1)
     coarse_rms = _estimate_noise_rms(coarse_noise, seg_coarse, eps=eps)
     refined_threshold = threshold_sigma * coarse_rms
     seg_refined = data > refined_threshold.view(-1, 1, 1, 1)
     factor_refined = _noise_scale_from_seg(data, snr, seg_refined, eps=eps)
-    return data + noise * factor_refined.view(-1, 1, 1, 1)
+    refined_count = seg_refined.sum(dim=(-1, -2, -3))
+    valid_refined = torch.isfinite(factor_refined) & (factor_refined > eps)
+    valid_refined &= refined_count > 0
+    factor_refined = torch.where(
+        valid_refined, factor_refined, factor_coarse
+    )
+    output = data + noise * factor_refined.view(-1, 1, 1, 1)
+    return (output, factor_refined) if return_scale else output
+
+
+def sample_observed_magnitude(rmag_true, image_snr, randgen=None):
+    """Draw a catalog measurement from a fixed-depth Gaussian flux model.
+
+    ``image_snr`` is the *expected* flux SNR implied by ``rmag_true`` and the
+    configured survey depth.  In units of the fixed flux uncertainty, the
+    measurement is therefore ``rho_obs = image_snr + Normal(0, 1)``.  The
+    returned magnitude, reported magnitude uncertainty, and ``image_flux_snr``
+    are all derived from that noisy observed flux.  Consequently none of the
+    returned context scalars algebraically reveals ``rmag_true``.
+
+    The simulator-v2 magnitude range has expected SNR >= 5.  We nevertheless
+    redraw the vanishingly rare non-positive Gaussian flux, because an
+    ordinary logarithmic magnitude is undefined there.  This is an explicit
+    positive-flux catalog selection, not a clamp.
+    """
+    rmag_true = torch.as_tensor(rmag_true)
+    if not rmag_true.is_floating_point():
+        rmag_true = rmag_true.to(torch.get_default_dtype())
+    image_snr = torch.as_tensor(
+        image_snr, device=rmag_true.device, dtype=rmag_true.dtype
+    )
+    rmag_true, image_snr = torch.broadcast_tensors(rmag_true, image_snr)
+    if bool((~torch.isfinite(rmag_true)).any()):
+        raise ValueError("rmag_true must contain finite values")
+    if bool((~torch.isfinite(image_snr) | (image_snr <= 0)).any()):
+        raise ValueError("image_snr must contain finite positive values")
+    observed_snr = image_snr + torch.randn(
+        rmag_true.shape,
+        device=rmag_true.device,
+        dtype=rmag_true.dtype,
+        generator=randgen,
+    )
+    for _ in range(16):
+        invalid = observed_snr <= 0
+        if not bool(invalid.any()):
+            break
+        observed_snr = observed_snr.clone()
+        observed_snr[invalid] = image_snr[invalid] + torch.randn(
+            (int(invalid.sum().item()),),
+            device=rmag_true.device,
+            dtype=rmag_true.dtype,
+            generator=randgen,
+        )
+    if bool((observed_snr <= 0).any()):
+        raise RuntimeError(
+            "failed to draw a positive observed flux after 16 attempts"
+        )
+
+    rmag_obs = rmag_true - 2.5 * torch.log10(observed_snr / image_snr)
+    rmag_sigma = magnitude_uncertainty_from_snr(observed_snr)
+    return {
+        "rmag_obs": rmag_obs,
+        "rmag_sigma": rmag_sigma,
+        "image_flux_snr": observed_snr,
+    }
+
+
+def deterministic_lower_median(values, dim=None, keepdim=False):
+    """Compute ``torch.median``'s lower median without its CUDA kernel.
+
+    PyTorch's CUDA ``median(dim=...)`` implementation always computes indices
+    and is rejected by ``torch.use_deterministic_algorithms(True)``.  Sorting
+    and selecting the lower middle element is deterministic and preserves
+    ``torch.median``'s behavior for even-length inputs.
+    """
+    values = torch.as_tensor(values)
+    if values.numel() == 0:
+        raise ValueError("values must be non-empty")
+    if dim is None:
+        flattened = values.reshape(-1)
+        return torch.sort(flattened).values[(flattened.numel() - 1) // 2]
+
+    dim = int(dim)
+    if dim < 0:
+        dim += values.ndim
+    if dim < 0 or dim >= values.ndim:
+        raise IndexError(
+            f"dimension out of range for tensor with {values.ndim} dimensions"
+        )
+    length = values.shape[dim]
+    if length == 0:
+        raise ValueError("median dimension must be non-empty")
+    result = torch.sort(values, dim=dim).values.select(
+        dim, (length - 1) // 2
+    )
+    return result.unsqueeze(dim) if keepdim else result
+
+
+def _continuum_subtracted_line_norm(spectra):
+    continuum = deterministic_lower_median(
+        spectra, dim=-1, keepdim=True
+    )
+    return torch.linalg.vector_norm(spectra - continuum, dim=-1)
+
+
+def estimate_spectral_reference_line_norm(spectra, center_fiber_index=2):
+    """Estimate a robust fixed H-alpha norm from the offset-fiber population."""
+    if spectra.ndim != 4 or spectra.shape[-2] < 2:
+        raise ValueError("spectra must have shape (B,C,F,W)")
+    if not 0 <= center_fiber_index < spectra.shape[-2]:
+        raise ValueError("center_fiber_index is out of range")
+    line_norm = _continuum_subtracted_line_norm(spectra)
+    offset_mask = torch.ones(
+        spectra.shape[-2], dtype=torch.bool, device=spectra.device
+    )
+    offset_mask[center_fiber_index] = False
+    values = line_norm[..., offset_mask].reshape(-1)
+    values = values[torch.isfinite(values) & (values > 0)]
+    if values.numel() == 0:
+        raise ValueError("cannot estimate a positive spectral reference norm")
+    return deterministic_lower_median(values)
+
+
+def apply_spectral_noise(
+    data,
+    reference_quality,
+    reference_line_norm,
+    *,
+    center_fiber_index=2,
+    center_exposure_s=180.0,
+    offset_exposure_s=600.0,
+    spectral_units="counts",
+    randgen=None,
+    device=None,
+    return_metadata=False,
+):
+    """Add independent Gaussian spectral noise using a fixed line reference."""
+    if data.ndim != 4 or data.shape[-2] < 2:
+        raise ValueError("data must have shape (B,C,F,W)")
+    if not 0 <= center_fiber_index < data.shape[-2]:
+        raise ValueError("center_fiber_index is out of range")
+    if center_exposure_s <= 0 or offset_exposure_s <= 0:
+        raise ValueError("exposure times must be positive")
+    if spectral_units not in ("counts", "count_rate"):
+        raise ValueError("spectral_units must be 'counts' or 'count_rate'")
+    if device is None:
+        device = data.device
+    quality = torch.as_tensor(
+        reference_quality, device=data.device, dtype=data.dtype
+    ).reshape(-1)
+    if quality.numel() == 1 and data.shape[0] != 1:
+        quality = quality.expand(data.shape[0])
+    if quality.numel() != data.shape[0]:
+        raise ValueError("reference_quality must be scalar or one value per spectrum")
+    if bool((~torch.isfinite(quality) | (quality <= 0)).any()):
+        raise ValueError("reference_quality must contain finite positive values")
+    reference_line_norm = torch.as_tensor(
+        reference_line_norm, device=data.device, dtype=data.dtype
+    ).reshape(())
+    if not bool(torch.isfinite(reference_line_norm)) or reference_line_norm <= 0:
+        raise ValueError("reference_line_norm must be finite and positive")
+
+    sigma_offset = reference_line_norm / quality
+    fiber_sigma = sigma_offset[:, None].expand(-1, data.shape[-2]).clone()
+    if spectral_units == "counts":
+        center_ratio = np.sqrt(center_exposure_s / offset_exposure_s)
+    else:
+        center_ratio = np.sqrt(offset_exposure_s / center_exposure_s)
+    fiber_sigma[:, center_fiber_index] *= center_ratio
+    sigma = fiber_sigma[:, None, :, None]
+    noise = torch.randn(
+        data.shape, device=device, dtype=data.dtype, generator=randgen
+    )
+    output = data + noise * sigma
+    if not return_metadata:
+        return output
+    achieved_snr = _continuum_subtracted_line_norm(data) / fiber_sigma[:, None, :]
+    return output, {
+        "noise_sigma": fiber_sigma,
+        "achieved_line_snr": achieved_snr,
+        "reference_quality": quality,
+    }
 
 
 def sample_magnitudes(n_samples, m_min, m_max, rng=None):

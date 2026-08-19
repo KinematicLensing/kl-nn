@@ -2,7 +2,7 @@
 
 set -u
 
-DATASET=${DATASET:-small_1m_fixedfiber}
+DATASET=${DATASET:-small_1m_simv2_galaxyaxis}
 FITS_ROOT=${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits/${DATASET}}
 NGAL=${NGAL:-5}
 ROWSPERGAL=${ROWSPERGAL:-2000}

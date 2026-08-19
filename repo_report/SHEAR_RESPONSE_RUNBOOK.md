@@ -14,9 +14,9 @@ From `data_generate/`, prepare the input and manifest:
 
 ```bash
 python make_shear_response_samples.py \
-  --input=/ocean/projects/phy250048p/shared/samples/samples_valid_1m.csv \
-  --output=/ocean/projects/phy250048p/shared/samples/samples_shear_response_5k.csv \
-  --manifest=/ocean/projects/phy250048p/shared/samples/shear_response_5k_manifest.csv \
+  --input=/ocean/projects/phy250048p/shared/samples/samples_valid_1m_simv2_galaxyaxis_halpha.csv \
+  --output=/ocean/projects/phy250048p/shared/samples/samples_shear_response_simv2_galaxyaxis_halpha_5k.csv \
+  --manifest=/ocean/projects/phy250048p/shared/samples/shear_response_simv2_galaxyaxis_halpha_5k_manifest.csv \
   --nbase=1000 --delta-g=0.01
 ```
 
@@ -29,8 +29,11 @@ MERGE=$(sbatch --parsable --dependency=afterok:$DB merge_shear_response_database
 ```
 
 After the merge, submit `arch/shear_response_inference.slurm` with `MODEL` and
-`EPOCH`. Finally run `arch/diagnostics/shear_response_report.py` against the
+`EPOCH`. It defaults to the v2 mode-1 base posterior; set
+`TF_INFERENCE=prior_replacement` only when the response should include the
+external TF prior. Finally run `arch/diagnostics/shear_response_report.py` against the
 resulting cache and the manifest. It splits by `base_id`, so no matched galaxy
 can leak between calibration and holdout. The inference job also reuses the
-same scalar SNR and injected image/spectral noise realization across each group
-of five; otherwise noise differences would dominate the finite difference.
+same latent `rmag_true` and `halpha_flux_true`, catalog-flux draw, spectral
+quality, and injected image/spectral noise realization across each group of five;
+otherwise observation differences would dominate the finite difference.

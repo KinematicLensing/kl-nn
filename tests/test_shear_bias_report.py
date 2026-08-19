@@ -1,5 +1,6 @@
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -144,24 +145,119 @@ def test_bias_figure_uses_physical_residuals_and_errors(monkeypatch):
             plt.close(fig)
 
 
+def test_significant_circular_modes_distinguishes_one_two_and_three_modes():
+    bins = report.THETA_HISTOGRAM_BINS
+    index = np.arange(bins)
 
-def _galaxy_to_image_clockwise(g_plus, g_cross, theta):
-    cos2 = np.cos(2.0 * theta)
-    sin2 = np.sin(2.0 * theta)
-    return (
-        g_plus * cos2 - g_cross * sin2,
-        g_plus * sin2 + g_cross * cos2,
+    def peak(center, width=1.5):
+        distance = np.minimum((index - center) % bins, (center - index) % bins)
+        return np.exp(-0.5 * (distance / width) ** 2)
+
+    assert len(report.significant_circular_modes(peak(8))) == 1
+    assert len(report.significant_circular_modes(peak(8) + peak(44))) == 2
+    assert len(
+        report.significant_circular_modes(peak(8) + peak(32) + peak(56))
+    ) == 3
+    assert len(report.significant_circular_modes(np.ones(bins))) == 0
+
+
+def test_theta_diagnostic_streams_directed_branches_and_selected_mode(tmp_path):
+    root = tmp_path / "model" / "dataset"
+    (root / "sample").mkdir(parents=True)
+    (root / "truth").mkdir()
+    truth = np.zeros((3, 8), dtype=np.float32)
+    truth[:, 2] = np.array([0.0, 0.4, -0.7])
+    samples = np.zeros((2, 3, 120, 8), dtype=np.float32)
+    # Mode zero is a sentinel; the requested mode has one, two antipodal, and
+    # three well-separated directed theta modes respectively.
+    samples[0, :, :, 2] = 1.2
+    samples[1, 0, :, 2] = truth[0, 2] + np.linspace(-0.03, 0.03, 120)
+    samples[1, 1, :60, 2] = truth[1, 2] + np.linspace(-0.03, 0.03, 60)
+    samples[1, 1, 60:, 2] = truth[1, 2] + np.pi + np.linspace(-0.03, 0.03, 60)
+    for start, shift in zip((0, 40, 80), (0.0, 2.0, -2.0)):
+        samples[1, 2, start : start + 40, 2] = (
+            truth[2, 2] + shift + np.linspace(-0.03, 0.03, 40)
+        )
+    np.save(root / "sample" / "part0of1.npy", samples)
+    np.save(root / "truth" / "part0of1.npy", truth)
+
+    diagnostic = report.load_theta_posterior_diagnostics(
+        {"root": root, "truth": truth}, mode=1, block_size=2
+    )
+
+    np.testing.assert_allclose(diagnostic["true_branch_mass"][:2], [1.0, 0.5])
+    np.testing.assert_allclose(diagnostic["opposite_branch_mass"][:2], [0.0, 0.5])
+    assert diagnostic["mode_count"].tolist() == [1, 2, 3]
+    assert len(diagnostic["aggregate_mode_indices"]) >= 2
+    assert diagnostic["truth_residual_density"].shape == (
+        report.THETA_HISTOGRAM_BINS,
+        report.THETA_HISTOGRAM_BINS,
     )
 
 
-def test_clockwise_galaxy_transform_known_quarter_turn():
+def test_theta_figure_uses_directed_two_pi_residuals(monkeypatch):
+    truth = np.zeros((4, 8), dtype=float)
+    truth[:, 2] = np.array([-2.5, -0.5, 0.5, 2.5])
+    map_estimate = truth.copy()
+    mean_estimate = truth.copy()
+    map_estimate[:, 2] += np.pi
+    mean_estimate[:, 2] += 0.1
+    edges = np.linspace(-np.pi, np.pi, report.THETA_HISTOGRAM_BINS + 1)
+    diagnostic = {
+        "angle_edges": edges,
+        "truth_residual_density": np.ones(
+            (report.THETA_HISTOGRAM_BINS, report.THETA_HISTOGRAM_BINS)
+        ),
+        "aggregate_histogram": np.ones(report.THETA_HISTOGRAM_BINS),
+        "aggregate_mode_indices": np.array([], dtype=int),
+    }
+    figures = []
+    monkeypatch.setattr(
+        report,
+        "fig_data_uri",
+        lambda figure: figures.append(figure) or "data:image/png;base64,theta",
+    )
+
+    try:
+        uri = report.theta_diagnostic_figure(
+            {
+                "case": "model:dataset",
+                "truth": truth,
+                "estimates": {"MAP": map_estimate, "Mean": mean_estimate},
+            },
+            diagnostic,
+        )
+        assert uri.endswith("theta")
+        assert len(figures[0].axes) == 4
+        assert "directed residual" in figures[0].axes[0].get_title().lower()
+        assert "2\\pi" in figures[0].axes[0].get_ylabel()
+        assert figures[0].axes[0].get_ylim() == pytest.approx((-np.pi, np.pi))
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
+
+def _galaxy_to_image_original_clockwise(g_plus, g_cross, theta):
+    """Invert the project's original clockwise ``theta_int`` convention."""
+    cos2 = np.cos(2.0 * theta)
+    sin2 = np.sin(2.0 * theta)
+    return (
+        g_plus * cos2 + g_cross * sin2,
+        -g_plus * sin2 + g_cross * cos2,
+    )
+
+
+def test_original_clockwise_galaxy_transform_known_quarter_turn():
+    # Positive image-frame g2 points toward theta_int=+pi/4, while theta_int's
+    # clockwise-positive convention gives the original transform its minus sign.
     g_plus, g_cross = report.img_to_galaxy_clockwise(
         np.array([0.0, 1.0]),
         np.array([1.0, 0.0]),
         np.array([np.pi / 4.0, 0.0]),
     )
 
-    np.testing.assert_allclose(g_plus, [1.0, 1.0], atol=1e-15)
+    np.testing.assert_allclose(g_plus, [-1.0, 1.0], atol=1e-15)
     np.testing.assert_allclose(g_cross, [0.0, 0.0], atol=1e-15)
 
 
@@ -170,7 +266,9 @@ def test_galaxy_frame_metrics_recover_physical_additive_and_response():
     theta = np.linspace(-np.pi, np.pi, n, endpoint=False)
     true_plus = np.linspace(-0.018, 0.018, n)
     true_cross = 0.017 * np.sin(np.linspace(0.0, 4.0 * np.pi, n))
-    true_g1, true_g2 = _galaxy_to_image_clockwise(true_plus, true_cross, theta)
+    true_g1, true_g2 = _galaxy_to_image_original_clockwise(
+        true_plus, true_cross, theta
+    )
     truth = np.zeros((n, 8), dtype=float)
     truth[:, 0] = true_g1
     truth[:, 1] = true_g2
@@ -181,7 +279,7 @@ def test_galaxy_frame_metrics_recover_physical_additive_and_response():
 
     estimated_plus = true_plus + 2.5e-4 + 0.03 * true_plus
     estimated_cross = true_cross - 1.5e-4 - 0.02 * true_cross
-    estimated_g1, estimated_g2 = _galaxy_to_image_clockwise(
+    estimated_g1, estimated_g2 = _galaxy_to_image_original_clockwise(
         estimated_plus, estimated_cross, theta
     )
     estimate = truth.copy()
@@ -218,7 +316,7 @@ def test_galaxy_frame_figure_uses_physical_residuals_and_errors(monkeypatch):
     truth[:, 2] = theta
     truth[:, 3] = sini
     estimate = truth.copy()
-    estimate[:, 0], estimate[:, 1] = _galaxy_to_image_clockwise(
+    estimate[:, 0], estimate[:, 1] = _galaxy_to_image_original_clockwise(
         plus_residual, cross_residual, theta
     )
     figures = []
@@ -522,6 +620,115 @@ def test_quantile_binned_filters_nonfinite_pairs_and_returns_physical_errors():
     np.testing.assert_allclose(error, [expected_se, expected_se])
 
 
+def test_conditional_axes_load_true_magnitude_from_aligned_archived_rows(tmp_path):
+    root = tmp_path / "model" / "dataset"
+    sample_root = tmp_path / "samples"
+    for directory in (root / "truth", root / "meta", root / "spectral_quality"):
+        directory.mkdir(parents=True, exist_ok=True)
+    sample_root.mkdir()
+    rows = []
+    for index in range(6):
+        values = [
+            0.01 * index,
+            -0.01 * index,
+            0.1 * index,
+            0.1 + 0.01 * index,
+            float(index),
+            100.0 + index,
+            0.2 + 0.01 * index,
+            0.5 + 0.02 * index,
+        ]
+        rows.append(values)
+    sample_path = sample_root / "sample.csv"
+    sample_path.write_text(
+        ",".join((*report.FEATURE_NAMES, "rmag_true"))
+        + "\n"
+        + "\n".join(
+            ",".join(str(value) for value in (*row, 18.0 + index))
+            for index, row in enumerate(rows)
+        )
+        + "\n"
+    )
+    selected = ((1, 3), (4, 6))
+    truth_parts = []
+    for part, (start, end) in enumerate(selected):
+        truth = np.asarray(rows[start:end], dtype=np.float32)
+        truth_parts.append(truth)
+        name = f"part{part}of2"
+        np.save(root / "truth" / f"{name}.npy", truth)
+        np.save(
+            root / "spectral_quality" / f"{name}.npy",
+            np.asarray([5.0 + start, 5.0 + start + 1], dtype=np.float32),
+        )
+        (root / "meta" / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "args": {"sample_set": "sample.csv"},
+                    "galaxy_range": {"start": start, "end": end},
+                }
+            )
+        )
+    case = {
+        "root": root,
+        "truth": np.concatenate(truth_parts),
+    }
+
+    axes = report.load_conditional_diagnostic_axes(case, sample_root)
+
+    np.testing.assert_allclose(axes["rmag_true"], [19.0, 20.0, 22.0, 23.0])
+    np.testing.assert_allclose(axes["spectral_snr"], [6.0, 7.0, 9.0, 10.0])
+    np.testing.assert_allclose(axes["hlr_true"], case["truth"][:, 7])
+
+
+def test_conditional_calibration_recovers_full_range_mean_m_and_c(monkeypatch):
+    shear = np.tile(np.linspace(-0.1, 0.1, 30), 3)
+    condition = np.repeat([1.0, 2.0, 3.0], 30)
+    truth = np.zeros((len(shear), 8), dtype=float)
+    truth[:, 0] = shear
+    truth[:, 1] = shear[::-1]
+    truth[:, 7] = condition
+    estimate = truth.copy()
+    for index in (0, 1):
+        estimate[:, index] += 1.0e-4 * condition + 0.01 * condition * truth[:, index]
+    case = {
+        "case": "model:dataset",
+        "truth": truth,
+        "estimates": {"Mean": estimate},
+    }
+    conditioning = {
+        "rmag_true": condition,
+        "spectral_snr": 10.0**condition,
+        "hlr_true": condition,
+    }
+
+    curves = report.conditional_shear_calibration(case, conditioning, bins=3)
+
+    for variable in conditioning:
+        for component in ("g1", "g2"):
+            curve = curves[variable][component]
+            np.testing.assert_allclose(curve["m"], [0.01, 0.02, 0.03], atol=1e-14)
+            np.testing.assert_allclose(curve["c"], [1e-4, 2e-4, 3e-4], atol=1e-14)
+            assert curve["n"].tolist() == [30, 30, 30]
+
+    figures = []
+    monkeypatch.setattr(
+        report,
+        "fig_data_uri",
+        lambda figure: figures.append(figure) or "data:image/png;base64,conditional",
+    )
+    try:
+        assert report.conditional_shear_calibration_figure(case, curves).endswith(
+            "conditional"
+        )
+        assert len(figures[0].axes) == 6
+        assert figures[0].axes[1].get_xscale() == "log"
+        np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [1, 2, 3])
+        np.testing.assert_allclose(figures[0].axes[3].lines[0].get_ydata(), [1, 2, 3])
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
 def test_nuisance_correlation_figure_is_mean_only_and_uses_physical_residuals(
     monkeypatch,
 ):
@@ -724,6 +931,8 @@ def test_main_describes_prior_matched_conditional_pp(monkeypatch, tmp_path):
         max_galaxies=None,
         low_g=0.02,
         bins=2,
+        conditional_bins=2,
+        sample_root=tmp_path,
         output=output,
     )
     truth = np.zeros((2, 8), dtype=float)
@@ -749,7 +958,35 @@ def test_main_describes_prior_matched_conditional_pp(monkeypatch, tmp_path):
         report, "galaxy_frame_diagnostics", lambda *unused: ([], [])
     )
     monkeypatch.setattr(report, "coverage_metrics", lambda *unused: [])
+    monkeypatch.setattr(
+        report,
+        "load_conditional_diagnostic_axes",
+        lambda *unused: {
+            "rmag_true": np.ones(2),
+            "spectral_snr": np.ones(2),
+            "hlr_true": np.ones(2),
+        },
+    )
+    monkeypatch.setattr(report, "conditional_shear_calibration", lambda *unused: {})
+    monkeypatch.setattr(
+        report,
+        "conditional_shear_calibration_figure",
+        lambda *unused: "data:image/png;base64,conditional",
+    )
     monkeypatch.setattr(report, "load_shear_pit_values", lambda *unused: pits)
+    theta_diagnostic = {
+        "true_branch_mass": np.ones(2),
+        "opposite_branch_mass": np.zeros(2),
+        "middle_mass": np.zeros(2),
+        "mode_count": np.ones(2, dtype=int),
+        "aggregate_mode_indices": np.array([0]),
+    }
+    monkeypatch.setattr(
+        report, "load_theta_posterior_diagnostics", lambda *unused: theta_diagnostic
+    )
+    monkeypatch.setattr(
+        report, "theta_diagnostic_figure", lambda *unused: "data:image/png;base64,theta"
+    )
     monkeypatch.setattr(
         report, "posterior_pp_figure", lambda *unused: "data:image/png;base64,pp"
     )
@@ -771,6 +1008,11 @@ def test_main_describes_prior_matched_conditional_pp(monkeypatch, tmp_path):
     assert "restricted to the same true-shear interval" in document
     assert "renormal" in document
     assert "zero retained draws" in document
+    assert "directed theta_int bias and posterior modality" in document
+    assert "spin-1 angle" in document
+    assert "conditional mean shear calibration" in document
+    assert "g_hat - g = c + m g" in document
+    assert "coupled nuisance-error diagnostic" not in document
     assert "need not be uniform even for an exact bayesian posterior" not in document
 
 

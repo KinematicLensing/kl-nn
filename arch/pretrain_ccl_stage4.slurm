@@ -19,7 +19,7 @@ conda activate kl-nn
 set -u
 
 SEED="${SEED:-42}"
-EPOCHS="${EPOCHS:-15}"
+EPOCHS="${EPOCHS:-20}"
 # Preserve the Stage 2/3 CCL global-batch geometry. The eight-view orbit raises
 # activation memory; all requested GPUs are 32 GB. Override to 50 only if a
 # production GPU reports OOM.
@@ -27,11 +27,11 @@ BATCH_SIZE="${BATCH_SIZE:-100}"
 CCL_SIGMA_LABEL="${CCL_SIGMA_LABEL:-0.15}"
 CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_PREFIX="CNN-SetAttn-D4_CCL_stage4_fixedgeo"
+MODEL_PREFIX="CNN-SetAttn-D4_CCL_stage4_simv2_galaxyaxis"
 MODEL_NAME="${MODEL_NAME:-${MODEL_PREFIX}_s${SEED}_${JOB_TAG}}"
 PRETRAIN_FROM="$((EPOCHS - 1))"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m_fixedfiber/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m_fixedfiber/}"
+TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m_simv2_galaxyaxis/}"
+VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m_simv2_galaxyaxis/}"
 TRAIN_SIZE="${TRAIN_SIZE:-100000}"
 VALID_SIZE="${VALID_SIZE:-10000}"
 if [[ -z "${MASTER_PORT:-}" ]]; then

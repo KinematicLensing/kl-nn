@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -42,6 +43,14 @@ FLOW_TYPES = (
     "hybrid_circular",
     "bounded_hybrid_circular",
 )
+DEFAULT_OBSERVATION_CONTEXT_FIELDS = (
+    "rmag_obs",
+    "rmag_sigma",
+    "image_snr",
+    "spectral_reference_quality",
+    "spectral_noise_scale",
+)
+
 
 
 class ConditionalNormalWithCircularTheta(Distribution):
@@ -950,21 +959,83 @@ class KLNPE(nn.Module):
     '''
     def __init__(self, 
                  feature_extractor=None,
-                 mode=config.train['mode'],    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
-                 batch_size=config.train['batch_size'],
-                 nfeatures=config.train['feature_number'],
-                 nspec=config.data['nspec'],
+                 mode=None,    # 0 = point estimate, 1 = density estimate, 2 = density estimate with TF prior
+                 batch_size=None,
+                 nfeatures=None,
+                 nspec=None,
                  # Lognormal TF prior parameters (only used when mode == 2)
-                 vcirc_dex=config.tf['scatter'],   # scatter in dex; fixed, represents TF relation scatter
-                 vcirc_min=config.par_ranges.get('vcirc', [60.0, 540.0])[0],
-                 vcirc_max=config.par_ranges.get('vcirc', [60.0, 540.0])[1],
+                 vcirc_dex=None,   # scatter in dex; fixed, represents TF relation scatter
+                 vcirc_min=None,
+                 vcirc_max=None,
                  vcirc_idx=None,
                  backbone_type=None,
                  posterior_symmetry=None):
 
+        # Resolve configuration-backed defaults at construction time.  Python
+        # evaluates function defaults when this module is imported, before a
+        # launcher-supplied config is loaded and propagated to spawned workers.
+        if mode is None:
+            mode = config.train['mode']
+        if batch_size is None:
+            batch_size = config.train['batch_size']
+        if nfeatures is None:
+            nfeatures = config.train['feature_number']
+        if nspec is None:
+            nspec = config.data['nspec']
+        if vcirc_dex is None:
+            vcirc_dex = config.tf['scatter']
+        vcirc_bounds = config.par_ranges.get('vcirc', [60.0, 540.0])
+        if vcirc_min is None:
+            vcirc_min = vcirc_bounds[0]
+        if vcirc_max is None:
+            vcirc_max = vcirc_bounds[1]
+
         self.bs = batch_size
         self.nfeatures = nfeatures
         self.nspecs = nspec
+        observation_config = getattr(config, "observation", {})
+        self.observation_model_version = int(
+            observation_config.get("model_version", 1)
+        )
+        configured_context_fields = tuple(
+            observation_config.get(
+                "context_fields", DEFAULT_OBSERVATION_CONTEXT_FIELDS
+            )
+        )
+        if self.observation_model_version == 1:
+            # Keep the historical flow input size and state-dict layout exact.
+            self.observation_context_fields = ()
+        elif self.observation_model_version == 2:
+            if configured_context_fields != DEFAULT_OBSERVATION_CONTEXT_FIELDS:
+                raise ValueError(
+                    "observation.context_fields must be exactly "
+                    f"{list(DEFAULT_OBSERVATION_CONTEXT_FIELDS)!r}; got "
+                    f"{list(configured_context_fields)!r}"
+                )
+            self.observation_context_fields = configured_context_fields
+        else:
+            raise ValueError("observation model_version must be 1 or 2")
+        self.observation_context_features = len(self.observation_context_fields)
+        self.flow_context_features = 1024 + self.observation_context_features
+
+        rmag_min = float(observation_config.get("rmag_min", 15.0))
+        rmag_max = float(observation_config.get("rmag_max", 23.4))
+        if not rmag_min < rmag_max:
+            raise ValueError("observation rmag_min must be below rmag_max")
+        self.observation_rmag_midpoint = 0.5 * (rmag_min + rmag_max)
+        self.observation_rmag_half_range = 0.5 * (rmag_max - rmag_min)
+        quality_min = float(observation_config.get("spectral_quality_min", 3.0))
+        quality_max = float(observation_config.get("spectral_quality_max", 100.0))
+        if not 0.0 < quality_min < quality_max:
+            raise ValueError(
+                "spectral quality bounds must satisfy 0 < min < max"
+            )
+        self.observation_quality_log_midpoint = 0.5 * (
+            math.log(quality_min) + math.log(quality_max)
+        )
+        self.observation_quality_log_half_range = 0.5 * math.log(
+            quality_max / quality_min
+        )
         self.feature_names = tuple(
             config.train.get(
                 'feature_names',
@@ -1007,6 +1078,14 @@ class KLNPE(nn.Module):
             )
 
         super(KLNPE, self).__init__()
+        if self.observation_model_version == 2:
+            self.register_buffer(
+                "image_noise_sigma", torch.tensor(float("nan"))
+            )
+            self.register_buffer(
+                "spectral_reference_line_norm", torch.tensor(float("nan"))
+            )
+
 
         if backbone_type is None:
             backbone_type = config.train.get("backbone_type", "legacy")
@@ -1044,9 +1123,151 @@ class KLNPE(nn.Module):
                 )
             elif self.flow_type == "affine":
                 self.flow = Flow(self.transform, self.base)
+    def _prepare_observation_context(
+        self, observation_context, batch_size, reference
+    ):
+        """Validate and standardize the observed scalar flow context.
+
+        Tensor column order is recorded by observation.context_fields. Mapping
+        inputs are safer at API boundaries because latent simulator quantities
+        such as rmag_true and halpha_flux_true can be rejected by name.
+        """
+        if getattr(self, "observation_model_version", 1) == 1:
+            if observation_context is not None:
+                raise ValueError(
+                    "observation_context is unavailable for legacy "
+                    "observation model_version=1"
+                )
+            return None
+        if observation_context is None:
+            raise ValueError(
+                "observation_context is required for observation model_version=2"
+            )
+
+        if isinstance(observation_context, Mapping):
+            supplied = set(observation_context)
+            if "rmag_true" in supplied:
+                raise ValueError(
+                    "observation_context must not contain latent rmag_true; "
+                    "pass the noisy catalog measurement rmag_obs"
+                )
+            if "halpha_flux_true" in supplied:
+                raise ValueError(
+                    "observation_context must not contain latent "
+                    "halpha_flux_true; spectral line strength is represented "
+                    "only by the observed spectrum and noise metadata"
+                )
+            expected = set(self.observation_context_fields)
+            if supplied != expected:
+                missing = sorted(expected - supplied)
+                extra = sorted(supplied - expected)
+                raise ValueError(
+                    "observation_context mapping keys do not match the "
+                    f"archived context_fields; missing={missing}, extra={extra}"
+                )
+            columns = []
+            for name in self.observation_context_fields:
+                column = torch.as_tensor(
+                    observation_context[name],
+                    device=reference.device,
+                    dtype=reference.dtype,
+                )
+                if column.ndim == 0:
+                    column = column.expand(batch_size)
+                elif column.ndim == 2 and column.shape[-1] == 1:
+                    column = column[:, 0]
+                if column.ndim != 1 or column.shape[0] != batch_size:
+                    raise ValueError(
+                        f"observation_context[{name!r}] must be scalar or "
+                        f"have shape ({batch_size},); got {tuple(column.shape)}"
+                    )
+                columns.append(column)
+            observed = torch.stack(columns, dim=-1)
+        else:
+            observed = torch.as_tensor(
+                observation_context,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            expected_shape = (
+                batch_size,
+                self.observation_context_features,
+            )
+            if observed.shape != expected_shape:
+                raise ValueError(
+                    "observation_context tensor must follow archived field "
+                    f"order {list(self.observation_context_fields)!r} and have "
+                    f"shape {expected_shape}; got {tuple(observed.shape)}"
+                )
+
+        if not bool(torch.isfinite(observed).all()):
+            raise ValueError("observation_context must contain only finite values")
+        positive = observed[:, 1:]
+        if not bool((positive > 0).all()):
+            raise ValueError(
+                "rmag_sigma, image_snr, spectral_reference_quality, and "
+                "spectral_noise_scale must all be positive"
+            )
+        reference_line_norm = self.spectral_reference_line_norm.to(
+            device=observed.device, dtype=observed.dtype
+        )
+        if not bool(
+            torch.isfinite(reference_line_norm)
+            & (reference_line_norm > 0)
+        ):
+            raise RuntimeError(
+                "spectral_reference_line_norm must be set to the positive "
+                "training-set reference before using simulator-v2 context"
+            )
+
+        standardized = observed.clone()
+        standardized[:, 0] = (
+            observed[:, 0] - self.observation_rmag_midpoint
+        ) / self.observation_rmag_half_range
+        five_sigma_mag_error = (2.5 / math.log(10.0)) / 5.0
+        standardized[:, 1] = torch.log10(
+            observed[:, 1] / five_sigma_mag_error
+        )
+        standardized[:, 2] = torch.log10(observed[:, 2] / 5.0)
+        standardized[:, 3] = (
+            torch.log(observed[:, 3])
+            - self.observation_quality_log_midpoint
+        ) / self.observation_quality_log_half_range
+        standardized[:, 4] = torch.log10(
+            observed[:, 4] / reference_line_norm
+        )
+        return standardized
+
+    def _flow_context_from_features(
+        self, raw_features, prepared_observation_context
+    ):
+        visual_context = self.layer_norm(raw_features)
+        if getattr(self, "observation_model_version", 1) == 1:
+            return visual_context
+        if (
+            prepared_observation_context is None
+            or prepared_observation_context.shape
+            != (raw_features.shape[0], self.observation_context_features)
+        ):
+            raise ValueError(
+                "prepared observation context does not match feature batch"
+            )
+        return torch.cat(
+            (visual_context, prepared_observation_context), dim=-1
+        )
+
 
     
-    def forward(self, x, y, true, fp, mag=None, snr=None):
+    def forward(
+        self,
+        x,
+        y,
+        true,
+        fp,
+        mag=None,
+        snr=None,
+        observation_context=None,
+    ):
         '''
         x: image tensor
         y: spectrum tensor
@@ -1061,14 +1282,19 @@ class KLNPE(nn.Module):
         if self.mode == 0:
             prediction = self.fully_connected_layer(raw_features)
             return self.loss(prediction, true)
+        prepared_observation_context = self._prepare_observation_context(
+            observation_context, raw_features.shape[0], raw_features
+        )
 
         if self.posterior_symmetry == "d4":
             branch_log_prob = self._d4_branch_log_prob_from_features(
-                raw_features, true
+                raw_features, true, prepared_observation_context
             )
             per_galaxy_log_prob = branch_log_prob.mean(dim=1)
         else:
-            context = self.layer_norm(raw_features)
+            context = self._flow_context_from_features(
+                raw_features, prepared_observation_context
+            )
             per_galaxy_log_prob = self.flow.log_prob(true, context=context)
 
         if self.mode == 2:
@@ -1094,13 +1320,15 @@ class KLNPE(nn.Module):
         self.last_training_diagnostics = training_diagnostics
         return loss
 
-    def _d4_contexts_from_features(self, raw_features):
-        """Build group-major flow contexts as LN(rho_g(raw_features))."""
+    def _d4_contexts_from_features(
+        self, raw_features, prepared_observation_context=None
+    ):
+        """Build group-major contexts with invariant observed scalars."""
         if self.posterior_symmetry != "d4":
             raise RuntimeError("D4 contexts require posterior_symmetry='d4'")
         if raw_features.ndim != 2 or raw_features.shape[-1] != 1024:
             raise ValueError("raw feature tensor must have shape (batch, 1024)")
-        return torch.stack(
+        visual_contexts = torch.stack(
             tuple(
                 self.layer_norm(
                     self.feature_extractor.transform_features(raw_features, element)
@@ -1109,12 +1337,36 @@ class KLNPE(nn.Module):
             ),
             dim=0,
         )
+        if getattr(self, "observation_model_version", 1) == 1:
+            return visual_contexts
+        expected_shape = (
+            raw_features.shape[0],
+            self.observation_context_features,
+        )
+        if (
+            prepared_observation_context is None
+            or prepared_observation_context.shape != expected_shape
+        ):
+            raise ValueError(
+                "prepared observation context does not match D4 feature batch"
+            )
+        invariant_context = prepared_observation_context.unsqueeze(0).expand(
+            len(D4_ELEMENTS), -1, -1
+        )
+        return torch.cat((visual_contexts, invariant_context), dim=-1)
 
-    def _d4_branch_log_prob_from_features(self, raw_features, parameters):
+    def _d4_branch_log_prob_from_features(
+        self,
+        raw_features,
+        parameters,
+        prepared_observation_context=None,
+    ):
         """Return the eight branch log densities with shape (batch, group)."""
         if parameters.ndim != 2 or parameters.shape[0] != raw_features.shape[0]:
             raise ValueError("parameters must have shape (batch, nfeatures)")
-        contexts = self._d4_contexts_from_features(raw_features)
+        contexts = self._d4_contexts_from_features(
+            raw_features, prepared_observation_context
+        )
         transformed_parameters = torch.stack(
             tuple(
                 transform_d4_parameters(
@@ -1133,20 +1385,39 @@ class KLNPE(nn.Module):
         )
         return log_prob.reshape(group_count, batch_size).transpose(0, 1)
 
-    def _d4_mixture_log_prob_from_features(self, raw_features, parameters):
+    def _d4_mixture_log_prob_from_features(
+        self,
+        raw_features,
+        parameters,
+        prepared_observation_context=None,
+    ):
         branch_log_prob = self._d4_branch_log_prob_from_features(
-            raw_features, parameters
+            raw_features, parameters, prepared_observation_context
         )
         return torch.logsumexp(branch_log_prob, dim=1) - math.log(len(D4_ELEMENTS))
 
-    def posterior_log_prob(self, x, y, parameters, fp):
+    def posterior_log_prob(
+        self,
+        x,
+        y,
+        parameters,
+        fp,
+        observation_context=None,
+    ):
         """Evaluate the configured conditional posterior at normalized parameters."""
         if self.mode == 0:
             raise RuntimeError("posterior_log_prob requires density mode 1 or 2")
         raw_features = self.feature_extractor(x, y, fp)
+        prepared_observation_context = self._prepare_observation_context(
+            observation_context, raw_features.shape[0], raw_features
+        )
         if self.posterior_symmetry == "d4":
-            return self._d4_mixture_log_prob_from_features(raw_features, parameters)
-        context = self.layer_norm(raw_features)
+            return self._d4_mixture_log_prob_from_features(
+                raw_features, parameters, prepared_observation_context
+            )
+        context = self._flow_context_from_features(
+            raw_features, prepared_observation_context
+        )
         return self.flow.log_prob(parameters, context=context)
     
     def posterior_mean(self, samples):
@@ -1175,13 +1446,20 @@ class KLNPE(nn.Module):
         z = self.fully_connected_layer(z)
         return z
     
-    def extract_latent(self, x, y, true, fp):
+    def extract_latent(
+        self, x, y, true, fp, observation_context=None
+    ):
         '''
         Run through feature extraction but map from true parameters to latent space in flow
         '''
-        z = self.feature_extractor(x, y, fp)
-        z = self.layer_norm(z)
-        latent = self.flow.transform_to_noise(true, context=z)
+        raw_features = self.feature_extractor(x, y, fp)
+        prepared_observation_context = self._prepare_observation_context(
+            observation_context, raw_features.shape[0], raw_features
+        )
+        context = self._flow_context_from_features(
+            raw_features, prepared_observation_context
+        )
+        latent = self.flow.transform_to_noise(true, context=context)
 
         return latent
 
@@ -1238,6 +1516,158 @@ class KLNPE(nn.Module):
         sigma_total_ln = sigma_total_dex * math.log(10.0)
         
         return vcirc_mu, sigma_total_ln
+
+    @staticmethod
+    def _log_standard_normal_interval(lower, upper):
+        """Return log(Phi(upper) - Phi(lower)) without tail cancellation."""
+        lower, upper = torch.broadcast_tensors(lower, upper)
+        if bool((lower >= upper).any()):
+            raise ValueError("normal interval lower bound must be below upper bound")
+        original_dtype = lower.dtype
+        lower = lower.to(torch.float64)
+        upper = upper.to(torch.float64)
+
+        def log_difference(log_larger, log_smaller):
+            return log_larger + torch.log(-torch.expm1(log_smaller - log_larger))
+
+        result = torch.empty_like(lower)
+        negative = upper <= 0
+        positive = lower >= 0
+        crossing = ~(negative | positive)
+        if bool(negative.any()):
+            result[negative] = log_difference(
+                torch.special.log_ndtr(upper[negative]),
+                torch.special.log_ndtr(lower[negative]),
+            )
+        if bool(positive.any()):
+            result[positive] = log_difference(
+                torch.special.log_ndtr(-lower[positive]),
+                torch.special.log_ndtr(-upper[positive]),
+            )
+        if bool(crossing.any()):
+            result[crossing] = log_difference(
+                torch.special.log_ndtr(upper[crossing]),
+                torch.special.log_ndtr(lower[crossing]),
+            )
+        return result.to(original_dtype)
+
+    def tf_prior_log_prob(self, v_circ, mag, mag_sigma):
+        """Log truncated TF density with respect to physical velocity."""
+        v_circ = torch.as_tensor(v_circ)
+        if not v_circ.is_floating_point():
+            v_circ = v_circ.to(dtype=torch.get_default_dtype())
+        mag = torch.as_tensor(mag, device=v_circ.device, dtype=v_circ.dtype)
+        mag_sigma = torch.as_tensor(
+            mag_sigma, device=v_circ.device, dtype=v_circ.dtype
+        )
+        v_circ, mag, mag_sigma = torch.broadcast_tensors(
+            v_circ, mag, mag_sigma
+        )
+        if not bool(torch.isfinite(mag).all()):
+            raise ValueError("mag must contain only finite values")
+        if not bool(torch.isfinite(mag_sigma).all()) or bool((mag_sigma < 0).any()):
+            raise ValueError("mag_sigma must contain finite, non-negative values")
+        slope = float(self.tf_calc.slope)
+        if not math.isfinite(slope) or slope == 0.0:
+            raise ValueError("TF slope must be finite and non-zero")
+        if not math.isfinite(self.vcirc_dex) or self.vcirc_dex <= 0.0:
+            raise ValueError("TF intrinsic scatter must be finite and positive")
+        if not (0.0 < self.vcirc_min < self.vcirc_max):
+            raise ValueError("vcirc bounds must satisfy 0 < min < max")
+
+        mean_log10 = (mag - float(self.tf_calc.intercept)) / slope
+        sigma_log10 = torch.sqrt(
+            torch.full_like(mag_sigma, self.vcirc_dex ** 2)
+            + (mag_sigma / slope).square()
+        )
+        lower = (math.log10(self.vcirc_min) - mean_log10) / sigma_log10
+        upper = (math.log10(self.vcirc_max) - mean_log10) / sigma_log10
+        log_truncation_mass = self._log_standard_normal_interval(lower, upper)
+        on_support = (
+            torch.isfinite(v_circ)
+            & (v_circ >= self.vcirc_min)
+            & (v_circ <= self.vcirc_max)
+        )
+        safe_v = torch.where(on_support, v_circ, torch.ones_like(v_circ))
+        standardized = (torch.log10(safe_v) - mean_log10) / sigma_log10
+        log_density = (
+            -0.5 * standardized.square()
+            - torch.log(sigma_log10)
+            - 0.5 * math.log(2.0 * math.pi)
+            - log_truncation_mass
+            - torch.log(safe_v)
+            - math.log(math.log(10.0))
+        )
+        return torch.where(
+            on_support, log_density, torch.full_like(log_density, -torch.inf)
+        )
+
+    @staticmethod
+    def _per_galaxy_observation(value, batch_size, samples, name):
+        value = torch.as_tensor(
+            value, device=samples.device, dtype=samples.dtype
+        ).reshape(-1)
+        if value.numel() == 1 and batch_size != 1:
+            value = value.expand(batch_size)
+        if value.numel() != batch_size:
+            raise ValueError(
+                f"{name} must be scalar or contain one value per galaxy; "
+                f"got {value.numel()} values for batch size {batch_size}"
+            )
+        return value
+
+    def tf_prior_replacement_weights(self, samples, mag, mag_sigma):
+        """Return per-galaxy pi_TF(v|m)/pi_0(v) weights for joint draws."""
+        if samples.ndim == 2:
+            samples = samples.unsqueeze(0)
+        if samples.ndim != 3 or samples.shape[-1] != self.nfeatures:
+            raise ValueError("samples must have shape (B, N, nfeatures)")
+        if samples.shape[1] <= 0:
+            raise ValueError("each galaxy must have at least one candidate sample")
+        batch_size = samples.shape[0]
+        mag = self._per_galaxy_observation(mag, batch_size, samples, "mag")
+        mag_sigma = self._per_galaxy_observation(
+            mag_sigma, batch_size, samples, "mag_sigma"
+        )
+        v_norm = samples[..., self.vcirc_idx]
+        v_circ = self.vcirc_min + 0.5 * (v_norm + 1.0) * (
+            self.vcirc_max - self.vcirc_min
+        )
+        log_tf = self.tf_prior_log_prob(
+            v_circ, mag[:, None], mag_sigma[:, None]
+        )
+        log_prior_ratio = log_tf + math.log(self.vcirc_max - self.vcirc_min)
+        finite = torch.isfinite(log_prior_ratio)
+        valid_rows = finite.any(dim=1)
+        if not bool(valid_rows.all()):
+            invalid = torch.nonzero(~valid_rows, as_tuple=False).flatten().tolist()
+            raise RuntimeError(
+                "TF prior replacement has no finite-weight candidates for "
+                f"galaxy indices {invalid}; increase the candidate bank"
+            )
+        safe_log_ratio = torch.where(
+            finite,
+            log_prior_ratio,
+            torch.full_like(log_prior_ratio, -torch.inf),
+        )
+        weight_dtype = (
+            torch.float32
+            if safe_log_ratio.dtype in (torch.float16, torch.bfloat16)
+            else safe_log_ratio.dtype
+        )
+        weights = torch.softmax(safe_log_ratio.to(weight_dtype), dim=1)
+        if not bool(torch.isfinite(weights).all()):
+            raise RuntimeError("TF prior replacement produced non-finite weights")
+        ess = weights.sum(dim=1).square() / weights.square().sum(dim=1)
+        diagnostics = {
+            "effective_sample_size": ess.detach(),
+            "effective_sample_fraction": (ess / samples.shape[1]).detach(),
+            "max_normalized_weight": weights.max(dim=1).values.detach(),
+            "candidate_log_normalizer": torch.logsumexp(
+                safe_log_ratio, dim=1
+            ).detach(),
+        }
+        return weights, safe_log_ratio, diagnostics
 
     def _compute_tf_weights(self, true, mag, snr):
         """
@@ -1373,7 +1803,7 @@ class KLNPE(nn.Module):
             raise ValueError("flow num_layers must be positive")
         hidden_units = 256
         num_blocks = 2
-        context_size = 1024
+        context_size = self.flow_context_features
 
         self.flow_type = str(config.flow.get('flow_type', 'affine')).lower()
         if self.flow_type not in FLOW_TYPES:
@@ -1615,6 +2045,20 @@ class KLNPE(nn.Module):
             f"last non-finite count was {last_bad}"
         )
 
+    def _apply_tf_prior_replacement(self, samples, mag, mag_sigma):
+        """Resample complete joint rows using the explicit TF/base-prior ratio."""
+        weights, log_prior_ratio, diagnostics = (
+            self.tf_prior_replacement_weights(samples, mag, mag_sigma)
+        )
+        indices = torch.multinomial(
+            weights, num_samples=samples.shape[1], replacement=True
+        )
+        joint_indices = indices.unsqueeze(-1).expand(-1, -1, samples.shape[-1])
+        resampled = torch.gather(samples, dim=1, index=joint_indices)
+        selected_log_ratio = torch.gather(log_prior_ratio, dim=1, index=indices)
+        self.last_tf_inference_diagnostics = diagnostics
+        return resampled, selected_log_ratio
+
     def _apply_tf_resampling(self, samples, mag, snr):
         """Apply the existing per-galaxy TF replacement to a candidate bank."""
         if samples.shape[0] != 1:
@@ -1673,12 +2117,20 @@ class KLNPE(nn.Module):
         )
         return candidates[indices].unsqueeze(0), log_w[indices]
 
-    def _d4_sample_from_features(self, raw_features, num_samples, sample_id=None):
+    def _d4_sample_from_features(
+        self,
+        raw_features,
+        num_samples,
+        sample_id=None,
+        prepared_observation_context=None,
+    ):
         if raw_features.shape[0] != 1:
             raise ValueError("D4 posterior sampling currently requires one galaxy")
         if num_samples <= 0 or num_samples % len(D4_ELEMENTS):
             raise ValueError("num_samples must be positive and divisible by 8")
-        contexts = self._d4_contexts_from_features(raw_features)[:, 0]
+        contexts = self._d4_contexts_from_features(
+            raw_features, prepared_observation_context
+        )[:, 0]
         per_component = num_samples // len(D4_ELEMENTS)
         branch_samples = self._draw_flow_samples(
             per_component,
@@ -1696,16 +2148,31 @@ class KLNPE(nn.Module):
         )
         return torch.cat(aligned, dim=0).unsqueeze(0)
 
-    def _d4_sample_log_prob(self, raw_features, samples, chunk_size=256):
+    def _d4_sample_log_prob(
+        self,
+        raw_features,
+        samples,
+        chunk_size=256,
+        prepared_observation_context=None,
+    ):
         if raw_features.shape[0] != 1 or samples.shape[0] != 1:
             raise ValueError("D4 sample scoring currently requires one galaxy")
         scores = []
         for start in range(0, samples.shape[1], chunk_size):
             candidates = samples[0, start : start + chunk_size]
             candidate_features = raw_features.expand(candidates.shape[0], -1)
+            candidate_observation_context = (
+                None
+                if prepared_observation_context is None
+                else prepared_observation_context.expand(
+                    candidates.shape[0], -1
+                )
+            )
             scores.append(
                 self._d4_mixture_log_prob_from_features(
-                    candidate_features, candidates
+                    candidate_features,
+                    candidates,
+                    candidate_observation_context,
                 )
             )
         return torch.cat(scores, dim=0)
@@ -1721,13 +2188,18 @@ class KLNPE(nn.Module):
         return_log_prob=False,
         log_context=None,
         sample_id=None,
+        tf_inference=None,
+        mag_sigma=None,
+        observation_context=None,
     ):
         """Sample one galaxy's configured conditional posterior.
 
         The D4 posterior uses a balanced eight-component mixture. Samples drawn
         in each transformed frame are mapped back to the input frame before TF
-        replacement and before returning. ``log_context`` is retained only for
-        backward call compatibility.
+        replacement and before returning. ``tf_inference='prior_replacement'``
+        applies the explicit pi_TF/pi_0 ratio to a mode-1 candidate bank and
+        requires an observed magnitude plus ``mag_sigma``. ``log_context``
+        is retained only for backward call compatibility.
         """
         del log_context
         if self.mode == 0:
@@ -1735,13 +2207,21 @@ class KLNPE(nn.Module):
         if x.shape[0] != 1:
             raise ValueError("sample currently requires a single-galaxy batch")
         raw_features = self.feature_extractor(x, y, fp)
+        prepared_observation_context = self._prepare_observation_context(
+            observation_context, raw_features.shape[0], raw_features
+        )
 
         if self.posterior_symmetry == "d4":
             samples = self._d4_sample_from_features(
-                raw_features, num_samples, sample_id=sample_id
+                raw_features,
+                num_samples,
+                sample_id=sample_id,
+                prepared_observation_context=prepared_observation_context,
             )
         else:
-            context = self.layer_norm(raw_features)
+            context = self._flow_context_from_features(
+                raw_features, prepared_observation_context
+            )
             samples = self._draw_flow_samples(
                 num_samples,
                 context,
@@ -1749,8 +2229,27 @@ class KLNPE(nn.Module):
                 canonical_theta=False,
             )
 
+        if tf_inference not in (None, "prior_replacement"):
+            raise ValueError(
+                "tf_inference must be None or 'prior_replacement'; "
+                f"got {tf_inference!r}"
+            )
         tf_log_correction = None
-        if self.mode == 2:
+        if tf_inference == "prior_replacement":
+            if self.mode != 1:
+                raise ValueError(
+                    "TF prior replacement requires a mode-1 base posterior; "
+                    "using it with mode 2 would apply TF information twice"
+                )
+            if mag is None or mag_sigma is None:
+                raise ValueError(
+                    "TF prior replacement requires both mag and mag_sigma"
+                )
+            samples, tf_log_correction = self._apply_tf_prior_replacement(
+                samples, mag, mag_sigma
+            )
+        elif self.mode == 2:
+            # Backward-compatible legacy mode-2 behavior/checkpoints.
             samples, tf_log_correction = self._apply_tf_resampling(
                 samples, mag, snr
             )
@@ -1759,15 +2258,21 @@ class KLNPE(nn.Module):
             return samples.reshape(1, num_samples, self.nfeatures)
 
         if self.posterior_symmetry == "d4":
-            flow_log_prob = self._d4_sample_log_prob(raw_features, samples)
+            flow_log_prob = self._d4_sample_log_prob(
+                raw_features,
+                samples,
+                prepared_observation_context=prepared_observation_context,
+            )
         else:
-            context = self.layer_norm(raw_features).expand(num_samples, -1)
+            context = self._flow_context_from_features(
+                raw_features, prepared_observation_context
+            ).expand(num_samples, -1)
             flow_log_prob = self.flow.log_prob(
                 samples.reshape(num_samples, self.nfeatures),
                 context=context,
             )
         if tf_log_correction is not None:
-            flow_log_prob = flow_log_prob + tf_log_correction
+            flow_log_prob = flow_log_prob + tf_log_correction.reshape(-1)
         return samples.reshape(1, num_samples, self.nfeatures), flow_log_prob
 
     def evaluate_conditional_2d(
@@ -1779,7 +2284,8 @@ class KLNPE(nn.Module):
         idx2,
         fp=None,
         grid_bins=200,
-        bounds=(-1, 1)
+        bounds=(-1, 1),
+        observation_context=None,
     ):
         '''
         Diagnostic: Sample 2 parameters conditional on all other parameters being fixed.
@@ -1789,8 +2295,13 @@ class KLNPE(nn.Module):
         idx1, idx2: Integers representing the parameter indices for g1 and g2.
         '''
         # 1. Extract context 'z' identically to your sample() function
-        z = self.feature_extractor(x, y, fp)
-        z = self.layer_norm(z)
+        raw_features = self.feature_extractor(x, y, fp)
+        prepared_observation_context = self._prepare_observation_context(
+            observation_context, raw_features.shape[0], raw_features
+        )
+        z = self._flow_context_from_features(
+            raw_features, prepared_observation_context
+        )
         
         # 2. Create a 2D grid for the two parameters
         g1_vals = torch.linspace(bounds[0], bounds[1], grid_bins, device=z.device)

@@ -14,8 +14,8 @@ module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
 
-SAMPFILE=${SAMPFILE:-samples_shear_response_5k.csv}
-DATASET=${DATASET:-shear_response_5k}
+SAMPFILE=${SAMPFILE:-samples_shear_response_simv2_galaxyaxis_halpha_5k.csv}
+DATASET=${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}
 NBASE=${NBASE:-1000}
 NTASKS=100
 TOTAL=$((5 * NBASE))
@@ -30,4 +30,5 @@ STOP=$((START + CHUNK))
 
 mkdir -p "/ocean/projects/phy250048p/shared/fits/${DATASET}"
 python generate_fits_wrapper.py -i="${START}" -j="${STOP}" \
-  -n="${SLURM_ARRAY_TASK_ID}" -s="${SAMPFILE}" -d="${DATASET}"
+  -n="${SLURM_ARRAY_TASK_ID}" -s="${SAMPFILE}" -d="${DATASET}" \
+  --observation-model-version 2 --fiber-layout galaxy_axis

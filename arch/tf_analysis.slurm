@@ -16,8 +16,8 @@ source ~/.bashrc
 conda activate kl-nn
 
 SCRIPT=\[scr\]_tf_analysis.py
-MODEL=CNN-CNN-flow_CCL_rot90
-EPOCH=179
+MODEL=CNN-CNN-flow_pretrained_CCL
+EPOCH=196
 SAMPFILE=samples_small_1m.csv
 DATASET=small_1m
 NGALS=1000
@@ -25,4 +25,4 @@ NSAMPS=10000
 NPARTS=10
 
 i=$((${SLURM_ARRAY_TASK_ID}-1))
-python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE} --conform-to-tf --cancel-add-noise
+python ${SCRIPT} -i=${i} --nparts=${NPARTS} --ngals=${NGALS} --nsamples=${NSAMPS} --stem=${MODEL} --epoch=${EPOCH} --dataset=${DATASET} --sample-set=${SAMPFILE} --conform-to-tf

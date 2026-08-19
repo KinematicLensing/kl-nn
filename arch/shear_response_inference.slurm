@@ -15,8 +15,8 @@ conda activate kl-nn
 
 : "${MODEL:?Set MODEL}"
 : "${EPOCH:?Set EPOCH}"
-DATASET=${DATASET:-shear_response_5k}
-SAMPFILE=${SAMPFILE:-samples_shear_response_5k.csv}
+DATASET=${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}
+SAMPFILE=${SAMPFILE:-samples_shear_response_simv2_galaxyaxis_halpha_5k.csv}
 NBASE=${NBASE:-1000}
 NSAMPS=${NSAMPS:-4096}
 NPARTS=10
@@ -31,4 +31,5 @@ INDEX=$((SLURM_ARRAY_TASK_ID - 1))
 python '[scr]_tf_analysis.py' -i="${INDEX}" --nparts="${NPARTS}" \
   --ngals="${NGALS}" --nsamples="${NSAMPS}" --stem="${MODEL}" \
   --epoch="${EPOCH}" --dataset="${DATASET}" --sample-set="${SAMPFILE}" \
-  --mode="${MODE:-2}" --cache-tag="${TAG:-response}" --matched-group-size=5
+  --mode="${MODE:-1}" --tf-inference="${TF_INFERENCE:-none}" \
+  --cache-tag="${TAG:-response_simv2_halpha}" --matched-group-size=5

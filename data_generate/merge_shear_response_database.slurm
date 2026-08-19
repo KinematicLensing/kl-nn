@@ -12,8 +12,8 @@ module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
 
-SAMPLE=${SAMPLE:-shear_response_5k}
-DATASET=${DATASET:-shear_response_5k}
+SAMPLE=${SAMPLE:-shear_response_simv2_galaxyaxis_halpha_5k}
+DATASET=${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}
 NBASE=${NBASE:-1000}
 NFOLDERS=100
 NSHARDS=10

@@ -51,6 +51,7 @@ class PretrainConfig:
     ccl_distance_reduction: str = "mean"
     seed: int = 42
     deterministic: bool = False
+    fixed_validation_streams: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +133,55 @@ class TFConfig:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+@dataclass
+class ObservationConfig:
+    """Versioned observation/noise policy for simulated data.
+
+    Version 1 preserves the historical shared-SNR augmentation. Version 2
+    renders independently sampled r-band magnitude and H-alpha line flux and
+    uses independent Gaussian image and spectral noise levels.
+    """
+
+    model_version: int = 1
+    # Keep the no-override configuration identical to the legacy simulator.
+    # Simulator-v2 launchers opt into galaxy-axis placement explicitly.
+    fiber_layout: str = "image_axis"
+    context_fields: list[str] = field(
+        default_factory=lambda: [
+            "rmag_obs",
+            "rmag_sigma",
+            "image_snr",
+            "spectral_reference_quality",
+            "spectral_noise_scale",
+        ]
+    )
+    rmag_min: float = 15.0
+    rmag_max: float = 23.4
+    # Integrated observed-frame H-alpha line flux [erg s^-1 cm^-2].
+    halpha_flux_min: float = 1.2e-16
+    halpha_flux_max: float = 301.43e-16
+    halpha_flux_distribution: str = "uniform"
+    halpha_flux_units: str = "erg s^-1 cm^-2"
+    image_band: str = "r"
+    target_line: str = "Ha"
+    image_depth_5sigma_mag: float = 23.4
+    # Fixed Gaussian-PSF-equivalent template used only to map m5 to one
+    # homoscedastic image-pixel RMS. The renderer itself uses airy_fwhm.
+    image_reference_psf_fwhm_arcsec: float = 1.0
+    image_pixel_scale_arcsec: float = 0.2637
+    spectral_quality_min: float = 3.0
+    spectral_quality_max: float = 100.0
+    spectral_quality_distribution: str = "log_uniform"
+    spectral_units: str = "counts"
+    center_fiber_index: int = 2
+    center_exposure_s: float = 180.0
+    offset_exposure_s: float = 600.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class ModelConfig:
     rmag_snr_source_path: str
@@ -143,6 +193,7 @@ class ModelConfig:
     train: TrainConfig
     flow: FlowConfig
     tf: TFConfig
+    observation: ObservationConfig = field(default_factory=ObservationConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -171,7 +222,8 @@ class ModelConfig:
             pretrain=pretrain_config,
             train=TrainConfig(**payload["train"]),
             flow=FlowConfig(**payload["flow"]),
-            tf=TFConfig(**payload["tf"])
+            tf=TFConfig(**payload["tf"]),
+            observation=ObservationConfig(**payload.get("observation", {})),
         )
 
     def to_json(self, path: str, *, indent: int = 2) -> None:
@@ -269,7 +321,8 @@ def _default_model_config() -> ModelConfig:
             noise_cache_maxs=True,
         ),
         flow=FlowConfig(num_layers=12),
-        tf=TFConfig(slope=-7.22, intercept=36.0, scatter=0.1)
+        tf=TFConfig(slope=-7.22, intercept=36.0, scatter=0.1),
+        observation=ObservationConfig(),
     )
 
 
@@ -277,7 +330,7 @@ MODEL_CONFIG: ModelConfig = _default_model_config()
 
 
 def _sync_legacy_globals(model_config: ModelConfig) -> None:
-    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, pretrain, train, flow, tf
+    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, pretrain, train, flow, tf, observation
 
     rmag_snr_source_path = model_config.rmag_snr_source_path
     rmag_snr_fit_path = model_config.rmag_snr_fit_path
@@ -298,6 +351,7 @@ def _sync_legacy_globals(model_config: ModelConfig) -> None:
     train = model_config.train.to_dict()
     flow = model_config.flow.to_dict()
     tf = model_config.tf.to_dict()
+    observation = model_config.observation.to_dict()
 
 
 def set_model_config(model_config: ModelConfig) -> None:

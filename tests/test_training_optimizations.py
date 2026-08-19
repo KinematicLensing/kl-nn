@@ -101,6 +101,48 @@ def test_load_train_objs_fused_adamw_flag(monkeypatch):
     assert model is not None
 
 
+def test_load_train_objs_passes_current_mode_to_klnpe_explicitly(monkeypatch):
+    _set_basic_train_config(monkeypatch, nfeatures=3, batch_size=2)
+    monkeypatch.setitem(config.train, "mode", 1)
+    monkeypatch.setitem(config.train, "backbone_type", "stage4_d4")
+    monkeypatch.setitem(config.train, "posterior_symmetry", "d4")
+    monkeypatch.setattr(train.pxt, "TorchDataset", lambda path: DummyDataset(4, 3))
+
+    class CapturingKLNPE(train.KLNPE):
+        def __init__(self, feature_extractor=None, **kwargs):
+            nn.Module.__init__(self)
+            self.feature_extractor = feature_extractor or nn.Linear(1, 1)
+            self.head = nn.Parameter(torch.zeros(()))
+            self.received = kwargs
+            self.mode = kwargs["mode"]
+
+    model_config = dict(config.train)
+    model_config["pretrained_name"] = "dummy"
+    monkeypatch.setattr(
+        train,
+        "load_model",
+        lambda *args, **kwargs: type(
+            "Pretrained", (), {"backbone": nn.Linear(1, 1)}
+        )(),
+    )
+
+    _, _, model, _ = train.load_train_objs(
+        CapturingKLNPE,
+        rank=0,
+        train_config=model_config,
+        train_mode="train",
+        epoch=19,
+        device=torch.device("cpu"),
+    )
+
+    assert model.mode == 1
+    assert model.received["mode"] == 1
+    assert model.received["batch_size"] == 2
+    assert model.received["nfeatures"] == 3
+    assert model.received["backbone_type"] == "stage4_d4"
+    assert model.received["posterior_symmetry"] == "d4"
+
+
 def test_load_model_can_explicitly_use_current_source(tmp_path, monkeypatch):
     class CurrentModel(nn.Module):
         def __init__(self):

@@ -27,6 +27,14 @@ from data import (
     _load_rmag_snr_relation,
     apply_views,
     apply_noise,
+    apply_fixed_gaussian_image_noise,
+    apply_spectral_noise,
+    depth_scaled_total_image_flux,
+    deterministic_lower_median,
+    estimate_spectral_reference_line_norm,
+    fixed_image_noise_sigma_from_depth_fluxes,
+    gaussian_psf_noise_equivalent_pixels,
+    sample_observed_magnitude,
     apply_d4_to_datavector,
     sample_magnitudes,
     app_mag_to_snr,
@@ -48,7 +56,203 @@ RNG_STREAM_IDS = {
     "valid_spec_noise": 8,
     "train_numpy": 9,
     "valid_numpy": 10,
+    "train_spec_quality": 11,
+    "valid_spec_quality": 12,
+    "train_mag_observation": 13,
+    "valid_mag_observation": 14,
 }
+
+FIBER_LAYOUT_CODES = {
+    "image_axis": 0,
+    "galaxy_axis": 1,
+}
+V2_INSTRUMENT_METADATA_FIELDS = (
+    "image_band_code",
+    "target_line_code",
+    "spectral_units_code",
+    "center_fiber_index",
+    "center_exposure_s",
+    "offset_exposure_s",
+    "image_reference_psf_fwhm_arcsec",
+    "image_pixel_scale_arcsec",
+)
+V2_IMAGE_BAND_CODES = {"r": 0}
+V2_TARGET_LINE_CODES = {"Ha": 0}
+V2_SPECTRAL_UNITS_CODES = {"counts": 0}
+
+
+def validate_v2_observation_record(
+    record,
+    *,
+    observation,
+    expected_fiber_layout,
+    location,
+):
+    """Validate and return the latent magnitude from one archived v2 record."""
+    required = (
+        "rmag_true",
+        "halpha_flux_true",
+        "observation_model_version",
+        "fiber_layout",
+        *V2_INSTRUMENT_METADATA_FIELDS,
+    )
+    missing = [name for name in required if name not in record]
+    if missing:
+        raise ValueError(
+            f"Observation-model-v2 {location} is missing LMDB metadata: "
+            f"{missing}"
+        )
+
+    scalars = {}
+    for name in required:
+        value = torch.as_tensor(record[name])
+        if value.numel() != 1:
+            raise ValueError(
+                f"Observation metadata {name!r} must be scalar in {location}; "
+                f"got shape {tuple(value.shape)}"
+            )
+        scalars[name] = value.reshape(())
+
+    expected_version = int(observation.get("model_version", 1))
+    version = int(scalars["observation_model_version"].item())
+    if version != expected_version:
+        raise ValueError(
+            f"Configured observation model v{expected_version} does not "
+            f"match {location} (v{version})"
+        )
+    if expected_fiber_layout not in FIBER_LAYOUT_CODES:
+        raise ValueError(
+            f"Unsupported configured fiber layout {expected_fiber_layout!r}"
+        )
+    expected_layout_code = FIBER_LAYOUT_CODES[expected_fiber_layout]
+    layout_code = int(scalars["fiber_layout"].item())
+    if layout_code != expected_layout_code:
+        raise ValueError(
+            f"Configured fiber layout {expected_fiber_layout!r} (code "
+            f"{expected_layout_code}) does not match {location} "
+            f"(code {layout_code})"
+        )
+
+    categorical_expectations = {
+        "image_band_code": V2_IMAGE_BAND_CODES.get(observation["image_band"]),
+        "target_line_code": V2_TARGET_LINE_CODES.get(observation["target_line"]),
+        "spectral_units_code": V2_SPECTRAL_UNITS_CODES.get(
+            observation["spectral_units"]
+        ),
+        "center_fiber_index": int(observation["center_fiber_index"]),
+    }
+    unsupported = [
+        name for name, value in categorical_expectations.items()
+        if value is None
+    ]
+    if unsupported:
+        raise ValueError(
+            "Configured v2 instrument schema is unsupported for "
+            + ", ".join(unsupported)
+        )
+    for name, expected in categorical_expectations.items():
+        actual = int(scalars[name].item())
+        if actual != expected:
+            raise ValueError(
+                f"Configured {name}={expected} does not match {location} "
+                f"({actual})"
+            )
+
+    continuous_expectations = {
+        "center_exposure_s": float(observation["center_exposure_s"]),
+        "offset_exposure_s": float(observation["offset_exposure_s"]),
+        "image_reference_psf_fwhm_arcsec": float(
+            observation["image_reference_psf_fwhm_arcsec"]
+        ),
+        "image_pixel_scale_arcsec": float(
+            observation["image_pixel_scale_arcsec"]
+        ),
+    }
+    for name, expected in continuous_expectations.items():
+        actual = float(scalars[name].item())
+        if (
+            not np.isfinite(actual)
+            or not np.isclose(actual, expected, rtol=1e-6, atol=1e-6)
+        ):
+            raise ValueError(
+                f"Configured {name}={expected} does not match {location} "
+                f"({actual})"
+            )
+
+    rmag_true = float(scalars["rmag_true"].item())
+    rmag_min = float(observation["rmag_min"])
+    rmag_max = float(observation["rmag_max"])
+    if not np.isfinite(rmag_true):
+        raise ValueError(f"Observation-model-v2 {location} has non-finite rmag_true")
+    tolerance = 1e-4
+    if rmag_true < rmag_min - tolerance or rmag_true > rmag_max + tolerance:
+        raise ValueError(
+            f"Observation-model-v2 {location} has rmag_true={rmag_true}, "
+            f"outside configured [{rmag_min}, {rmag_max}]"
+        )
+    halpha_flux_true = float(scalars["halpha_flux_true"].item())
+    halpha_flux_min = float(observation["halpha_flux_min"])
+    halpha_flux_max = float(observation["halpha_flux_max"])
+    flux_tolerance = 2e-6 * halpha_flux_max
+    if not np.isfinite(halpha_flux_true):
+        raise ValueError(
+            f"Observation-model-v2 {location} has non-finite halpha_flux_true"
+        )
+    if (
+        halpha_flux_true < halpha_flux_min - flux_tolerance
+        or halpha_flux_true > halpha_flux_max + flux_tolerance
+    ):
+        raise ValueError(
+            f"Observation-model-v2 {location} has "
+            f"halpha_flux_true={halpha_flux_true}, outside configured "
+            f"[{halpha_flux_min}, {halpha_flux_max}]"
+        )
+    return rmag_true
+
+
+def build_v2_observation_levels(
+    rmag_true,
+    *,
+    image_band="r",
+    image_depth_5sigma_mag=23.4,
+    spectral_quality_min=3.0,
+    spectral_quality_max=100.0,
+    spectral_quality_distribution="log_uniform",
+    spectral_generator=None,
+):
+    """Build independent image and spectral quality levels for simulator v2."""
+    rmag_true = torch.as_tensor(rmag_true)
+    if not rmag_true.is_floating_point():
+        rmag_true = rmag_true.to(torch.get_default_dtype())
+    if bool((~torch.isfinite(rmag_true)).any()):
+        raise ValueError("rmag_true must contain finite values")
+    quality_min = float(spectral_quality_min)
+    quality_max = float(spectral_quality_max)
+    if not np.isfinite(quality_min) or not np.isfinite(quality_max):
+        raise ValueError("spectral-quality bounds must be finite")
+    if quality_min <= 0 or quality_min >= quality_max:
+        raise ValueError("spectral-quality bounds must be positive and increasing")
+    if spectral_quality_distribution not in ("log_uniform", "uniform"):
+        raise ValueError("unsupported spectral-quality distribution")
+
+    image_snr = app_mag_to_snr(
+        rmag_true,
+        band=image_band,
+        depth_5sigma_mag=image_depth_5sigma_mag,
+    )
+    unit_draw = torch.rand(
+        rmag_true.shape,
+        device=rmag_true.device,
+        dtype=rmag_true.dtype,
+        generator=spectral_generator,
+    )
+    if spectral_quality_distribution == "log_uniform":
+        log_min = np.log10(quality_min)
+        log_max = np.log10(quality_max)
+        spectral_quality = 10 ** (unit_draw * (log_max - log_min) + log_min)
+    else:
+        spectral_quality = unit_draw * (quality_max - quality_min) + quality_min
+    return image_snr, spectral_quality
 
 
 def derive_stream_seed(base_seed, rank=0, epoch=0, stream="ambient"):
@@ -264,6 +468,16 @@ class Trainer:
         else:
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.use_channels_last = bool(config.train.get('channels_last', False))
+        self.observation_model_version = int(
+            config.observation.get("model_version", 1)
+        )
+        self.expected_fiber_layout = str(
+            config.observation.get("fiber_layout", "galaxy_axis")
+        )
+        if self.expected_fiber_layout not in FIBER_LAYOUT_CODES:
+            raise ValueError(
+                f"Unsupported configured fiber layout {self.expected_fiber_layout!r}"
+            )
         self.use_noise_cache_maxs = bool(config.train.get('noise_cache_maxs', False))
         self.fixed_validation_streams = bool(
             config.train.get('fixed_validation_streams', False)
@@ -287,6 +501,18 @@ class Trainer:
             torch.distributed.is_available()
             and torch.distributed.is_initialized()
         )
+
+    def _noise_cache_for_batch(self, cache, batch_ids):
+        """Select a legacy max cache when it exists.
+
+        Observation model v2 uses fixed image noise and independent spectral
+        noise, so it intentionally does not allocate the legacy per-object
+        maximum caches even when an archived pretraining config leaves
+        ``noise_cache_maxs`` enabled.
+        """
+        if not self.use_noise_cache_maxs or cache is None:
+            return None
+        return cache[batch_ids]
 
     def _all_ranks_true(self, value):
         """Return ``True`` only when every distributed rank reports true."""
@@ -358,6 +584,10 @@ class Trainer:
             "valid_order",
             "train_snr",
             "valid_snr",
+            "train_spec_quality",
+            "valid_spec_quality",
+            "train_mag_observation",
+            "valid_mag_observation",
             "train_img_noise",
             "train_spec_noise",
             "valid_img_noise",
@@ -388,6 +618,16 @@ class Trainer:
             )
             for split in ("train", "valid")
         }
+
+    def _load_v2_record_metadata(self, record, *, split, record_index):
+        observation = dict(config.observation)
+        observation["model_version"] = self.observation_model_version
+        return validate_v2_observation_record(
+            record,
+            observation=observation,
+            expected_fiber_layout=self.expected_fiber_layout,
+            location=f"{split} record {record_index}",
+        )
     
     def _set_tensors(self):
         '''
@@ -425,6 +665,16 @@ class Trainer:
         self.fid_valid = torch.empty((self.nvalid, self.nfeatures), dtype=torch.float, device=self.device)
         self.fibpos_train = torch.empty((self.ntrain, 5, 2), dtype=torch.float, device=self.device)
         self.fibpos_valid = torch.empty((self.nvalid, 5, 2), dtype=torch.float, device=self.device)
+        if self.observation_model_version == 2:
+            self.rmag_train = torch.empty(
+                self.ntrain, dtype=torch.float, device=self.device
+            )
+            self.rmag_valid = torch.empty(
+                self.nvalid, dtype=torch.float, device=self.device
+            )
+        else:
+            self.rmag_train = None
+            self.rmag_valid = None
         
         # Fill arrays with values
         start = self.gpu_id*self.ntrain
@@ -433,10 +683,15 @@ class Trainer:
         prev_prog = 0
         for i in range(self.ntrain):
             i_db = start+i
-            self.img_train[i] = self.train_data[i_db]['img']
-            self.spec_train[i] = self.train_data[i_db]['spec']
-            self.fid_train[i] = self.train_data[i_db]['fid_pars'][:self.nfeatures]
-            self.fibpos_train[i] = self.train_data[i_db]['fib_pos']
+            record = self.train_data[i_db]
+            self.img_train[i] = record['img']
+            self.spec_train[i] = record['spec']
+            self.fid_train[i] = record['fid_pars'][:self.nfeatures]
+            self.fibpos_train[i] = record['fib_pos']
+            if self.observation_model_version == 2:
+                self.rmag_train[i] = self._load_v2_record_metadata(
+                    record, split="training", record_index=i_db
+                )
 
             prog = 100*i//self.ntrain
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
@@ -449,21 +704,102 @@ class Trainer:
         prev_prog = 0
         for i in range(self.nvalid):
             i_db = start+i
-            self.img_valid[i] = self.valid_data[i_db]['img']
-            self.spec_valid[i] = self.valid_data[i_db]['spec']
-            self.fid_valid[i] = self.valid_data[i_db]['fid_pars'][:self.nfeatures]
-            self.fibpos_valid[i] = self.valid_data[i_db]['fib_pos']
+            record = self.valid_data[i_db]
+            self.img_valid[i] = record['img']
+            self.spec_valid[i] = record['spec']
+            self.fid_valid[i] = record['fid_pars'][:self.nfeatures]
+            self.fibpos_valid[i] = record['fib_pos']
+            if self.observation_model_version == 2:
+                self.rmag_valid[i] = self._load_v2_record_metadata(
+                    record, split="validation", record_index=i_db
+                )
 
             prog = 100*i//self.nvalid
             if prog % 10 == 0 and prog > prev_prog and self.gpu_id == self.log_rank:
                 prev_prog = prog
                 self.logger.info(f"{prog}% complete")
 
+        self.image_noise_sigma = None
+        self.spectral_reference_line_norm = None
+        if self.observation_model_version == 2:
+            local_depth_fluxes = depth_scaled_total_image_flux(
+                self.img_train,
+                self.rmag_train,
+                config.observation["image_depth_5sigma_mag"],
+            )
+            if self._distributed_is_initialized():
+                gathered_depth_fluxes = [
+                    torch.empty_like(local_depth_fluxes)
+                    for _ in range(torch.distributed.get_world_size())
+                ]
+                torch.distributed.all_gather(
+                    gathered_depth_fluxes, local_depth_fluxes
+                )
+                global_depth_fluxes = torch.cat(gathered_depth_fluxes)
+            else:
+                global_depth_fluxes = local_depth_fluxes
+            reference_noise_pixels = gaussian_psf_noise_equivalent_pixels(
+                config.observation["image_reference_psf_fwhm_arcsec"],
+                config.observation["image_pixel_scale_arcsec"],
+            )
+            self.image_noise_sigma = (
+                fixed_image_noise_sigma_from_depth_fluxes(
+                    global_depth_fluxes, reference_noise_pixels
+                ).reshape(())
+            )
+
+            local_reference = estimate_spectral_reference_line_norm(
+                self.spec_train,
+                center_fiber_index=int(config.observation["center_fiber_index"]),
+            ).reshape(1)
+            if self._distributed_is_initialized():
+                gathered = [
+                    torch.empty_like(local_reference)
+                    for _ in range(torch.distributed.get_world_size())
+                ]
+                torch.distributed.all_gather(gathered, local_reference)
+                local_reference = deterministic_lower_median(
+                    torch.cat(gathered)
+                ).reshape(1)
+            self.spectral_reference_line_norm = local_reference.reshape(())
+            model_owner = self.model.module
+            while hasattr(model_owner, "_orig_mod"):
+                model_owner = model_owner._orig_mod
+            checkpoint_values = {
+                "image_noise_sigma": self.image_noise_sigma,
+                "spectral_reference_line_norm": (
+                    self.spectral_reference_line_norm
+                ),
+            }
+            for buffer_name, value in checkpoint_values.items():
+                if hasattr(model_owner, buffer_name):
+                    buffer = getattr(model_owner, buffer_name)
+                    with torch.no_grad():
+                        buffer.copy_(
+                            value.to(device=buffer.device, dtype=buffer.dtype)
+                        )
+                elif hasattr(model_owner, "_prepare_observation_context"):
+                    raise RuntimeError(
+                        "Observation-model-v2 NPE is missing its archived "
+                        f"{buffer_name} buffer"
+                    )
+            if self.gpu_id == self.log_rank:
+                self.logger.info(
+                    "Observation v2 fixed image noise sigma: %.8g "
+                    "(Gaussian-equivalent N_eff=%.6g)",
+                    float(self.image_noise_sigma.item()),
+                    reference_noise_pixels,
+                )
+                self.logger.info(
+                    "Observation v2 spectral reference line norm: %.8g",
+                    float(self.spectral_reference_line_norm.item()),
+                )
+
         self.img_train_maxs = None
         self.img_valid_maxs = None
         self.spec_train_maxs = None
         self.spec_valid_maxs = None
-        if self.use_noise_cache_maxs:
+        if self.use_noise_cache_maxs and self.observation_model_version != 2:
             if self.gpu_id == self.log_rank:
                 self.logger.info("Precomputing noise max caches")
             self.img_train_maxs = torch.amax(self.img_train, dim=(-1, -2, -3))
@@ -477,17 +813,85 @@ class Trainer:
     def _apply_noise(self, data, snr, maxs=None, randgen=None):
         if snr is None:
             return data
-        output = apply_noise(
+        if self.observation_model_version == 2:
+            if self.image_noise_sigma is None:
+                raise RuntimeError(
+                    "Observation model v2 fixed image noise sigma is unset"
+                )
+            output = apply_fixed_gaussian_image_noise(
+                data, self.image_noise_sigma, randgen=randgen
+            )
+        else:
+            output = apply_noise(
+                data,
+                snr,
+                device=self.device,
+                use_iterative=True,
+                maxs=maxs,
+                randgen=randgen,
+            )
+        if self.use_channels_last:
+            output = output.contiguous(memory_format=torch.channels_last)
+        return output
+
+    def _apply_spectrum_noise(
+        self,
+        data,
+        image_snr,
+        *,
+        spectral_quality=None,
+        maxs=None,
+        randgen=None,
+    ):
+        if self.observation_model_version != 2:
+            return self._apply_noise(
+                data, image_snr, maxs=maxs, randgen=randgen
+            )
+        if spectral_quality is None:
+            raise ValueError("Observation model v2 requires spectral quality")
+        if self.spectral_reference_line_norm is None:
+            raise RuntimeError("Observation model v2 spectral reference is unset")
+        output = apply_spectral_noise(
             data,
-            snr,
-            device=self.device,
-            use_iterative=True,
-            maxs=maxs,
+            spectral_quality,
+            self.spectral_reference_line_norm,
+            center_fiber_index=int(config.observation["center_fiber_index"]),
+            center_exposure_s=float(config.observation["center_exposure_s"]),
+            offset_exposure_s=float(config.observation["offset_exposure_s"]),
+            spectral_units=config.observation["spectral_units"],
             randgen=randgen,
+            device=self.device,
         )
         if self.use_channels_last:
             output = output.contiguous(memory_format=torch.channels_last)
         return output
+
+    def _observation_context_for_batch(
+        self, batch_ids, *, split, duplicate=False
+    ):
+        """Return observed, D4-invariant v2 scalars for one density batch."""
+        if self.observation_model_version != 2:
+            return None
+        if split not in ("train", "valid"):
+            raise ValueError("split must be 'train' or 'valid'")
+        suffix = "train" if split == "train" else "valid"
+        source_names = {
+            "rmag_obs": f"RMAG_OBS_{suffix}",
+            "rmag_sigma": f"RMAG_SIGMA_{suffix}",
+            "image_snr": f"IMAGE_SNR_OBS_{suffix}",
+            "spectral_reference_quality": f"SPEC_QUALITY_{suffix}",
+            "spectral_noise_scale": f"SPEC_NOISE_SCALE_{suffix}",
+        }
+        context = {
+            name: getattr(self, attribute)[batch_ids]
+            for name, attribute in source_names.items()
+        }
+        if duplicate:
+            context = {
+                name: torch.cat((value, value), dim=0)
+                for name, value in context.items()
+            }
+        return context
     
     def _run_epoch(self, epoch, show_log=True):
         self._reset_epoch_rngs(epoch)
@@ -507,21 +911,91 @@ class Trainer:
             generator=self.epoch_generators["valid_order"],
         )
             
-        self.SNR_train = self.generate_snr(
-            size=self.ntrain,
-            mode='log_uniform',
-            generator=self.epoch_generators["train_snr"],
-            np_rng=self.epoch_numpy_generators["train"],
-        )
-        self.SNR_valid = self.generate_snr(
-            size=self.nvalid,
-            mode='log_uniform',
-            generator=self.epoch_generators["valid_snr"],
-            np_rng=self.epoch_numpy_generators["valid"],
-        )
-        
-        if self.gpu_id == self.log_rank:
-            self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
+        if self.observation_model_version == 2:
+            observation = config.observation
+            level_kwargs = {
+                "image_band": observation["image_band"],
+                "image_depth_5sigma_mag": observation["image_depth_5sigma_mag"],
+                "spectral_quality_min": observation["spectral_quality_min"],
+                "spectral_quality_max": observation["spectral_quality_max"],
+                "spectral_quality_distribution": observation[
+                    "spectral_quality_distribution"
+                ],
+            }
+            self.SNR_train, self.SPEC_QUALITY_train = build_v2_observation_levels(
+                self.rmag_train,
+                spectral_generator=self.epoch_generators["train_spec_quality"],
+                **level_kwargs,
+            )
+            self.SNR_valid, self.SPEC_QUALITY_valid = build_v2_observation_levels(
+                self.rmag_valid,
+                spectral_generator=self.epoch_generators["valid_spec_quality"],
+                **level_kwargs,
+            )
+            train_mag_observation = sample_observed_magnitude(
+                self.rmag_train,
+                self.SNR_train,
+                randgen=self.epoch_generators["train_mag_observation"],
+            )
+            valid_mag_observation = sample_observed_magnitude(
+                self.rmag_valid,
+                self.SNR_valid,
+                randgen=self.epoch_generators["valid_mag_observation"],
+            )
+            self.RMAG_OBS_train = train_mag_observation["rmag_obs"]
+            self.RMAG_SIGMA_train = train_mag_observation["rmag_sigma"]
+            self.IMAGE_SNR_OBS_train = train_mag_observation[
+                "image_flux_snr"
+            ]
+            self.RMAG_OBS_valid = valid_mag_observation["rmag_obs"]
+            self.RMAG_SIGMA_valid = valid_mag_observation["rmag_sigma"]
+            self.IMAGE_SNR_OBS_valid = valid_mag_observation[
+                "image_flux_snr"
+            ]
+            self.SPEC_NOISE_SCALE_train = (
+                self.spectral_reference_line_norm / self.SPEC_QUALITY_train
+            )
+            self.SPEC_NOISE_SCALE_valid = (
+                self.spectral_reference_line_norm / self.SPEC_QUALITY_valid
+            )
+            if self.gpu_id == self.log_rank:
+                self.logger.info(
+                    "Observation v2 epoch %d: target image SNR %.5g--%.5g; "
+                    "observed flux SNR %.5g--%.5g; independent spectral "
+                    "quality %.5g--%.5g",
+                    epoch + 1,
+                    float(self.SNR_train.min().item()),
+                    float(self.SNR_train.max().item()),
+                    float(self.IMAGE_SNR_OBS_train.min().item()),
+                    float(self.IMAGE_SNR_OBS_train.max().item()),
+                    float(self.SPEC_QUALITY_train.min().item()),
+                    float(self.SPEC_QUALITY_train.max().item()),
+                )
+        else:
+            self.SNR_train = self.generate_snr(
+                size=self.ntrain,
+                mode='log_uniform',
+                generator=self.epoch_generators["train_snr"],
+                np_rng=self.epoch_numpy_generators["train"],
+            )
+            self.SNR_valid = self.generate_snr(
+                size=self.nvalid,
+                mode='log_uniform',
+                generator=self.epoch_generators["valid_snr"],
+                np_rng=self.epoch_numpy_generators["valid"],
+            )
+            self.SPEC_QUALITY_train = None
+            self.SPEC_QUALITY_valid = None
+            self.RMAG_OBS_train = None
+            self.RMAG_SIGMA_train = None
+            self.IMAGE_SNR_OBS_train = None
+            self.RMAG_OBS_valid = None
+            self.RMAG_SIGMA_valid = None
+            self.IMAGE_SNR_OBS_valid = None
+            self.SPEC_NOISE_SCALE_train = None
+            self.SPEC_NOISE_SCALE_valid = None
+            if self.gpu_id == self.log_rank:
+                self.logger.info(f'Randomized SNR and noise for epoch {epoch+1}')
 
         train_loss = self._trainFunc(epoch)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -751,6 +1225,9 @@ class FETrainer(Trainer):
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.use_channels_last = bool(config.pretrain.get('channels_last', False))
         self.use_noise_cache_maxs = bool(config.pretrain.get('noise_cache_maxs', False))
+        self.fixed_validation_streams = bool(
+            config.pretrain.get('fixed_validation_streams', False)
+        )
         self.use_rot90_counterpart = bool(
             config.pretrain.get('use_rot90_counterpart', True)
         )
@@ -834,17 +1311,27 @@ class FETrainer(Trainer):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
-            img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
-            spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
+            spectral_quality = (
+                self.SPEC_QUALITY_train[batch_ids]
+                if self.SPEC_QUALITY_train is not None
+                else None
+            )
+            img_maxs = self._noise_cache_for_batch(
+                self.img_train_maxs, batch_ids
+            )
+            spec_maxs = self._noise_cache_for_batch(
+                self.spec_train_maxs, batch_ids
+            )
             img = self._apply_noise(
                 self.img_train[batch_ids],
                 snr,
                 maxs=img_maxs,
                 randgen=self.epoch_generators["train_img_noise"],
             )
-            spec = self._apply_noise(
+            spec = self._apply_spectrum_noise(
                 self.spec_train[batch_ids],
                 snr,
+                spectral_quality=spectral_quality,
                 maxs=spec_maxs,
                 randgen=self.epoch_generators["train_spec_noise"],
             )
@@ -936,17 +1423,27 @@ class FETrainer(Trainer):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
-                img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
-                spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
+                spectral_quality = (
+                    self.SPEC_QUALITY_valid[batch_ids]
+                    if self.SPEC_QUALITY_valid is not None
+                    else None
+                )
+                img_maxs = self._noise_cache_for_batch(
+                    self.img_valid_maxs, batch_ids
+                )
+                spec_maxs = self._noise_cache_for_batch(
+                    self.spec_valid_maxs, batch_ids
+                )
                 img = self._apply_noise(
                     self.img_valid[batch_ids],
                     snr,
                     maxs=img_maxs,
                     randgen=self.epoch_generators["valid_img_noise"],
                 )
-                spec = self._apply_noise(
+                spec = self._apply_spectrum_noise(
                     self.spec_valid[batch_ids],
                     snr,
+                    spectral_quality=spectral_quality,
                     maxs=spec_maxs,
                     randgen=self.epoch_generators["valid_spec_noise"],
                 )
@@ -1044,6 +1541,14 @@ class NPETrainer(Trainer):
             seed=seed,
             deterministic=deterministic,
         )
+        if (
+            self.observation_model_version == 2
+            and int(getattr(self.model.module, "mode", -1)) != 1
+        ):
+            raise ValueError(
+                "Observation model v2 requires an unweighted mode-1 base posterior; "
+                "apply TF information explicitly at inference"
+            )
         
         self.model_name = config.train['model_name']
         self.scheduler_type = str(
@@ -1210,17 +1715,36 @@ class NPETrainer(Trainer):
             diagnostics[key] = value if np.isfinite(value) else float('nan')
         return diagnostics
 
-    def _run_batch(self, img, spec, fid, mode, fp=None, snr=None):
+    def _run_batch(
+        self,
+        img,
+        spec,
+        fid,
+        mode,
+        fp=None,
+        snr=None,
+        observation_context=None,
+    ):
         if mode == 'train':
             self.optimizer.zero_grad(set_to_none=True)
 
         if self.model.module.mode == 2:
             self.mag = snr_to_app_mag(snr) if snr is not None else None
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                loss = self.model(img, spec, fid, fp=fp, mag=self.mag, snr=snr)
+                model_kwargs = {
+                    "fp": fp,
+                    "mag": self.mag,
+                    "snr": snr,
+                }
+                if observation_context is not None:
+                    model_kwargs["observation_context"] = observation_context
+                loss = self.model(img, spec, fid, **model_kwargs)
         else:
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                loss = self.model(img, spec, fid, fp=fp)
+                model_kwargs = {"fp": fp}
+                if observation_context is not None:
+                    model_kwargs["observation_context"] = observation_context
+                loss = self.model(img, spec, fid, **model_kwargs)
         if mode == 'train':
             self._capture_training_diagnostics()
 
@@ -1307,34 +1831,58 @@ class NPETrainer(Trainer):
             start = i*self.batch_size
             batch_ids = self.train_order[start:start+self.batch_size]
             snr = self.SNR_train[batch_ids] if self.SNR_train is not None else None
-            img_maxs = self.img_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
-            spec_maxs = self.spec_train_maxs[batch_ids] if self.use_noise_cache_maxs else None
+            spectral_quality = (
+                self.SPEC_QUALITY_train[batch_ids]
+                if self.SPEC_QUALITY_train is not None
+                else None
+            )
+            img_maxs = self._noise_cache_for_batch(
+                self.img_train_maxs, batch_ids
+            )
+            spec_maxs = self._noise_cache_for_batch(
+                self.spec_train_maxs, batch_ids
+            )
             img = self._apply_noise(
                 self.img_train[batch_ids],
                 snr,
                 maxs=img_maxs,
                 randgen=self.epoch_generators["train_img_noise"],
             )
-            spec = self._apply_noise(
+            spec = self._apply_spectrum_noise(
                 self.spec_train[batch_ids],
                 snr,
+                spectral_quality=spectral_quality,
                 maxs=spec_maxs,
                 randgen=self.epoch_generators["train_spec_noise"],
             )
             fid = self.fid_train[batch_ids]
             fp = self.fibpos_train[batch_ids]
+            observation_context = self._observation_context_for_batch(
+                batch_ids,
+                split="train",
+                duplicate=self.use_rot90_counterpart,
+            )
+            model_snr = None if self.observation_model_version == 2 else snr
             img, spec, fid, fp, snr = make_npe_training_batch(
                 img,
                 spec,
                 fid,
                 fp,
-                snr,
+                model_snr,
                 use_rot90_counterpart=self.use_rot90_counterpart,
             )
             if self.use_channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
-            loss = self._run_batch(img, spec, fid, 'train', fp=fp, snr=snr)
+            loss = self._run_batch(
+                img,
+                spec,
+                fid,
+                'train',
+                fp=fp,
+                snr=snr,
+                observation_context=observation_context,
+            )
             if self.last_batch_globally_valid:
                 local_loss_sum += float(loss.detach().item())
                 local_loss_count += 1
@@ -1455,34 +2003,58 @@ class NPETrainer(Trainer):
                 start = i*self.batch_size
                 batch_ids = self.valid_order[start:start+self.batch_size]
                 snr = self.SNR_valid[batch_ids] if self.SNR_valid is not None else None
-                img_maxs = self.img_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
-                spec_maxs = self.spec_valid_maxs[batch_ids] if self.use_noise_cache_maxs else None
+                spectral_quality = (
+                    self.SPEC_QUALITY_valid[batch_ids]
+                    if self.SPEC_QUALITY_valid is not None
+                    else None
+                )
+                img_maxs = self._noise_cache_for_batch(
+                    self.img_valid_maxs, batch_ids
+                )
+                spec_maxs = self._noise_cache_for_batch(
+                    self.spec_valid_maxs, batch_ids
+                )
                 img = self._apply_noise(
                     self.img_valid[batch_ids],
                     snr,
                     maxs=img_maxs,
                     randgen=self.epoch_generators["valid_img_noise"],
                 )
-                spec = self._apply_noise(
+                spec = self._apply_spectrum_noise(
                     self.spec_valid[batch_ids],
                     snr,
+                    spectral_quality=spectral_quality,
                     maxs=spec_maxs,
                     randgen=self.epoch_generators["valid_spec_noise"],
                 )
                 fid = self.fid_valid[batch_ids]
                 fp = self.fibpos_valid[batch_ids]
+                observation_context = self._observation_context_for_batch(
+                    batch_ids,
+                    split="valid",
+                    duplicate=self.use_rot90_counterpart,
+                )
+                model_snr = None if self.observation_model_version == 2 else snr
                 img, spec, fid, fp, snr = make_npe_training_batch(
                     img,
                     spec,
                     fid,
                     fp,
-                    snr,
+                    model_snr,
                     use_rot90_counterpart=self.use_rot90_counterpart,
                 )
                 if self.use_channels_last:
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
-                loss = self._run_batch(img, spec, fid, 'valid', fp=fp, snr=snr)
+                loss = self._run_batch(
+                    img,
+                    spec,
+                    fid,
+                    'valid',
+                    fp=fp,
+                    snr=snr,
+                    observation_context=observation_context,
+                )
                 if self.last_batch_globally_valid:
                     local_loss_sum += float(loss.detach().item())
                     local_loss_count += 1
@@ -1736,19 +2308,37 @@ def load_train_objs(
     # Create dataset objects
     train_ds = pxt.TorchDataset(config.data['data_dir'])
     valid_ds = pxt.TorchDataset(config.test['data_dir'])
+    model_kwargs = dict(kwargs)
+    if isinstance(Model, type) and issubclass(Model, KLNPE):
+        # Never rely on constructor defaults for values supplied by a loaded
+        # run config.  This also protects worker processes using archived
+        # configurations from module-import-time defaults.
+        model_kwargs.setdefault('mode', int(train_config['mode']))
+        model_kwargs.setdefault('batch_size', int(train_config['batch_size']))
+        model_kwargs.setdefault(
+            'nfeatures', int(train_config['feature_number'])
+        )
+        model_kwargs.setdefault('nspec', int(config.data['nspec']))
+        model_kwargs.setdefault(
+            'backbone_type', train_config.get('backbone_type', None)
+        )
+        model_kwargs.setdefault(
+            'posterior_symmetry',
+            train_config.get('posterior_symmetry', None),
+        )
     # Initialize model and optimizer
     if epoch is not None: # if epoch is specified, load pretrained model
         strict = True
         model_dir = train_config['model_path'] + train_config['pretrained_name'] + '/' + train_config['pretrained_name'] + str(epoch)
         pretrained_model = load_model(train_config, Model=CCLPretrain, path=model_dir, strict=strict, assign=True)
-        model = Model(pretrained_model.backbone, **kwargs)
+        model = Model(pretrained_model.backbone, **model_kwargs)
         for param in model.feature_extractor.parameters():
             param.requires_grad = False
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded model {train_config['pretrained_name']} at epoch {epoch}")
     else:
-        model = Model(**kwargs)  # initialize new model
+        model = Model(**model_kwargs)  # initialize new model
         if rank == 0:
             if log is not None:
                 log.info(f"Loaded new model {train_config['model_name']}")
@@ -1916,6 +2506,94 @@ def pair_rotation_branches(values):
     paired = values.reshape(values.shape[0] // 2, 2, *values.shape[1:])
     return np.moveaxis(paired, 1, 2)
 
+def _unwrap_posterior_model(model):
+    """Return the checkpoint-owning module through optional compile wrappers."""
+    owner = model
+    while hasattr(owner, "_orig_mod"):
+        owner = owner._orig_mod
+    return owner
+
+
+def load_v2_observation_metadata(
+    dataset,
+    *,
+    expected_fiber_layout=None,
+    device="cpu",
+    return_halpha_flux: bool = False,
+):
+    """Load validated v2 magnitudes and optionally integrated H-alpha fluxes."""
+    observation = config.observation
+    expected_version = int(observation.get("model_version", 1))
+    if expected_version != 2:
+        raise ValueError(
+            "load_v2_observation_metadata requires observation model_version=2"
+        )
+    if expected_fiber_layout is None:
+        expected_fiber_layout = observation.get("fiber_layout", "galaxy_axis")
+    expected_fiber_layout = str(expected_fiber_layout)
+    if expected_fiber_layout not in FIBER_LAYOUT_CODES:
+        raise ValueError(
+            f"Unsupported configured fiber layout {expected_fiber_layout!r}"
+        )
+    magnitudes = torch.empty(len(dataset), dtype=torch.float32, device=device)
+    halpha_fluxes = (
+        torch.empty(len(dataset), dtype=torch.float32, device=device)
+        if return_halpha_flux
+        else None
+    )
+
+    for index in range(len(dataset)):
+        record = dataset[index]
+        magnitudes[index] = validate_v2_observation_record(
+            record,
+            observation=observation,
+            expected_fiber_layout=expected_fiber_layout,
+            location=f"analysis record {index}",
+        )
+        if halpha_fluxes is not None:
+            halpha_fluxes[index] = torch.as_tensor(
+                record["halpha_flux_true"], dtype=torch.float32, device=device
+            ).reshape(())
+    if halpha_fluxes is not None:
+        return magnitudes, halpha_fluxes
+    return magnitudes
+
+
+def checkpoint_spectral_reference_line_norm(model):
+    """Read the positive spectral reference persisted in a v2 checkpoint."""
+    owner = _unwrap_posterior_model(model)
+    if not hasattr(owner, "spectral_reference_line_norm"):
+        raise RuntimeError(
+            "Observation-model-v2 checkpoint is missing "
+            "spectral_reference_line_norm"
+        )
+    reference = owner.spectral_reference_line_norm.detach().reshape(())
+    if not bool(torch.isfinite(reference) & (reference > 0)):
+        raise RuntimeError(
+            "Observation-model-v2 checkpoint has an invalid "
+            "spectral_reference_line_norm"
+        )
+    return reference
+
+
+def checkpoint_image_noise_sigma(model):
+    """Read the positive fixed image-pixel RMS persisted in a v2 checkpoint."""
+    owner = _unwrap_posterior_model(model)
+    if not hasattr(owner, "image_noise_sigma"):
+        raise RuntimeError(
+            "Observation-model-v2 checkpoint is missing image_noise_sigma"
+        )
+    sigma = owner.image_noise_sigma.detach().reshape(())
+    if not bool(torch.isfinite(sigma) & (sigma > 0)):
+        raise RuntimeError(
+            "Observation-model-v2 checkpoint has an invalid image_noise_sigma"
+        )
+    return sigma
+
+
+def _seeded_generator(device, seed):
+    return torch.Generator(device=device).manual_seed(int(seed) % (2**63 - 1))
+
 
 def sample_density(
     model,
@@ -1931,13 +2609,26 @@ def sample_density(
     channels_last: bool | None = None,
     matched_group_size: int = 1,
     noise_seed: int = 42,
+    spectral_noise_seed: int | None = None,
+    magnitude_seed: int | None = None,
+    spectral_quality_seed: int | None = None,
+    image_randgen=None,
+    spectral_randgen=None,
+    magnitude_randgen=None,
+    spectral_quality_randgen=None,
+    spectral_quality=None,
+    rmag_true=None,
+    tf_inference=None,
+    return_observation_metadata: bool = False,
     progress=None,
 ):
-    '''
-    Run this function to sample from trained density estimation models
-    '''
-    posterior_owner = getattr(model, "_orig_mod", model)
+    """Sample posteriors with legacy-v1 or versioned-v2 observations."""
+    del vcirc_mu  # Retained in the public signature for legacy callers.
+    posterior_owner = _unwrap_posterior_model(model)
     posterior_symmetry = getattr(posterior_owner, "posterior_symmetry", "none")
+    observation_model_version = int(
+        getattr(posterior_owner, "observation_model_version", 1)
+    )
     if posterior_symmetry == "d4" and apply_add_noise_cancellation:
         raise ValueError(
             "apply_add_noise_cancellation is redundant and incompatible with "
@@ -1945,37 +2636,368 @@ def sample_density(
         )
     if channels_last is None:
         channels_last = bool(config.train.get('channels_last', False))
-    if snr is None and randgen is not None:
-        snr = torch.rand(len(test_ds), generator=randgen, device=device)*995 + 5
+    if matched_group_size < 1 or len(test_ds) % matched_group_size:
+        raise ValueError(
+            "matched_group_size must be positive and divide the dataset size"
+        )
+
+    observation_metadata = None
+    if observation_model_version == 2:
+        if getattr(posterior_owner, "mode", None) != 1:
+            raise ValueError(
+                "Observation model v2 requires a mode-1 base posterior"
+            )
+        if tf_inference not in (None, "prior_replacement"):
+            raise ValueError(
+                "Observation model v2 supports only no TF inference or "
+                "tf_inference='prior_replacement'"
+            )
+        if (
+            tf_inference == "prior_replacement"
+            and apply_add_noise_cancellation
+        ):
+            raise ValueError(
+                "TF prior replacement does not support the two-branch "
+                "additive-noise cancellation diagnostic"
+            )
+        if mag is not None:
+            raise ValueError(
+                "Do not pass mag for observation model v2; the noisy catalog "
+                "magnitude is generated from archived rmag_true"
+            )
+        archived_rmag, archived_halpha_flux = load_v2_observation_metadata(
+            test_ds,
+            expected_fiber_layout=config.observation.get(
+                "fiber_layout", "galaxy_axis"
+            ),
+            device=device,
+            return_halpha_flux=True,
+        )
+        if rmag_true is not None:
+            supplied_rmag = torch.as_tensor(
+                rmag_true,
+                dtype=archived_rmag.dtype,
+                device=archived_rmag.device,
+            )
+            if supplied_rmag.shape != archived_rmag.shape or not torch.allclose(
+                supplied_rmag, archived_rmag, rtol=0.0, atol=1e-4
+            ):
+                raise ValueError(
+                    "Supplied rmag_true does not match archived LMDB metadata"
+                )
+        rmag_true = archived_rmag
+
+        grouped_rmag = rmag_true.reshape(-1, matched_group_size)
+        group_rmag = grouped_rmag[:, 0]
+        if not torch.allclose(
+            grouped_rmag,
+            group_rmag[:, None].expand_as(grouped_rmag),
+            rtol=0.0,
+            atol=1e-4,
+        ):
+            raise ValueError(
+                "Every matched observation group must share the same "
+                "archived rmag_true"
+            )
+        grouped_halpha_flux = archived_halpha_flux.reshape(
+            -1, matched_group_size
+        )
+        if not torch.allclose(
+            grouped_halpha_flux,
+            grouped_halpha_flux[:, :1].expand_as(grouped_halpha_flux),
+            rtol=2e-6,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "Every matched observation group must share the same "
+                "archived halpha_flux_true"
+            )
+
+        if spectral_noise_seed is None:
+            spectral_noise_seed = noise_seed + 101
+        if magnitude_seed is None:
+            magnitude_seed = noise_seed + 211
+        if spectral_quality_seed is None:
+            spectral_quality_seed = noise_seed + 307
+        if image_randgen is None:
+            image_randgen = randgen
+        if image_randgen is None:
+            image_randgen = _seeded_generator(device, noise_seed)
+        if spectral_randgen is None:
+            spectral_randgen = _seeded_generator(device, spectral_noise_seed)
+        if magnitude_randgen is None:
+            magnitude_randgen = _seeded_generator(device, magnitude_seed)
+        if spectral_quality_randgen is None:
+            spectral_quality_randgen = _seeded_generator(
+                device, spectral_quality_seed
+            )
+
+        observation = config.observation
+        group_expected_snrs, group_generated_quality = (
+            build_v2_observation_levels(
+                group_rmag,
+                image_band=observation["image_band"],
+                image_depth_5sigma_mag=observation["image_depth_5sigma_mag"],
+                spectral_quality_min=observation["spectral_quality_min"],
+                spectral_quality_max=observation["spectral_quality_max"],
+                spectral_quality_distribution=observation[
+                    "spectral_quality_distribution"
+                ],
+                spectral_generator=spectral_quality_randgen,
+            )
+        )
+        expected_snrs = torch.repeat_interleave(
+            group_expected_snrs, matched_group_size
+        )
+        generated_quality = torch.repeat_interleave(
+            group_generated_quality, matched_group_size
+        )
+        if snr is not None:
+            supplied_snrs = torch.as_tensor(
+                snr, dtype=expected_snrs.dtype, device=expected_snrs.device
+            )
+            if supplied_snrs.shape != expected_snrs.shape or not torch.allclose(
+                supplied_snrs, expected_snrs, rtol=2e-6, atol=1e-6
+            ):
+                raise ValueError(
+                    "Observation-model-v2 image SNR must be derived from "
+                    "archived rmag_true and the configured survey depth"
+                )
+        snrs = expected_snrs
+        if spectral_quality is None:
+            spectral_quality = generated_quality
+        else:
+            spectral_quality = torch.as_tensor(
+                spectral_quality,
+                dtype=snrs.dtype,
+                device=snrs.device,
+            )
+            if spectral_quality.shape != snrs.shape:
+                raise ValueError(
+                    "spectral_quality must have one value per galaxy"
+                )
+            if bool(
+                (~torch.isfinite(spectral_quality)
+                 | (spectral_quality <= 0)).any()
+            ):
+                raise ValueError(
+                    "spectral_quality must contain finite positive values"
+                )
+            grouped_quality = spectral_quality.reshape(
+                -1, matched_group_size
+            )
+            if not torch.allclose(
+                grouped_quality,
+                grouped_quality[:, :1].expand_as(grouped_quality),
+                rtol=0.0,
+                atol=1e-6,
+            ):
+                raise ValueError(
+                    "Every matched observation group must share one "
+                    "spectral_quality"
+                )
+
+        image_noise_sigma = checkpoint_image_noise_sigma(model).to(
+            device=device, dtype=snrs.dtype
+        )
+        reference_line_norm = checkpoint_spectral_reference_line_norm(model).to(
+            device=device, dtype=snrs.dtype
+        )
+        group_mag_measurement = sample_observed_magnitude(
+            group_rmag,
+            group_expected_snrs,
+            randgen=magnitude_randgen,
+        )
+        mag_measurement = {
+            name: torch.repeat_interleave(value, matched_group_size)
+            for name, value in group_mag_measurement.items()
+        }
+        mags = mag_measurement["rmag_obs"]
+        mag_sigmas = mag_measurement["rmag_sigma"]
+        spectral_noise_scales = reference_line_norm / spectral_quality
+        observation_metadata = {
+            "image_snr": mag_measurement["image_flux_snr"].detach().cpu().numpy(),
+            "spectral_quality": spectral_quality.detach().cpu().numpy(),
+            "spectral_noise_scale": spectral_noise_scales.detach().cpu().numpy(),
+            "rmag_obs": mags.detach().cpu().numpy(),
+            "rmag_sigma": mag_sigmas.detach().cpu().numpy(),
+            "image_noise_sigma": float(
+                image_noise_sigma.detach().cpu().item()
+            ),
+            "spectral_reference_line_norm": float(
+                reference_line_norm.detach().cpu().item()
+            ),
+        }
+        if tf_inference == "prior_replacement":
+            diagnostic_fields = {
+                "tf_effective_sample_size": "effective_sample_size",
+                "tf_effective_sample_fraction": (
+                    "effective_sample_fraction"
+                ),
+                "tf_max_normalized_weight": "max_normalized_weight",
+                "tf_candidate_log_normalizer": (
+                    "candidate_log_normalizer"
+                ),
+            }
+            for cache_name in diagnostic_fields:
+                observation_metadata[cache_name] = np.full(
+                    len(test_ds), np.nan, dtype=np.float64
+                )
+    else:
+        if tf_inference is not None:
+            raise ValueError(
+                "Explicit tf_inference is reserved for observation model v2"
+            )
+        if snr is None and randgen is not None:
+            snr = (
+                torch.rand(
+                    len(test_ds), generator=randgen, device=device
+                ) * 995 + 5
+            )
+        snrs = (
+            torch.as_tensor(snr, device=device)
+            if snr is not None
+            else torch.rand((len(test_ds),), device=device) * 995 + 5
+        )
+        mags = (
+            torch.as_tensor(mag, device=device)
+            if mag is not None
+            else snr_to_app_mag(snrs)
+            if getattr(posterior_owner, "mode", None) == 2
+            else None
+        )
+        mag_sigmas = None
+
     model.eval()
     samples = []
     if return_log_prob:
         log_probs = []
-    snrs = snr if snr is not None else torch.rand((len(test_ds),), device=device)*995 + 5
-    mags = mag if mag is not None else snr_to_app_mag(snrs) if model.mode == 2 else None
     iterator = range(len(test_ds))
     if progress is not None:
         iterator = progress(iterator, total=len(test_ds), desc="Sampling")
     with torch.no_grad():
         for i in iterator:
-            snr = snrs[i]
-            mag = mags[i] if mags is not None else None
-            noise_gen = randgen
+            image_snr_i = snrs[i]
+            mag_i = mags[i] if mags is not None else None
+            image_noise_gen = (
+                image_randgen if observation_model_version == 2 else randgen
+            )
+            spectrum_noise_gen = spectral_randgen
             if matched_group_size > 1:
-                noise_gen = torch.Generator(device=device).manual_seed(
-                    noise_seed + i // matched_group_size
+                image_noise_gen = _seeded_generator(
+                    device, noise_seed + i // matched_group_size
                 )
-            img = apply_noise(test_ds[i]['img'].unsqueeze(0).float().to(device), snr, randgen=noise_gen, device=device)
-            spec = apply_noise(test_ds[i]['spec'].unsqueeze(0).float().to(device), snr, randgen=noise_gen, device=device)
-            fp = test_ds[i]['fib_pos'].unsqueeze(0).float().to(device) if 'fib_pos' in test_ds[i] else None
+                if observation_model_version == 2:
+                    spectrum_noise_gen = _seeded_generator(
+                        device,
+                        spectral_noise_seed + i // matched_group_size,
+                    )
+            record = test_ds[i]
+            if observation_model_version == 2:
+                img = apply_fixed_gaussian_image_noise(
+                    record['img'].unsqueeze(0).float().to(device),
+                    image_noise_sigma,
+                    randgen=image_noise_gen,
+                )
+                spec = apply_spectral_noise(
+                    record['spec'].unsqueeze(0).float().to(device),
+                    spectral_quality[i],
+                    reference_line_norm,
+                    center_fiber_index=int(
+                        config.observation["center_fiber_index"]
+                    ),
+                    center_exposure_s=float(
+                        config.observation["center_exposure_s"]
+                    ),
+                    offset_exposure_s=float(
+                        config.observation["offset_exposure_s"]
+                    ),
+                    spectral_units=config.observation["spectral_units"],
+                    randgen=spectrum_noise_gen,
+                    device=device,
+                )
+                observation_context = {
+                    "rmag_obs": mag_i,
+                    "rmag_sigma": mag_sigmas[i],
+                    "image_snr": mag_measurement["image_flux_snr"][i],
+                    "spectral_reference_quality": spectral_quality[i],
+                    "spectral_noise_scale": spectral_noise_scales[i],
+                }
+                sample_kwargs = {
+                    "mag": mag_i if tf_inference is not None else None,
+                    "mag_sigma": (
+                        mag_sigmas[i] if tf_inference is not None else None
+                    ),
+                    "snr": None,
+                    "tf_inference": tf_inference,
+                    "observation_context": observation_context,
+                }
+            else:
+                img = apply_noise(
+                    record['img'].unsqueeze(0).float().to(device),
+                    image_snr_i,
+                    randgen=image_noise_gen,
+                    device=device,
+                )
+                spec = apply_noise(
+                    record['spec'].unsqueeze(0).float().to(device),
+                    image_snr_i,
+                    randgen=image_noise_gen,
+                    device=device,
+                )
+                sample_kwargs = {
+                    "mag": mag_i,
+                    "snr": image_snr_i,
+                }
+            fp = (
+                record['fib_pos'].unsqueeze(0).float().to(device)
+                if 'fib_pos' in record
+                else None
+            )
             if channels_last:
                 img = img.contiguous(memory_format=torch.channels_last)
                 spec = spec.contiguous(memory_format=torch.channels_last)
             if return_log_prob:
-                sample, log_prob = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, return_log_prob=True, sample_id=i)
+                sample, log_prob = model.sample(
+                    img,
+                    spec,
+                    nsamples,
+                    fp=fp,
+                    return_log_prob=True,
+                    sample_id=i,
+                    **sample_kwargs,
+                )
                 log_probs.append(log_prob.detach().cpu().numpy())
             else:
-                sample = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, sample_id=i)
+                sample = model.sample(
+                    img,
+                    spec,
+                    nsamples,
+                    fp=fp,
+                    sample_id=i,
+                    **sample_kwargs,
+                )
+            if tf_inference == "prior_replacement":
+                diagnostics = getattr(
+                    posterior_owner, "last_tf_inference_diagnostics", None
+                )
+                if not isinstance(diagnostics, dict):
+                    raise RuntimeError(
+                        "TF prior replacement did not publish diagnostics"
+                    )
+                for cache_name, diagnostic_name in diagnostic_fields.items():
+                    value = torch.as_tensor(diagnostics[diagnostic_name])
+                    if value.numel() != 1:
+                        raise RuntimeError(
+                            f"Unexpected TF diagnostic {diagnostic_name!r} "
+                            f"shape {tuple(value.shape)}"
+                        )
+                    scalar = float(value.detach().cpu().reshape(()).item())
+                    if not np.isfinite(scalar):
+                        raise RuntimeError(
+                            f"Non-finite TF diagnostic {diagnostic_name!r}"
+                        )
+                    observation_metadata[cache_name][i] = scalar
             samples.append(sample.detach().cpu().numpy())
             if apply_add_noise_cancellation:
                 img, _, fp = rotate_90_degrees(img, fp=fp)
@@ -1983,20 +3005,39 @@ def sample_density(
                     img = img.contiguous(memory_format=torch.channels_last)
                     spec = spec.contiguous(memory_format=torch.channels_last)
                 if return_log_prob:
-                    sample, log_prob = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, return_log_prob=True, sample_id=i)
+                    sample, log_prob = model.sample(
+                        img,
+                        spec,
+                        nsamples,
+                        fp=fp,
+                        return_log_prob=True,
+                        sample_id=i,
+                        **sample_kwargs,
+                    )
                     log_probs.append(log_prob.detach().cpu().numpy())
                 else:
-                    sample = model.sample(img, spec, nsamples, fp=fp, mag=mag, snr=snr, sample_id=i)
+                    sample = model.sample(
+                        img,
+                        spec,
+                        nsamples,
+                        fp=fp,
+                        sample_id=i,
+                        **sample_kwargs,
+                    )
                 samples.append(sample.detach().cpu().numpy())
     samples = np.vstack(samples)
     if apply_add_noise_cancellation:
         samples = pair_rotation_branches(samples)
-    snrs = snrs.cpu().numpy()
+    snrs = snrs.detach().cpu().numpy()
     if return_log_prob:
         log_probs = np.vstack(log_probs)
         if apply_add_noise_cancellation:
             log_probs = pair_rotation_branches(log_probs)
+        if return_observation_metadata:
+            return samples, log_probs, snrs, observation_metadata
         return samples, log_probs, snrs
+    if return_observation_metadata:
+        return samples, snrs, observation_metadata
     return samples, snrs
 
 

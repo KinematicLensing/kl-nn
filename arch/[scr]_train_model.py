@@ -55,6 +55,68 @@ def parse_args(argv=None):
     parser.add_argument("--valid-data", help="Validation LMDB directory")
     parser.add_argument("--train-size", type=int, help="Recorded training-set size")
     parser.add_argument("--valid-size", type=int, help="Recorded validation-set size")
+    parser.add_argument(
+        "--observation-model-version",
+        type=int,
+        choices=(1, 2),
+        help="Observation schema: 1 is legacy shared SNR; 2 uses independent magnitude and spectral quality",
+    )
+    parser.add_argument(
+        "--fiber-layout",
+        choices=("galaxy_axis", "image_axis"),
+        help="Fiber-position convention required by observation-model-v2 LMDBs",
+    )
+    parser.add_argument("--rmag-min", type=float, help="Lower true-r magnitude proposal bound")
+    parser.add_argument("--rmag-max", type=float, help="Upper true-r magnitude proposal bound")
+    parser.add_argument(
+        "--halpha-flux-min",
+        type=float,
+        help="Lower integrated H-alpha flux proposal bound [erg/s/cm^2]",
+    )
+    parser.add_argument(
+        "--halpha-flux-max",
+        type=float,
+        help="Upper integrated H-alpha flux proposal bound [erg/s/cm^2]",
+    )
+    parser.add_argument(
+        "--halpha-flux-distribution",
+        choices=("uniform",),
+        help="Proposal distribution for integrated H-alpha flux",
+    )
+    parser.add_argument("--image-band", choices=("g", "r", "z"), help="Photometric band")
+    parser.add_argument(
+        "--target-line",
+        choices=("Ha",),
+        help="Single emission-line window archived in simulator-v2 datasets",
+    )
+    parser.add_argument(
+        "--image-depth-5sigma-mag",
+        type=float,
+        help=(
+            "Reference five-sigma depth mapped to one fixed Gaussian image "
+            "pixel RMS"
+        ),
+    )
+    parser.add_argument(
+        "--image-reference-psf-fwhm-arcsec",
+        type=float,
+        help="FWHM of the Gaussian-equivalent reference template for m5",
+    )
+    parser.add_argument(
+        "--image-pixel-scale-arcsec",
+        type=float,
+        help="Image pixel scale used by the Gaussian-equivalent m5 template",
+    )
+    parser.add_argument("--spectral-quality-min", type=float)
+    parser.add_argument("--spectral-quality-max", type=float)
+    parser.add_argument(
+        "--spectral-quality-distribution",
+        choices=("log_uniform", "uniform"),
+    )
+    parser.add_argument("--spectral-units", choices=("counts", "count_rate"))
+    parser.add_argument("--center-fiber-index", type=int)
+    parser.add_argument("--center-exposure-s", type=float)
+    parser.add_argument("--offset-exposure-s", type=float)
     parser.add_argument("--model-name", help="Output model and artifact name")
     parser.add_argument(
         "--pretrained-name",
@@ -197,6 +259,32 @@ def apply_overrides(args):
         config.MODEL_CONFIG.data.size = args.train_size
     if args.valid_size is not None:
         config.MODEL_CONFIG.test.size = args.valid_size
+    observation_overrides = {
+        "model_version": args.observation_model_version,
+        "fiber_layout": args.fiber_layout,
+        "rmag_min": args.rmag_min,
+        "rmag_max": args.rmag_max,
+        "halpha_flux_min": args.halpha_flux_min,
+        "halpha_flux_max": args.halpha_flux_max,
+        "halpha_flux_distribution": args.halpha_flux_distribution,
+        "image_band": args.image_band,
+        "target_line": args.target_line,
+        "image_depth_5sigma_mag": args.image_depth_5sigma_mag,
+        "image_reference_psf_fwhm_arcsec": (
+            args.image_reference_psf_fwhm_arcsec
+        ),
+        "image_pixel_scale_arcsec": args.image_pixel_scale_arcsec,
+        "spectral_quality_min": args.spectral_quality_min,
+        "spectral_quality_max": args.spectral_quality_max,
+        "spectral_quality_distribution": args.spectral_quality_distribution,
+        "spectral_units": args.spectral_units,
+        "center_fiber_index": args.center_fiber_index,
+        "center_exposure_s": args.center_exposure_s,
+        "offset_exposure_s": args.offset_exposure_s,
+    }
+    for name, value in observation_overrides.items():
+        if value is not None:
+            setattr(config.MODEL_CONFIG.observation, name, value)
     if args.backbone_type is not None:
         config.MODEL_CONFIG.pretrain.backbone_type = args.backbone_type
         config.MODEL_CONFIG.train.backbone_type = args.backbone_type
@@ -240,6 +328,7 @@ def apply_overrides(args):
         "mode": args.mode,
         "initial_learning_rate": args.initial_learning_rate,
         "weight_decay": args.weight_decay,
+        "fixed_validation_streams": args.fixed_validation_streams,
     }
     for name, value in overrides.items():
         if value is not None:
@@ -251,7 +340,6 @@ def apply_overrides(args):
         "scheduler_type": args.scheduler_type,
         "warmup_epochs": args.warmup_epochs,
         "min_learning_rate": args.min_learning_rate,
-        "fixed_validation_streams": args.fixed_validation_streams,
         "context_norm_trainable": args.context_norm_trainable,
         "early_stopping_patience": args.early_stopping_patience,
         "early_stopping_min_delta": args.early_stopping_min_delta,
@@ -289,6 +377,91 @@ def apply_overrides(args):
         raise ValueError("--initial-learning-rate must be positive and finite")
     if stage_config.weight_decay < 0 or not math.isfinite(stage_config.weight_decay):
         raise ValueError("--weight-decay must be non-negative and finite")
+
+    observation = config.MODEL_CONFIG.observation
+    if observation.model_version not in (1, 2):
+        raise ValueError("--observation-model-version must be 1 or 2")
+    if observation.fiber_layout not in ("galaxy_axis", "image_axis"):
+        raise ValueError("--fiber-layout must be 'galaxy_axis' or 'image_axis'")
+    expected_context_fields = [
+        "rmag_obs",
+        "rmag_sigma",
+        "image_snr",
+        "spectral_reference_quality",
+        "spectral_noise_scale",
+    ]
+    if list(observation.context_fields) != expected_context_fields:
+        raise ValueError(
+            "observation context_fields must remain in the archived order "
+            f"{expected_context_fields!r}"
+        )
+    if (
+        not math.isfinite(observation.rmag_min)
+        or not math.isfinite(observation.rmag_max)
+        or observation.rmag_min >= observation.rmag_max
+    ):
+        raise ValueError("rmag bounds must be finite and increasing")
+    if (
+        not math.isfinite(observation.halpha_flux_min)
+        or not math.isfinite(observation.halpha_flux_max)
+        or observation.halpha_flux_min <= 0.0
+        or observation.halpha_flux_min >= observation.halpha_flux_max
+    ):
+        raise ValueError(
+            "H-alpha flux bounds must be finite, positive, and increasing"
+        )
+    if observation.halpha_flux_distribution != "uniform":
+        raise ValueError("H-alpha flux distribution must be 'uniform'")
+    if observation.halpha_flux_units != "erg s^-1 cm^-2":
+        raise ValueError(
+            "H-alpha flux units must be integrated 'erg s^-1 cm^-2'"
+        )
+    if (
+        not math.isfinite(observation.image_depth_5sigma_mag)
+        or observation.image_depth_5sigma_mag <= 0
+    ):
+        raise ValueError("--image-depth-5sigma-mag must be positive and finite")
+    if (
+        not math.isfinite(observation.image_reference_psf_fwhm_arcsec)
+        or observation.image_reference_psf_fwhm_arcsec <= 0
+    ):
+        raise ValueError(
+            "--image-reference-psf-fwhm-arcsec must be positive and finite"
+        )
+    if (
+        not math.isfinite(observation.image_pixel_scale_arcsec)
+        or observation.image_pixel_scale_arcsec <= 0
+    ):
+        raise ValueError("--image-pixel-scale-arcsec must be positive and finite")
+    if (
+        not math.isfinite(observation.spectral_quality_min)
+        or not math.isfinite(observation.spectral_quality_max)
+        or observation.spectral_quality_min <= 0
+        or observation.spectral_quality_min >= observation.spectral_quality_max
+    ):
+        raise ValueError("spectral-quality bounds must be finite, positive, and increasing")
+    if observation.spectral_quality_distribution not in ("log_uniform", "uniform"):
+        raise ValueError("unsupported spectral-quality distribution")
+    if observation.spectral_units not in ("counts", "count_rate"):
+        raise ValueError("--spectral-units must be 'counts' or 'count_rate'")
+    if not 0 <= observation.center_fiber_index < config.MODEL_CONFIG.data.nspec:
+        raise ValueError("--center-fiber-index is outside the configured fibers")
+    if (
+        not math.isfinite(observation.center_exposure_s)
+        or not math.isfinite(observation.offset_exposure_s)
+        or observation.center_exposure_s <= 0
+        or observation.offset_exposure_s <= 0
+    ):
+        raise ValueError("spectral exposure times must be positive and finite")
+    if (
+        observation.model_version == 2
+        and args.train_type == "train"
+        and stage_config.mode != 1
+    ):
+        raise ValueError(
+            "observation model v2 trains the broad base posterior with --mode 1; "
+            "apply TF information explicitly at inference"
+        )
 
     if args.train_type == "pretrain":
         is_d4_backbone = stage_config.backbone_type == "stage4_d4"
@@ -434,6 +607,22 @@ if __name__ == "__main__":
         f"early_stop_patience={getattr(train_config, 'early_stopping_patience', None)}, "
         f"early_stop_min_delta={getattr(train_config, 'early_stopping_min_delta', None)}, "
         f"gradient_clip_norm={getattr(train_config, 'gradient_clip_norm', None)}, "
+        f"observation_v={config.MODEL_CONFIG.observation.model_version}, "
+        f"fiber_layout={config.MODEL_CONFIG.observation.fiber_layout}, "
+        f"rmag_range=({config.MODEL_CONFIG.observation.rmag_min},"
+        f"{config.MODEL_CONFIG.observation.rmag_max}), "
+        f"halpha_flux_range=("
+        f"{config.MODEL_CONFIG.observation.halpha_flux_min},"
+        f"{config.MODEL_CONFIG.observation.halpha_flux_max}), "
+        f"halpha_flux_distribution="
+        f"{config.MODEL_CONFIG.observation.halpha_flux_distribution}, "
+        f"image_depth={config.MODEL_CONFIG.observation.image_depth_5sigma_mag}, "
+        f"image_reference_psf_fwhm="
+        f"{config.MODEL_CONFIG.observation.image_reference_psf_fwhm_arcsec}, "
+        f"image_pixel_scale="
+        f"{config.MODEL_CONFIG.observation.image_pixel_scale_arcsec}, "
+        f"spec_quality_range=({config.MODEL_CONFIG.observation.spectral_quality_min},"
+        f"{config.MODEL_CONFIG.observation.spectral_quality_max}), "
         f"train={config.MODEL_CONFIG.data.data_dir} "
         f"(size={config.MODEL_CONFIG.data.size}), "
         f"valid={config.MODEL_CONFIG.test.data_dir} "

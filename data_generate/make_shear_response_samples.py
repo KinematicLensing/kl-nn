@@ -9,11 +9,32 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from .observation_schema import (
+        FIBER_LAYOUT_COLUMN,
+        HALPHA_FLUX_TRUE_COLUMN,
+        OBSERVATION_MODEL_VERSION_COLUMN,
+        RMAG_TRUE_COLUMN,
+    )
+except ImportError:  # Support direct execution from data_generate/.
+    from observation_schema import (
+        FIBER_LAYOUT_COLUMN,
+        HALPHA_FLUX_TRUE_COLUMN,
+        OBSERVATION_MODEL_VERSION_COLUMN,
+        RMAG_TRUE_COLUMN,
+    )
+
 
 PARAMETERS = [
     'g1', 'g2', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr',
-    'dx_disk', 'dy_disk', 'dx_spec', 'dy_spec',
 ]
+LEGACY_OFFSET_PARAMETERS = ['dx_disk', 'dy_disk', 'dx_spec', 'dy_spec']
+AUXILIARY_COLUMNS = (
+    RMAG_TRUE_COLUMN,
+    HALPHA_FLUX_TRUE_COLUMN,
+    FIBER_LAYOUT_COLUMN,
+    OBSERVATION_MODEL_VERSION_COLUMN,
+)
 STATES = (
     ('zero', 0.0, 0.0),
     ('g1_plus', 1.0, 0.0),
@@ -40,12 +61,9 @@ def main():
     unnamed = [column for column in source if column.startswith('Unnamed:')]
     if unnamed:
         source = source.drop(columns=unnamed)
-    missing = [name for name in PARAMETERS[:8] if name not in source]
+    missing = [name for name in PARAMETERS if name not in source]
     if missing:
         raise ValueError(f'Missing required columns: {missing}')
-    for name in PARAMETERS[8:]:
-        if name not in source:
-            source[name] = 0.0
     if not (0 < args.nbase <= len(source)):
         raise ValueError(f'nbase must be in [1, {len(source)}]')
     if not (0 < args.delta_g <= 0.1):
@@ -54,16 +72,25 @@ def main():
     rng = np.random.default_rng(args.seed)
     chosen = np.sort(rng.choice(len(source), size=args.nbase, replace=False))
     base = source.iloc[chosen].reset_index(drop=True)
+    parameter_columns = [
+        *PARAMETERS,
+        *(name for name in LEGACY_OFFSET_PARAMETERS if name in source),
+    ]
     sample_rows, manifest_rows = [], []
     output_id = 0
     for base_id, (_, row) in enumerate(base.iterrows()):
-        nuisance = row[PARAMETERS].astype(float).to_dict()
+        nuisance = row[parameter_columns].astype(float).to_dict()
+        observation_metadata = {
+            name: row[name]
+            for name in AUXILIARY_COLUMNS
+            if name in row.index
+        }
         source_id = int(chosen[base_id])
         for state, g1_sign, g2_sign in STATES:
             values = dict(nuisance)
             values['g1'] = g1_sign * args.delta_g
             values['g2'] = g2_sign * args.delta_g
-            sample_rows.append({'ID': output_id, **values})
+            sample_rows.append({'ID': output_id, **values, **observation_metadata})
             manifest_rows.append({
                 'ID': output_id,
                 'base_id': base_id,
@@ -74,7 +101,11 @@ def main():
             })
             output_id += 1
 
-    samples = pd.DataFrame(sample_rows, columns=['ID', *PARAMETERS])
+    present_metadata = [name for name in AUXILIARY_COLUMNS if name in source]
+    samples = pd.DataFrame(
+        sample_rows,
+        columns=['ID', *parameter_columns, *present_metadata],
+    )
     manifest = pd.DataFrame(manifest_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.parent.mkdir(parents=True, exist_ok=True)

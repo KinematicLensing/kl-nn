@@ -128,7 +128,6 @@ def test_hybrid_npe_cli_persists_flow_and_stability_settings():
         ("--theta-num-layers", "1"),
         ("--theta-logit-limit", "10"),
         ("--scheduler-type", "warmup_cosine"),
-        ("--fixed-validation-streams",),
         ("--gradient-clip-norm", "1"),
     ),
 )
@@ -139,6 +138,19 @@ def test_hybrid_and_stability_options_are_npe_only(arguments):
         args = entrypoint.parse_args(("--train-type", "pretrain", *arguments))
         with pytest.raises(ValueError, match="only valid for NPE training"):
             entrypoint.apply_overrides(args)
+    finally:
+        config.set_model_config(original)
+
+
+def test_fixed_validation_streams_are_available_to_pretraining():
+    entrypoint = _load_training_entrypoint()
+    original = copy.deepcopy(config.MODEL_CONFIG)
+    try:
+        args = entrypoint.parse_args(
+            ("--train-type", "pretrain", "--fixed-validation-streams")
+        )
+        stage = entrypoint.apply_overrides(args)
+        assert stage.fixed_validation_streams is True
     finally:
         config.set_model_config(original)
 

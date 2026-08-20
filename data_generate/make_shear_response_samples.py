@@ -28,7 +28,6 @@ except ImportError:  # Support direct execution from data_generate/.
 PARAMETERS = [
     'g1', 'g2', 'theta_int', 'sini', 'v0', 'vcirc', 'rscale', 'hlr',
 ]
-LEGACY_OFFSET_PARAMETERS = ['dx_disk', 'dy_disk', 'dx_spec', 'dy_spec']
 AUXILIARY_COLUMNS = (
     RMAG_TRUE_COLUMN,
     HALPHA_FLUX_TRUE_COLUMN,
@@ -61,7 +60,8 @@ def main():
     unnamed = [column for column in source if column.startswith('Unnamed:')]
     if unnamed:
         source = source.drop(columns=unnamed)
-    missing = [name for name in PARAMETERS if name not in source]
+    required = (*PARAMETERS, *AUXILIARY_COLUMNS)
+    missing = [name for name in required if name not in source]
     if missing:
         raise ValueError(f'Missing required columns: {missing}')
     if not (0 < args.nbase <= len(source)):
@@ -72,19 +72,12 @@ def main():
     rng = np.random.default_rng(args.seed)
     chosen = np.sort(rng.choice(len(source), size=args.nbase, replace=False))
     base = source.iloc[chosen].reset_index(drop=True)
-    parameter_columns = [
-        *PARAMETERS,
-        *(name for name in LEGACY_OFFSET_PARAMETERS if name in source),
-    ]
+    parameter_columns = PARAMETERS
     sample_rows, manifest_rows = [], []
     output_id = 0
     for base_id, (_, row) in enumerate(base.iterrows()):
         nuisance = row[parameter_columns].astype(float).to_dict()
-        observation_metadata = {
-            name: row[name]
-            for name in AUXILIARY_COLUMNS
-            if name in row.index
-        }
+        observation_metadata = {name: row[name] for name in AUXILIARY_COLUMNS}
         source_id = int(chosen[base_id])
         for state, g1_sign, g2_sign in STATES:
             values = dict(nuisance)
@@ -101,10 +94,9 @@ def main():
             })
             output_id += 1
 
-    present_metadata = [name for name in AUXILIARY_COLUMNS if name in source]
     samples = pd.DataFrame(
         sample_rows,
-        columns=['ID', *parameter_columns, *present_metadata],
+        columns=['ID', *parameter_columns, *AUXILIARY_COLUMNS],
     )
     manifest = pd.DataFrame(manifest_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)

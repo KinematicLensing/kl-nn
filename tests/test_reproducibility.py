@@ -1,37 +1,59 @@
-import copy
-import importlib.util
+import os
 import random
-from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
-import config
-from data import TFCalculator, sample_magnitudes
 from train import RNG_STREAM_IDS, derive_stream_seed, seed_everything
+
+
+@pytest.fixture(autouse=True)
+def _restore_determinism_state():
+    algorithms = torch.are_deterministic_algorithms_enabled()
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    cudnn_deterministic = torch.backends.cudnn.deterministic
+    python_hash_seed = os.environ.get("PYTHONHASHSEED")
+    cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    yield
+    torch.use_deterministic_algorithms(algorithms)
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.deterministic = cudnn_deterministic
+    if python_hash_seed is None:
+        os.environ.pop("PYTHONHASHSEED", None)
+    else:
+        os.environ["PYTHONHASHSEED"] = python_hash_seed
+    if cublas is None:
+        os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    else:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = cublas
 
 
 def test_seed_everything_repeats_python_numpy_and_torch_draws():
     seed_everything(123456)
-    first = (
-        random.random(),
-        np.random.random(),
-        torch.rand(5),
-    )
+    first = (random.random(), np.random.random(), torch.rand(5))
 
     seed_everything(123456)
-    second = (
-        random.random(),
-        np.random.random(),
-        torch.rand(5),
-    )
+    second = (random.random(), np.random.random(), torch.rand(5))
 
     assert first[0] == second[0]
     assert first[1] == second[1]
     assert torch.equal(first[2], second[2])
+    assert os.environ["PYTHONHASHSEED"] == "123456"
 
 
-def test_derived_stream_seeds_are_stable_and_distinct():
+def test_current_rng_stream_ids_are_stable_distinct_and_tf_free():
+    assert RNG_STREAM_IDS == {
+        "ambient": 0,
+        "train_order": 1,
+        "valid_order": 2,
+        "train_img_noise": 3,
+        "train_spec_noise": 4,
+        "valid_img_noise": 5,
+        "valid_spec_noise": 6,
+        "train_spec_quality": 7,
+        "valid_spec_quality": 8,
+    }
     first = {
         stream: derive_stream_seed(20260810, rank=2, epoch=7, stream=stream)
         for stream in RNG_STREAM_IDS
@@ -43,136 +65,43 @@ def test_derived_stream_seeds_are_stable_and_distinct():
 
     assert first == repeated
     assert len(set(first.values())) == len(first)
-    assert first["train_snr"] != derive_stream_seed(
-        20260810,
-        rank=3,
-        epoch=7,
-        stream="train_snr",
+    assert all("tf" not in stream.lower() for stream in RNG_STREAM_IDS)
+    assert first["train_spec_quality"] != derive_stream_seed(
+        20260810, rank=3, epoch=7, stream="train_spec_quality"
     )
-    assert first["train_snr"] != derive_stream_seed(
-        20260810,
-        rank=2,
-        epoch=8,
-        stream="train_snr",
+    assert first["train_spec_quality"] != derive_stream_seed(
+        20260810, rank=2, epoch=8, stream="train_spec_quality"
+    )
+    with pytest.raises(ValueError, match="unknown RNG stream"):
+        derive_stream_seed(1, stream="unknown_stream")
+
+
+def test_explicit_torch_streams_repeat_independently():
+    image_seed = derive_stream_seed(9, rank=0, epoch=4, stream="train_img_noise")
+    spectrum_seed = derive_stream_seed(
+        9, rank=0, epoch=4, stream="train_spec_noise"
     )
 
-
-def test_explicit_torch_and_numpy_streams_repeat_independently():
-    img_seed = derive_stream_seed(9, rank=0, epoch=4, stream="train_img_noise")
-    spec_seed = derive_stream_seed(9, rank=0, epoch=4, stream="train_spec_noise")
-
-    img_1 = torch.randn(16, generator=torch.Generator().manual_seed(img_seed))
-    img_2 = torch.randn(16, generator=torch.Generator().manual_seed(img_seed))
-    spec = torch.randn(16, generator=torch.Generator().manual_seed(spec_seed))
-
-    assert torch.equal(img_1, img_2)
-    assert not torch.equal(img_1, spec)
-
-    tf = TFCalculator(slope=-7.22, intercept=36.0, scatter=0.1)
-    vcirc = np.array([100.0, 200.0, 300.0])
-    mag_1 = tf.sample_mag_from_vcirc(vcirc, rng=np.random.default_rng(41))
-    mag_2 = tf.sample_mag_from_vcirc(vcirc, rng=np.random.default_rng(41))
-    rmag_1 = sample_magnitudes(8, 15, 23, rng=np.random.default_rng(42))
-    rmag_2 = sample_magnitudes(8, 15, 23, rng=np.random.default_rng(42))
-
-    np.testing.assert_array_equal(mag_1, mag_2)
-    np.testing.assert_array_equal(rmag_1, rmag_2)
-
-
-
-
-def test_archived_auxiliary_config_is_readable_but_not_reserialized():
-    original = copy.deepcopy(config.MODEL_CONFIG)
-    payload = copy.deepcopy(original.to_dict())
-    payload["pretrain"]["ccl_objective"] = "ccl_shear"
-    payload["pretrain"]["ccl_shear_loss_weight"] = 1.25
-
-    restored = config.ModelConfig.from_dict(payload)
-    serialized = restored.to_dict()
-    try:
-        config.set_model_config(restored)
-        assert config.pretrain["ccl_objective"] == "ccl_shear"
-        assert config.pretrain["ccl_shear_loss_weight"] == 1.25
-        assert "ccl_objective" not in serialized["pretrain"]
-        assert "ccl_shear_loss_weight" not in serialized["pretrain"]
-    finally:
-        config.set_model_config(original)
-
-def test_old_model_config_without_backbone_selector_defaults_to_legacy():
-    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
-    payload["pretrain"].pop("backbone_type")
-    payload["train"].pop("backbone_type")
-
-    restored = config.ModelConfig.from_dict(payload)
-
-    assert restored.pretrain.backbone_type == "legacy"
-    assert restored.train.backbone_type == "legacy"
-
-def test_training_cli_overrides_are_serializable_to_spawned_workers():
-    entrypoint_path = (
-        Path(__file__).resolve().parents[1] / "arch" / "[scr]_train_model.py"
+    image_1 = torch.randn(16, generator=torch.Generator().manual_seed(image_seed))
+    image_2 = torch.randn(16, generator=torch.Generator().manual_seed(image_seed))
+    spectrum = torch.randn(
+        16, generator=torch.Generator().manual_seed(spectrum_seed)
     )
-    module_spec = importlib.util.spec_from_file_location(
-        "seeded_training_entrypoint",
-        entrypoint_path,
-    )
-    module = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
 
-    original = copy.deepcopy(config.MODEL_CONFIG)
-    try:
-        args = module.parse_args(
-            [
-                "--train-type",
-                "pretrain",
-                "--backbone-type",
-                "stage3",
-                "--train-data",
-                "/tmp/train_lmdb",
-                "--valid-data",
-                "/tmp/valid_lmdb",
-                "--train-size",
-                "100",
-                "--valid-size",
-                "10",
-                "--model-name",
-                "seed-test",
-                "--pretrained-name",
-                "stage3-pretrain",
-                "--pretrain-from",
-                "8",
-                "--epochs",
-                "9",
-                "--batch-size",
-                "7",
-                "--ccl-sigma-label",
-                "0.15",
-                "--ccl-d-cutoff",
-                "0.4",
-                "--seed",
-                "31415",
-                "--deterministic",
-                "--no-compile",
-            ]
-        )
-        stage = module.apply_overrides(args)
-        restored = config.ModelConfig.from_dict(config.MODEL_CONFIG.to_dict())
+    assert torch.equal(image_1, image_2)
+    assert not torch.equal(image_1, spectrum)
 
-        assert stage.seed == 31415
-        assert stage.deterministic is True
-        assert stage.use_compile is False
-        assert restored.pretrain.model_name == "seed-test"
-        assert restored.pretrain.backbone_type == "stage3"
-        assert restored.train.backbone_type == "stage3"
-        assert restored.train.pretrained_name == "stage3-pretrain"
-        assert restored.train.pretrain_from == 8
-        assert restored.pretrain.epoch_number == 9
-        assert restored.pretrain.batch_size == 7
-        assert restored.pretrain.ccl_sigma_label == 0.15
-        assert restored.pretrain.ccl_d_cutoff == 0.4
-        assert restored.data.data_dir == "/tmp/train_lmdb"
-        assert restored.test.data_dir == "/tmp/valid_lmdb"
-        assert restored.data.size == 100
-        assert restored.test.size == 10
-    finally:
-        config.set_model_config(original)
+
+def test_deterministic_flag_controls_torch_backends():
+    os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    seed_everything(77, deterministic=True)
+
+    assert torch.are_deterministic_algorithms_enabled()
+    assert torch.backends.cudnn.deterministic is True
+    assert torch.backends.cudnn.benchmark is False
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+
+    seed_everything(77, deterministic=False)
+    assert not torch.are_deterministic_algorithms_enabled()
+    assert torch.backends.cudnn.deterministic is False
+    assert torch.backends.cudnn.benchmark is True

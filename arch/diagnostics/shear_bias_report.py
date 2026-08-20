@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
-"""Build a self-contained shear-bias report from cached posterior products.
-
-Most diagnostics use the compact truth, SNR, MAP, and posterior-summary
-arrays. The shear P-P and theta-modality diagnostics memory-map posterior
-sample partitions and reduce small galaxy blocks; they never concatenate the
-raw sample bank in memory.
-"""
+"""Build a proposal-versus-TF shear report from current posterior caches."""
 
 from __future__ import annotations
 
 import argparse
 import base64
-import csv
+from io import BytesIO
 import html
-import io
-import json
-import re
-import sys
-from datetime import datetime, timezone
+import math
 from pathlib import Path
 
 import matplotlib
@@ -26,687 +16,280 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Import the module directly because ``arch.__init__`` still references removed
-# legacy modules. This works for direct execution from the repository root,
-# from inside ``arch``, and for importlib-based tests.
-arch_dir = Path(__file__).resolve().parents[1]
-if str(arch_dir) not in sys.path:
-    sys.path.insert(0, str(arch_dir))
-from utils import img_to_gal_axis as _img_to_gal_axis
+ARCH_DIR = Path(__file__).resolve().parents[1]
+import sys
+
+if str(ARCH_DIR) not in sys.path:
+    sys.path.insert(0, str(ARCH_DIR))
+
+from cache_contract import load_cache_partitions, load_partitioned_array
+from tf_prior import effective_sample_size, normalize_population_log_weights
+from utils import img_to_gal_axis
 
 
-PART_RE = re.compile(r"part(\d+)of(\d+)\.npy$")
-SINI_CUTS = (0.3, 0.5, 0.7, np.inf)
-ADDITIVE_DISPLAY_SCALE = 1e4
-MULTIPLICATIVE_DISPLAY_SCALE = 1e2
-SHEAR_PP_BIN_EDGES = np.linspace(-0.1, 0.1, 4)
-THETA_HISTOGRAM_BINS = 72
-THETA_BRANCH_HALF_WIDTH = np.pi / 4.0
-THETA_MODE_MIN_HEIGHT_RATIO = 0.10
-THETA_MODE_MIN_PROMINENCE_RATIO = 0.05
-THETA_MODE_PROMINENCE_RADIUS = 4
-FEATURE_NAMES = (
-    "g1",
-    "g2",
-    "theta_int",
-    "sini",
-    "v0",
-    "vcirc",
-    "rscale",
-    "hlr",
+SHEAR_PP_BIN_EDGES = np.asarray(
+    [-0.1, -1.0 / 30.0, 1.0 / 30.0, 0.1], dtype=np.float64
 )
-NUISANCE_INDICES = {"sini": 3, "vcirc": 5, "hlr": 7}
-NUISANCE_LABELS = {
-    "sini": "sini estimate - truth",
-    "vcirc": "vcirc estimate - truth [km/s]",
-    "hlr": "hlr estimate - truth [arcsec]",
-}
-GALAXY_COMPONENT_COLORS = {"g+": "tab:red", "gx": "tab:blue"}
-SHEAR_COMPONENT_COLORS = {"g1": "tab:blue", "g2": "tab:orange"}
-ESTIMATOR_COLORS = {
-    "MAP": "tab:blue",
-    "Mean": "tab:orange",
-    "In-support Mean": "tab:green",
-}
+SINI_CUTS = (np.inf, 0.9, 0.8, 0.7, 0.6)
+LOW_G_DEFAULT = 0.02
+ADDITIVE_DISPLAY_SCALE = 1.0e4
+MULTIPLICATIVE_DISPLAY_SCALE = 1.0e2
 
 
-class PosteriorPPUnavailable(RuntimeError):
-    """Raised when cached draws cannot represent the reported posterior."""
-
-
-class ConditionalDiagnosticUnavailable(RuntimeError):
-    """Raised when a cache lacks metadata required by conditional m/c plots."""
-
-
-def parse_args():
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument(
         "--case",
         action="append",
         required=True,
-        metavar="MODEL:DATASET",
-        help="Cached model/dataset pair; repeat for comparisons.",
-    )
-    parser.add_argument(
-        "--cache-root",
-        type=Path,
-        default=Path("/ocean/projects/phy250048p/shared/cache"),
-    )
-    parser.add_argument("--mode", type=int, default=0, help="TF-analysis mode index.")
-    parser.add_argument("--low-g", type=float, default=0.02)
-    parser.add_argument("--bins", type=int, default=20)
-    parser.add_argument(
-        "--conditional-bins",
-        type=int,
-        default=10,
-        help="Equal-count bins for conditional Mean m/c diagnostics.",
-    )
-    parser.add_argument(
-        "--sample-root",
-        type=Path,
-        default=Path("/ocean/projects/phy250048p/shared/samples"),
-        help="Sample-table root used to recover archived simulator-v2 truths.",
-    )
-    parser.add_argument(
-        "--max-galaxies",
-        type=int,
-        default=None,
-        help="Use only the first N galaxies after combining cache partitions.",
+        help="MODEL:DATASET cache pair; repeat to compare cases.",
     )
     parser.add_argument("--output", type=Path, required=True)
-    return parser.parse_args()
-
-
-def partition_files(directory: Path) -> list[Path]:
-    files = []
-    for path in directory.glob("part*of*.npy"):
-        match = PART_RE.match(path.name)
-        if match:
-            files.append((int(match.group(1)), int(match.group(2)), path))
-    if not files:
-        raise FileNotFoundError(f"No partition arrays in {directory}")
-    totals = {item[1] for item in files}
-    if len(totals) != 1:
-        raise ValueError(f"Mixed partition totals in {directory}: {totals}")
-    expected = next(iter(totals))
-    files.sort(key=lambda item: item[0])
-    indices = [item[0] for item in files]
-    if indices != list(range(expected)):
-        raise ValueError(f"Incomplete partitions in {directory}: {indices} of {expected}")
-    return [item[2] for item in files]
-
-
-def load_concat(directory: Path, axis: int) -> np.ndarray:
-    arrays = [np.load(path, mmap_mode="r") for path in partition_files(directory)]
-    return np.concatenate(arrays, axis=axis)
+    parser.add_argument("--max-galaxies", type=int, default=None)
+    parser.add_argument("--low-g", type=float, default=LOW_G_DEFAULT)
+    parser.add_argument("--bins", type=int, default=8)
+    return parser.parse_args(argv)
 
 
 def load_case(
-    cache_root: Path, case: str, mode: int, max_galaxies: int | None = None
+    cache_root: Path,
+    case: str,
+    max_galaxies: int | None = None,
 ) -> dict:
     try:
         model, dataset = case.split(":", 1)
     except ValueError as exc:
         raise ValueError(f"Case must be MODEL:DATASET, got {case!r}") from exc
     root = cache_root / model / dataset
-    truth = load_concat(root / "truth", axis=0)
-    snr = load_concat(root / "snr", axis=0)
-    map_all = load_concat(root / "map_estimates", axis=1)
-    mean_all = load_concat(root / "mean_estimates", axis=1)
-    support_summary_dir = root / "in_support_mean_estimates"
-    support_retention_dir = root / "in_support_retention"
-    support_dirs_present = (
-        support_summary_dir.is_dir(),
-        support_retention_dir.is_dir(),
+    cache_partitions = load_cache_partitions(root)
+    feature_names = cache_partitions.feature_names
+    truth = np.asarray(load_partitioned_array(cache_partitions, "truth"))
+    proposal_map = np.asarray(
+        load_partitioned_array(cache_partitions, "proposal_map_estimates")
     )
-    if any(support_dirs_present) and not all(support_dirs_present):
-        raise FileNotFoundError(
-            "Incomplete in-support cache: both in_support_mean_estimates and "
-            "in_support_retention are required"
-        )
-    support_all = None
-    retention_all = None
-    if all(support_dirs_present):
-        support_all = load_concat(support_summary_dir, axis=1)
-        retention_all = load_concat(support_retention_dir, axis=1)
-    if not (0 <= mode < map_all.shape[0]):
-        raise IndexError(f"Mode {mode} outside [0, {map_all.shape[0]}) for {case}")
-    if support_all is not None and not (0 <= mode < support_all.shape[0]):
-        raise IndexError(f"Mode {mode} outside in-support summaries for {case}")
+    proposal_summary = np.asarray(
+        load_partitioned_array(cache_partitions, "proposal_mean_estimates")
+    )
+    target_map = np.asarray(
+        load_partitioned_array(cache_partitions, "tf_target_map_estimates")
+    )
+    target_summary = np.asarray(
+        load_partitioned_array(cache_partitions, "tf_target_mean_estimates")
+    )
+    population_log_ratio = np.asarray(
+        load_partitioned_array(cache_partitions, "population_tf_log_ratio"),
+        dtype=np.float64,
+    )
+    rmag_true = np.asarray(
+        load_partitioned_array(cache_partitions, "rmag_true"), dtype=float
+    )
+    spectral_quality = np.asarray(
+        load_partitioned_array(cache_partitions, "spectral_reference_quality"),
+        dtype=float,
+    )
+    posterior_ess = np.asarray(
+        load_partitioned_array(cache_partitions, "posterior_tf_ess"), dtype=float
+    )
+    posterior_ess_fraction = np.asarray(
+        load_partitioned_array(cache_partitions, "posterior_tf_ess_fraction"),
+        dtype=float,
+    )
+    posterior_max_weight = np.asarray(
+        load_partitioned_array(cache_partitions, "posterior_tf_max_weight"),
+        dtype=float,
+    )
+
+    n = len(truth)
+    expected_summary = (n, 3, len(feature_names))
+    for name, value, expected in (
+        ("proposal_map", proposal_map, truth.shape),
+        ("target_map", target_map, truth.shape),
+        ("proposal_summary", proposal_summary, expected_summary),
+        ("target_summary", target_summary, expected_summary),
+    ):
+        if value.shape != expected:
+            raise ValueError(f"{name} shape {value.shape}; expected {expected}")
+    vectors = (
+        population_log_ratio,
+        rmag_true,
+        spectral_quality,
+        posterior_ess,
+        posterior_ess_fraction,
+        posterior_max_weight,
+    )
+    if any(value.shape != (n,) for value in vectors):
+        raise ValueError(f"Scalar cache length mismatch for {case}")
     if max_galaxies is not None:
         if max_galaxies <= 0:
             raise ValueError("max_galaxies must be positive")
-        truth = truth[:max_galaxies]
-        snr = snr[:max_galaxies]
-        map_all = map_all[:, :max_galaxies]
-        mean_all = mean_all[:, :max_galaxies]
-        if support_all is not None:
-            support_all = support_all[:, :max_galaxies]
-            retention_all = retention_all[:, :max_galaxies]
-    estimates = {
-        "MAP": np.asarray(map_all[mode]),
-        "Mean": np.asarray(mean_all[mode, :, 1]),
-    }
-    summaries = {"Mean": np.asarray(mean_all[mode])}
-    support_retention = None
-    if support_all is not None:
-        estimates["In-support Mean"] = np.asarray(support_all[mode, :, 1])
-        summaries["In-support Mean"] = np.asarray(support_all[mode])
-        support_retention = np.asarray(retention_all[mode])
-    if any(value.shape[0] != truth.shape[0] for value in [snr, *estimates.values()]):
-        raise ValueError(f"Length mismatch among cached summaries for {case}")
-    if support_retention is not None and support_retention.shape != (truth.shape[0],):
-        raise ValueError(f"In-support retention shape mismatch for {case}")
+        take = min(max_galaxies, n)
+        truth = truth[:take]
+        proposal_map = proposal_map[:take]
+        proposal_summary = proposal_summary[:take]
+        target_map = target_map[:take]
+        target_summary = target_summary[:take]
+        population_log_ratio = population_log_ratio[:take]
+        rmag_true = rmag_true[:take]
+        spectral_quality = spectral_quality[:take]
+        posterior_ess = posterior_ess[:take]
+        posterior_ess_fraction = posterior_ess_fraction[:take]
+        posterior_max_weight = posterior_max_weight[:take]
+        n = take
+
+    proposal_weight = np.full(n, 1.0 / n, dtype=np.float64)
+    target_weight = normalize_population_log_weights(population_log_ratio)
     return {
         "case": case,
         "model": model,
         "dataset": dataset,
         "root": root,
-        "truth": np.asarray(truth),
-        "snr": np.asarray(snr),
-        "estimates": estimates,
-        "mean_summary": np.asarray(mean_all[mode]),
-        "summaries": summaries,
-        "support_retention": support_retention,
-        "support_manifest": (
-            root / "in_support_meta" / "manifest.json"
-            if support_retention is not None
-            else None
-        ),
+        "cache_partitions": cache_partitions,
+        "feature_names": feature_names,
+        "truth": truth,
+        "rmag_true": rmag_true,
+        "spectral_reference_quality": spectral_quality,
+        "posterior_tf_ess": posterior_ess,
+        "posterior_tf_ess_fraction": posterior_ess_fraction,
+        "posterior_tf_max_weight": posterior_max_weight,
+        "populations": {
+            "Proposal population / base posterior": {
+                "key": "proposal",
+                "map": proposal_map,
+                "summary": proposal_summary,
+                "mean": proposal_summary[:, 1],
+                "galaxy_weight": proposal_weight,
+            },
+            "TF target population / TF posterior": {
+                "key": "tf_target",
+                "map": target_map,
+                "summary": target_summary,
+                "mean": target_summary[:, 1],
+                "galaxy_weight": target_weight,
+            },
+        },
     }
 
 
-def _load_optional_case_array(case: dict, data_type: str) -> np.ndarray | None:
-    directory = Path(case["root"]) / data_type
-    if not directory.is_dir():
-        return None
-    values = np.asarray(load_concat(directory, axis=0))
-    values = values[: len(case["truth"])]
-    if values.shape != (len(case["truth"]),):
-        raise ConditionalDiagnosticUnavailable(
-            f"Cached {data_type} has shape {values.shape}; expected "
-            f"({len(case['truth'])},)"
-        )
-    return values.astype(float, copy=False)
+def normalize_subset_weights(
+    weight: np.ndarray, mask: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(weight, dtype=np.float64)
+    finite = np.isfinite(values) & (values >= 0.0)
+    if mask is not None:
+        finite &= np.asarray(mask, dtype=bool)
+    if not np.any(finite):
+        return finite, np.array([], dtype=np.float64)
+    selected = values[finite]
+    total = np.sum(selected)
+    if not np.isfinite(total) or total <= 0.0:
+        return np.zeros_like(finite), np.array([], dtype=np.float64)
+    return finite, selected / total
 
 
-def _archived_sample_column(
-    case: dict,
-    sample_root: Path,
-    column: str,
+def weighted_mean_and_se(
+    values: np.ndarray, weight: np.ndarray
+) -> tuple[float, float, float]:
+    values = np.asarray(values, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)
+    mask, normalized = normalize_subset_weights(
+        weight, np.isfinite(values)
+    )
+    if not len(normalized):
+        return float("nan"), float("nan"), 0.0
+    selected = values[mask]
+    mean = float(np.sum(normalized * selected))
+    ess = effective_sample_size(normalized)
+    variance = float(np.sum(normalized * np.square(selected - mean)))
+    se = math.sqrt(variance / max(ess - 1.0, 1.0))
+    return mean, se, ess
+
+
+def fit_design(
+    y: np.ndarray, design: np.ndarray, weight: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float]:
+    y = np.asarray(y, dtype=np.float64)
+    design = np.asarray(design, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)
+    if design.ndim != 2 or y.shape != (design.shape[0],):
+        raise ValueError("inconsistent regression shapes")
+    finite = np.isfinite(y) & np.all(np.isfinite(design), axis=1)
+    mask, normalized = normalize_subset_weights(weight, finite)
+    x = design[mask]
+    y = y[mask]
+    if len(y) <= x.shape[1] or np.linalg.matrix_rank(x) < x.shape[1]:
+        nan = np.full(x.shape[1], np.nan)
+        return nan, nan.copy(), effective_sample_size(normalized) if len(normalized) else 0.0
+    bread = np.linalg.pinv(x.T @ (normalized[:, None] * x))
+    coefficient = bread @ (x.T @ (normalized * y))
+    residual = y - x @ coefficient
+    score = x * (normalized * residual)[:, None]
+    covariance = bread @ (score.T @ score) @ bread
+    ess = effective_sample_size(normalized)
+    correction = ess / max(ess - x.shape[1], 1.0)
+    uncertainty = np.sqrt(np.clip(np.diag(covariance) * correction, 0.0, None))
+    return coefficient, uncertainty, ess
+
+
+def wrap_angle(angle: np.ndarray) -> np.ndarray:
+    """Wrap a directed angle to ``[-pi, pi)``."""
+
+    return (np.asarray(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def weighted_quantile(
+    values: np.ndarray, quantiles: np.ndarray, weight: np.ndarray
 ) -> np.ndarray:
-    """Load one truth column from the exact sample rows named by cache metadata."""
-    root = Path(case["root"])
-    n_galaxies = len(case["truth"])
-    ranges = []
-    sample_sets = set()
-    remaining = n_galaxies
-    for truth_path in partition_files(root / "truth"):
-        if remaining <= 0:
-            break
-        meta_path = root / "meta" / truth_path.with_suffix(".json").name
-        try:
-            payload = json.loads(meta_path.read_text())
-            sample_set = payload["args"]["sample_set"]
-            start = int(payload["galaxy_range"]["start"])
-            end = int(payload["galaxy_range"]["end"])
-        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ConditionalDiagnosticUnavailable(
-                f"Cannot recover {column}: invalid cache metadata {meta_path}"
-            ) from exc
-        if end <= start:
-            raise ConditionalDiagnosticUnavailable(
-                f"Cannot recover {column}: empty galaxy range in {meta_path}"
-            )
-        take = min(end - start, remaining)
-        ranges.append((start, start + take))
-        sample_sets.add(str(sample_set))
-        remaining -= take
-    if remaining:
-        raise ConditionalDiagnosticUnavailable(
-            f"Cannot recover {column}: cache metadata covers only "
-            f"{n_galaxies - remaining} of {n_galaxies} report rows"
-        )
-    if len(sample_sets) != 1:
-        raise ConditionalDiagnosticUnavailable(
-            f"Cannot recover {column}: partitions name multiple sample sets"
-        )
-    sample_path = Path(next(iter(sample_sets)))
-    if not sample_path.is_absolute():
-        sample_path = Path(sample_root) / sample_path
-    if not sample_path.is_file():
-        raise ConditionalDiagnosticUnavailable(
-            f"Cannot recover {column}: sample table not found at {sample_path}"
-        )
-
-    requested = {
-        index
-        for start, end in ranges
-        for index in range(start, end)
-    }
-    rows = {}
-    with sample_path.open(newline="") as stream:
-        reader = csv.DictReader(stream)
-        required = set(FEATURE_NAMES) | {column}
-        missing = required - set(reader.fieldnames or ())
-        if missing:
-            raise ConditionalDiagnosticUnavailable(
-                f"Sample table {sample_path} lacks columns {sorted(missing)}"
-            )
-        for index, row in enumerate(reader):
-            if index in requested:
-                rows[index] = row
-            if len(rows) == len(requested):
-                break
-    missing_rows = requested - set(rows)
-    if missing_rows:
-        raise ConditionalDiagnosticUnavailable(
-            f"Sample table {sample_path} is missing {len(missing_rows)} requested rows"
-        )
-    ordered_indices = [
-        index
-        for start, end in ranges
-        for index in range(start, end)
-    ]
-    archived_truth = np.asarray(
-        [[float(rows[index][name]) for name in FEATURE_NAMES] for index in ordered_indices]
+    values = np.asarray(values, dtype=np.float64)
+    quantiles = np.asarray(quantiles, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)
+    if values.ndim != 1 or weight.shape != values.shape:
+        raise ValueError("values and weight must be matching vectors")
+    finite = np.isfinite(values) & np.isfinite(weight) & (weight >= 0.0)
+    values, weight = values[finite], weight[finite]
+    if not len(values) or np.sum(weight) <= 0.0:
+        return np.full(quantiles.shape, np.nan)
+    order = np.argsort(values, kind="stable")
+    values, weight = values[order], weight[order]
+    weight = weight / np.sum(weight)
+    coordinate = np.cumsum(weight) - 0.5 * weight
+    return np.interp(
+        quantiles, coordinate, values, left=values[0], right=values[-1]
     )
-    if not np.allclose(
-        archived_truth,
-        np.asarray(case["truth"]),
-        rtol=2e-5,
-        atol=2e-6,
-    ):
-        raise ConditionalDiagnosticUnavailable(
-            f"Sample table {sample_path} does not align with cached truth rows"
-        )
-    return np.asarray([float(rows[index][column]) for index in ordered_indices])
 
 
-def load_conditional_diagnostic_axes(case: dict, sample_root: Path) -> dict:
-    """Return authoritative conditioning variables for the Mean m/c plots."""
-    magnitude = _load_optional_case_array(case, "rmag_true")
-    if magnitude is None:
-        magnitude = _archived_sample_column(case, sample_root, "rmag_true")
-    spectral_snr = _load_optional_case_array(case, "spectral_quality")
-    if spectral_snr is None:
-        raise ConditionalDiagnosticUnavailable(
-            "cache has no spectral_quality array; reference spectral SNR is unavailable"
-        )
-    if not np.all(np.isfinite(magnitude)):
-        raise ConditionalDiagnosticUnavailable("true magnitude contains non-finite values")
-    if not np.all(np.isfinite(spectral_snr) & (spectral_snr > 0.0)):
-        raise ConditionalDiagnosticUnavailable(
-            "reference spectral SNR must be finite and positive"
-        )
-    return {
-        "rmag_true": magnitude,
-        "spectral_snr": spectral_snr,
-        "hlr_true": np.asarray(case["truth"][:, 7], dtype=float),
-    }
-
-
-def _validate_pp_provenance(root: Path, sample_files: list[Path]) -> None:
-    """Ensure raw draws correspond to the posterior summaries being reported."""
-    meta_dir = root / "meta"
-    flags = []
-    for sample_path in sample_files:
-        meta_path = meta_dir / sample_path.with_suffix(".json").name
-        if not meta_path.is_file():
-            raise PosteriorPPUnavailable(
-                f"P-P plot unavailable: missing provenance file {meta_path}"
-            )
-        try:
-            payload = json.loads(meta_path.read_text())
-            flag = payload["args"]["cancel_add_noise"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PosteriorPPUnavailable(
-                f"P-P plot unavailable: invalid provenance in {meta_path}"
-            ) from exc
-        if not isinstance(flag, bool):
-            raise PosteriorPPUnavailable(
-                f"P-P plot unavailable: cancel_add_noise is not Boolean in {meta_path}"
-            )
-        flags.append(flag)
-    if len(set(flags)) != 1:
-        raise PosteriorPPUnavailable(
-            "P-P plot unavailable: cancel_add_noise differs across partitions"
-        )
-    if flags[0]:
-        raise PosteriorPPUnavailable(
-            "P-P plot unavailable: this legacy cache stores only the original "
-            "draw bank, while its Mean summaries combine original and rotated "
-            "draws for additive-noise cancellation"
-        )
-
-
-def load_shear_pit_values(
-    case: dict, mode: int, block_size: int = 64
-) -> dict[str, np.ndarray]:
-    """Return prior-matched conditional midpoint ranks for g1 and g2.
-
-    For each component, the galaxy's true shear selects one of the fixed
-    intervals in ``SHEAR_PP_BIN_EDGES``. The posterior is then conditioned on
-    the matching restricted prior by retaining only draws of that component in
-    the same interval. The finite-sample rank within those retained draws is
-    ``(n_less + 0.5 * n_equal + 0.5) / (n_retained + 1)``. Raw sample
-    partitions are memory-mapped and only a small block of their two shear
-    columns is materialized at once.
-    """
-    if mode < 0:
-        raise IndexError("mode must be non-negative")
-    if block_size <= 0:
-        raise ValueError("block_size must be positive")
-    truth = np.asarray(case["truth"])
-    if truth.ndim != 2 or truth.shape[1] < 2:
-        raise ValueError("case truth must have shape (galaxy, feature>=2)")
-    if not len(truth):
-        raise ValueError("cannot build a P-P plot for zero galaxies")
-
-    root = Path(case["root"])
-    sample_files = partition_files(root / "sample")
-    truth_files = partition_files(root / "truth")
-    if len(sample_files) != len(truth_files):
-        raise ValueError("sample and truth caches have different partition counts")
-    if [path.name for path in sample_files] != [path.name for path in truth_files]:
-        raise ValueError("sample and truth partition labels do not match")
-    _validate_pp_provenance(root, sample_files)
-
-    pit = np.full((len(truth), 2), np.nan, dtype=np.float64)
-    retained = np.zeros((len(truth), 2), dtype=np.int64)
-    offset = 0
-    for sample_path, truth_path in zip(sample_files, truth_files):
-        if offset >= len(truth):
-            break
-        samples = np.load(sample_path, mmap_mode="r")
-        partition_truth = np.load(truth_path, mmap_mode="r")
-        if samples.ndim != 4 or samples.shape[-1] < 2:
-            raise ValueError(
-                f"Expected sample shape (mode, galaxy, draw, feature>=2), got "
-                f"{samples.shape} in {sample_path}"
-            )
-        if partition_truth.ndim != 2 or partition_truth.shape[1] < 2:
-            raise ValueError(f"Invalid truth shape {partition_truth.shape} in {truth_path}")
-        if samples.shape[1] != partition_truth.shape[0]:
-            raise ValueError(f"Galaxy-count mismatch between {sample_path} and {truth_path}")
-        if mode >= samples.shape[0]:
-            raise IndexError(
-                f"Mode {mode} outside [0, {samples.shape[0]}) for {sample_path}"
-            )
-
-        take = min(samples.shape[1], len(truth) - offset)
-        expected_truth = truth[offset : offset + take, :2]
-        stored_truth = np.asarray(partition_truth[:take, :2])
-        if not np.array_equal(stored_truth, expected_truth, equal_nan=True):
-            raise ValueError(
-                f"Truth rows in {truth_path} do not align with the loaded case prefix"
-            )
-
-        for local_start in range(0, take, block_size):
-            local_end = min(take, local_start + block_size)
-            draws = np.asarray(samples[mode, local_start:local_end, :, :2])
-            targets = expected_truth[local_start:local_end]
-            ranks = np.full(targets.shape, np.nan, dtype=np.float64)
-            block_retained = np.zeros(targets.shape, dtype=np.int64)
-            for component in range(2):
-                truth_bins = shear_pp_bin_indices(targets[:, component])
-                draw_bins = shear_pp_bin_indices(draws[:, :, component])
-                for bin_index in range(len(SHEAR_PP_BIN_EDGES) - 1):
-                    galaxy_mask = truth_bins == bin_index
-                    if not np.any(galaxy_mask):
-                        continue
-                    component_draws = draws[galaxy_mask, :, component]
-                    kept = (
-                        np.isfinite(component_draws)
-                        & (draw_bins[galaxy_mask] == bin_index)
-                    )
-                    n_kept = kept.sum(axis=1)
-                    component_targets = targets[galaxy_mask, component]
-                    n_less = (
-                        (component_draws < component_targets[:, None]) & kept
-                    ).sum(axis=1)
-                    n_equal = (
-                        (component_draws == component_targets[:, None]) & kept
-                    ).sum(axis=1)
-                    component_ranks = np.full(
-                        len(component_targets), np.nan, dtype=np.float64
-                    )
-                    valid = np.isfinite(component_targets) & (n_kept > 0)
-                    component_ranks[valid] = (
-                        n_less[valid] + 0.5 * n_equal[valid] + 0.5
-                    ) / (n_kept[valid] + 1.0)
-                    ranks[galaxy_mask, component] = component_ranks
-                    block_retained[galaxy_mask, component] = n_kept
-            start = offset + local_start
-            stop = offset + local_end
-            pit[start:stop] = ranks
-            retained[start:stop] = block_retained
-        offset += take
-        del samples, partition_truth
-
-    if offset != len(truth):
-        raise ValueError(
-            f"Sample cache contains {offset} galaxies, but report case has {len(truth)}"
-        )
-    return {
-        "g1": pit[:, 0],
-        "g2": pit[:, 1],
-        "g1_retained": retained[:, 0],
-        "g2_retained": retained[:, 1],
-    }
-
-
-def _smooth_circular_histogram(histogram: np.ndarray) -> np.ndarray:
-    """Smooth a one-dimensional circular histogram without SciPy."""
-    histogram = np.asarray(histogram, dtype=float)
-    if histogram.ndim != 1 or len(histogram) < 9:
-        raise ValueError("circular histogram must be one-dimensional with >=9 bins")
-    smoothed = histogram
-    for _ in range(2):
-        smoothed = (
-            np.roll(smoothed, 2)
-            + 4.0 * np.roll(smoothed, 1)
-            + 6.0 * smoothed
-            + 4.0 * np.roll(smoothed, -1)
-            + np.roll(smoothed, -2)
-        ) / 16.0
-    return smoothed
-
-
-def significant_circular_modes(histogram: np.ndarray) -> np.ndarray:
-    """Return diagnostic peak indices in a smoothed circular histogram.
-
-    A peak must reach ten percent of the tallest peak and rise by five percent
-    of that height above the lowest bin on both sides within four bins. These
-    fixed thresholds reject sampling ripples and nearly uniform posteriors;
-    the resulting count is descriptive, not a formal model-selection test.
-    """
-    smoothed = _smooth_circular_histogram(histogram)
-    maximum = float(np.max(smoothed))
-    if not np.isfinite(maximum) or maximum <= 0.0:
-        return np.array([], dtype=int)
-    candidates = np.flatnonzero(
-        (smoothed > np.roll(smoothed, 1))
-        & (smoothed >= np.roll(smoothed, -1))
-        & (smoothed >= THETA_MODE_MIN_HEIGHT_RATIO * maximum)
-    )
-    selected = []
-    for peak in candidates:
-        left_minimum = min(
-            smoothed[(peak - offset) % len(smoothed)]
-            for offset in range(1, THETA_MODE_PROMINENCE_RADIUS + 1)
-        )
-        right_minimum = min(
-            smoothed[(peak + offset) % len(smoothed)]
-            for offset in range(1, THETA_MODE_PROMINENCE_RADIUS + 1)
-        )
-        prominence = smoothed[peak] - max(left_minimum, right_minimum)
-        if prominence >= THETA_MODE_MIN_PROMINENCE_RATIO * maximum:
-            selected.append(int(peak))
-    return np.asarray(selected, dtype=int)
-
-
-def load_theta_posterior_diagnostics(
-    case: dict,
-    mode: int,
-    block_size: int = 64,
-    histogram_bins: int = THETA_HISTOGRAM_BINS,
+def component_metrics(
+    truth: np.ndarray,
+    estimate: np.ndarray,
+    low_g: float,
+    weight: np.ndarray,
 ) -> dict:
-    """Stream directed theta bias and posterior-modality diagnostics.
+    """Weighted additive and multiplicative shear calibration metrics."""
 
-    Theta is treated as a directed spin-1 angle on a 2*pi domain. The opposite
-    branch at theta+pi is deliberately not folded onto the truth. Each galaxy
-    contributes unit total weight to the two-dimensional density.
-    """
-    if block_size <= 0:
-        raise ValueError("theta diagnostic block_size must be positive")
-    if histogram_bins < 9:
-        raise ValueError("theta diagnostic requires at least 9 histogram bins")
-    truth = np.asarray(case["truth"])
-    if truth.ndim != 2 or truth.shape[1] < 3:
-        raise ValueError("case truth must have shape (galaxy, feature>=3)")
-    root = Path(case["root"])
-    sample_files = partition_files(root / "sample")
-    theta_truth = np.asarray(truth[:, 2], dtype=float)
-    n_galaxies = len(theta_truth)
-    result = {
-        "directional_mean": np.full(n_galaxies, np.nan),
-        "axial_mean": np.full(n_galaxies, np.nan),
-        "directional_resultant": np.full(n_galaxies, np.nan),
-        "axial_resultant": np.full(n_galaxies, np.nan),
-        "true_branch_mass": np.full(n_galaxies, np.nan),
-        "opposite_branch_mass": np.full(n_galaxies, np.nan),
-        "middle_mass": np.full(n_galaxies, np.nan),
-        "mode_count": np.zeros(n_galaxies, dtype=np.int16),
-    }
-    aggregate_histogram = np.zeros(histogram_bins, dtype=np.int64)
-    truth_residual_density = np.zeros(
-        (histogram_bins, histogram_bins), dtype=float
-    )
-    angle_edges = np.linspace(-np.pi, np.pi, histogram_bins + 1)
-    offset = 0
-    for sample_path in sample_files:
-        samples = np.load(sample_path, mmap_mode="r")
-        truth_path = root / "truth" / sample_path.name
-        partition_truth = np.load(truth_path, mmap_mode="r")
-        if samples.ndim != 4 or samples.shape[-1] < 3:
-            raise ValueError(
-                f"Unexpected posterior sample shape {samples.shape} in {sample_path}"
-            )
-        if not (0 <= mode < samples.shape[0]):
-            raise IndexError(
-                f"Mode {mode} outside [0, {samples.shape[0]}) in {sample_path}"
-            )
-        take = min(samples.shape[1], n_galaxies - offset)
-        if take <= 0:
-            break
-        if partition_truth.shape[0] < take or not np.allclose(
-            partition_truth[:take, :3], truth[offset : offset + take, :3]
-        ):
-            raise ValueError(
-                f"Truth rows in {truth_path} do not align with the loaded case prefix"
-            )
-        for local_start in range(0, take, block_size):
-            local_stop = min(take, local_start + block_size)
-            start = offset + local_start
-            stop = offset + local_stop
-            theta = np.asarray(
-                samples[mode, local_start:local_stop, :, 2], dtype=float
-            )
-            finite = np.isfinite(theta)
-            counts = finite.sum(axis=1)
-            sin1 = np.where(finite, np.sin(theta), 0.0).sum(axis=1)
-            cos1 = np.where(finite, np.cos(theta), 0.0).sum(axis=1)
-            sin2 = np.where(finite, np.sin(2.0 * theta), 0.0).sum(axis=1)
-            cos2 = np.where(finite, np.cos(2.0 * theta), 0.0).sum(axis=1)
-            valid = counts > 0
-            directional_mean = np.full(local_stop - local_start, np.nan)
-            axial_mean = np.full(local_stop - local_start, np.nan)
-            directional_resultant = np.full(local_stop - local_start, np.nan)
-            axial_resultant = np.full(local_stop - local_start, np.nan)
-            directional_mean[valid] = np.arctan2(sin1[valid], cos1[valid])
-            axial_mean[valid] = 0.5 * np.arctan2(sin2[valid], cos2[valid])
-            directional_resultant[valid] = np.hypot(
-                sin1[valid], cos1[valid]
-            ) / counts[valid]
-            axial_resultant[valid] = np.hypot(
-                sin2[valid], cos2[valid]
-            ) / counts[valid]
-            result["directional_mean"][start:stop] = directional_mean
-            result["axial_mean"][start:stop] = axial_mean
-            result["directional_resultant"][start:stop] = directional_resultant
-            result["axial_resultant"][start:stop] = axial_resultant
-
-            residual = wrap_angle(theta - theta_truth[start:stop, None])
-            finite_residual = np.isfinite(residual)
-            absolute_residual = np.abs(residual)
-            primary = finite_residual & (
-                absolute_residual < THETA_BRANCH_HALF_WIDTH
-            )
-            opposite = finite_residual & (
-                absolute_residual > np.pi - THETA_BRANCH_HALF_WIDTH
-            )
-            middle = finite_residual & ~(primary | opposite)
-            for key, mask in (
-                ("true_branch_mass", primary),
-                ("opposite_branch_mass", opposite),
-                ("middle_mass", middle),
-            ):
-                values = np.full(local_stop - local_start, np.nan)
-                values[valid] = mask.sum(axis=1)[valid] / counts[valid]
-                result[key][start:stop] = values
-
-            for local_index in range(local_stop - local_start):
-                row = residual[local_index, finite_residual[local_index]]
-                if not len(row):
-                    continue
-                histogram = np.histogram(row, bins=angle_edges)[0]
-                galaxy_index = start + local_index
-                result["mode_count"][galaxy_index] = len(
-                    significant_circular_modes(histogram)
-                )
-                aggregate_histogram += histogram
-                truth_bin = np.searchsorted(
-                    angle_edges, theta_truth[galaxy_index], side="right"
-                ) - 1
-                truth_bin = int(np.clip(truth_bin, 0, histogram_bins - 1))
-                truth_residual_density[truth_bin] += histogram / histogram.sum()
-        offset += take
-        del samples, partition_truth
-
-    if offset != n_galaxies:
-        raise ValueError(
-            f"Sample cache contains {offset} galaxies, but report case has "
-            f"{n_galaxies}"
-        )
-    result["aggregate_histogram"] = aggregate_histogram
-    result["aggregate_mode_indices"] = significant_circular_modes(
-        aggregate_histogram
-    )
-    result["truth_residual_density"] = truth_residual_density
-    result["angle_edges"] = angle_edges
-    return result
-
-
-def fit_design(y: np.ndarray, design: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
-    residual = y - design @ coef
-    dof = max(1, len(y) - design.shape[1])
-    cov = np.linalg.pinv(design.T @ design) * (residual @ residual / dof)
-    return coef, np.sqrt(np.maximum(np.diag(cov), 0))
-
-
-def component_metrics(truth: np.ndarray, estimate: np.ndarray, low_g: float) -> dict:
+    truth = np.asarray(truth, dtype=np.float64)
+    estimate = np.asarray(estimate, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)
+    if truth.shape != estimate.shape or weight.shape != truth.shape:
+        raise ValueError("truth, estimate, and weight must be matching vectors")
+    finite = np.isfinite(truth) & np.isfinite(estimate)
     residual = estimate - truth
-    additive = float(np.mean(residual))
-    additive_se = float(np.std(residual, ddof=1) / np.sqrt(len(residual)))
-    low = np.abs(truth) < low_g
-    linear, linear_se = fit_design(
-        residual[low], np.column_stack([np.ones(low.sum()), truth[low]])
+    additive, additive_se, ess = weighted_mean_and_se(residual[finite], weight[finite])
+    low = finite & (np.abs(truth) < low_g)
+    linear, linear_se, low_ess = fit_design(
+        residual[low],
+        np.column_stack((np.ones(np.count_nonzero(low)), truth[low])),
+        weight[low],
     )
-    cubic, cubic_se = fit_design(
-        residual,
-        np.column_stack([np.ones(len(truth)), truth, truth**3]),
+    cubic, cubic_se, cubic_ess = fit_design(
+        residual[finite],
+        np.column_stack(
+            (
+                np.ones(np.count_nonzero(finite)),
+                truth[finite],
+                truth[finite] ** 3,
+            )
+        ),
+        weight[finite],
     )
     return {
         "c": additive,
@@ -720,758 +303,829 @@ def component_metrics(truth: np.ndarray, estimate: np.ndarray, low_g: float) -> 
         "cubic_q": float(cubic[2]),
         "cubic_m_se": float(cubic_se[1]),
         "cubic_q_se": float(cubic_se[2]),
+        "n": int(np.count_nonzero(finite)),
+        "ess": ess,
+        "n_low": int(np.count_nonzero(low)),
+        "ess_low": low_ess,
+        "ess_cubic": cubic_ess,
     }
-
-
-def spin_metrics(theta: np.ndarray, residual: np.ndarray) -> dict:
-    design = np.column_stack(
-        [
-            np.ones(len(theta)),
-            np.cos(2 * theta),
-            np.sin(2 * theta),
-            np.cos(4 * theta),
-            np.sin(4 * theta),
-        ]
-    )
-    coef, _ = fit_design(residual, design)
-    return {
-        "offset": float(coef[0]),
-        "spin2": float(np.hypot(coef[1], coef[2])),
-        "spin4": float(np.hypot(coef[3], coef[4])),
-        "coef": coef,
-    }
-
-
-def img_to_galaxy_clockwise(
-    g1: np.ndarray, g2: np.ndarray, theta: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Use the shared clockwise ``theta_int`` shear transform."""
-    return _img_to_gal_axis(g1, g2, theta)
 
 
 def galaxy_frame_components(
     truth: np.ndarray, estimate: np.ndarray
 ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
-    """Return true and estimated (g_plus, g_cross) using true theta_int."""
+    """Use true theta to rotate truth and estimate into the galaxy frame."""
+
     theta = truth[:, 2]
-    true_components = img_to_galaxy_clockwise(truth[:, 0], truth[:, 1], theta)
-    estimate_components = img_to_galaxy_clockwise(
+    true_components = img_to_gal_axis(truth[:, 0], truth[:, 1], theta)
+    estimated_components = img_to_gal_axis(
         estimate[:, 0], estimate[:, 1], theta
     )
-    return true_components, estimate_components
+    return true_components, estimated_components
 
 
-def pearson_correlation(x: np.ndarray, y: np.ndarray) -> tuple[float, int]:
-    """Return a finite-pair Pearson correlation and contributing sample size."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    finite = np.isfinite(x) & np.isfinite(y)
-    x = x[finite]
-    y = y[finite]
-    n = len(x)
-    if n < 2 or np.ptp(x) == 0 or np.ptp(y) == 0:
-        return float("nan"), n
-    return float(np.corrcoef(x, y)[0, 1]), n
-
-
-def galaxy_frame_diagnostics(case: dict, low_g: float) -> tuple[list[dict], list[dict]]:
-    """Compute galaxy-frame bias and coupled nuisance-error diagnostics."""
-    metric_rows = []
-    correlation_rows = []
+def compute_metrics(case: dict, low_g: float) -> list[dict]:
+    rows = []
     truth = case["truth"]
-    for estimator, estimate in case["estimates"].items():
-        true_components, estimate_components = galaxy_frame_components(truth, estimate)
-        for label, true_component, estimate_component in zip(
-            ("g+ (E)", "gx (B)"), true_components, estimate_components
+    sini_index = case["feature_names"].index("sini")
+    sini = truth[:, sini_index]
+    for population_label, population in case["populations"].items():
+        weight = population["galaxy_weight"]
+        for estimator, estimate in (
+            ("MAP", population["map"]),
+            ("Mean", population["mean"]),
         ):
-            residual = estimate_component - true_component
-            row = component_metrics(true_component, estimate_component, low_g)
-            row.update(
-                estimator=estimator,
-                component=label,
-                n_low=int(np.count_nonzero(np.abs(true_component) < low_g)),
-            )
-            metric_rows.append(row)
-            for nuisance, index in NUISANCE_INDICES.items():
-                nuisance_error = estimate[:, index] - truth[:, index]
-                correlation, n = pearson_correlation(residual, nuisance_error)
-                correlation_rows.append(
-                    {
-                        "estimator": estimator,
-                        "component": label,
-                        "nuisance": nuisance,
-                        "correlation": correlation,
-                        "n": n,
-                    }
+            frames = {
+                "image": (
+                    (truth[:, 0], truth[:, 1]),
+                    (estimate[:, 0], estimate[:, 1]),
+                    ("g1", "g2"),
                 )
-    return metric_rows, correlation_rows
-
-
-def wrap_angle(angle: np.ndarray) -> np.ndarray:
-    """Wrap radians to [-pi, pi)."""
-    return (np.asarray(angle) + np.pi) % (2.0 * np.pi) - np.pi
+            }
+            true_gal, estimate_gal = galaxy_frame_components(truth, estimate)
+            frames["galaxy"] = (true_gal, estimate_gal, ("g+ (E)", "gx (B)"))
+            for frame, (true_components, estimated_components, labels) in frames.items():
+                for component_truth, component_estimate, component in zip(
+                    true_components, estimated_components, labels
+                ):
+                    row = component_metrics(
+                        component_truth, component_estimate, low_g, weight
+                    )
+                    cuts = {}
+                    for cut in SINI_CUTS:
+                        cut_mask = (
+                            np.ones(len(sini), dtype=bool)
+                            if np.isinf(cut)
+                            else sini < cut
+                        )
+                        cut_metrics = component_metrics(
+                            component_truth[cut_mask],
+                            component_estimate[cut_mask],
+                            low_g,
+                            weight[cut_mask],
+                        )
+                        cuts["all" if np.isinf(cut) else f"{cut:.1f}"] = {
+                            "m": cut_metrics["low_m"],
+                            "m_se": cut_metrics["low_m_se"],
+                            "n": cut_metrics["n_low"],
+                            "ess": cut_metrics["ess_low"],
+                        }
+                    row.update(
+                        population=population_label,
+                        population_key=population["key"],
+                        estimator=estimator,
+                        frame=frame,
+                        component=component,
+                        sini_cuts=cuts,
+                    )
+                    rows.append(row)
+    return rows
 
 
 def coverage_metrics(
     truth: np.ndarray,
     summary: np.ndarray,
-    feature_names: tuple[str, ...] = FEATURE_NAMES,
+    weight: np.ndarray,
+    feature_names: tuple[str, ...] | list[str],
+    population: str = "",
 ) -> list[dict]:
-    """Compute empirical coverage of cached 16th--84th posterior intervals.
+    """Weighted 16th--84th posterior coverage for every target."""
 
-    The theta interval is represented around its cached circular center and may
-    cross the -pi/pi seam, so it cannot use a direct lower <= truth <= upper
-    comparison.
-    """
-    truth = np.asarray(truth)
-    summary = np.asarray(summary)
-    if summary.ndim != 3 or summary.shape[1] != 3:
-        raise ValueError("mean summary must have shape (galaxy, 3, feature)")
-    if truth.shape != (summary.shape[0], summary.shape[2]):
-        raise ValueError("truth and mean-summary shapes are inconsistent")
-    if len(feature_names) != truth.shape[1]:
-        raise ValueError("feature_names must match the cached feature dimension")
-
+    truth = np.asarray(truth, dtype=np.float64)
+    summary = np.asarray(summary, dtype=np.float64)
+    feature_names = tuple(feature_names)
+    if summary.shape != (len(truth), 3, len(feature_names)):
+        raise ValueError("posterior summary has an unexpected shape")
     rows = []
-    for index, name in enumerate(feature_names):
-        lower = summary[:, 0, index]
-        center = summary[:, 1, index]
-        upper = summary[:, 2, index]
+    for index, parameter in enumerate(feature_names):
+        lower, upper = summary[:, 0, index], summary[:, 2, index]
         target = truth[:, index]
-        finite = (
-            np.isfinite(lower)
-            & np.isfinite(center)
-            & np.isfinite(upper)
-            & np.isfinite(target)
-        )
-        if name == "theta_int":
-            lower_delta = wrap_angle(lower - center)
-            upper_delta = wrap_angle(upper - center)
-            target_delta = wrap_angle(target - center)
-            covered = (target_delta >= lower_delta) & (target_delta <= upper_delta)
+        finite = np.isfinite(target) & np.isfinite(lower) & np.isfinite(upper)
+        if parameter == "theta_int":
+            target = wrap_angle(target)
+            lower, upper = wrap_angle(lower), wrap_angle(upper)
+            inside = np.where(
+                lower <= upper,
+                (target >= lower) & (target <= upper),
+                (target >= lower) | (target <= upper),
+            )
         else:
-            covered = (target >= lower) & (target <= upper)
-        covered = covered[finite]
-        n = len(covered)
-        fraction = float(np.mean(covered)) if n else float("nan")
-        se = (
-            float(np.sqrt(fraction * (1.0 - fraction) / n))
-            if n and np.isfinite(fraction)
-            else float("nan")
-        )
+            inside = (target >= lower) & (target <= upper)
+        mask, normalized = normalize_subset_weights(weight, finite)
+        if len(normalized):
+            coverage = float(np.sum(normalized * inside[mask]))
+            ess = effective_sample_size(normalized)
+            se = math.sqrt(coverage * (1.0 - coverage) / ess)
+        else:
+            coverage = se = float("nan")
+            ess = 0.0
         rows.append(
             {
-                "parameter": name,
-                "coverage": fraction,
+                "population": population,
+                "parameter": parameter,
+                "coverage": coverage,
                 "coverage_se": se,
-                "delta": fraction - 0.68,
-                "n": n,
+                "delta": coverage - 0.68,
+                "n": int(np.count_nonzero(finite)),
+                "ess": ess,
             }
         )
     return rows
 
 
-def binned(x: np.ndarray, y: np.ndarray, bins: int):
-    edges = np.linspace(np.nanmin(x), np.nanmax(x), bins + 1)
-    index = np.clip(np.digitize(x, edges) - 1, 0, bins - 1)
-    center, mean, error = [], [], []
-    for i in range(bins):
-        mask = index == i
-        if mask.sum() < 2:
-            continue
-        center.append(np.mean(x[mask]))
-        mean.append(np.mean(y[mask]))
-        error.append(np.std(y[mask], ddof=1) / np.sqrt(mask.sum()))
-    return np.asarray(center), np.asarray(mean), np.asarray(error)
+def quantile_binned(
+    x: np.ndarray, y: np.ndarray, bins: int, weight: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Weighted-quantile bins with weighted centers, means, and errors."""
 
-
-def quantile_binned(x: np.ndarray, y: np.ndarray, bins: int):
-    """Bin finite pairs into nearly equal-count bins and return mean +/- SEM."""
     if bins <= 0:
         raise ValueError("bins must be positive")
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if x.shape != y.shape:
-        raise ValueError("x and y must have matching shapes")
-    finite = np.isfinite(x) & np.isfinite(y)
-    x = x[finite]
-    y = y[finite]
-    if len(x) < 2:
-        return (np.array([], dtype=float),) * 3
-    n_bins = min(bins, len(x) // 2)
-    groups = np.array_split(np.argsort(x, kind="stable"), n_bins)
-    center = np.asarray([np.mean(x[group]) for group in groups])
-    mean = np.asarray([np.mean(y[group]) for group in groups])
-    error = np.asarray(
-        [np.std(y[group], ddof=1) / np.sqrt(len(group)) for group in groups]
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    weight = np.asarray(weight, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(weight) & (weight >= 0)
+    x, y, weight = x[finite], y[finite], weight[finite]
+    if not len(x) or np.sum(weight) <= 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty, empty, empty.astype(int), empty
+    edges = weighted_quantile(x, np.linspace(0.0, 1.0, bins + 1), weight)
+    edges[0], edges[-1] = -np.inf, np.inf
+    assignment = np.searchsorted(edges[1:-1], x, side="right")
+    center, mean, error, count, ess = [], [], [], [], []
+    for bin_index in range(bins):
+        selected = assignment == bin_index
+        if not np.any(selected) or np.sum(weight[selected]) <= 0:
+            continue
+        selected_weight = weight[selected] / np.sum(weight[selected])
+        center_value = float(np.sum(selected_weight * x[selected]))
+        mean_value, se_value, ess_value = weighted_mean_and_se(
+            y[selected], selected_weight
+        )
+        center.append(center_value)
+        mean.append(mean_value)
+        error.append(se_value)
+        count.append(int(np.count_nonzero(selected)))
+        ess.append(ess_value)
+    return (
+        np.asarray(center),
+        np.asarray(mean),
+        np.asarray(error),
+        np.asarray(count, dtype=int),
+        np.asarray(ess),
     )
-    return center, mean, error
 
 
 def conditional_shear_calibration(
-    case: dict,
-    conditioning: dict,
-    bins: int,
+    case: dict, population_label: str, bins: int
 ) -> dict:
-    """Fit residual = c + m*g across the full shear range in condition bins."""
-    if bins <= 0:
-        raise ValueError("conditional bins must be positive")
-    try:
-        estimate = np.asarray(case["estimates"]["Mean"], dtype=float)
-    except KeyError as exc:
-        raise ConditionalDiagnosticUnavailable(
-            "conditional m/c plots require the Mean estimator"
-        ) from exc
-    truth = np.asarray(case["truth"], dtype=float)
-    if estimate.shape != truth.shape or truth.ndim != 2 or truth.shape[1] < 8:
-        raise ValueError("Mean estimates and truth must have matching (N, feature>=8) shapes")
+    """Weighted full-range Mean-estimator m and c in nuisance bins."""
 
-    curves = {}
-    for variable, values in conditioning.items():
-        values = np.asarray(values, dtype=float)
-        if values.shape != (len(truth),):
-            raise ValueError(
-                f"conditioning variable {variable!r} has shape {values.shape}; "
-                f"expected ({len(truth)},)"
-            )
-        component_curves = {}
+    population = case["populations"][population_label]
+    truth, estimate = case["truth"], population["mean"]
+    weights = population["galaxy_weight"]
+    names = case["feature_names"]
+    conditions = {
+        "true magnitude": case["rmag_true"],
+        "spectral reference quality": case["spectral_reference_quality"],
+        "true hlr": truth[:, names.index("hlr")],
+    }
+    result = {}
+    for condition, axis in conditions.items():
+        finite = np.isfinite(axis) & np.isfinite(weights) & (weights >= 0)
+        edges = weighted_quantile(
+            axis[finite], np.linspace(0.0, 1.0, bins + 1), weights[finite]
+        )
+        edges[0], edges[-1] = -np.inf, np.inf
+        assignment = np.full(len(axis), -1, dtype=int)
+        assignment[finite] = np.searchsorted(
+            edges[1:-1], axis[finite], side="right"
+        )
+        result[condition] = {}
         for component, index in (("g1", 0), ("g2", 1)):
-            target = truth[:, index]
-            residual = estimate[:, index] - target
-            finite = np.isfinite(values) & np.isfinite(target) & np.isfinite(residual)
-            order = np.flatnonzero(finite)
-            order = order[np.argsort(values[order], kind="stable")]
-            if len(order) < 3:
-                raise ConditionalDiagnosticUnavailable(
-                    f"too few finite rows for {component} versus {variable}"
-                )
-            groups = np.array_split(order, min(bins, len(order) // 3))
-            rows = []
-            for group in groups:
+            curve = {key: [] for key in ("x", "m", "m_se", "c", "c_se", "n", "ess")}
+            residual = estimate[:, index] - truth[:, index]
+            for bin_index in range(bins):
+                selected = assignment == bin_index
                 design = np.column_stack(
-                    [np.ones(len(group)), target[group]]
+                    (np.ones(np.count_nonzero(selected)), truth[selected, index])
                 )
-                if len(group) < 3 or np.linalg.matrix_rank(design) < 2:
-                    continue
-                coefficient, uncertainty = fit_design(residual[group], design)
-                rows.append(
-                    (
-                        float(np.mean(values[group])),
-                        float(coefficient[1]),
-                        float(uncertainty[1]),
-                        float(coefficient[0]),
-                        float(uncertainty[0]),
-                        len(group),
-                    )
+                coefficient, uncertainty, ess = fit_design(
+                    residual[selected], design, weights[selected]
                 )
-            if not rows:
-                raise ConditionalDiagnosticUnavailable(
-                    f"no identifiable bins for {component} versus {variable}"
+                mask, normalized = normalize_subset_weights(weights, selected)
+                center = (
+                    float(np.sum(normalized * axis[mask]))
+                    if len(normalized)
+                    else float("nan")
                 )
-            data = np.asarray(rows, dtype=float)
-            component_curves[component] = {
-                "x": data[:, 0],
-                "m": data[:, 1],
-                "m_se": data[:, 2],
-                "c": data[:, 3],
-                "c_se": data[:, 4],
-                "n": data[:, 5].astype(int),
+                for key, value in (
+                    ("x", center),
+                    ("c", float(coefficient[0])),
+                    ("c_se", float(uncertainty[0])),
+                    ("m", float(coefficient[1])),
+                    ("m_se", float(uncertainty[1])),
+                    ("n", int(np.count_nonzero(selected))),
+                    ("ess", ess),
+                ):
+                    curve[key].append(value)
+            result[condition][component] = {
+                key: np.asarray(value) for key, value in curve.items()
             }
-        curves[variable] = component_curves
-    return curves
-
-
-def conditional_shear_calibration_figure(case: dict, curves: dict) -> str:
-    """Plot Mean multiplicative and additive calibration versus three truths."""
-    variables = (
-        ("rmag_true", "true r magnitude", False),
-        ("spectral_snr", "spectral SNR (reference quality)", True),
-        ("hlr_true", "true hlr [arcsec]", False),
-    )
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    for column, (variable, label, logarithmic) in enumerate(variables):
-        if variable not in curves:
-            raise ValueError(f"missing conditional calibration variable {variable!r}")
-        for component in ("g1", "g2"):
-            curve = curves[variable][component]
-            for row, statistic, uncertainty, scale in (
-                (0, "m", "m_se", MULTIPLICATIVE_DISPLAY_SCALE),
-                (1, "c", "c_se", ADDITIVE_DISPLAY_SCALE),
-            ):
-                container = axes[row, column].errorbar(
-                    curve["x"],
-                    scale * curve[statistic],
-                    yerr=scale * curve[uncertainty],
-                    marker="o",
-                    ms=3,
-                    lw=1,
-                    label=component,
-                    color=SHEAR_COMPONENT_COLORS[component],
-                )
-                container.lines[0].set_label(component)
-        for row in range(2):
-            axes[row, column].axhline(0.0, color="black", ls="--", lw=0.8)
-            axes[row, column].set_xlabel(label)
-            if logarithmic:
-                axes[row, column].set_xscale("log")
-        axes[0, column].set_title(f"m vs {label}")
-        axes[1, column].set_title(f"c vs {label}")
-    axes[0, 0].set_ylabel(r"$10^2 m$")
-    axes[1, 0].set_ylabel(r"$10^4 c$")
-    axes[0, 0].legend()
-    fig.suptitle(
-        f"{case['case']} — Mean conditional full-range shear calibration"
-    )
-    fig.tight_layout()
-    return fig_data_uri(fig)
-
-
-def fig_data_uri(fig) -> str:
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=135, bbox_inches="tight")
-    plt.close(fig)
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-
-
-def bias_figure(case: dict, bins: int) -> str:
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7))
-    for component in range(2):
-        true = case["truth"][:, component]
-        for name, estimate in case["estimates"].items():
-            residual = estimate[:, component] - true
-            x, y, error = binned(true, residual, bins)
-            axes[0, component].errorbar(
-                x, y,
-                yerr=error,
-                marker="o", ms=3, lw=1, label=name,
-                color=ESTIMATOR_COLORS.get(name, "tab:gray"),
-            )
-            theta = case["truth"][:, 2]
-            tx, ty, terror = binned(theta, residual, bins)
-            axes[1, component].errorbar(
-                tx, ty,
-                yerr=terror,
-                marker="o", ms=3, lw=1,
-                label=name, color=ESTIMATOR_COLORS.get(name, "tab:gray"),
-            )
-        axes[0, component].axhline(0, color="black", ls="--", lw=0.8)
-        axes[1, component].axhline(0, color="black", ls="--", lw=0.8)
-        axes[0, component].set_title(f"g{component + 1} residual vs truth")
-        axes[1, component].set_title(f"g{component + 1} residual vs theta_int")
-        axes[0, component].set_ylabel("estimate - truth")
-        axes[1, component].set_ylabel("estimate - truth")
-        axes[0, component].legend()
-    axes[0, 0].set_xlabel("true g1")
-    axes[0, 1].set_xlabel("true g2")
-    axes[1, 0].set_xlabel("theta_int [rad]")
-    axes[1, 1].set_xlabel("theta_int [rad]")
-    fig.suptitle(case["case"])
-    fig.tight_layout()
-    return fig_data_uri(fig)
-
-
-def theta_modality_table(diagnostic: dict) -> str:
-    """Summarize directed theta branch masses and diagnostic mode counts."""
-    primary = np.asarray(diagnostic["true_branch_mass"], dtype=float)
-    opposite = np.asarray(diagnostic["opposite_branch_mass"], dtype=float)
-    middle = np.asarray(diagnostic["middle_mass"], dtype=float)
-    modes = np.asarray(diagnostic["mode_count"])
-    finite = np.isfinite(primary) & np.isfinite(opposite) & np.isfinite(middle)
-    if not np.any(finite):
-        return '<p class="note">No finite theta posterior draws.</p>'
-    primary = primary[finite]
-    opposite = opposite[finite]
-    middle = middle[finite]
-    modes = modes[finite]
-    antipodal = (primary >= 0.15) & (opposite >= 0.15)
-    opposite_dominant = opposite > primary
-    aggregate_modes = len(diagnostic["aggregate_mode_indices"])
-    body = (
-        f"<tr><td>{np.median(primary):.3f}</td>"
-        f"<td>{np.median(opposite):.3f}</td>"
-        f"<td>{np.median(middle):.3f}</td>"
-        f"<td>{100.0 * np.mean(antipodal):.1f}%</td>"
-        f"<td>{100.0 * np.mean(opposite_dominant):.1f}%</td>"
-        f"<td>{100.0 * np.mean(modes == 1):.1f}%</td>"
-        f"<td>{100.0 * np.mean(modes == 2):.1f}%</td>"
-        f"<td>{100.0 * np.mean(modes >= 3):.1f}%</td>"
-        f"<td>{100.0 * np.mean(modes == 0):.1f}%</td>"
-        f"<td>{aggregate_modes}</td><td>{len(primary):,}</td></tr>"
-    )
-    return (
-        "<table><thead><tr><th>Median true-branch mass</th>"
-        "<th>Median opposite-branch mass</th><th>Median middle mass</th>"
-        "<th>Both branches ≥15%</th><th>Opposite branch dominant</th>"
-        "<th>1 mode</th><th>2 modes</th><th>≥3 modes</th>"
-        "<th>Unresolved/flat</th><th>Aggregate modes</th><th>N</th>"
-        "</tr></thead><tbody>" + body + "</tbody></table>"
-    )
-
-
-def theta_diagnostic_figure(case: dict, diagnostic: dict) -> str:
-    """Plot directed theta point bias and raw posterior residual structure."""
-    truth = np.asarray(case["truth"][:, 2], dtype=float)
-    edges = np.asarray(diagnostic["angle_edges"], dtype=float)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    for axis, estimator in zip(axes[0], ("MAP", "Mean")):
-        estimate = case["estimates"].get(estimator)
-        if estimate is None:
-            axis.text(0.5, 0.5, f"{estimator} unavailable", ha="center", va="center")
-        else:
-            residual = wrap_angle(np.asarray(estimate[:, 2], dtype=float) - truth)
-            histogram, x_edges, y_edges = np.histogram2d(
-                truth, residual, bins=(edges, edges)
-            )
-            axis.pcolormesh(
-                x_edges,
-                y_edges,
-                np.log1p(histogram.T),
-                shading="auto",
-                cmap="viridis",
-            )
-        axis.axhline(0.0, color="white", ls="--", lw=0.8)
-        axis.axhline(np.pi, color="white", ls=":", lw=0.8)
-        axis.axhline(-np.pi, color="white", ls=":", lw=0.8)
-        axis.set_title(f"{estimator}: directed residual density")
-        axis.set_xlabel(r"true $\theta_{\rm int}$ [rad]")
-        axis.set_ylabel(r"wrap$_{2\pi}(\hat\theta-\theta)$ [rad]")
-        axis.set_xlim(-np.pi, np.pi)
-        axis.set_ylim(-np.pi, np.pi)
-
-    density = np.asarray(diagnostic["truth_residual_density"], dtype=float)
-    axes[1, 0].pcolormesh(
-        edges,
-        edges,
-        np.log1p(density.T),
-        shading="auto",
-        cmap="magma",
-    )
-    axes[1, 0].axhline(0.0, color="white", ls="--", lw=0.8)
-    axes[1, 0].set_title("Raw posterior: equal galaxy weight")
-    axes[1, 0].set_xlabel(r"true $\theta_{\rm int}$ [rad]")
-    axes[1, 0].set_ylabel(r"wrap$_{2\pi}(\theta^{(s)}-\theta_{\rm true})$ [rad]")
-    axes[1, 0].set_xlim(-np.pi, np.pi)
-    axes[1, 0].set_ylim(-np.pi, np.pi)
-
-    histogram = np.asarray(diagnostic["aggregate_histogram"], dtype=float)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    smoothed = _smooth_circular_histogram(histogram)
-    if smoothed.sum() > 0:
-        smoothed = smoothed / np.trapz(smoothed, centers)
-    axes[1, 1].plot(centers, smoothed, color="black", lw=1.5)
-    for index, peak in enumerate(diagnostic["aggregate_mode_indices"]):
-        axes[1, 1].axvline(
-            centers[peak],
-            color="tab:red",
-            ls="--",
-            lw=0.9,
-            label="significant aggregate mode" if index == 0 else "_nolegend_",
-        )
-    axes[1, 1].axvline(0.0, color="0.4", ls=":", lw=0.8, label="truth branch")
-    axes[1, 1].set_title("Truth-centered posterior residual density")
-    axes[1, 1].set_xlabel("directed theta residual [rad]")
-    axes[1, 1].set_ylabel("density")
-    axes[1, 1].set_xlim(-np.pi, np.pi)
-    axes[1, 1].legend(fontsize="small")
-    fig.suptitle(f"{case['case']} — directed theta bias and modality")
-    fig.tight_layout()
-    return fig_data_uri(fig)
-
-
-def galaxy_frame_figure(case: dict, bins: int) -> str:
-    """Plot galaxy-frame residuals against inclination in physical shear units."""
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    sini = case["truth"][:, 3]
-    for estimator, estimate in case["estimates"].items():
-        true_components, estimate_components = galaxy_frame_components(
-            case["truth"], estimate
-        )
-        for axis, label, true_component, estimate_component in zip(
-            axes,
-            (r"$g_+$ (E)", r"$g_\times$ (B)"),
-            true_components,
-            estimate_components,
-        ):
-            residual = estimate_component - true_component
-            x, y, error = binned(sini, residual, bins)
-            axis.errorbar(
-                x,
-                y,
-                yerr=error,
-                marker="o",
-                ms=3,
-                lw=1,
-                label=estimator,
-                color=ESTIMATOR_COLORS.get(estimator, "tab:gray"),
-            )
-            axis.set_title(f"{label} residual vs sin i")
-            axis.set_xlabel("true sin i")
-            axis.set_ylabel("estimate - truth")
-            axis.axhline(0, color="black", ls="--", lw=0.8)
-            axis.legend()
-    fig.suptitle(f"{case['case']} — clockwise galaxy frame")
-    fig.tight_layout()
-    return fig_data_uri(fig)
-
-
-def nuisance_correlation_figure(case: dict, bins: int) -> str:
-    """Plot Mean galaxy-frame shear residuals versus nuisance errors."""
-    try:
-        estimate = case["estimates"]["Mean"]
-    except KeyError as exc:
-        raise ValueError("nuisance plots require the Mean estimator") from exc
-    truth = case["truth"]
-    true_components, estimate_components = galaxy_frame_components(truth, estimate)
-    residuals = tuple(
-        estimated - target
-        for target, estimated in zip(true_components, estimate_components)
-    )
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), sharey=True)
-    for axis, (nuisance, index) in zip(axes, NUISANCE_INDICES.items()):
-        nuisance_error = estimate[:, index] - truth[:, index]
-        for component, residual, label in zip(
-            ("g+", "gx"),
-            residuals,
-            (r"$g_+$ (E)", r"$g_\times$ (B)"),
-        ):
-            x, y, error = quantile_binned(nuisance_error, residual, bins)
-            errorbar = axis.errorbar(
-                x,
-                y,
-                yerr=error,
-                marker="o",
-                ms=3,
-                lw=1,
-                label="_nolegend_",
-                color=GALAXY_COMPONENT_COLORS[component],
-            )
-            errorbar.lines[0].set_label(label)
-        axis.axhline(0, color="black", ls="--", lw=0.8)
-        axis.axvline(0, color="0.5", ls=":", lw=0.8)
-        axis.set_title(nuisance)
-        axis.set_xlabel(NUISANCE_LABELS[nuisance])
-        axis.set_ylabel("shear estimate - truth")
-        axis.legend()
-    fig.suptitle(
-        f"{case['case']} — Mean galaxy-frame shear residual vs nuisance error"
-    )
-    fig.tight_layout()
-    return fig_data_uri(fig)
-
-
-def posterior_pp_curve(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """Return sorted finite PIT values, their ECDF, and the KS distance."""
-    values = np.asarray(values, dtype=float)
-    values = np.sort(values[np.isfinite(values)])
-    if np.any((values < 0.0) | (values > 1.0)):
-        raise ValueError("posterior PIT values must lie in [0, 1]")
-    if not len(values):
-        return values, np.array([], dtype=float), float("nan")
-    empirical = np.arange(1, len(values) + 1, dtype=float) / len(values)
-    lower = np.arange(len(values), dtype=float) / len(values)
-    distance = float(
-        max(np.max(empirical - values), np.max(values - lower))
-    )
-    return values, empirical, distance
+    return result
 
 
 def shear_pp_bin_indices(
     values: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
 ) -> np.ndarray:
-    """Assign values to half-open shear bins, closing the final interval.
+    """Assign shear to half-open bins, with a closed final interval."""
 
-    Values within a few source-dtype ulps of any edge are snapped to that edge
-    before assignment. This keeps float32 cached values and float64 report
-    edges from disagreeing about boundary ownership.
-    """
-    raw_values = np.asarray(values)
-    values = np.asarray(raw_values, dtype=float)
-    edges = np.asarray(edges, dtype=float)
+    raw = np.asarray(values)
+    values = np.asarray(raw, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.float64)
     if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
         raise ValueError("shear P-P bin edges must be strictly increasing")
-    dtype_epsilon = (
-        np.finfo(raw_values.dtype).eps
-        if np.issubdtype(raw_values.dtype, np.floating)
+    tolerance = 4.0 * (
+        np.finfo(raw.dtype).eps
+        if np.issubdtype(raw.dtype, np.floating)
         else np.finfo(float).eps
     )
-    endpoint_tolerance = 4.0 * dtype_epsilon * max(1.0, np.max(np.abs(edges)))
     snapped = values.copy()
     for edge in edges:
-        snapped[np.abs(snapped - edge) <= endpoint_tolerance] = edge
-
-    finite_inside = (
+        snapped[np.abs(snapped - edge) <= tolerance] = edge
+    assigned = np.searchsorted(edges, snapped, side="right") - 1
+    assigned[snapped == edges[-1]] = len(edges) - 2
+    valid = (
         np.isfinite(snapped)
         & (snapped >= edges[0])
         & (snapped <= edges[-1])
+        & (assigned >= 0)
+        & (assigned < len(edges) - 1)
     )
-    assigned = np.searchsorted(edges, snapped, side="right") - 1
-    assigned[snapped == edges[-1]] = len(edges) - 2
-    valid_assignment = finite_inside & (assigned >= 0) & (assigned < len(edges) - 1)
     result = np.full(values.shape, -1, dtype=np.int8)
-    result[valid_assignment] = assigned[valid_assignment]
+    result[valid] = assigned[valid]
     return result
 
 
 def shear_pp_bin_masks(
-    truth: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
+    values: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
 ) -> list[np.ndarray]:
-    """Return non-overlapping true-shear masks with a closed final interval."""
-    truth = np.asarray(truth)
-    if truth.ndim != 1:
-        raise ValueError("true shear must be one-dimensional")
-    indices = shear_pp_bin_indices(truth, edges)
+    indices = shear_pp_bin_indices(values, edges)
     return [indices == index for index in range(len(edges) - 1)]
 
 
-def posterior_pp_figure(pits: dict[str, np.ndarray], truth: np.ndarray) -> str:
-    """Plot prior-matched g1/g2 rank ECDFs in fixed true-shear bins."""
-    truth = np.asarray(truth)
-    if truth.ndim != 2 or truth.shape[1] < 2:
-        raise ValueError("truth must have shape (galaxy, feature>=2)")
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharex=True, sharey=True)
-    grid = np.linspace(0.0, 1.0, 501)
-    colors = ("tab:blue", "tab:green", "tab:red")
-    for component_index, (axis, component) in enumerate(zip(axes, ("g1", "g2"))):
-        if component not in pits:
-            raise KeyError(f"Missing posterior PIT values for {component}")
-        component_pits = np.asarray(pits[component], dtype=float)
-        if component_pits.shape != (len(truth),):
-            raise ValueError(
-                f"{component} PIT values must have shape ({len(truth)},)"
-            )
-        retained_key = f"{component}_retained"
-        if retained_key not in pits:
-            raise KeyError(f"Missing retained-draw counts for {component}")
-        component_retained = np.asarray(pits[retained_key])
-        if component_retained.shape != (len(truth),):
-            raise ValueError(
-                f"{component} retained counts must have shape ({len(truth)},)"
-            )
-        curves = []
-        masks = shear_pp_bin_masks(truth[:, component_index])
-        for bin_index, mask in enumerate(masks):
-            values, empirical, distance = posterior_pp_curve(component_pits[mask])
-            retained_in_bin = component_retained[mask]
-            finite_rank = np.isfinite(component_pits[mask])
-            median_retained = (
-                float(np.median(retained_in_bin[finite_rank]))
-                if np.any(finite_rank)
-                else float("nan")
-            )
-            zero_retained = int(np.count_nonzero(retained_in_bin == 0))
-            curves.append(
-                (
-                    bin_index,
-                    values,
-                    empirical,
-                    distance,
-                    int(np.count_nonzero(mask)),
-                    median_retained,
-                    zero_retained,
-                )
-            )
+def load_shear_pit_values(
+    case: dict, population_key: str, block_size: int = 64
+) -> dict[str, np.ndarray]:
+    """Stream prior-matched conditional ranks from the joint candidate bank.
 
-        nonempty_sizes = [
-            len(values) for _, values, _, _, _, _, _ in curves if len(values)
-        ]
-        for (
-            bin_index,
-            values,
-            empirical,
-            distance,
-            total,
-            median_retained,
-            zero_retained,
-        ) in curves:
-            lower = SHEAR_PP_BIN_EDGES[bin_index]
-            upper = SHEAR_PP_BIN_EDGES[bin_index + 1]
-            closing = "]" if bin_index == len(curves) - 1 else ")"
-            interval = f"[{lower:+.4f}, {upper:+.4f}{closing}"
-            n = len(values)
-            label = f"true {component} in {interval}; N={n:,}/{total:,}"
-            if n:
-                label += (
-                    f", median retained={median_retained:,.0f}, "
-                    f"zero retained={zero_retained:,}, KS D={distance:.3f}"
-                )
-                epsilon = np.sqrt(np.log(2.0 / 0.05) / (2.0 * n))
-                axis.fill_between(
-                    grid,
-                    np.maximum(0.0, grid - epsilon),
-                    np.minimum(1.0, grid + epsilon),
-                    color=colors[bin_index],
-                    alpha=0.08,
-                )
-            axis.step(
-                values,
-                empirical,
-                where="post",
-                color=colors[bin_index],
-                lw=1.4,
-                label=label,
+    Proposal ranks give every candidate equal mass. TF-target ranks instead use
+    the cached, within-galaxy TF weights. In both cases the selected shear
+    component is restricted to the same fixed prior bin as its truth and the
+    retained mass is renormalized before evaluating the rank.
+    """
+
+    if population_key not in {"proposal", "tf_target"}:
+        raise ValueError("population_key must be proposal or tf_target")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    truth = np.asarray(case["truth"])
+    root = Path(case["root"])
+    cache_partitions = case.get("cache_partitions")
+    if cache_partitions is None:
+        cache_partitions = load_cache_partitions(root)
+    sample_files = cache_partitions.files["sample"]
+    truth_files = cache_partitions.files["truth"]
+    weight_files = (
+        cache_partitions.files["posterior_tf_log_weight"]
+        if population_key == "tf_target"
+        else None
+    )
+
+    pit = np.full((len(truth), 2), np.nan, dtype=np.float64)
+    retained_count = np.zeros((len(truth), 2), dtype=np.int64)
+    retained_mass = np.zeros((len(truth), 2), dtype=np.float64)
+    conditional_ess = np.zeros((len(truth), 2), dtype=np.float64)
+    offset = 0
+    for part_index, (sample_path, truth_path) in enumerate(
+        zip(sample_files, truth_files)
+    ):
+        if offset >= len(truth):
+            break
+        samples = np.load(sample_path, mmap_mode="r")
+        stored_truth = np.load(truth_path, mmap_mode="r")
+        if samples.ndim != 3 or samples.shape[-1] != len(case["feature_names"]):
+            raise ValueError(
+                f"Expected flat candidate shape (galaxy, draw, feature), got "
+                f"{samples.shape} in {sample_path}"
             )
-        if not nonempty_sizes:
-            axis.text(
-                0.5,
-                0.5,
-                "No finite posterior ranks in requested shear range",
-                ha="center",
-                va="center",
-                transform=axis.transAxes,
+        if stored_truth.shape != (samples.shape[0], samples.shape[-1]):
+            raise ValueError(f"Truth/sample shape mismatch in {sample_path}")
+        candidate_weight = (
+            np.load(weight_files[part_index], mmap_mode="r")
+            if weight_files is not None
+            else None
+        )
+        if candidate_weight is not None and candidate_weight.shape != samples.shape[:2]:
+            raise ValueError(f"Candidate-weight shape mismatch in {weight_files[part_index]}")
+        take = min(samples.shape[0], len(truth) - offset)
+        expected_truth = truth[offset : offset + take]
+        if not np.array_equal(
+            np.asarray(stored_truth[:take]), expected_truth, equal_nan=True
+        ):
+            raise ValueError(
+                f"Truth rows in {truth_path} do not align with the report prefix"
             )
-        included = np.logical_or.reduce(masks)
-        excluded = int(np.count_nonzero(np.isfinite(truth[:, component_index]) & ~included))
-        suffix = f"; {excluded} outside range" if excluded else ""
-        axis.set_title(f"{component}{suffix}")
-        axis.plot(grid, grid, color="black", ls="--", lw=0.9, label="Uniform")
-        axis.set_xlim(0.0, 1.0)
-        axis.set_ylim(0.0, 1.0)
-        axis.set_aspect("equal", adjustable="box")
-        axis.set_xlabel("Restricted-posterior quantile")
-        axis.legend(loc="upper left", fontsize="x-small")
-    axes[0].set_ylabel("Fraction of truths below quantile")
-    fig.suptitle("Prior-matched conditional posterior P-P diagnostic")
+        for local_start in range(0, take, block_size):
+            local_end = min(take, local_start + block_size)
+            draws = np.asarray(samples[local_start:local_end, :, :2], dtype=np.float64)
+            n_draw = draws.shape[1]
+            log_weights = (
+                np.asarray(candidate_weight[local_start:local_end], dtype=np.float64)
+                if candidate_weight is not None
+                else None
+            )
+            targets = expected_truth[local_start:local_end, :2]
+            truth_bins = shear_pp_bin_indices(targets)
+            draw_bins = shear_pp_bin_indices(draws)
+            for row in range(len(targets)):
+                for component in range(2):
+                    selected_bin = truth_bins[row, component]
+                    if selected_bin < 0:
+                        continue
+                    keep = (
+                        np.isfinite(draws[row, :, component])
+                        & (draw_bins[row, :, component] == selected_bin)
+                    )
+                    if log_weights is None:
+                        count = int(np.count_nonzero(keep))
+                        conditional = (
+                            np.full(count, 1.0 / count) if count else np.array([])
+                        )
+                        mass = count / n_draw
+                    else:
+                        keep &= np.isfinite(log_weights[row])
+                        selected_log_weight = log_weights[row, keep]
+                        if len(selected_log_weight):
+                            maximum = float(np.max(selected_log_weight))
+                            scaled = np.exp(selected_log_weight - maximum)
+                            conditional = scaled / np.sum(scaled)
+                            log_mass = maximum + math.log(float(np.sum(scaled)))
+                            mass = float(np.exp(log_mass))
+                        else:
+                            conditional = np.array([])
+                            mass = 0.0
+                    global_row = offset + local_start + row
+                    retained_count[global_row, component] = int(np.count_nonzero(keep))
+                    retained_mass[global_row, component] = mass
+                    if not len(conditional):
+                        continue
+                    values = draws[row, keep, component]
+                    target = targets[row, component]
+                    pit[global_row, component] = float(
+                        np.sum(conditional[values < target])
+                        + 0.5 * np.sum(conditional[values == target])
+                    )
+                    conditional_ess[global_row, component] = effective_sample_size(
+                        conditional
+                    )
+        offset += take
+        del samples, stored_truth, candidate_weight
+    if offset != len(truth):
+        raise ValueError(
+            f"Sample cache has {offset} galaxies, report uses {len(truth)}"
+        )
+    return {
+        "g1": pit[:, 0],
+        "g2": pit[:, 1],
+        "g1_retained": retained_count[:, 0],
+        "g2_retained": retained_count[:, 1],
+        "g1_retained_mass": retained_mass[:, 0],
+        "g2_retained_mass": retained_mass[:, 1],
+        "g1_conditional_ess": conditional_ess[:, 0],
+        "g2_conditional_ess": conditional_ess[:, 1],
+    }
+
+
+def posterior_pp_curve(
+    values: np.ndarray, galaxy_weight: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Weighted PIT ECDF, two-sided KS distance, and galaxy ESS."""
+
+    values = np.asarray(values, dtype=np.float64)
+    galaxy_weight = np.asarray(galaxy_weight, dtype=np.float64)
+    finite = (
+        np.isfinite(values)
+        & np.isfinite(galaxy_weight)
+        & (galaxy_weight >= 0.0)
+    )
+    values, galaxy_weight = values[finite], galaxy_weight[finite]
+    if np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("posterior PIT values must lie in [0, 1]")
+    if not len(values) or np.sum(galaxy_weight) <= 0.0:
+        return values, np.array([]), float("nan"), 0.0
+    order = np.argsort(values, kind="stable")
+    values, galaxy_weight = values[order], galaxy_weight[order]
+    galaxy_weight = galaxy_weight / np.sum(galaxy_weight)
+    empirical = np.cumsum(galaxy_weight)
+    before = empirical - galaxy_weight
+    distance = float(
+        max(np.max(empirical - values), np.max(values - before))
+    )
+    return values, empirical, distance, effective_sample_size(galaxy_weight)
+
+
+def fig_data_uri(figure) -> str:
+    buffer = BytesIO()
+    figure.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+    plt.close(figure)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def bias_figure(case: dict, bins: int) -> str:
+    """Weighted residual trends for proposal and TF-target populations."""
+
+    populations = list(case["populations"].items())
+    fig, axes = plt.subplots(
+        len(populations), 2, figsize=(11, 4.2 * len(populations)), squeeze=False
+    )
+    for row, (label, population) in enumerate(populations):
+        for component, axis in enumerate(axes[row]):
+            true = case["truth"][:, component]
+            for estimator, estimate, color in (
+                ("MAP", population["map"], "tab:blue"),
+                ("Mean", population["mean"], "tab:orange"),
+            ):
+                center, residual, error, _, _ = quantile_binned(
+                    true,
+                    estimate[:, component] - true,
+                    bins,
+                    population["galaxy_weight"],
+                )
+                axis.errorbar(
+                    center, residual, yerr=error, marker="o", ms=3,
+                    lw=1, color=color, label=estimator,
+                )
+            axis.axhline(0.0, color="black", ls="--", lw=0.8)
+            axis.set_xlabel(f"true g{component + 1}")
+            axis.set_ylabel("estimate - truth")
+            axis.set_title(f"{label} — g{component + 1}")
+            axis.legend()
+    fig.suptitle(f"{case['case']} — weighted shear residuals")
     fig.tight_layout()
     return fig_data_uri(fig)
 
 
-def compute_metrics(case: dict, low_g: float) -> list[dict]:
-    rows = []
-    theta = case["truth"][:, 2]
-    sini = case["truth"][:, 3]
-    for estimator, estimate in case["estimates"].items():
-        for component in range(2):
-            true = case["truth"][:, component]
-            residual = estimate[:, component] - true
-            base = component_metrics(true, estimate[:, component], low_g)
-            base.update(spin_metrics(theta, residual))
-            cuts = {}
-            for cut in SINI_CUTS:
-                mask = np.ones(len(sini), dtype=bool) if np.isinf(cut) else sini < cut
-                mask &= np.abs(true) < low_g
-                coef, se = fit_design(
-                    residual[mask], np.column_stack([np.ones(mask.sum()), true[mask]])
+def conditional_shear_calibration_figure(
+    case: dict, population_label: str, curves: dict
+) -> str:
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7.5), squeeze=False)
+    colors = {"g1": "tab:blue", "g2": "tab:orange"}
+    for column, (condition, components) in enumerate(curves.items()):
+        for row, (metric, scale, ylabel) in enumerate(
+            (("m", 100.0, r"$10^2 m$"), ("c", 1.0e4, r"$10^4 c$"))
+        ):
+            axis = axes[row, column]
+            for component, curve in components.items():
+                axis.errorbar(
+                    curve["x"],
+                    scale * curve[metric],
+                    yerr=scale * curve[f"{metric}_se"],
+                    marker="o", ms=3, lw=1,
+                    color=colors[component], label=component,
                 )
-                cuts["all" if np.isinf(cut) else f"{cut:.1f}"] = (
-                    float(coef[1]), float(se[1]), int(mask.sum())
-                )
-            base.update(
-                estimator=estimator,
-                component=f"g{component + 1}",
-                sini_cuts=cuts,
+            axis.axhline(0.0, color="black", ls="--", lw=0.8)
+            axis.set_xlabel(condition)
+            axis.set_ylabel(ylabel)
+            axis.set_title(f"{metric} vs {condition}")
+            if condition == "spectral reference quality" and np.all(
+                np.asarray(case["spectral_reference_quality"]) > 0
+            ):
+                axis.set_xscale("log")
+            axis.legend()
+    fig.suptitle(f"{case['case']} — {population_label} — Mean estimator")
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def theta_bias_figure(case: dict, bins: int) -> str:
+    theta_index = case["feature_names"].index("theta_int")
+    theta_true = case["truth"][:, theta_index]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3), sharey=True)
+    for axis, (label, population) in zip(axes, case["populations"].items()):
+        for estimator, estimate, color in (
+            ("MAP", population["map"], "tab:blue"),
+            ("Mean", population["mean"], "tab:orange"),
+        ):
+            residual = wrap_angle(estimate[:, theta_index] - theta_true)
+            center, mean, error, _, _ = quantile_binned(
+                theta_true, residual, bins, population["galaxy_weight"]
             )
-            rows.append(base)
-    return rows
+            axis.errorbar(
+                center, mean, yerr=error, marker="o", ms=3, lw=1,
+                color=color, label=estimator,
+            )
+        axis.axhline(0.0, color="black", ls="--", lw=0.8)
+        axis.set_title(label)
+        axis.set_xlabel("true theta_int [rad]")
+        axis.legend()
+    axes[0].set_ylabel("wrapped estimate - truth [rad]")
+    fig.suptitle(f"{case['case']} — directed theta_int bias")
+    fig.tight_layout()
+    return fig_data_uri(fig)
 
 
-def fmt(value: float) -> str:
-    return f"{value:.3e}"
+def _smooth_circular_histogram(histogram: np.ndarray) -> np.ndarray:
+    histogram = np.asarray(histogram, dtype=np.float64)
+    if histogram.ndim != 1 or len(histogram) < 9:
+        raise ValueError("circular histogram requires at least nine bins")
+    smoothed = histogram.copy()
+    for _ in range(2):
+        smoothed = (
+            np.roll(smoothed, 2)
+            + 4.0 * np.roll(smoothed, 1)
+            + 6.0 * smoothed
+            + 4.0 * np.roll(smoothed, -1)
+            + np.roll(smoothed, -2)
+        ) / 16.0
+    return smoothed
 
 
-def fmt_scaled(value: float, scale: float) -> str:
-    """Format a metric in report units without changing stored physical units."""
-    return f"{scale * value:.3f}"
+def significant_circular_modes(histogram: np.ndarray) -> np.ndarray:
+    """Descriptive peaks in a weighted, smoothed circular histogram."""
+
+    smoothed = _smooth_circular_histogram(histogram)
+    maximum = float(np.max(smoothed))
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        return np.array([], dtype=int)
+    candidates = np.flatnonzero(
+        (smoothed > np.roll(smoothed, 1))
+        & (smoothed >= np.roll(smoothed, -1))
+        & (smoothed >= 0.10 * maximum)
+    )
+    selected = []
+    for peak in candidates:
+        left = min(smoothed[(peak - step) % len(smoothed)] for step in range(1, 5))
+        right = min(smoothed[(peak + step) % len(smoothed)] for step in range(1, 5))
+        if smoothed[peak] - max(left, right) >= 0.05 * maximum:
+            selected.append(int(peak))
+    return np.asarray(selected, dtype=int)
+
+
+def load_theta_posterior_diagnostics(
+    case: dict,
+    population_key: str,
+    *,
+    histogram_bins: int = 72,
+    block_size: int = 64,
+) -> dict:
+    """Stream directed-theta branch mass and weighted posterior mode counts."""
+
+    if population_key not in {"proposal", "tf_target"}:
+        raise ValueError("population_key must be proposal or tf_target")
+    if histogram_bins < 9 or block_size <= 0:
+        raise ValueError("invalid theta histogram or block size")
+    theta_index = case["feature_names"].index("theta_int")
+    truth = np.asarray(case["truth"])
+    theta_truth = truth[:, theta_index]
+    root = Path(case["root"])
+    cache_partitions = case.get("cache_partitions")
+    if cache_partitions is None:
+        cache_partitions = load_cache_partitions(root)
+    sample_files = cache_partitions.files["sample"]
+    truth_files = cache_partitions.files["truth"]
+    weight_files = (
+        cache_partitions.files["posterior_tf_log_weight"]
+        if population_key == "tf_target"
+        else None
+    )
+    result = {
+        "directional_mean": np.full(len(truth), np.nan),
+        "directional_resultant": np.full(len(truth), np.nan),
+        "true_branch_mass": np.full(len(truth), np.nan),
+        "opposite_branch_mass": np.full(len(truth), np.nan),
+        "middle_mass": np.full(len(truth), np.nan),
+        "mode_count": np.zeros(len(truth), dtype=np.int16),
+    }
+    edges = np.linspace(-np.pi, np.pi, histogram_bins + 1)
+    galaxy_histograms = np.zeros((len(truth), histogram_bins), dtype=np.float64)
+    offset = 0
+    for part_index, sample_path in enumerate(sample_files):
+        if offset >= len(truth):
+            break
+        samples = np.load(sample_path, mmap_mode="r")
+        stored_truth = np.load(truth_files[part_index], mmap_mode="r")
+        if samples.ndim != 3 or samples.shape[-1] != len(case["feature_names"]):
+            raise ValueError(f"Invalid flat candidate bank {samples.shape} in {sample_path}")
+        take = min(samples.shape[0], len(truth) - offset)
+        if not np.array_equal(
+            np.asarray(stored_truth[:take]), truth[offset : offset + take], equal_nan=True
+        ):
+            raise ValueError(f"Truth rows do not align in {sample_path}")
+        cached_weight = (
+            np.load(weight_files[part_index], mmap_mode="r")
+            if weight_files is not None
+            else None
+        )
+        for local_start in range(0, take, block_size):
+            local_end = min(take, local_start + block_size)
+            theta = np.asarray(
+                samples[local_start:local_end, :, theta_index], dtype=np.float64
+            )
+            if cached_weight is None:
+                weight = np.full(theta.shape, 1.0 / theta.shape[1])
+            else:
+                log_weight = np.asarray(
+                    cached_weight[local_start:local_end], dtype=np.float64
+                )
+                row_maximum = np.max(log_weight, axis=1, keepdims=True)
+                weight = np.exp(log_weight - row_maximum)
+                weight = weight / np.sum(weight, axis=1, keepdims=True)
+            for row in range(len(theta)):
+                global_row = offset + local_start + row
+                finite = np.isfinite(theta[row]) & np.isfinite(weight[row]) & (weight[row] >= 0)
+                if not np.any(finite) or np.sum(weight[row, finite]) <= 0.0:
+                    continue
+                angle = theta[row, finite]
+                posterior_weight = weight[row, finite]
+                posterior_weight /= np.sum(posterior_weight)
+                sine = np.sum(posterior_weight * np.sin(angle))
+                cosine = np.sum(posterior_weight * np.cos(angle))
+                result["directional_mean"][global_row] = math.atan2(sine, cosine)
+                result["directional_resultant"][global_row] = math.hypot(sine, cosine)
+                residual = wrap_angle(angle - theta_truth[global_row])
+                primary = np.abs(residual) < np.pi / 4.0
+                opposite = np.abs(residual) > 3.0 * np.pi / 4.0
+                result["true_branch_mass"][global_row] = np.sum(posterior_weight[primary])
+                result["opposite_branch_mass"][global_row] = np.sum(posterior_weight[opposite])
+                result["middle_mass"][global_row] = np.sum(
+                    posterior_weight[~(primary | opposite)]
+                )
+                histogram = np.histogram(
+                    residual, bins=edges, weights=posterior_weight
+                )[0]
+                galaxy_histograms[global_row] = histogram
+                result["mode_count"][global_row] = len(
+                    significant_circular_modes(histogram)
+                )
+        offset += take
+        del samples, stored_truth, cached_weight
+    if offset != len(truth):
+        raise ValueError("theta sample cache is shorter than the report case")
+    population = next(
+        value for value in case["populations"].values()
+        if value["key"] == population_key
+    )
+    galaxy_weight = population["galaxy_weight"]
+    result["aggregate_residual_histogram"] = np.sum(
+        galaxy_weight[:, None] * galaxy_histograms, axis=0
+    )
+    result["angle_edges"] = edges
+    return result
+
+
+def theta_modality_table(case: dict, diagnostics: dict[str, dict]) -> str:
+    body = []
+    for label, population in case["populations"].items():
+        diagnostic = diagnostics[population["key"]]
+        weight = population["galaxy_weight"]
+        mode_count = diagnostic["mode_count"]
+        antipodal = (
+            (diagnostic["true_branch_mass"] >= 0.15)
+            & (diagnostic["opposite_branch_mass"] >= 0.15)
+        )
+        cells = []
+        for selected in (
+            mode_count == 1, mode_count == 2, mode_count >= 3, antipodal
+        ):
+            cells.append(100.0 * float(np.sum(weight[selected])))
+        true_mass, _, _ = weighted_mean_and_se(
+            diagnostic["true_branch_mass"], weight
+        )
+        opposite_mass, _, _ = weighted_mean_and_se(
+            diagnostic["opposite_branch_mass"], weight
+        )
+        body.append(
+            f"<tr><td>{html.escape(label)}</td>"
+            f"<td>{cells[0]:.2f}%</td><td>{cells[1]:.2f}%</td>"
+            f"<td>{cells[2]:.2f}%</td><td>{cells[3]:.2f}%</td>"
+            f"<td>{true_mass:.3f}</td><td>{opposite_mass:.3f}</td></tr>"
+        )
+    return (
+        "<table><thead><tr><th>Population / posterior</th><th>1 mode</th>"
+        "<th>2 modes</th><th>3+ modes</th><th>antipodal bimodality</th>"
+        "<th>mean true-branch mass</th><th>mean opposite-branch mass</th>"
+        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+    )
+
+
+def theta_modality_figure(case: dict, diagnostics: dict[str, dict]) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    colors = ("tab:blue", "tab:orange")
+    for color, (label, population) in zip(colors, case["populations"].items()):
+        diagnostic = diagnostics[population["key"]]
+        edges = diagnostic["angle_edges"]
+        center = 0.5 * (edges[:-1] + edges[1:])
+        axes[0].plot(
+            center, diagnostic["aggregate_residual_histogram"],
+            color=color, lw=1.4, label=label,
+        )
+        mode_count = diagnostic["mode_count"]
+        weights = population["galaxy_weight"]
+        fractions = [
+            np.sum(weights[mode_count == 1]),
+            np.sum(weights[mode_count == 2]),
+            np.sum(weights[mode_count >= 3]),
+        ]
+        offset = -0.18 if population["key"] == "proposal" else 0.18
+        axes[1].bar(
+            np.arange(3) + offset, fractions, width=0.34,
+            color=color, alpha=0.8, label=label,
+        )
+    axes[0].axvline(0.0, color="black", ls="--", lw=0.8)
+    axes[0].set_xlabel("wrapped theta sample - truth [rad]")
+    axes[0].set_ylabel("population-weighted posterior mass / bin")
+    axes[0].legend(fontsize="small")
+    axes[1].set_xticks(np.arange(3), ("1", "2", "3+"))
+    axes[1].set_xlabel("significant posterior mode count")
+    axes[1].set_ylabel("population-weighted galaxy fraction")
+    axes[1].legend(fontsize="small")
+    fig.suptitle(f"{case['case']} — directed theta posterior modality")
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def posterior_pp_figure(case: dict, pits_by_population: dict[str, dict]) -> str:
+    populations = list(case["populations"].items())
+    fig, axes = plt.subplots(
+        len(populations), 2, figsize=(12, 5 * len(populations)),
+        sharex=True, sharey=True, squeeze=False,
+    )
+    grid = np.linspace(0.0, 1.0, 501)
+    colors = ("tab:blue", "tab:green", "tab:red")
+    for row, (population_label, population) in enumerate(populations):
+        pits = pits_by_population[population["key"]]
+        galaxy_weight = population["galaxy_weight"]
+        for component_index, component in enumerate(("g1", "g2")):
+            axis = axes[row, component_index]
+            truth_component = case["truth"][:, component_index]
+            for bin_index, mask in enumerate(shear_pp_bin_masks(truth_component)):
+                selected = mask & np.isfinite(pits[component])
+                x, y, distance, ess = posterior_pp_curve(
+                    pits[component][selected], galaxy_weight[selected]
+                )
+                lower, upper = (
+                    SHEAR_PP_BIN_EDGES[bin_index],
+                    SHEAR_PP_BIN_EDGES[bin_index + 1],
+                )
+                closing = "]" if bin_index == 2 else ")"
+                label = (
+                    f"[{lower:+.4f}, {upper:+.4f}{closing}; "
+                    f"N={len(x):,}, ESS={ess:.1f}, KS={distance:.3f}"
+                )
+                if len(x):
+                    selected_weight = galaxy_weight[selected]
+                    candidate_ess = weighted_quantile(
+                        pits[f"{component}_conditional_ess"][selected],
+                        np.asarray([0.5]),
+                        selected_weight,
+                    )[0]
+                    retained_mass = weighted_quantile(
+                        pits[f"{component}_retained_mass"][selected],
+                        np.asarray([0.5]),
+                        selected_weight,
+                    )[0]
+                    label += (
+                        f", median draw ESS={candidate_ess:.0f}, "
+                        f"mass={retained_mass:.2f}"
+                    )
+                    epsilon = math.sqrt(math.log(40.0) / (2.0 * ess))
+                    axis.fill_between(
+                        grid,
+                        np.maximum(0.0, grid - epsilon),
+                        np.minimum(1.0, grid + epsilon),
+                        color=colors[bin_index], alpha=0.07,
+                    )
+                axis.step(
+                    x, y, where="post", color=colors[bin_index], lw=1.3,
+                    label=label,
+                )
+            axis.plot(grid, grid, color="black", ls="--", lw=0.9, label="Uniform")
+            axis.set_xlim(0.0, 1.0)
+            axis.set_ylim(0.0, 1.0)
+            axis.set_aspect("equal", adjustable="box")
+            axis.set_xlabel("conditional posterior quantile")
+            axis.set_title(f"{population_label} — {component}")
+            axis.legend(fontsize="xx-small", loc="upper left")
+        axes[row, 0].set_ylabel("weighted fraction of truths")
+    fig.suptitle(
+        f"{case['case']} — prior-matched conditional P-P (three true-shear bins)"
+    )
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
+def _format_scaled(value: float, scale: float) -> str:
+    return "n/a" if not np.isfinite(value) else f"{scale * value:.3f}"
 
 
 def metrics_table(rows: list[dict]) -> str:
@@ -1479,81 +1133,49 @@ def metrics_table(rows: list[dict]) -> str:
     for row in rows:
         body.append(
             "<tr>"
-            f"<td>{row['estimator']}</td><td>{row['component']}</td>"
-            f"<td>{fmt_scaled(row['c'], ADDITIVE_DISPLAY_SCALE)} ± "
-            f"{fmt_scaled(row['c_se'], ADDITIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{fmt_scaled(row['low_m'], MULTIPLICATIVE_DISPLAY_SCALE)} ± "
-            f"{fmt_scaled(row['low_m_se'], MULTIPLICATIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{fmt_scaled(row['cubic_m'], MULTIPLICATIVE_DISPLAY_SCALE)} ± "
-            f"{fmt_scaled(row['cubic_m_se'], MULTIPLICATIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{fmt(row['cubic_q'])} ± {fmt(row['cubic_q_se'])}</td>"
-            f"<td>{fmt_scaled(row['spin2'], ADDITIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{fmt_scaled(row['spin4'], ADDITIVE_DISPLAY_SCALE)}</td>"
+            f"<td>{html.escape(row['population'])}</td>"
+            f"<td>{row['estimator']}</td><td>{row['frame']}</td>"
+            f"<td>{row['component']}</td>"
+            f"<td>{_format_scaled(row['c'], 1e4)} ± "
+            f"{_format_scaled(row['c_se'], 1e4)}</td>"
+            f"<td>{_format_scaled(row['low_m'], 1e2)} ± "
+            f"{_format_scaled(row['low_m_se'], 1e2)}</td>"
+            f"<td>{_format_scaled(row['cubic_m'], 1e2)} ± "
+            f"{_format_scaled(row['cubic_m_se'], 1e2)}</td>"
+            f"<td>{_format_scaled(row['cubic_q'], 1.0)}</td>"
+            f"<td>{row['n']:,} / {row['ess']:.1f}</td>"
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>Estimator</th><th>Component</th>"
-        "<th>10<sup>4</sup> mean c</th><th>10<sup>2</sup> low-|g| m</th>"
-        "<th>10<sup>2</sup> cubic m</th><th>cubic q (unscaled)</th>"
-        "<th>10<sup>4</sup> spin-2 amp</th>"
-        "<th>10<sup>4</sup> spin-4 amp</th></tr></thead><tbody>"
-        + "".join(body)
-        + "</tbody></table>"
+        "<table><thead><tr><th>Population / posterior</th><th>Estimator</th>"
+        "<th>Frame</th><th>Component</th><th>10<sup>4</sup> c</th>"
+        "<th>10<sup>2</sup> low-|g| m</th><th>10<sup>2</sup> cubic m</th>"
+        "<th>cubic q</th><th>N / galaxy ESS</th></tr></thead><tbody>"
+        + "".join(body) + "</tbody></table>"
     )
 
 
 def cuts_table(rows: list[dict]) -> str:
     body = []
     for row in rows:
-        for cut, (slope, se, n) in row["sini_cuts"].items():
+        if row["frame"] != "image":
+            continue
+        for cut, values in row["sini_cuts"].items():
             body.append(
-                f"<tr><td>{row['estimator']}</td><td>{row['component']}</td>"
-                f"<td>{html.escape(cut)}</td>"
-                f"<td>{fmt_scaled(slope, MULTIPLICATIVE_DISPLAY_SCALE)} ± "
-                f"{fmt_scaled(se, MULTIPLICATIVE_DISPLAY_SCALE)}</td>"
-                f"<td>{n:,}</td></tr>"
+                "<tr>"
+                f"<td>{html.escape(row['population'])}</td>"
+                f"<td>{row['estimator']}</td><td>{row['component']}</td>"
+                f"<td>{cut}</td>"
+                f"<td>{_format_scaled(values['m'], 1e2)} ± "
+                f"{_format_scaled(values['m_se'], 1e2)}</td>"
+                f"<td>{values['n']:,} / {values['ess']:.1f}</td>"
+                "</tr>"
             )
     return (
-        "<table><thead><tr><th>Estimator</th><th>Component</th><th>sin i cut</th>"
-        "<th>10<sup>2</sup> low-|g| m</th><th>N</th></tr></thead><tbody>"
-        + "".join(body)
+        "<table><thead><tr><th>Population / posterior</th><th>Estimator</th>"
+        "<th>Component</th><th>sin i cut</th><th>10<sup>2</sup> low-|g| m</th>"
+        "<th>N / galaxy ESS</th></tr></thead><tbody>" + "".join(body)
         + "</tbody></table>"
-    )
-
-
-def galaxy_metrics_table(rows: list[dict]) -> str:
-    body = []
-    for row in rows:
-        body.append(
-            f"<tr><td>{row['estimator']}</td><td>{row['component']}</td>"
-            f"<td>{fmt_scaled(row['c'], ADDITIVE_DISPLAY_SCALE)} ± "
-            f"{fmt_scaled(row['c_se'], ADDITIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{fmt_scaled(row['low_m'], MULTIPLICATIVE_DISPLAY_SCALE)} ± "
-            f"{fmt_scaled(row['low_m_se'], MULTIPLICATIVE_DISPLAY_SCALE)}</td>"
-            f"<td>{row['n_low']:,}</td></tr>"
-        )
-    return (
-        "<table><thead><tr><th>Estimator</th><th>Galaxy component</th>"
-        "<th>10<sup>4</sup> mean c</th>"
-        "<th>10<sup>2</sup> low-|g| m</th><th>N low-|g|</th>"
-        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
-    )
-
-
-def correlations_table(rows: list[dict]) -> str:
-    body = []
-    for row in rows:
-        correlation = row["correlation"]
-        rendered = "n/a" if not np.isfinite(correlation) else f"{correlation:+.3f}"
-        body.append(
-            f"<tr><td>{row['estimator']}</td><td>{row['component']}</td>"
-            f"<td>{row['nuisance']}</td><td>{rendered}</td>"
-            f"<td>{row['n']:,}</td></tr>"
-        )
-    return (
-        "<table><thead><tr><th>Estimator</th><th>Galaxy component</th>"
-        "<th>Nuisance error</th><th>Pearson r</th><th>N</th>"
-        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
     )
 
 
@@ -1561,221 +1183,163 @@ def coverage_table(rows: list[dict]) -> str:
     body = []
     for row in rows:
         body.append(
-            f"<tr><td>{row['estimator']}</td><td>{row['parameter']}</td>"
-            f"<td>{100.0 * row['coverage']:.1f}% ± "
-            f"{100.0 * row['coverage_se']:.1f}%</td>"
-            f"<td>{100.0 * row['delta']:+.1f} pp</td>"
-            f"<td>{row['n']:,}</td></tr>"
+            "<tr>"
+            f"<td>{html.escape(row['population'])}</td>"
+            f"<td>{row['parameter']}</td>"
+            f"<td>{100 * row['coverage']:.2f}% ± "
+            f"{100 * row['coverage_se']:.2f}%</td>"
+            f"<td>{100 * row['delta']:+.2f} pp</td>"
+            f"<td>{row['n']:,} / {row['ess']:.1f}</td>"
+            "</tr>"
         )
     return (
-        "<table><thead><tr><th>Estimator</th><th>Parameter</th>"
-        "<th>16th–84th coverage</th>"
-        "<th>Difference from 68%</th><th>N finite</th>"
-        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+        "<table><thead><tr><th>Population / posterior</th><th>Parameter</th>"
+        "<th>16th–84th coverage</th><th>Difference from 68%</th>"
+        "<th>N / galaxy ESS</th></tr></thead><tbody>" + "".join(body)
+        + "</tbody></table>"
     )
 
 
-def retention_table(retention: np.ndarray) -> str:
-    """Render joint all-parameter draw retention for the selected mode."""
-    values = np.asarray(retention, dtype=float)
-    finite = values[np.isfinite(values)]
-    if not len(finite):
-        raise ValueError("No finite in-support retention fractions")
-    lower, median, upper = np.percentile(finite, (16, 50, 84))
-    body = (
-        "<tr><td>In-support Mean</td>"
-        f"<td>{100.0 * np.mean(finite):.2f}%</td>"
-        f"<td>{100.0 * median:.2f}%</td>"
-        f"<td>{100.0 * lower:.2f}%–{100.0 * upper:.2f}%</td>"
-        f"<td>{100.0 * np.min(finite):.2f}%</td>"
-        f"<td>{np.count_nonzero(finite == 0.0):,}</td>"
-        f"<td>{len(finite):,}</td></tr>"
-    )
+def importance_table(case: dict) -> str:
+    target_label = "TF target population / TF posterior"
+    target_weight = case["populations"][target_label]["galaxy_weight"]
+    population_ess = effective_sample_size(target_weight)
+    rows = []
+    for label, values in (
+        ("posterior candidate ESS", case["posterior_tf_ess"]),
+        ("posterior candidate ESS fraction", case["posterior_tf_ess_fraction"]),
+        ("largest posterior candidate weight", case["posterior_tf_max_weight"]),
+    ):
+        quantiles = weighted_quantile(
+            values, np.asarray((0.16, 0.5, 0.84)), target_weight
+        )
+        mean, _, _ = weighted_mean_and_se(values, target_weight)
+        rows.append(
+            f"<tr><td>{label}</td><td>{mean:.4g}</td>"
+            f"<td>{quantiles[0]:.4g}</td><td>{quantiles[1]:.4g}</td>"
+            f"<td>{quantiles[2]:.4g}</td></tr>"
+        )
     return (
-        "<table><thead><tr><th>Estimator</th><th>Mean retained</th>"
-        "<th>Median retained</th><th>16th–84th galaxy range</th>"
-        "<th>Minimum</th><th>Galaxies with zero draws</th><th>N</th>"
-        "</tr></thead><tbody>" + body + "</tbody></table>"
+        f"<p>Globally normalized TF population weights have effective sample "
+        f"size <b>{population_ess:.1f}</b> of {len(target_weight):,} galaxies.</p>"
+        "<table><thead><tr><th>Diagnostic</th><th>weighted mean</th>"
+        "<th>16th</th><th>median</th><th>84th</th></tr></thead><tbody>"
+        + "".join(rows) + "</tbody></table>"
     )
 
 
-def main():
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    if args.bins < 2:
+        raise ValueError("bins must be at least 2")
+    if args.low_g <= 0.0:
+        raise ValueError("low-g must be positive")
     cases = [
-        load_case(args.cache_root, item, args.mode, args.max_galaxies)
-        for item in args.case
+        load_case(args.cache_root, value, args.max_galaxies)
+        for value in args.case
     ]
     sections = []
     for case in cases:
-        metrics = compute_metrics(case, args.low_g)
-        galaxy_metrics, _ = galaxy_frame_diagnostics(case, args.low_g)
-        coverage = []
-        for estimator, summary in case["summaries"].items():
-            estimator_rows = coverage_metrics(case["truth"], summary)
-            for row in estimator_rows:
-                row["estimator"] = estimator
-            coverage.extend(estimator_rows)
-        try:
-            theta_diagnostic = load_theta_posterior_diagnostics(case, args.mode)
-            theta_section = (
-                "<h3>Directed theta_int bias and posterior modality</h3>"
-                "<p>This diagnostic treats <code>theta_int</code> as a directed "
-                "spin-1 angle on a 2-pi domain. Residuals are wrapped only at "
-                "+/-pi, so posterior mass at theta+pi remains visible rather "
-                "than being folded onto the truth. The true and opposite "
-                "branches are the +/-pi/4 neighborhoods around residual 0 and "
-                "pi. A galaxy is flagged as antipodally bimodal when each branch "
-                "contains at least 15% of its finite draws. Mode counts come from "
-                "a twice-smoothed 72-bin circular histogram; peaks must reach "
-                "10% of the tallest peak with 5% local prominence. These are "
-                "fixed descriptive thresholds, not formal evidence ratios.</p>"
-                + theta_modality_table(theta_diagnostic)
-                + f"<img src=\"{theta_diagnostic_figure(case, theta_diagnostic)}\" "
-                + "alt=\"directed theta bias and posterior modality\">"
+        metric_rows = compute_metrics(case, args.low_g)
+        coverage_rows = []
+        for population_label, population in case["populations"].items():
+            coverage_rows.extend(
+                coverage_metrics(
+                    case["truth"], population["summary"],
+                    population["galaxy_weight"], case["feature_names"],
+                    population_label,
+                )
             )
-        except (FileNotFoundError, IndexError, ValueError) as exc:
-            theta_section = (
-                "<h3>Directed theta_int bias and posterior modality</h3>"
-                f"<p class=\"note\">Theta diagnostic unavailable: "
-                f"{html.escape(str(exc))}</p>"
+        pits = {
+            population["key"]: load_shear_pit_values(case, population["key"])
+            for population in case["populations"].values()
+        }
+        theta_diagnostics = {
+            population["key"]: load_theta_posterior_diagnostics(
+                case, population["key"]
             )
-        try:
-            shear_pits = load_shear_pit_values(case, args.mode)
-            pp_section = (
-                "<h3>Prior-matched conditional posterior P-P diagnostic</h3>"
-                "<p>These curves use the raw posterior draws for the selected "
-                "cache mode. For each component, the truth selects one of three "
-                "equal-width intervals from -0.1 to 0.1, and that component's "
-                "posterior draws are restricted to the same true-shear interval "
-                "and renormalized before computing the finite-sample midpoint "
-                "rank. Other parameters are not restricted. This matches the "
-                "posterior and truth-generating prior within each bin, so an exact "
-                "posterior should follow the diagonal. The legend reports the "
-                "median retained draws per galaxy; a galaxy with zero retained "
-                "draws has no rank and is excluded from its curve. "
-                "Each faint 95% DKW band uses that bin's finite galaxy count and "
-                "represents galaxy-sampling uncertainty only, not posterior Monte "
-                "Carlo error. Exact-D4 draws are balanced across group components "
-                "rather than independent.</p>"
-                f"<img src=\"{posterior_pp_figure(shear_pits, case['truth'])}\" "
-                "alt=\"g1 and g2 posterior P-P calibration\">"
+            for population in case["populations"].values()
+        }
+        conditional = []
+        for population_label in case["populations"]:
+            curves = conditional_shear_calibration(
+                case, population_label, args.bins
             )
-        except (PosteriorPPUnavailable, FileNotFoundError) as exc:
-            pp_section = (
-                "<h3>Prior-matched conditional posterior P-P diagnostic</h3>"
-                f"<p class=\"note\">{html.escape(str(exc))}</p>"
-            )
-        support_section = ""
-        if case["support_retention"] is not None:
-            manifest = case["support_manifest"]
-            manifest_note = (
-                f" Provenance: <code>{html.escape(str(manifest))}</code>."
-                if manifest is not None and manifest.is_file()
-                else ""
-            )
-            support_section = (
-                "<h3>Archived-prior support diagnostic</h3>"
-                "<p><b>In-support Mean</b> conditions the cached draws on all eight "
-                "parameters being finite and inside their archived inclusive prior "
-                "bounds. It is a diagnostic truncated posterior, not the original "
-                "model posterior, and can expose rather than repair learned support "
-                "mismatch."
-                + manifest_note
-                + "</p>"
-                + retention_table(case["support_retention"])
-            )
-        try:
-            conditioning = load_conditional_diagnostic_axes(case, args.sample_root)
-            conditional_curves = conditional_shear_calibration(
-                case,
-                conditioning,
-                args.conditional_bins,
-            )
-            conditional_section = (
-                "<h3>Conditional Mean shear calibration</h3>"
-                "<p>Galaxies are divided into equal-count bins of true r-band "
-                "magnitude, cached spectral reference quality, and true "
-                "<code>hlr</code>. Within every bin and detector component, the "
-                "full-range fit is <code>g_hat - g = c + m g</code>; points and "
-                "error bars show the fitted coefficient and its standard error "
-                "for the primary posterior Mean. The spectral x-axis is the "
-                "independently drawn reference SNR-like quality that fixes the "
-                "Gaussian spectral noise level. It is not the achieved H-alpha "
-                "matched-filter SNR, which also depends on line flux and aperture "
-                "throughput.</p>"
-                f"<img src=\"{conditional_shear_calibration_figure(case, conditional_curves)}\" "
-                "alt=\"conditional multiplicative and additive shear calibration\">"
-            )
-        except (ConditionalDiagnosticUnavailable, FileNotFoundError, ValueError) as exc:
-            conditional_section = (
-                "<h3>Conditional Mean shear calibration</h3>"
-                f"<p class=\"note\">Conditional m/c diagnostic unavailable: "
-                f"{html.escape(str(exc))}</p>"
+            conditional.append(
+                f"<h4>{html.escape(population_label)}</h4>"
+                f"<img src=\"{conditional_shear_calibration_figure(case, population_label, curves)}\" "
+                "alt=\"conditional shear calibration\">"
             )
         sections.append(
             f"<section><h2>{html.escape(case['case'])}</h2>"
-            f"<p><b>N:</b> {len(case['truth']):,}; <b>mode index:</b> {args.mode}; "
-            f"<b>cache:</b> <code>{html.escape(str(case['root']))}</code></p>"
-            + metrics_table(metrics)
-            + support_section
-            + "<h3>Inclination-cut diagnostic</h3>"
-            + cuts_table(metrics)
-            + f"<img src=\"{bias_figure(case, args.bins)}\" alt=\"bias diagnostics\">"
-            + conditional_section
-            + theta_section
-            + "<h3>Clockwise galaxy-frame E/B diagnostic</h3>"
-            + "<p>The transform uses the true <code>theta_int</code>, whose positive "
-            + "direction is clockwise in this repository. A nonzero E residual can "
-            + "therefore expose shear leakage aligned with each galaxy even when "
-            + "detector-frame additive bias averages to zero.</p>"
-            + galaxy_metrics_table(galaxy_metrics)
-            + f"<img src=\"{galaxy_frame_figure(case, args.bins)}\" "
-            + "alt=\"clockwise galaxy-frame residuals versus inclination\">"
-            + "<h3>Posterior interval coverage</h3>"
-            + "<p>Coverage uses each available estimator's cached 16th/84th "
-            + "percentiles. The theta interval is evaluated circularly across the "
-            + "-pi/pi seam. In-support coverage, when present, describes the "
-            + "diagnostically truncated draws rather than the original posterior.</p>"
-            + coverage_table(coverage)
-            + pp_section
-            + "</section>"
+            "<h3>Importance-sampling health</h3>"
+            + importance_table(case)
+            + "<h3>Shear calibration</h3>"
+            "<p>Every number is an ensemble statistic with the galaxy weights "
+            "appropriate to the named population. Low-|g| fits use "
+            f"|g| &lt; {args.low_g:g}; cubic fits use the full range.</p>"
+            + metrics_table(metric_rows)
+            + f"<img src=\"{bias_figure(case, args.bins)}\" alt=\"weighted residual trends\">"
+            "<h3>Inclination-cut statistics</h3>"
+            "<p>Weights are renormalized inside each cut before fitting.</p>"
+            + cuts_table(metric_rows)
+            + "<h3>Conditional Mean calibration</h3>"
+            "<p>Bin edges, fit coefficients, and errors are population-weighted. "
+            "Spectral reference quality is the independently drawn noise-level "
+            "control (an SNR-like reference), not a claim that every galaxy has "
+            "that achieved emission-line SNR. "
+            "The TF-target panel therefore describes the target population, not "
+            "the uniform simulator proposal.</p>"
+            + "".join(conditional)
+            + "<h3>Directed theta_int bias</h3>"
+            + f"<img src=\"{theta_bias_figure(case, args.bins)}\" alt=\"theta bias versus truth\">"
+            "<p>The mode audit treats theta_int as directed on a 2π domain; "
+            "mass near theta+π is not folded onto the true branch. Candidate "
+            "histograms use equal proposal mass or the within-galaxy TF weights, "
+            "and reported galaxy fractions use the corresponding population "
+            "weights. Peaks are descriptive: a twice-smoothed 72-bin circular "
+            "histogram requires 10% relative height and 5% local prominence.</p>"
+            + theta_modality_table(case, theta_diagnostics)
+            + f"<img src=\"{theta_modality_figure(case, theta_diagnostics)}\" alt=\"theta posterior modality\">"
+            "<h3>Posterior coverage</h3>"
+            "<p>The base posterior uses equal candidate mass and equal galaxy "
+            "mass. The TF posterior uses within-galaxy TF candidate weights; its "
+            "coverage average additionally uses globally normalized TF population "
+            "weights.</p>"
+            + coverage_table(coverage_rows)
+            + "<h3>Prior-matched conditional P-P diagnostic</h3>"
+            "<p>For each component, candidates are restricted to the same one of "
+            "three true-shear intervals as the truth. TF-target ranks use the "
+            "within-galaxy TF weights and their curves use global target-population "
+            "galaxy weights. Candidate retention mass and conditional candidate "
+            "ESS are reported separately from galaxy ESS.</p>"
+            + f"<img src=\"{posterior_pp_figure(case, pits)}\" alt=\"weighted posterior P-P plots\">"
+            "</section>"
         )
-    generated = datetime.now(timezone.utc).isoformat()
-    document = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>KL-NN shear-bias diagnostics</title>
-<style>
-body {{ font-family: system-ui, sans-serif; max-width: 1200px; margin: 2rem auto; padding: 0 1rem; color: #202124; }}
-table {{ border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; font-size: 0.9rem; }}
-th, td {{ border: 1px solid #ccd1d5; padding: 0.45rem; text-align: right; }}
-th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
-th {{ background: #f1f3f4; }} img {{ max-width: 100%; height: auto; }}
-.note {{ background: #fff7df; border-left: 4px solid #e6a700; padding: 0.8rem 1rem; }}
-code {{ overflow-wrap: anywhere; }}
-</style></head><body>
-<h1>KL-NN shear-bias diagnostics</h1>
-<p>Generated {generated}. Most diagnostics use compact truth/SNR/MAP/mean
-summaries. The P-P and theta-modality diagnostics stream memory-mapped
-posterior draws partition by partition and never concatenate the raw sample
-bank, keeping the report suitable for a 4 GB CPU job.</p>
-<section><h2>Estimator and cache provenance</h2>
-<p>This report evaluates the point estimates and posterior summaries already
-stored in each requested cache. It does not apply an additional symmetry,
-rotation-pairing, or response correction. Exact-D4 caches therefore retain their
-native D4 posterior treatment; legacy caches retain whatever treatment was used
-when they were generated. If a legacy cache used 90° cancellation, verify that
-it was generated after the rotation-pairing ordering fix before interpreting it.</p>
-<p>If <code>--max-galaxies N</code> is supplied, every case uses its first N
-combined cache rows. This supports matched-prefix comparisons only when those
-caches were generated from the same ordered galaxy sample and seed.</p></section>
-<section><h2>Cached MAP/mean audit</h2>
-<p class="note"><b>Interpretation:</b> Reported additive quantities use 10<sup>4</sup> shear units and multiplicative slopes use 10<sup>2</sup>; the approximate requirements are |10<sup>4</sup> c| &lt; 1 and |10<sup>2</sup> m| &lt; 1. Uncertainties must still be considered when judging either threshold. Mean <i>c</i> is the unbinned average residual. The low-|g| fit uses |g| &lt; {args.low_g:g}. The cubic fit is residual = c + m g + q g³; q is left unscaled because it has different units. Spin amplitudes come from a joint constant + spin-2 + spin-4 regression against true theta_int.</p>
-<p class="note"><b>Estimator caveats:</b> Treat posterior <b>Mean</b> as the primary point estimator. <b>In-support Mean</b>, if present, is a diagnostic conditioning on all archived prior bounds and is not a replacement for a bounded-support model. Cached MAP values depend on a finite posterior draw set and an argmax over cached log probabilities, so they can be unstable—especially if non-finite log probabilities are present. MAP has no interval-coverage entry. Galaxy-frame results use the true orientation to diagnose conditional leakage; they are not an inference procedure that assumes true orientations will be known for observed galaxies.</p>
-{''.join(sections)}
-</section>
-</body></html>"""
+
+    document = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>KL-NN shear bias report</title><style>"
+        "body{font-family:system-ui,sans-serif;max-width:1500px;margin:2rem auto;"
+        "padding:0 1rem;color:#1b1b1b}section{margin:3rem 0;border-top:2px solid #ddd}"
+        "table{border-collapse:collapse;width:100%;font-size:.88rem;margin:1rem 0}"
+        "th,td{border:1px solid #ccc;padding:.35rem .5rem;text-align:right}"
+        "th:first-child,td:first-child{text-align:left}th{background:#f3f3f3}"
+        "img{display:block;max-width:100%;height:auto;margin:1rem auto}"
+        "code{background:#f4f4f4;padding:.1rem .25rem}</style></head><body>"
+        "<h1>KL-NN shear bias diagnostics</h1>"
+        "<p>This report deliberately keeps two estimands separate: "
+        "<b>Proposal population / base posterior</b> is the uninformative "
+        "simulator population and raw NPE posterior; <b>TF target population / "
+        "TF posterior</b> applies post-training prior replacement within each "
+        "joint posterior and global importance weighting across galaxies. There "
+        "is no model mode, resampling, or hidden TF-conditioned network.</p>"
+        + "".join(sections) + "</body></html>"
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(document)
-    print(f"Wrote {args.output} ({args.output.stat().st_size / 1024**2:.2f} MiB)")
+    args.output.write_text(document, encoding="utf-8")
+    print(f"Wrote {args.output}")
 
 
 if __name__ == "__main__":

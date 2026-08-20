@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -18,13 +17,36 @@ if str(ARCH_DIR) not in sys.path:
     sys.path.insert(0, str(ARCH_DIR))
 
 import config
-from data import apply_noise
+from data import apply_fixed_gaussian_image_noise, apply_spectral_noise
 from model_registry import load_model_config
 from networks import CCLPretrain
-from train import load_model, seed_everything
+from train import (
+    build_observation_levels,
+    checkpoint_scalar,
+    load_model,
+    seed_everything,
+    validate_observation_record,
+)
 
 
 DEFAULT_OUTPUT_ROOT = Path("/ocean/projects/phy250048p/shared/figures")
+
+
+def checkpoint_suffix(value: str) -> str:
+    text = str(value).strip().lower()
+    if text == "best":
+        return text
+    try:
+        epoch = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "checkpoint suffix must be 'best' or a non-negative epoch index"
+        ) from error
+    if epoch < 0:
+        raise argparse.ArgumentTypeError(
+            "checkpoint suffix must be 'best' or a non-negative epoch index"
+        )
+    return str(epoch)
 
 
 def parse_args(argv=None):
@@ -33,7 +55,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--checkpoint-path")
-    parser.add_argument("--checkpoint-suffix", default="latest")
+    parser.add_argument(
+        "--checkpoint-suffix", type=checkpoint_suffix, default="best"
+    )
     parser.add_argument("--model-root")
     parser.add_argument("--train-data")
     parser.add_argument("--valid-data")
@@ -45,13 +69,6 @@ def parse_args(argv=None):
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=(512, 256))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--noise-mode",
-        choices=("log_uniform", "none"),
-        default="log_uniform",
-    )
-    parser.add_argument("--snr-log-min", type=float, default=0.0)
-    parser.add_argument("--snr-log-max", type=float, default=4.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output")
     parser.add_argument("--overwrite", action="store_true")
@@ -63,20 +80,7 @@ def resolve_checkpoint(args, model_root):
         path = Path(args.checkpoint_path)
     else:
         model_dir = Path(model_root) / args.model_name
-        if args.checkpoint_suffix != "latest":
-            path = model_dir / f"{args.model_name}{args.checkpoint_suffix}"
-        else:
-            pattern = re.compile(rf"^{re.escape(args.model_name)}(\d+)$")
-            candidates = []
-            for candidate in model_dir.iterdir():
-                match = pattern.match(candidate.name)
-                if match:
-                    candidates.append((int(match.group(1)), candidate))
-            if not candidates:
-                raise FileNotFoundError(
-                    f"No numeric checkpoints found for {args.model_name} in {model_dir}"
-                )
-            path = max(candidates, key=lambda item: item[0])[1]
+        path = model_dir / f"{args.model_name}{args.checkpoint_suffix}"
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
     return path
@@ -101,21 +105,20 @@ def extract_features(
     batch_size,
     device,
     seed,
-    noise_mode,
-    snr_log_min,
-    snr_log_max,
     channels_last,
     split_name,
 ):
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    if snr_log_max <= snr_log_min:
-        raise ValueError("snr_log_max must exceed snr_log_min")
 
     generator_device = device if device.type == "cuda" else torch.device("cpu")
-    snr_generator = torch.Generator(device=generator_device).manual_seed(seed + 11)
+    quality_generator = torch.Generator(device=generator_device).manual_seed(seed + 11)
     img_generator = torch.Generator(device=generator_device).manual_seed(seed + 23)
     spec_generator = torch.Generator(device=generator_device).manual_seed(seed + 37)
+    image_sigma = checkpoint_scalar(model, "image_noise_sigma").to(device)
+    line_reference = checkpoint_scalar(
+        model, "spectral_reference_line_norm"
+    ).to(device)
 
     all_features = []
     all_labels = []
@@ -126,36 +129,50 @@ def extract_features(
         img = torch.stack([torch.as_tensor(row["img"]) for row in rows]).float().to(device)
         spec = torch.stack([torch.as_tensor(row["spec"]) for row in rows]).float().to(device)
         fp = torch.stack([torch.as_tensor(row["fib_pos"]) for row in rows]).float().to(device)
+        metadata = [
+            validate_observation_record(
+                row, location=f"{split_name} probe record {int(index)}"
+            )
+            for row, index in zip(rows, batch_indices)
+        ]
+        rmag = torch.tensor(
+            [item[0] for item in metadata], device=device, dtype=torch.float32
+        )
         labels = torch.stack(
-            [torch.as_tensor(row["fid_pars"][:8]) for row in rows]
+            [torch.as_tensor(row["fid_pars"]) for row in rows]
         ).float()
-
-        if noise_mode == "log_uniform":
-            log_snr = torch.rand(
-                (len(rows),),
-                device=device,
-                generator=snr_generator,
-            )
-            log_snr = log_snr * (snr_log_max - snr_log_min) + snr_log_min
-            snr = torch.pow(10.0, log_snr)
-            img = apply_noise(
-                img,
-                snr,
-                device=device,
-                randgen=img_generator,
-            )
-            spec = apply_noise(
-                spec,
-                snr,
-                device=device,
-                randgen=spec_generator,
-            )
+        _, quality = build_observation_levels(
+            rmag, spectral_generator=quality_generator
+        )
+        img = apply_fixed_gaussian_image_noise(
+            img, image_sigma, randgen=img_generator
+        )
+        spec = apply_spectral_noise(
+            spec,
+            quality,
+            line_reference,
+            center_fiber_index=config.observation["center_fiber_index"],
+            center_exposure_s=config.observation["center_exposure_s"],
+            offset_exposure_s=config.observation["offset_exposure_s"],
+            spectral_units=config.observation["spectral_units"],
+            randgen=spec_generator,
+            device=device,
+        )
 
         if channels_last:
             img = img.contiguous(memory_format=torch.channels_last)
             spec = spec.contiguous(memory_format=torch.channels_last)
 
-        all_features.append(model.extract_features(img, spec, fp).float().cpu())
+        features = model.extract_features(img, spec, fp).float()
+        oracle = model.context_normalizer(
+            {
+                "rmag_true": rmag,
+                "spectral_reference_quality": quality,
+            },
+            len(rows),
+            features,
+        )
+        all_features.append(torch.cat((features, oracle), dim=-1).cpu())
         all_labels.append(labels)
         if batch_number == 1 or batch_number == total_batches or batch_number % 20 == 0:
             print(f"{split_name}: extracted batch {batch_number}/{total_batches}", flush=True)
@@ -356,9 +373,27 @@ def main(argv=None):
         raise RuntimeError("CUDA was requested but is not available")
     device = torch.device(args.device)
 
-    model_config = load_model_config(args.model_name, allow_fallback_current=False)
+    requested_model_root = (
+        Path(args.model_root).expanduser().resolve()
+        if args.model_root is not None
+        else None
+    )
+    config_root = (
+        requested_model_root.parent / "configs"
+        if requested_model_root is not None
+        else None
+    )
+    model_config = load_model_config(
+        args.model_name,
+        **(
+            {"configs_root": str(config_root)}
+            if config_root is not None
+            else {}
+        ),
+    )
     config.set_model_config(model_config)
-    model_root = args.model_root or model_config.pretrain.model_path
+    model_root = requested_model_root or Path(model_config.pretrain.model_path)
+    networks_root = model_root.parent / "networks"
     checkpoint = resolve_checkpoint(args, model_root)
 
     train_data = args.train_data or model_config.data.data_dir
@@ -368,15 +403,12 @@ def main(argv=None):
     print(f"valid_data={valid_data}")
 
     model = load_model(
-        config.pretrain,
-        Model=CCLPretrain,
+        CCLPretrain,
         path=str(checkpoint),
-        strict=True,
-        assign=True,
-        GPUs=1,
-        device=str(device),
         model_name=args.model_name,
-        use_compile=False,
+        device=str(device),
+        strict=True,
+        networks_root=str(networks_root),
     )
     model.eval()
 
@@ -388,9 +420,6 @@ def main(argv=None):
     extraction_kwargs = {
         "batch_size": args.batch_size,
         "device": device,
-        "noise_mode": args.noise_mode,
-        "snr_log_min": args.snr_log_min,
-        "snr_log_max": args.snr_log_max,
         "channels_last": bool(model_config.pretrain.channels_last),
     }
     train_features, train_labels = extract_features(
@@ -452,9 +481,8 @@ def main(argv=None):
         "valid_data": valid_data,
         "train_samples": len(train_indices),
         "valid_samples": len(valid_indices),
-        "noise_mode": args.noise_mode,
-        "snr_log_min": args.snr_log_min,
-        "snr_log_max": args.snr_log_max,
+        "observation_context": list(model_config.observation.context_fields),
+        "noise_model": "fixed-depth image Gaussian plus independent spectral quality",
         "probe": {
             "type": "mlp",
             "hidden_dims": list(args.hidden_dims),

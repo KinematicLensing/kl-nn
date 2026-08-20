@@ -1,49 +1,69 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
-from os.path import dirname, join
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 import numpy as np
 
 
+TARGET_NAMES = (
+    "g1",
+    "g2",
+    "theta_int",
+    "sini",
+    "v0",
+    "vcirc",
+    "rscale",
+    "hlr",
+    "halpha_flux_true",
+)
+
+CANONICAL_PARAMETER_RANGES = {
+    "g1": [-0.1, 0.1],
+    "g2": [-0.1, 0.1],
+    "theta_int": [-float(np.pi), float(np.pi)],
+    "sini": [0.0, 1.0],
+    "v0": [-30.0, 30.0],
+    "vcirc": [60.0, 540.0],
+    "rscale": [0.1, 2.0],
+    "hlr": [0.1, 3.0],
+    "halpha_flux_true": [1.2e-16, 301.43e-16],
+}
+
+ORACLE_CONTEXT_FIELDS = (
+    "rmag_true",
+    "spectral_reference_quality",
+)
+
+
 @dataclass
 class DatasetConfig:
     size: int
-    nimg: int
     nspec: int
     data_dir: str
-    data_stem: str
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 @dataclass
 class PretrainConfig:
-    epoch_number: int
-    initial_learning_rate: float
-    weight_decay: float
-    eps: float
-    batch_size: int
-    save_model: bool
-    model_path: str
-    model_name: str
-    backbone_type: str = "legacy"
-    use_rot90_counterpart: bool = True
-    use_amp: bool = True
+    epoch_number: int = 100
+    initial_learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    eps: float = 1e-8
+    batch_size: int = 100
+    model_path: str = "/ocean/projects/phy250048p/shared/models/"
+    model_name: str = "SetAttn-CCL-simv2-r90"
+    use_amp: bool = False
     amp_dtype: str = "float16"
-    use_compile: bool = True
+    use_compile: bool = False
     compile_mode: str = "default"
     compile_backend: str | None = None
     use_fused_adamw: bool = True
-    cudnn_benchmark: bool = True
     channels_last: bool = True
     ddp_static_graph: bool = True
     ddp_find_unused_parameters: bool = False
     ddp_gradient_as_bucket_view: bool = True
     ddp_broadcast_buffers: bool = False
-    noise_cache_maxs: bool = True
     ccl_temperature: float = 0.1
     ccl_sigma_label: float = 0.15
     ccl_d_cutoff: float = 0.40
@@ -51,114 +71,65 @@ class PretrainConfig:
     ccl_distance_reduction: str = "mean"
     seed: int = 42
     deterministic: bool = False
-    fixed_validation_streams: bool = False
+    fixed_validation_streams: bool = True
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 @dataclass
 class TrainConfig:
-    mode: int
-    epoch_number: int
-    initial_learning_rate: float
-    weight_decay: float
-    batch_size: int
-    feature_number: int
-    feature_names: list[str]
-    save_model: bool
-    model_path: str
-    model_name: str
-    use_pretrain: bool
-    pretrained_name: str
-    pretrain_from: int
-    backbone_type: str = "legacy"
-    posterior_symmetry: str = "none"
-    use_rot90_counterpart: bool = True
-    use_amp: bool = True
+    epoch_number: int = 200
+    initial_learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+    batch_size: int = 50
+    feature_names: list[str] = field(default_factory=lambda: list(TARGET_NAMES))
+    model_path: str = "/ocean/projects/phy250048p/shared/models/"
+    model_name: str = "SetAttn-bounded-hybrid-simv2-r90"
+    pretrained_name: str = "SetAttn-CCL-simv2-r90"
+    pretrain_from: int | str = "best"
+    use_amp: bool = False
     amp_dtype: str = "float16"
-    use_compile: bool = True
+    use_compile: bool = False
     compile_mode: str = "default"
     compile_backend: str | None = None
     use_fused_adamw: bool = True
-    cudnn_benchmark: bool = True
     channels_last: bool = True
     ddp_static_graph: bool = True
     ddp_find_unused_parameters: bool = False
-    ddp_gradient_as_bucket_view: bool = True
+    ddp_gradient_as_bucket_view: bool = False
     ddp_broadcast_buffers: bool = False
-    noise_cache_maxs: bool = True
     seed: int = 42
     deterministic: bool = False
-    # Keep the historical optimizer/scheduler behavior as defaults so archived
-    # JSON configs load without silently changing their training semantics.
-    scheduler_type: str = "plateau"
-    warmup_epochs: int = 0
+    scheduler_type: str = "warmup_cosine"
+    warmup_epochs: int = 2
     min_learning_rate: float = 1e-6
-    fixed_validation_streams: bool = False
-    context_norm_trainable: bool = True
+    fixed_validation_streams: bool = True
+    feature_norm_trainable: bool = True
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
     gradient_clip_norm: float = 1.0
-    affine_learning_rate: float | None = None
+    non_theta_learning_rate: float | None = None
     theta_learning_rate: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass
 class FlowConfig:
-    num_layers: int
-    mlp: list[int] = field(default_factory=lambda: [1, 128, 64, 2])
-    # ``affine`` preserves the historical Euclidean NPE. ``circular_rqs``
-    # applies RQS transforms to the joint vector. ``hybrid_circular`` retains
-    # the affine seven-dimensional flow and adds a conditional circular theta
-    # factor. ``bounded_hybrid_circular`` replaces that affine marginal with a
-    # compact RQS marginal while retaining the correlated circular factor.
-    flow_type: str = "affine"
+    num_layers: int = 4
     num_bins: int = 8
     theta_num_layers: int = 1
     theta_logit_limit: float = 10.0
     bounded_logit_limit: float = 10.0
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-    
-@dataclass
-class TFConfig:
-    slope: float = -7.22
-    intercept: float = 36.0
-    scatter: float = 0.1
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
 class ObservationConfig:
-    """Versioned observation/noise policy for simulated data.
+    """The sole supported simulator-v2 observation and metadata schema."""
 
-    Version 1 preserves the historical shared-SNR augmentation. Version 2
-    renders independently sampled r-band magnitude and H-alpha line flux and
-    uses independent Gaussian image and spectral noise levels.
-    """
-
-    model_version: int = 1
-    # Keep the no-override configuration identical to the legacy simulator.
-    # Simulator-v2 launchers opt into galaxy-axis placement explicitly.
-    fiber_layout: str = "image_axis"
+    schema_version: int = 2
+    fiber_layout: str = "galaxy_axis"
     context_fields: list[str] = field(
-        default_factory=lambda: [
-            "rmag_obs",
-            "rmag_sigma",
-            "image_snr",
-            "spectral_reference_quality",
-            "spectral_noise_scale",
-        ]
+        default_factory=lambda: list(ORACLE_CONTEXT_FIELDS)
     )
     rmag_min: float = 15.0
     rmag_max: float = 23.4
-    # Integrated observed-frame H-alpha line flux [erg s^-1 cm^-2].
     halpha_flux_min: float = 1.2e-16
     halpha_flux_max: float = 301.43e-16
     halpha_flux_distribution: str = "uniform"
@@ -166,8 +137,6 @@ class ObservationConfig:
     image_band: str = "r"
     target_line: str = "Ha"
     image_depth_5sigma_mag: float = 23.4
-    # Fixed Gaussian-PSF-equivalent template used only to map m5 to one
-    # homoscedastic image-pixel RMS. The renderer itself uses airy_fwhm.
     image_reference_psf_fwhm_arcsec: float = 1.0
     image_pixel_scale_arcsec: float = 0.2637
     spectral_quality_min: float = 3.0
@@ -178,186 +147,230 @@ class ObservationConfig:
     center_exposure_s: float = 180.0
     offset_exposure_s: float = 600.0
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
 class ModelConfig:
-    rmag_snr_source_path: str
-    rmag_snr_fit_path: str
     data: DatasetConfig
     test: DatasetConfig
     par_ranges: dict[str, list[float]]
-    pretrain: PretrainConfig
-    train: TrainConfig
-    flow: FlowConfig
-    tf: TFConfig
+    pretrain: PretrainConfig = field(default_factory=PretrainConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+    flow: FlowConfig = field(default_factory=FlowConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
+
+    def __post_init__(self) -> None:
+        names = tuple(self.train.feature_names)
+        if names != TARGET_NAMES:
+            raise ValueError(
+                "feature_names must exactly match the current nine-target schema: "
+                f"{TARGET_NAMES!r}"
+            )
+        if tuple(self.par_ranges) != TARGET_NAMES:
+            raise ValueError(
+                "par_ranges must use the current target order: "
+                f"{TARGET_NAMES!r}"
+            )
+        canonical_ranges = {
+            name: [float(value) for value in bounds]
+            for name, bounds in CANONICAL_PARAMETER_RANGES.items()
+        }
+        if self.par_ranges != canonical_ranges:
+            raise ValueError(
+                "par_ranges are immutable for the current normalized LMDB schema; "
+                f"expected {canonical_ranges!r}"
+            )
+        if tuple(self.observation.context_fields) != ORACLE_CONTEXT_FIELDS:
+            raise ValueError(
+                "context_fields must contain only the independent oracle fields: "
+                f"{ORACLE_CONTEXT_FIELDS!r}"
+            )
+        if self.data.nspec != 5 or self.test.nspec != 5:
+            raise ValueError(
+                "the current simulator schema requires five spectra per galaxy"
+            )
+        observation = self.observation
+        if observation.schema_version != 2:
+            raise ValueError("only simulator schema version 2 is supported")
+        if observation.fiber_layout != "galaxy_axis":
+            raise ValueError("the current pipeline requires galaxy_axis fibers")
+        if observation.image_band != "r" or observation.target_line != "Ha":
+            raise ValueError("the current observation schema requires r band and H-alpha")
+        if observation.spectral_units != "counts":
+            raise ValueError("the current spectral schema requires count units")
+        if observation.halpha_flux_distribution != "uniform":
+            raise ValueError("the H-alpha proposal must be uniform")
+        if observation.halpha_flux_units != "erg s^-1 cm^-2":
+            raise ValueError("H-alpha must use integrated flux units")
+        if observation.spectral_quality_distribution != "log_uniform":
+            raise ValueError("spectral reference quality must be log-uniform")
+        fixed_simulator_metadata = {
+            "rmag_min": 15.0,
+            "rmag_max": 23.4,
+            "image_reference_psf_fwhm_arcsec": 1.0,
+            "image_pixel_scale_arcsec": 0.2637,
+            "center_fiber_index": 2,
+            "center_exposure_s": 180.0,
+            "offset_exposure_s": 600.0,
+        }
+        for name, expected in fixed_simulator_metadata.items():
+            if getattr(observation, name) != expected:
+                raise ValueError(
+                    f"observation {name} is fixed by simulator schema v2 at "
+                    f"{expected!r}"
+                )
+        if (
+            observation.halpha_flux_min
+            != canonical_ranges["halpha_flux_true"][0]
+            or observation.halpha_flux_max
+            != canonical_ranges["halpha_flux_true"][1]
+        ):
+            raise ValueError(
+                "observation H-alpha bounds must match the immutable target bounds"
+            )
+        for name in (
+            "rmag_min",
+            "rmag_max",
+            "image_depth_5sigma_mag",
+            "image_reference_psf_fwhm_arcsec",
+            "image_pixel_scale_arcsec",
+            "spectral_quality_min",
+            "spectral_quality_max",
+            "center_exposure_s",
+            "offset_exposure_s",
+        ):
+            if not np.isfinite(getattr(observation, name)):
+                raise ValueError(f"observation {name} must be finite")
+        if observation.spectral_quality_min <= 0 or (
+            observation.spectral_quality_min >= observation.spectral_quality_max
+        ):
+            raise ValueError("spectral-quality bounds must be positive and increasing")
+        if not (
+            self.train.pretrain_from == "best"
+            or (
+                isinstance(self.train.pretrain_from, int)
+                and not isinstance(self.train.pretrain_from, bool)
+                and self.train.pretrain_from >= 0
+            )
+        ):
+            raise ValueError(
+                "train.pretrain_from must be 'best' or a non-negative integer"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ModelConfig":
-        pretrain_payload = dict(payload["pretrain"])
-        archived_objective = pretrain_payload.pop("ccl_objective", None)
-        archived_shear_weight = pretrain_payload.pop("ccl_shear_loss_weight", None)
-        pretrain_config = PretrainConfig(**pretrain_payload)
-        # Archived network snapshots for the retired auxiliary experiment still
-        # read these legacy dictionary keys. Dynamic attributes keep those old
-        # checkpoints loadable without serializing retired options in new configs.
-        if archived_objective not in (None, "ccl"):
-            pretrain_config._archived_ccl_objective = archived_objective
-            pretrain_config._archived_ccl_shear_loss_weight = (
-                1.0 if archived_shear_weight is None else archived_shear_weight
+        """Load only the current schema; archived compatibility is absent."""
+        expected = {
+            "data",
+            "test",
+            "par_ranges",
+            "pretrain",
+            "train",
+            "flow",
+            "observation",
+        }
+        supplied = set(payload)
+        if supplied != expected:
+            raise ValueError(
+                "ModelConfig keys must exactly match the current schema; "
+                f"missing={sorted(expected - supplied)}, "
+                f"extra={sorted(supplied - expected)}"
             )
-
+        nested_types = {
+            "data": DatasetConfig,
+            "test": DatasetConfig,
+            "pretrain": PretrainConfig,
+            "train": TrainConfig,
+            "flow": FlowConfig,
+            "observation": ObservationConfig,
+        }
+        for name, nested_type in nested_types.items():
+            value = payload[name]
+            if not isinstance(value, dict):
+                raise ValueError(f"ModelConfig {name!r} must be an object")
+            expected_fields = {item.name for item in fields(nested_type)}
+            supplied_fields = set(value)
+            if supplied_fields != expected_fields:
+                raise ValueError(
+                    f"ModelConfig {name!r} keys must exactly match the current "
+                    f"schema; missing={sorted(expected_fields - supplied_fields)}, "
+                    f"extra={sorted(supplied_fields - expected_fields)}"
+                )
+        for name, bounds in payload["par_ranges"].items():
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                raise ValueError(f"par_ranges[{name!r}] must contain exactly two bounds")
         return cls(
-            rmag_snr_source_path=payload["rmag_snr_source_path"],
-            rmag_snr_fit_path=payload["rmag_snr_fit_path"],
             data=DatasetConfig(**payload["data"]),
             test=DatasetConfig(**payload["test"]),
-            par_ranges={k: [float(v[0]), float(v[1])] for k, v in payload["par_ranges"].items()},
-            pretrain=pretrain_config,
+            par_ranges={
+                name: [float(bounds[0]), float(bounds[1])]
+                for name, bounds in payload["par_ranges"].items()
+            },
+            pretrain=PretrainConfig(**payload["pretrain"]),
             train=TrainConfig(**payload["train"]),
             flow=FlowConfig(**payload["flow"]),
-            tf=TFConfig(**payload["tf"]),
-            observation=ObservationConfig(**payload.get("observation", {})),
+            observation=ObservationConfig(**payload["observation"]),
         )
 
     def to_json(self, path: str, *, indent: int = 2) -> None:
-        with open(path, "w", encoding="utf-8") as fobj:
-            json.dump(self.to_dict(), fobj, indent=indent)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(self.to_dict(), stream, indent=indent)
 
     @classmethod
     def from_json(cls, path: str) -> "ModelConfig":
-        with open(path, "r", encoding="utf-8") as fobj:
-            payload = json.load(fobj)
-        return cls.from_dict(payload)
+        with open(path, "r", encoding="utf-8") as stream:
+            return cls.from_dict(json.load(stream))
 
 
 def _default_model_config() -> ModelConfig:
     return ModelConfig(
-        rmag_snr_source_path="/ocean/projects/phy250048p/shared/temp/rmag_snr_pv.npz",
-        rmag_snr_fit_path=join(dirname(__file__), "rmag_snr_fit.npz"),
         data=DatasetConfig(
-            size=1000000,
-            nimg=1,
+            size=100_000,
             nspec=5,
-            data_dir="/ocean/projects/phy250048p/shared/datasets/train_1m/",
-            data_stem="gal_",
+            data_dir=(
+                "/ocean/projects/phy250048p/shared/datasets/"
+                "valid_1m_simv2_galaxyaxis_halpha/"
+            ),
         ),
         test=DatasetConfig(
-            size=100000,
-            nimg=1,
+            size=10_000,
             nspec=5,
-            data_dir="/ocean/projects/phy250048p/shared/datasets/valid_1m/",
-            data_stem="gal_",
+            data_dir=(
+                "/ocean/projects/phy250048p/shared/datasets/"
+                "small_1m_simv2_galaxyaxis_halpha/"
+            ),
         ),
         par_ranges={
-            "g1": [-0.1, 0.1],
-            "g2": [-0.1, 0.1],
-            "theta_int": [-float(np.pi), float(np.pi)],
-            "sini": [0.0, 1.0],
-            "v0": [-30.0, 30.0],
-            "vcirc": [60.0, 540.0],
-            "rscale": [0.1, 2.0],
-            "hlr": [0.1, 3.0],
-            # "dx_disk": [-0.5, 0.5],
-            # "dy_disk": [-0.5, 0.5],
-            # "dx_spec": [-0.5, 0.5],
-            # "dy_spec": [-0.5, 0.5],
+            name: list(bounds)
+            for name, bounds in CANONICAL_PARAMETER_RANGES.items()
         },
-        pretrain=PretrainConfig(
-            epoch_number=100,
-            initial_learning_rate=1e-3,
-            weight_decay=1e-4,
-            eps=1e-8,
-            batch_size=100,
-            save_model=True,
-            model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="CNN-CNN_CCL_rot90",
-            use_amp=False,
-            amp_dtype="float16",
-            use_compile=False,
-            compile_mode="default",
-            compile_backend=None,
-            use_fused_adamw=True,
-            cudnn_benchmark=True,
-            channels_last=True,
-            ddp_static_graph=True,
-            ddp_find_unused_parameters=False,
-            ddp_gradient_as_bucket_view=True,
-            ddp_broadcast_buffers=False,
-            noise_cache_maxs=True
-        ),
-        train=TrainConfig(
-            mode=2,  # 0: point estimate; 1: density estimate; 2: density estimate with TF prior
-            epoch_number=200,
-            initial_learning_rate=1e-3,
-            weight_decay=1e-5,
-            batch_size=50,
-            feature_number=8,
-            feature_names=["g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr"],
-            save_model=True,
-            model_path="/ocean/projects/phy250048p/shared/models/",
-            model_name="CNN-CNN-flow_CCL_rot90",
-            use_pretrain=True,
-            pretrained_name="CNN-CNN_CCL_rot90",
-            pretrain_from=73,
-            use_amp=False,
-            amp_dtype="float16",
-            use_compile=False,
-            compile_mode="default",
-            compile_backend=None,
-            use_fused_adamw=True,
-            cudnn_benchmark=True,
-            channels_last=True,
-            ddp_static_graph=True,
-            ddp_find_unused_parameters=False,
-            ddp_gradient_as_bucket_view=False,
-            ddp_broadcast_buffers=False,
-            noise_cache_maxs=True,
-        ),
-        flow=FlowConfig(num_layers=12),
-        tf=TFConfig(slope=-7.22, intercept=36.0, scatter=0.1),
-        observation=ObservationConfig(),
     )
 
 
 MODEL_CONFIG: ModelConfig = _default_model_config()
 
 
-def _sync_legacy_globals(model_config: ModelConfig) -> None:
-    global rmag_snr_source_path, rmag_snr_fit_path, data, test, par_ranges, pretrain, train, flow, tf, observation
-
-    rmag_snr_source_path = model_config.rmag_snr_source_path
-    rmag_snr_fit_path = model_config.rmag_snr_fit_path
-    data = model_config.data.to_dict()
-    test = model_config.test.to_dict()
-    par_ranges = model_config.par_ranges.copy()
-    pretrain = model_config.pretrain.to_dict()
-    archived_objective = getattr(
-        model_config.pretrain, "_archived_ccl_objective", None
-    )
-    if archived_objective is not None:
-        pretrain["ccl_objective"] = archived_objective
-        pretrain["ccl_shear_loss_weight"] = getattr(
-            model_config.pretrain,
-            "_archived_ccl_shear_loss_weight",
-            1.0,
-        )
-    train = model_config.train.to_dict()
-    flow = model_config.flow.to_dict()
-    tf = model_config.tf.to_dict()
-    observation = model_config.observation.to_dict()
+def _publish_runtime_views(model_config: ModelConfig) -> None:
+    """Publish current dataclass values as runtime dictionaries."""
+    global data, test, par_ranges, pretrain, train, flow, observation
+    data = asdict(model_config.data)
+    test = asdict(model_config.test)
+    par_ranges = {
+        name: list(bounds) for name, bounds in model_config.par_ranges.items()
+    }
+    pretrain = asdict(model_config.pretrain)
+    train = asdict(model_config.train)
+    train["feature_number"] = len(model_config.train.feature_names)
+    flow = asdict(model_config.flow)
+    observation = asdict(model_config.observation)
 
 
 def set_model_config(model_config: ModelConfig) -> None:
     global MODEL_CONFIG
     MODEL_CONFIG = model_config
-    _sync_legacy_globals(MODEL_CONFIG)
+    _publish_runtime_views(model_config)
 
 
 def load_model_config_from_json(path: str) -> ModelConfig:
@@ -366,4 +379,4 @@ def load_model_config_from_json(path: str) -> ModelConfig:
     return model_config
 
 
-_sync_legacy_globals(MODEL_CONFIG)
+_publish_runtime_views(MODEL_CONFIG)

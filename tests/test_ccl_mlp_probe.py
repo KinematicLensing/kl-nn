@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from diagnostics.ccl_mlp_probe import (
     choose_indices,
@@ -6,6 +7,7 @@ from diagnostics.ccl_mlp_probe import (
     evaluate_probe,
     MLPProbe,
     fit_mlp_probe,
+    parse_args,
 )
 
 
@@ -18,7 +20,31 @@ FEATURE_NAMES = [
     "vcirc",
     "rscale",
     "hlr",
+    "halpha_flux_true",
 ]
+
+
+def test_probe_cli_defaults_to_best_and_accepts_shared_model_root():
+    args = parse_args(
+        [
+            "--model-name",
+            "current-ccl",
+            "--model-root",
+            "/tmp/current-shared/models",
+        ]
+    )
+
+    assert args.checkpoint_suffix == "best"
+    assert args.model_root == "/tmp/current-shared/models"
+
+    numbered = parse_args(
+        ["--model-name", "current-ccl", "--checkpoint-suffix", "17"]
+    )
+    assert numbered.checkpoint_suffix == "17"
+    with pytest.raises(SystemExit):
+        parse_args(
+            ["--model-name", "current-ccl", "--checkpoint-suffix", "invalid"]
+        )
 
 
 def test_choose_indices_is_seeded_sorted_and_unique():
@@ -67,7 +93,7 @@ def test_mlp_probe_contains_nonlinear_hidden_layers():
 
 def test_probe_metrics_handle_theta_as_a_circular_target():
     generator = torch.Generator().manual_seed(9)
-    labels = torch.rand((64, 8), generator=generator) * 2.0 - 1.0
+    labels = torch.rand((64, 9), generator=generator) * 2.0 - 1.0
     encoded, encoded_names = encode_probe_targets(labels, FEATURE_NAMES)
 
     metrics = evaluate_probe(labels, encoded, FEATURE_NAMES, encoded_names)

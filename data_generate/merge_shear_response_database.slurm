@@ -8,18 +8,25 @@
 #SBATCH --mem=15G
 
 set -euo pipefail
+ulimit -c 0
 module load anaconda3
-source ~/.bashrc
+KLNN_CONDA_BASE="$(conda info --base)"
+source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 
-SAMPLE=${SAMPLE:-shear_response_simv2_galaxyaxis_halpha_5k}
-DATASET=${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}
-NBASE=${NBASE:-1000}
+SAMPLE="${SAMPLE:-shear_response_simv2_galaxyaxis_halpha_5k}"
+DATASET="${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}"
+NBASE="${NBASE:-1000}"
 NFOLDERS=100
 NSHARDS=10
 TOTAL=$((5 * NBASE))
+if (( TOTAL % NFOLDERS != 0 )); then
+  echo "5*NBASE must be divisible by ${NFOLDERS}; got ${TOTAL}" >&2
+  exit 2
+fi
 CHUNK=$((TOTAL / NFOLDERS))
 
+cd /jet/home/xwang30/kl-nn/data_generate
 python make_database.py -s="${SAMPLE}" -d="${DATASET}" \
   -N="${NFOLDERS}" -n="${CHUNK}" --nspec=5 \
   --num_shards="${NSHARDS}" --merge

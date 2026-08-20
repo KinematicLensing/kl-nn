@@ -18,8 +18,8 @@ source ~/.bashrc
 conda activate kl-nn
 set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-valid_1m_simv2_galaxyaxis}"
-DATASET_NAME="${DATASET_NAME:-valid_1m_simv2_galaxyaxis}"
+SAMPLE_NAME="${SAMPLE_NAME:-valid_1m_simv2_galaxyaxis_halpha}"
+DATASET_NAME="${DATASET_NAME:-valid_1m_simv2_galaxyaxis_halpha}"
 TOTAL="${TOTAL:-100000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 

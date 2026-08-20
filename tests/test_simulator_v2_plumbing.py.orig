@@ -1,0 +1,149 @@
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import config
+from data_generate.generate_fits_wrapper import SIMULATION_PARAMETERS, build_generate_command
+from data_generate.make_database import extract_fiducial_parameters, merge_shards, normalize_sample_table
+from data_generate import make_shear_response_samples
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _row(sample_id=17):
+    return {
+        "ID": sample_id,
+        "g1": 0.01,
+        "g2": -0.02,
+        "theta_int": 0.3,
+        "sini": 0.7,
+        "v0": 2.0,
+        "vcirc": 250.0,
+        "rscale": 0.8,
+        "hlr": 1.2,
+        "rmag_true": 20.125,
+        "halpha_flux_true": 4.2e-15,
+        "fiber_layout": "galaxy_axis",
+        "observation_model_version": 2,
+    }
+
+
+def test_wrapper_forwards_only_current_simulator_inputs():
+    command = build_generate_command(pd.Series(_row()), part=4, dataset="pilot")
+    assert command[0] == sys.executable
+    for item in ("-n=4", "-d=pilot", "-ID=17", "--rmag-true=20.125", "--halpha-flux-true=4.2e-15"):
+        assert item in command
+    assert SIMULATION_PARAMETERS == tuple(config.TARGET_NAMES[:8])
+    assert not any("version" in item or "fiber-layout" in item or "low_psf" in item for item in command)
+    assert not any("dx_" in item or "dy_" in item for item in command)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rmag_true", np.nan),
+        ("halpha_flux_true", 0.0),
+        ("fiber_layout", "detector_axis"),
+        ("observation_model_version", 99),
+    ],
+)
+def test_wrapper_rejects_noncurrent_rows(field, value):
+    row = _row()
+    row[field] = value
+    with pytest.raises(ValueError):
+        build_generate_command(pd.Series(row), part=1, dataset="bad")
+
+
+def test_database_fiducials_are_exactly_nine_targets_in_current_order():
+    rows = []
+    for fraction in (0.0, 0.5, 1.0):
+        row = _row()
+        row.update(
+            {
+                name: low + fraction * (high - low)
+                for name, (low, high) in config.par_ranges.items()
+            }
+        )
+        rows.append(row)
+    normalized = normalize_sample_table(pd.DataFrame(rows), config.par_ranges)
+    fids = extract_fiducial_parameters(normalized, [2, 0], config.TARGET_NAMES)
+    assert fids.shape == (2, 9)
+    np.testing.assert_allclose(fids[0], np.ones(9), atol=2e-6)
+    np.testing.assert_allclose(fids[1], -np.ones(9), atol=2e-6)
+
+
+def test_merge_refuses_missing_or_existing_outputs_before_writer(tmp_path, monkeypatch):
+    base = tmp_path / "merged"
+    (tmp_path / "merged_shard_0_of_2").mkdir()
+    monkeypatch.setattr(
+        "data_generate.make_database.px.Writer",
+        lambda **kwargs: pytest.fail(f"writer opened: {kwargs}"),
+    )
+    with pytest.raises(FileNotFoundError):
+        merge_shards(str(base), num_shards=2, chunk_size=8)
+    (tmp_path / "merged_shard_1_of_2").mkdir()
+    base.mkdir()
+    with pytest.raises(FileExistsError):
+        merge_shards(str(base), num_shards=2, chunk_size=8)
+
+
+def test_matched_shear_samples_preserve_magnitude_and_halpha(tmp_path, monkeypatch):
+    source = pd.DataFrame([_row(0), {**_row(1), "rmag_true": 22.1, "halpha_flux_true": 7.4e-15}])
+    source_path = tmp_path / "source.csv"
+    output = tmp_path / "response.csv"
+    manifest = tmp_path / "manifest.csv"
+    source.to_csv(source_path, index=False)
+    monkeypatch.setattr(sys, "argv", ["make_shear_response_samples.py", "--input", str(source_path), "--output", str(output), "--manifest", str(manifest), "--nbase", "2"])
+    make_shear_response_samples.main()
+    matched = pd.read_csv(output)
+    index = pd.read_csv(manifest)
+    joined = index.merge(matched, on="ID", validate="one_to_one")
+    for _, group in joined.groupby("base_id"):
+        assert len(group) == 5
+        assert group["rmag_true"].nunique() == 1
+        assert group["halpha_flux_true"].nunique() == 1
+
+
+def test_all_canonical_launchers_are_current_and_syntax_valid():
+    paths = [
+        ROOT / "data_generate" / name
+        for name in (
+            "generate_simulator_v2.slurm",
+            "make_database_simulator_v2.slurm",
+            "merge_database_simulator_v2.slurm",
+            "generate_shear_response.slurm",
+            "make_shear_response_database.slurm",
+            "merge_shear_response_database.slurm",
+        )
+    ] + [
+        ROOT / "arch" / name
+        for name in (
+            "pretrain_ccl.slurm",
+            "train_npe.slurm",
+            "cache_posteriors.slurm",
+            "shear_response_inference.slurm",
+        )
+    ]
+    for path in paths:
+        subprocess.run(["bash", "-n", str(path)], check=True)
+        assert path.read_text()
+    assert "--stage pretrain" in (ROOT / "arch/pretrain_ccl.slurm").read_text()
+    npe = (ROOT / "arch/train_npe.slurm").read_text()
+    assert "bounded-hybrid" in npe
+    assert "--flow-num-layers" in npe
+    assert "--theta-num-layers" in npe
+    assert 'PRETRAIN_FROM="${PRETRAIN_FROM:-best}"' in npe
+    assert '--model-root "${MODEL_ROOT}"' in npe
+    pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
+    assert '--model-root "${MODEL_ROOT}"' in pretrain
+    generate = (ROOT / "data_generate/generate_simulator_v2.slurm").read_text()
+    package = (ROOT / "data_generate/make_database_simulator_v2.slurm").read_text()
+    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"' in generate
+    assert "TASK_COUNT != ARRAY_TASK_COUNT" in generate
+    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"' in package
+    assert "PART_COUNT != ARRAY_TASK_COUNT" in package

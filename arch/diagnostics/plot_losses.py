@@ -35,11 +35,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--train-mode",
-        default="train",
-        help=(
-            "Training mode to use when loading saved config, either train or pretrain"
-        ),
+        "--stage", choices=("pretrain", "npe"), default="npe",
+        help="Configuration stage whose loss history should be plotted.",
     )
     parser.add_argument(
         "--model-name",
@@ -86,13 +83,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _get_saved_config_candidates(configs_root: str, model_name: str) -> tuple[str, ...]:
-    return (
-        join(configs_root, f"cfg_{model_name}.json"),
-        join(configs_root, f"cfg_train_model_{model_name}.json"),
-    )
+    return (join(configs_root, f"cfg_{model_name}.json"),)
 
 
-def load_saved_train_config(configs_root: str, model_name: str, train_mode: str, *, required: bool = True) -> dict | None:
+def load_saved_train_config(configs_root: str, model_name: str, stage: str, *, required: bool = True) -> dict | None:
     cfg_path = next(
         (path for path in _get_saved_config_candidates(configs_root, model_name) if os.path.exists(path)),
         None,
@@ -106,19 +100,20 @@ def load_saved_train_config(configs_root: str, model_name: str, train_mode: str,
     with open(cfg_path, "r", encoding="utf-8") as fobj:
         payload = json.load(fobj)
 
-    train_cfg = payload.get(train_mode)
+    config_key = "pretrain" if stage == "pretrain" else "train"
+    train_cfg = payload.get(config_key)
     if not isinstance(train_cfg, dict):
-        raise ValueError(f"Saved config missing '{train_mode}' dictionary: {cfg_path}")
+        raise ValueError(f"Saved config missing '{config_key}' dictionary: {cfg_path}")
     return train_cfg
 
 
 def resolve_runtime_settings(args: argparse.Namespace) -> tuple[str, str]:
-    train_config = config.train if args.train_mode == "train" else config.pretrain
+    train_config = config.pretrain if args.stage == "pretrain" else config.train
     requested_model_name = args.model_name if args.model_name is not None else train_config["model_name"]
     train_cfg = load_saved_train_config(
         args.configs_root,
         requested_model_name,
-        args.train_mode,
+        args.stage,
         required=args.model_name is not None,
     )
     if train_cfg is not None:
@@ -144,16 +139,22 @@ def load_losses(csv_path: str) -> tuple[np.ndarray, np.ndarray]:
         raise FileNotFoundError(f"Loss CSV not found: {csv_path}")
 
     losses = pd.read_csv(csv_path)
-    if losses.shape[0] != 2:
+    required = {"train", "valid"}
+    missing = required - set(losses.columns)
+    if missing or losses.empty:
         raise ValueError(
-            "Expected exactly 2 rows in losses CSV "
-            f"(train row + valid row), got shape={losses.shape}."
+            "Loss CSV must contain one row per epoch and the columns "
+            f"'train' and 'valid'; missing={sorted(missing)}."
         )
-    if losses.shape[1] < 1:
-        raise ValueError("Loss CSV has no epoch columns.")
-
-    train_losses = losses.iloc[0, :].to_numpy(dtype=np.float64)
-    valid_losses = losses.iloc[1, :].to_numpy(dtype=np.float64)
+    try:
+        numeric = losses.apply(pd.to_numeric, errors="raise")
+    except (TypeError, ValueError) as error:
+        raise ValueError("Loss CSV columns must all be numeric") from error
+    values = numeric.to_numpy(dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Loss CSV must contain only finite values")
+    train_losses = numeric["train"].to_numpy(dtype=np.float64)
+    valid_losses = numeric["valid"].to_numpy(dtype=np.float64)
     return train_losses, valid_losses
 
 

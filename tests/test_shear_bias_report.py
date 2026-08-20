@@ -1,20 +1,14 @@
-from copy import deepcopy
 import importlib.util
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pytest
 
 
-def _load_report():
+def _report():
     path = (
         Path(__file__).resolve().parents[1]
-        / "arch"
-        / "diagnostics"
-        / "shear_bias_report.py"
+        / "arch" / "diagnostics" / "shear_bias_report.py"
     )
     spec = importlib.util.spec_from_file_location("shear_bias_report_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -22,1011 +16,227 @@ def _load_report():
     return module
 
 
-report = _load_report()
+FEATURES = (
+    "g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr",
+    "halpha_flux_true",
+)
 
 
-def _metric_row():
+def _write_part(root, name, value, label="part0of1"):
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    np.save(directory / f"{label}.npy", value)
+
+
+def _cache_arrays(n, draws=4):
+    f = len(FEATURES)
+    samples = np.zeros((n, draws, f), dtype=np.float32)
+    truth = np.zeros((n, f), dtype=np.float32)
+    maps = np.zeros((n, f), dtype=np.float32)
+    summary = np.zeros((n, 3, f), dtype=np.float32)
+    candidate = np.zeros((n, draws), dtype=np.float32)
+    scalar = np.zeros(n, dtype=np.float64)
     return {
-        "estimator": "Mean",
-        "component": "g1",
-        "c": 2.5e-4,
-        "c_se": 3.0e-5,
-        "low_m": -1.7e-2,
-        "low_m_se": 2.0e-3,
-        "cubic_m": 2.6e-2,
-        "cubic_m_se": 3.0e-3,
-        "cubic_q": -7.25,
-        "cubic_q_se": 0.5,
-        "spin2": 4.0e-5,
-        "spin4": 1.2e-4,
-        "sini_cuts": {"0.5": (-1.3e-2, 2.0e-3, 1234)},
-    }
-
-
-def test_metrics_table_scales_additive_and_multiplicative_values_only():
-    row = _metric_row()
-    original = deepcopy(row)
-
-    table = report.metrics_table([row])
-
-    assert "10<sup>4</sup> mean c" in table
-    assert "10<sup>2</sup> low-|g| m" in table
-    assert "10<sup>2</sup> cubic m" in table
-    assert "cubic q (unscaled)" in table
-    assert "10<sup>4</sup> spin-2 amp" in table
-    assert "2.500 ± 0.300" in table
-    assert "-1.700 ± 0.200" in table
-    assert "2.600 ± 0.300" in table
-    assert "-7.250e+00 ± 5.000e-01" in table
-    assert "<td>0.400</td><td>1.200</td>" in table
-    assert row == original
-
-
-def test_cuts_table_scales_slope_and_uncertainty():
-    row = _metric_row()
-    original = deepcopy(row)
-
-    table = report.cuts_table([row])
-
-    assert "10<sup>2</sup> low-|g| m" in table
-    assert "-1.300 ± 0.200" in table
-    assert "1,234" in table
-    assert row == original
-
-
-def test_component_metrics_remain_in_physical_units():
-    truth = np.array([-0.015, -0.005, 0.005, 0.015])
-    estimate = truth + 2.0e-4 + 3.0e-2 * truth
-
-    metrics = report.component_metrics(truth, estimate, low_g=0.02)
-
-    np.testing.assert_allclose(metrics["c"], 2.0e-4, atol=1e-14)
-    np.testing.assert_allclose(metrics["low_c"], 2.0e-4, atol=1e-14)
-    np.testing.assert_allclose(metrics["low_m"], 3.0e-2, atol=1e-14)
-    np.testing.assert_allclose(metrics["cubic_m"], 3.0e-2, atol=1e-12)
-    np.testing.assert_allclose(metrics["cubic_q"], 0.0, atol=1e-10)
-
-
-def _assert_errorbar_in_physical_units(axis, index, x, residual, bins):
-    _, expected_y, expected_error = report.binned(x, residual, bins)
-    np.testing.assert_allclose(axis.lines[index].get_ydata(), expected_y)
-    segments = axis.collections[index].get_segments()
-    bounds = np.asarray([[segment[0, 1], segment[1, 1]] for segment in segments])
-    np.testing.assert_allclose(
-        bounds,
-        np.column_stack([expected_y - expected_error, expected_y + expected_error]),
-    )
-
-
-def test_bias_figure_uses_physical_residuals_and_errors(monkeypatch):
-    truth = np.zeros((8, 4), dtype=float)
-    truth[:, 0] = np.linspace(-0.02, 0.02, len(truth))
-    truth[:, 1] = np.linspace(0.02, -0.02, len(truth))
-    truth[:, 2] = np.linspace(-np.pi, np.pi, len(truth))
-    map_residual = np.linspace(1.0e-4, 4.0e-4, len(truth))
-    mean_residual = -np.linspace(2.0e-4, 5.0e-4, len(truth))
-    map_estimate = truth.copy()
-    mean_estimate = truth.copy()
-    map_estimate[:, :2] += map_residual[:, None]
-    mean_estimate[:, :2] += mean_residual[:, None]
-    case = {
-        "case": "model:dataset",
+        "sample": samples,
+        "base_log_prob": candidate,
+        "posterior_tf_log_ratio": candidate,
+        "posterior_tf_log_weight": np.full((n, draws), -np.log(draws)),
+        "posterior_tf_weight": np.full((n, draws), 1.0 / draws),
+        "posterior_tf_ess": np.full(n, draws, dtype=np.float64),
+        "posterior_tf_ess_fraction": np.ones(n, dtype=np.float64),
+        "posterior_tf_max_weight": np.full(n, 1.0 / draws),
+        "posterior_tf_log_mean_ratio": scalar,
+        "population_tf_log_ratio": scalar,
         "truth": truth,
-        "estimates": {"MAP": map_estimate, "Mean": mean_estimate},
+        "rmag_true": np.full(n, 20.0),
+        "spectral_reference_quality": np.full(n, 10.0),
+        "proposal_map_estimates": maps,
+        "proposal_mean_estimates": summary,
+        "tf_target_map_estimates": maps,
+        "tf_target_mean_estimates": summary,
     }
-    figures = []
-
-    def capture_figure(fig):
-        figures.append(fig)
-        return "data:image/png;base64,test"
-
-    monkeypatch.setattr(report, "fig_data_uri", capture_figure)
-
-    try:
-        assert report.bias_figure(case, bins=2) == "data:image/png;base64,test"
-        truth_axis = figures[0].axes[0]
-        theta_axis = figures[0].axes[2]
-        _assert_errorbar_in_physical_units(
-            truth_axis, 0, truth[:, 0], map_residual, bins=2
-        )
-        _assert_errorbar_in_physical_units(
-            truth_axis, 1, truth[:, 0], mean_residual, bins=2
-        )
-        _assert_errorbar_in_physical_units(
-            theta_axis, 0, truth[:, 2], map_residual, bins=2
-        )
-        _assert_errorbar_in_physical_units(
-            theta_axis, 1, truth[:, 2], mean_residual, bins=2
-        )
-        assert truth_axis.get_ylabel() == "estimate - truth"
-        assert theta_axis.get_ylabel() == "estimate - truth"
-    finally:
-        for fig in figures:
-            plt.close(fig)
 
 
-def test_significant_circular_modes_distinguishes_one_two_and_three_modes():
-    bins = report.THETA_HISTOGRAM_BINS
-    index = np.arange(bins)
-
-    def peak(center, width=1.5):
-        distance = np.minimum((index - center) % bins, (center - index) % bins)
-        return np.exp(-0.5 * (distance / width) ** 2)
-
-    assert len(report.significant_circular_modes(peak(8))) == 1
-    assert len(report.significant_circular_modes(peak(8) + peak(44))) == 2
-    assert len(
-        report.significant_circular_modes(peak(8) + peak(32) + peak(56))
-    ) == 3
-    assert len(report.significant_circular_modes(np.ones(bins))) == 0
-
-
-def test_theta_diagnostic_streams_directed_branches_and_selected_mode(tmp_path):
-    root = tmp_path / "model" / "dataset"
-    (root / "sample").mkdir(parents=True)
-    (root / "truth").mkdir()
-    truth = np.zeros((3, 8), dtype=np.float32)
-    truth[:, 2] = np.array([0.0, 0.4, -0.7])
-    samples = np.zeros((2, 3, 120, 8), dtype=np.float32)
-    # Mode zero is a sentinel; the requested mode has one, two antipodal, and
-    # three well-separated directed theta modes respectively.
-    samples[0, :, :, 2] = 1.2
-    samples[1, 0, :, 2] = truth[0, 2] + np.linspace(-0.03, 0.03, 120)
-    samples[1, 1, :60, 2] = truth[1, 2] + np.linspace(-0.03, 0.03, 60)
-    samples[1, 1, 60:, 2] = truth[1, 2] + np.pi + np.linspace(-0.03, 0.03, 60)
-    for start, shift in zip((0, 40, 80), (0.0, 2.0, -2.0)):
-        samples[1, 2, start : start + 40, 2] = (
-            truth[2, 2] + shift + np.linspace(-0.03, 0.03, 40)
-        )
-    np.save(root / "sample" / "part0of1.npy", samples)
-    np.save(root / "truth" / "part0of1.npy", truth)
-
-    diagnostic = report.load_theta_posterior_diagnostics(
-        {"root": root, "truth": truth}, mode=1, block_size=2
-    )
-
-    np.testing.assert_allclose(diagnostic["true_branch_mass"][:2], [1.0, 0.5])
-    np.testing.assert_allclose(diagnostic["opposite_branch_mass"][:2], [0.0, 0.5])
-    assert diagnostic["mode_count"].tolist() == [1, 2, 3]
-    assert len(diagnostic["aggregate_mode_indices"]) >= 2
-    assert diagnostic["truth_residual_density"].shape == (
-        report.THETA_HISTOGRAM_BINS,
-        report.THETA_HISTOGRAM_BINS,
-    )
-
-
-def test_theta_figure_uses_directed_two_pi_residuals(monkeypatch):
-    truth = np.zeros((4, 8), dtype=float)
-    truth[:, 2] = np.array([-2.5, -0.5, 0.5, 2.5])
-    map_estimate = truth.copy()
-    mean_estimate = truth.copy()
-    map_estimate[:, 2] += np.pi
-    mean_estimate[:, 2] += 0.1
-    edges = np.linspace(-np.pi, np.pi, report.THETA_HISTOGRAM_BINS + 1)
-    diagnostic = {
-        "angle_edges": edges,
-        "truth_residual_density": np.ones(
-            (report.THETA_HISTOGRAM_BINS, report.THETA_HISTOGRAM_BINS)
-        ),
-        "aggregate_histogram": np.ones(report.THETA_HISTOGRAM_BINS),
-        "aggregate_mode_indices": np.array([], dtype=int),
+def _write_complete_cache(root, *, n, draws=4, overrides=None):
+    arrays = _cache_arrays(n, draws)
+    arrays.update(overrides or {})
+    for name, value in arrays.items():
+        _write_part(root, name, value)
+    meta = root / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    label = "part0of1"
+    manifest = {
+        "schema": "klnn-posterior-cache-v1",
+        "model_name": "model",
+        "checkpoint": "/models/model/modelbest",
+        "dataset": "/datasets/dataset",
+        "dataset_size": n,
+        "partition": {
+            "index": 0,
+            "total": 1,
+            "label": label,
+            "galaxy_start": 0,
+            "galaxy_end": n,
+        },
+        "feature_names": list(FEATURES),
+        "sample_shape": [n, draws, len(FEATURES)],
+        "symmetry": {
+            "policy": "original_plus_r90_equal_mixture",
+            "rotated_joint_rows_inverse_aligned": True,
+        },
+        "tf": {
+            "slope": -7.22,
+            "intercept": 36.0,
+            "scatter_dex": 0.1,
+            "vcirc_min": 60.0,
+            "vcirc_max": 540.0,
+            "magnitude": "rmag_true",
+            "magnitude_measurement_error": 0.0,
+            "posterior_log_ratio": "raw ratio",
+            "posterior_log_weight": "within-galaxy log-softmax",
+            "posterior_weight_normalization": "within_galaxy",
+            "population_log_ratio_normalization": "global_after_partition_concat",
+            "resampling": False,
+        },
+        "posterior_populations": {
+            "proposal": "base posterior",
+            "tf_target": "TF-weighted posterior",
+        },
+        "observation_provenance": {
+            "image_noise_sigma": 1.0,
+            "spectral_reference_line_norm": 2.0,
+            "matched_group_size": 1,
+            "posterior_sample_seed": 42,
+            "image_noise_seed": 42,
+            "spectral_noise_seed": 143,
+            "spectral_quality_seed": 349,
+        },
+        "files": {name: f"{name}/{label}.npy" for name in arrays},
     }
-    figures = []
-    monkeypatch.setattr(
-        report,
-        "fig_data_uri",
-        lambda figure: figures.append(figure) or "data:image/png;base64,theta",
-    )
-
-    try:
-        uri = report.theta_diagnostic_figure(
-            {
-                "case": "model:dataset",
-                "truth": truth,
-                "estimates": {"MAP": map_estimate, "Mean": mean_estimate},
-            },
-            diagnostic,
-        )
-        assert uri.endswith("theta")
-        assert len(figures[0].axes) == 4
-        assert "directed residual" in figures[0].axes[0].get_title().lower()
-        assert "2\\pi" in figures[0].axes[0].get_ylabel()
-        assert figures[0].axes[0].get_ylim() == pytest.approx((-np.pi, np.pi))
-    finally:
-        for figure in figures:
-            plt.close(figure)
+    (meta / f"{label}.json").write_text(json.dumps(manifest))
+    return arrays
 
 
-
-def _galaxy_to_image_original_clockwise(g_plus, g_cross, theta):
-    """Invert the project's original clockwise ``theta_int`` convention."""
-    cos2 = np.cos(2.0 * theta)
-    sin2 = np.sin(2.0 * theta)
-    return (
-        g_plus * cos2 + g_cross * sin2,
-        -g_plus * sin2 + g_cross * cos2,
-    )
-
-
-def test_original_clockwise_galaxy_transform_known_quarter_turn():
-    # Positive image-frame g2 points toward theta_int=+pi/4, while theta_int's
-    # clockwise-positive convention gives the original transform its minus sign.
-    g_plus, g_cross = report.img_to_galaxy_clockwise(
-        np.array([0.0, 1.0]),
-        np.array([1.0, 0.0]),
-        np.array([np.pi / 4.0, 0.0]),
-    )
-
-    np.testing.assert_allclose(g_plus, [-1.0, 1.0], atol=1e-15)
-    np.testing.assert_allclose(g_cross, [0.0, 0.0], atol=1e-15)
-
-
-def test_galaxy_frame_metrics_recover_physical_additive_and_response():
-    n = 80
-    theta = np.linspace(-np.pi, np.pi, n, endpoint=False)
-    true_plus = np.linspace(-0.018, 0.018, n)
-    true_cross = 0.017 * np.sin(np.linspace(0.0, 4.0 * np.pi, n))
-    true_g1, true_g2 = _galaxy_to_image_original_clockwise(
-        true_plus, true_cross, theta
-    )
-    truth = np.zeros((n, 8), dtype=float)
-    truth[:, 0] = true_g1
-    truth[:, 1] = true_g2
-    truth[:, 2] = theta
-    truth[:, 3] = np.linspace(0.05, 0.95, n)
-    truth[:, 5] = np.linspace(100.0, 300.0, n)
-    truth[:, 7] = np.linspace(0.2, 2.0, n)
-
-    estimated_plus = true_plus + 2.5e-4 + 0.03 * true_plus
-    estimated_cross = true_cross - 1.5e-4 - 0.02 * true_cross
-    estimated_g1, estimated_g2 = _galaxy_to_image_original_clockwise(
-        estimated_plus, estimated_cross, theta
-    )
-    estimate = truth.copy()
-    estimate[:, 0] = estimated_g1
-    estimate[:, 1] = estimated_g2
-    # Make the sini error exactly track the E residual to test the correlation.
-    estimate[:, 3] += estimated_plus - true_plus
-
-    rows, correlations = report.galaxy_frame_diagnostics(
-        {"truth": truth, "estimates": {"Mean": estimate}}, low_g=0.02
-    )
-    plus = next(row for row in rows if row["component"] == "g+ (E)")
-    cross = next(row for row in rows if row["component"] == "gx (B)")
-    np.testing.assert_allclose(plus["low_c"], 2.5e-4, atol=1e-14)
-    np.testing.assert_allclose(plus["low_m"], 0.03, atol=1e-12)
-    np.testing.assert_allclose(cross["low_c"], -1.5e-4, atol=1e-14)
-    np.testing.assert_allclose(cross["low_m"], -0.02, atol=1e-12)
-    sini_plus = next(
-        row
-        for row in correlations
-        if row["component"] == "g+ (E)" and row["nuisance"] == "sini"
-    )
-    np.testing.assert_allclose(sini_plus["correlation"], 1.0, atol=1e-14)
-    assert sini_plus["n"] == n
-
-
-def test_galaxy_frame_figure_uses_physical_residuals_and_errors(monkeypatch):
-    n = 8
-    theta = np.linspace(-np.pi, np.pi, n, endpoint=False)
-    sini = np.linspace(0.1, 0.9, n)
-    plus_residual = np.linspace(1.0e-4, 4.0e-4, n)
-    cross_residual = -np.linspace(2.0e-4, 5.0e-4, n)
-    truth = np.zeros((n, 8), dtype=float)
-    truth[:, 2] = theta
-    truth[:, 3] = sini
-    estimate = truth.copy()
-    estimate[:, 0], estimate[:, 1] = _galaxy_to_image_original_clockwise(
-        plus_residual, cross_residual, theta
-    )
-    figures = []
-
-    def capture_figure(fig):
-        figures.append(fig)
-        return "data:image/png;base64,test"
-
-    monkeypatch.setattr(report, "fig_data_uri", capture_figure)
-    try:
-        uri = report.galaxy_frame_figure(
-            {
-                "case": "model:dataset",
-                "truth": truth,
-                "estimates": {"Mean": estimate},
-            },
-            bins=2,
-        )
-        assert uri == "data:image/png;base64,test"
-        _assert_errorbar_in_physical_units(
-            figures[0].axes[0], 0, sini, plus_residual, bins=2
-        )
-        _assert_errorbar_in_physical_units(
-            figures[0].axes[1], 0, sini, cross_residual, bins=2
-        )
-        assert figures[0].axes[0].get_ylabel() == "estimate - truth"
-        assert figures[0].axes[1].get_ylabel() == "estimate - truth"
-    finally:
-        for fig in figures:
-            plt.close(fig)
-
-
-
-def test_coverage_metrics_handles_theta_interval_across_wrap_seam():
-    truth = np.array([[-3.10], [0.0], [0.10]])
-    summary = np.array(
-        [
-            [[2.90], [3.10], [-3.00]],
-            [[2.90], [3.10], [-3.00]],
-            [[-0.20], [0.00], [0.20]],
-        ]
-    )
-
-    row = report.coverage_metrics(
-        truth, summary, feature_names=("theta_int",)
-    )[0]
-
-    assert row["n"] == 3
-    np.testing.assert_allclose(row["coverage"], 2.0 / 3.0)
-    np.testing.assert_allclose(
-        row["coverage_se"], np.sqrt((2.0 / 3.0) * (1.0 / 3.0) / 3.0)
-    )
-
-
-def test_load_case_max_galaxies_uses_identical_combined_prefix(monkeypatch, tmp_path):
-    n = 5
-    truth = np.arange(n * 8, dtype=float).reshape(n, 8)
-    snr = np.arange(n, dtype=float)
-    map_all = np.arange(2 * n * 8, dtype=float).reshape(2, n, 8)
-    mean_all = np.arange(2 * n * 3 * 8, dtype=float).reshape(2, n, 3, 8)
-
-    def fake_load_concat(directory, axis):
-        return {
+def _manual_case(
+    report, root, truth, samples, log_weight,
+    proposal_weight=None, target_weight=None,
+):
+    n = len(truth)
+    _write_complete_cache(
+        root,
+        n=n,
+        draws=samples.shape[1],
+        overrides={
             "truth": truth,
-            "snr": snr,
-            "map_estimates": map_all,
-            "mean_estimates": mean_all,
-        }[directory.name]
-
-    monkeypatch.setattr(report, "load_concat", fake_load_concat)
-    case = report.load_case(
-        tmp_path, "model:dataset", mode=1, max_galaxies=3
-    )
-
-    np.testing.assert_array_equal(case["truth"], truth[:3])
-    np.testing.assert_array_equal(case["snr"], snr[:3])
-    np.testing.assert_array_equal(case["estimates"]["MAP"], map_all[1, :3])
-    np.testing.assert_array_equal(
-        case["mean_summary"], mean_all[1, :3]
-    )
-    with pytest.raises(ValueError, match="must be positive"):
-        report.load_case(tmp_path, "model:dataset", mode=0, max_galaxies=0)
-
-
-def test_load_case_detects_in_support_summary_and_retention(monkeypatch, tmp_path):
-    n = 5
-    root = tmp_path / "model" / "dataset"
-    (root / "in_support_mean_estimates").mkdir(parents=True)
-    (root / "in_support_retention").mkdir()
-    truth = np.arange(n * 8, dtype=float).reshape(n, 8)
-    snr = np.arange(n, dtype=float)
-    map_all = np.zeros((1, n, 8))
-    mean_all = np.zeros((1, n, 3, 8))
-    support_all = np.full((1, n, 3, 8), 7.0)
-    retention_all = np.linspace(0.5, 0.9, n)[None]
-
-    def fake_load_concat(directory, axis):
-        return {
-            "truth": truth,
-            "snr": snr,
-            "map_estimates": map_all,
-            "mean_estimates": mean_all,
-            "in_support_mean_estimates": support_all,
-            "in_support_retention": retention_all,
-        }[directory.name]
-
-    monkeypatch.setattr(report, "load_concat", fake_load_concat)
-    case = report.load_case(tmp_path, "model:dataset", mode=0, max_galaxies=3)
-
-    np.testing.assert_array_equal(
-        case["estimates"]["In-support Mean"], support_all[0, :3, 1]
-    )
-    np.testing.assert_array_equal(
-        case["summaries"]["In-support Mean"], support_all[0, :3]
-    )
-    np.testing.assert_array_equal(case["support_retention"], retention_all[0, :3])
-    assert case["support_manifest"] == root / "in_support_meta" / "manifest.json"
-
-
-def test_retention_and_coverage_tables_label_truncated_estimator():
-    retention = report.retention_table(np.array([0.0, 0.5, 0.75, 1.0]))
-    assert "In-support Mean" in retention
-    assert "56.25%" in retention
-    assert "Galaxies with zero draws" in retention
-
-    row = report.coverage_metrics(
-        np.array([[0.0], [0.0]]),
-        np.array([[[-1.0], [0.0], [1.0]], [[-1.0], [0.0], [1.0]]]),
-        feature_names=("g1",),
-    )[0]
-    row["estimator"] = "In-support Mean"
-    table = report.coverage_table([row])
-    assert "<th>Estimator</th>" in table
-    assert "In-support Mean" in table
-
-
-def test_bias_figure_styles_in_support_estimator_without_key_error(monkeypatch):
-    n = 8
-    truth = np.zeros((n, 8))
-    truth[:, 0] = np.linspace(-0.02, 0.02, n)
-    truth[:, 1] = np.linspace(0.02, -0.02, n)
-    truth[:, 2] = np.linspace(-np.pi, np.pi, n)
-    estimate = truth.copy()
-    figures = []
-    monkeypatch.setattr(
-        report,
-        "fig_data_uri",
-        lambda fig: figures.append(fig) or "data:image/png;base64,test",
-    )
-    try:
-        report.bias_figure(
-            {
-                "case": "model:dataset",
-                "truth": truth,
-                "estimates": {"In-support Mean": estimate},
-            },
-            bins=2,
-        )
-        assert figures[0].axes[0].lines[0].get_color() == "tab:green"
-    finally:
-        for figure in figures:
-            plt.close(figure)
-
-
-def _write_posterior_part(
-    root,
-    index,
-    total,
-    samples,
-    *,
-    truth=None,
-    cancel_add_noise=False,
-):
-    sample_dir = root / "sample"
-    truth_dir = root / "truth"
-    meta_dir = root / "meta"
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    truth_dir.mkdir(parents=True, exist_ok=True)
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    label = f"part{index}of{total}"
-    np.save(sample_dir / f"{label}.npy", samples)
-    if truth is None:
-        truth = np.zeros(
-            (samples.shape[1], samples.shape[-1]), dtype=np.float32
-        )
-    np.save(truth_dir / f"{label}.npy", truth)
-    (meta_dir / f"{label}.json").write_text(
-        '{"args": {"cancel_add_noise": '
-        + ("true" if cancel_add_noise else "false")
-        + "}}"
-    )
-
-
-def test_load_shear_pit_values_streams_parts_selects_mode_and_prefix(
-    monkeypatch, tmp_path
-):
-    """Prior-matched ranks stream the selected mode and common case prefix."""
-    root = tmp_path / "model" / "dataset"
-    draws = 5
-    features = 8
-    edges = report.SHEAR_PP_BIN_EDGES
-    truth = np.zeros((6, features), dtype=np.float64)
-    truth[:, :2] = [
-        [-0.1, 0.0],
-        [edges[1], -0.05],
-        [0.0, 0.05],
-        [edges[2], np.nan],
-        [0.1, -0.1],
-        [0.0, 0.0],  # Deliberately beyond the loaded five-galaxy prefix.
-    ]
-    parts = []
-    for _ in range(2):
-        # Mode 0 is an out-of-support sentinel. Selecting it accidentally would
-        # give zero retained draws for every component.
-        values = np.full((2, 3, draws, features), 99.0, dtype=np.float64)
-        parts.append(values)
-
-    # Component-wise filtering is intentional: g1 and g2 use the bin selected
-    # by their own truths and do not require the other component to be in-bin.
-    parts[0][1, 0, :, 0] = [-0.1, -0.09, -0.04, edges[1], np.nan]
-    parts[0][1, 1, :, 0] = [edges[1], -0.02, 0.0, edges[2], np.nan]
-    parts[0][1, 2, :, 0] = [edges[1], -0.01, 0.0, 0.01, edges[2]]
-    parts[1][1, 0, :, 0] = [edges[2], 0.05, 0.1, edges[2] - 1e-6, 0.11]
-    parts[1][1, 1, :, 0] = [edges[2], 0.05, 0.1, np.nan, 0.11]
-
-    # The first galaxy has no middle-bin g2 draws. The fourth has a nonfinite
-    # truth. Both must produce NaN ranks and retained count zero.
-    parts[0][1, 0, :, 1] = [-0.09, -0.05, 0.05, 0.09, np.nan]
-    parts[0][1, 1, :, 1] = [-0.09, -0.05, -0.04, 0.0, np.nan]
-    parts[0][1, 2, :, 1] = [0.04, 0.05, 0.08, 0.0, np.nan]
-    parts[1][1, 0, :, 1] = [0.0, 0.0, 0.0, 0.0, 0.0]
-    parts[1][1, 1, :, 1] = [-0.1, -0.05, -0.04, edges[1], np.nan]
-
-    for index, values in enumerate(parts):
-        start = 3 * index
-        _write_posterior_part(
-            root,
-            index,
-            2,
-            values,
-            truth=truth[start : start + 3],
-        )
-
-    # Five truths deliberately stop in the middle of the second sample part.
-    case = {"root": root, "truth": truth[:5], "case": "model:dataset"}
-    original_load = report.np.load
-    posterior_loads = []
-
-    def audited_load(path, *args, **kwargs):
-        if Path(path).parent.name in {"sample", "truth"}:
-            posterior_loads.append(
-                (Path(path).parent.name, Path(path).name, kwargs.get("mmap_mode"))
-            )
-        return original_load(path, *args, **kwargs)
-
-    monkeypatch.setattr(report.np, "load", audited_load)
-    pits = report.load_shear_pit_values(case, mode=1, block_size=2)
-
-    # Finite-sample midpoint rank after same-bin filtering:
-    # (n_less + 0.5*n_equal + 0.5) / (n_retained + 1).
-    np.testing.assert_allclose(pits["g1"], [0.25, 0.25, 0.6, 0.25, 0.75])
-    np.testing.assert_array_equal(pits["g1_retained"], [3, 3, 4, 3, 3])
-    assert np.isnan(pits["g2"][[0, 3]]).all()
-    np.testing.assert_allclose(pits["g2"][[1, 2, 4]], [0.5, 0.5, 0.25])
-    np.testing.assert_array_equal(pits["g2_retained"], [0, 3, 3, 0, 3])
-    assert posterior_loads == [
-        ("sample", "part0of2.npy", "r"),
-        ("truth", "part0of2.npy", "r"),
-        ("sample", "part1of2.npy", "r"),
-        ("truth", "part1of2.npy", "r"),
-    ]
-
-
-@pytest.mark.parametrize("metadata", ["missing", "cancelled"])
-def test_load_shear_pit_values_rejects_unverifiable_or_cancelled_samples(
-    metadata, tmp_path
-):
-    root = tmp_path / "model" / "dataset"
-    samples = np.zeros((1, 2, 3, 8), dtype=np.float32)
-    _write_posterior_part(
-        root, 0, 1, samples, cancel_add_noise=(metadata == "cancelled")
-    )
-    if metadata == "missing":
-        (root / "meta" / "part0of1.json").unlink()
-    case = {"root": root, "truth": np.zeros((2, 8)), "case": "model:dataset"}
-
-    with pytest.raises(report.PosteriorPPUnavailable):
-        report.load_shear_pit_values(case, mode=0)
-
-
-def test_quantile_binned_filters_nonfinite_pairs_and_returns_physical_errors():
-    x = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, np.nan])
-    y = 1.0e-4 + 2.0e-5 * x
-    y[-1] = 9.0
-
-    center, mean, error = report.quantile_binned(x, y, bins=2)
-
-    np.testing.assert_allclose(center, [1.5, 5.5])
-    np.testing.assert_allclose(mean, [1.3e-4, 2.1e-4])
-    expected_se = np.std([1.0e-4, 1.2e-4, 1.4e-4, 1.6e-4], ddof=1) / 2.0
-    np.testing.assert_allclose(error, [expected_se, expected_se])
-
-
-def test_conditional_axes_load_true_magnitude_from_aligned_archived_rows(tmp_path):
-    root = tmp_path / "model" / "dataset"
-    sample_root = tmp_path / "samples"
-    for directory in (root / "truth", root / "meta", root / "spectral_quality"):
-        directory.mkdir(parents=True, exist_ok=True)
-    sample_root.mkdir()
-    rows = []
-    for index in range(6):
-        values = [
-            0.01 * index,
-            -0.01 * index,
-            0.1 * index,
-            0.1 + 0.01 * index,
-            float(index),
-            100.0 + index,
-            0.2 + 0.01 * index,
-            0.5 + 0.02 * index,
-        ]
-        rows.append(values)
-    sample_path = sample_root / "sample.csv"
-    sample_path.write_text(
-        ",".join((*report.FEATURE_NAMES, "rmag_true"))
-        + "\n"
-        + "\n".join(
-            ",".join(str(value) for value in (*row, 18.0 + index))
-            for index, row in enumerate(rows)
-        )
-        + "\n"
-    )
-    selected = ((1, 3), (4, 6))
-    truth_parts = []
-    for part, (start, end) in enumerate(selected):
-        truth = np.asarray(rows[start:end], dtype=np.float32)
-        truth_parts.append(truth)
-        name = f"part{part}of2"
-        np.save(root / "truth" / f"{name}.npy", truth)
-        np.save(
-            root / "spectral_quality" / f"{name}.npy",
-            np.asarray([5.0 + start, 5.0 + start + 1], dtype=np.float32),
-        )
-        (root / "meta" / f"{name}.json").write_text(
-            json.dumps(
-                {
-                    "args": {"sample_set": "sample.csv"},
-                    "galaxy_range": {"start": start, "end": end},
-                }
-            )
-        )
-    case = {
-        "root": root,
-        "truth": np.concatenate(truth_parts),
-    }
-
-    axes = report.load_conditional_diagnostic_axes(case, sample_root)
-
-    np.testing.assert_allclose(axes["rmag_true"], [19.0, 20.0, 22.0, 23.0])
-    np.testing.assert_allclose(axes["spectral_snr"], [6.0, 7.0, 9.0, 10.0])
-    np.testing.assert_allclose(axes["hlr_true"], case["truth"][:, 7])
-
-
-def test_conditional_calibration_recovers_full_range_mean_m_and_c(monkeypatch):
-    shear = np.tile(np.linspace(-0.1, 0.1, 30), 3)
-    condition = np.repeat([1.0, 2.0, 3.0], 30)
-    truth = np.zeros((len(shear), 8), dtype=float)
-    truth[:, 0] = shear
-    truth[:, 1] = shear[::-1]
-    truth[:, 7] = condition
-    estimate = truth.copy()
-    for index in (0, 1):
-        estimate[:, index] += 1.0e-4 * condition + 0.01 * condition * truth[:, index]
-    case = {
-        "case": "model:dataset",
-        "truth": truth,
-        "estimates": {"Mean": estimate},
-    }
-    conditioning = {
-        "rmag_true": condition,
-        "spectral_snr": 10.0**condition,
-        "hlr_true": condition,
-    }
-
-    curves = report.conditional_shear_calibration(case, conditioning, bins=3)
-
-    for variable in conditioning:
-        for component in ("g1", "g2"):
-            curve = curves[variable][component]
-            np.testing.assert_allclose(curve["m"], [0.01, 0.02, 0.03], atol=1e-14)
-            np.testing.assert_allclose(curve["c"], [1e-4, 2e-4, 3e-4], atol=1e-14)
-            assert curve["n"].tolist() == [30, 30, 30]
-
-    figures = []
-    monkeypatch.setattr(
-        report,
-        "fig_data_uri",
-        lambda figure: figures.append(figure) or "data:image/png;base64,conditional",
-    )
-    try:
-        assert report.conditional_shear_calibration_figure(case, curves).endswith(
-            "conditional"
-        )
-        assert len(figures[0].axes) == 6
-        assert figures[0].axes[1].get_xscale() == "log"
-        np.testing.assert_allclose(figures[0].axes[0].lines[0].get_ydata(), [1, 2, 3])
-        np.testing.assert_allclose(figures[0].axes[3].lines[0].get_ydata(), [1, 2, 3])
-    finally:
-        for figure in figures:
-            plt.close(figure)
-
-
-def test_nuisance_correlation_figure_is_mean_only_and_uses_physical_residuals(
-    monkeypatch,
-):
-    n = 24
-    truth = np.zeros((n, 8), dtype=float)
-    truth[:, 2] = 0.0  # Image and galaxy-frame components coincide.
-    mean_estimate = truth.copy()
-    map_estimate = truth.copy()
-    nuisance_errors = {
-        "sini": np.linspace(-0.2, 0.2, n),
-        "vcirc": np.linspace(-30.0, 30.0, n),
-        "hlr": np.linspace(0.3, -0.3, n),
-    }
-    for name, values in nuisance_errors.items():
-        mean_estimate[:, report.NUISANCE_INDICES[name]] += values
-        map_estimate[:, report.NUISANCE_INDICES[name]] += 10.0 * values
-    plus_residual = np.linspace(-4.0e-4, 4.0e-4, n)
-    cross_residual = 2.0e-4 * np.cos(np.linspace(0.0, 2.0 * np.pi, n))
-    mean_estimate[:, 0] = plus_residual
-    mean_estimate[:, 1] = cross_residual
-    # A visibly different MAP must not add curves to this Mean-only diagnostic.
-    map_estimate[:, 0] = 0.1
-    map_estimate[:, 1] = -0.1
-    case = {
-        "case": "model:dataset",
-        "truth": truth,
-        "estimates": {"MAP": map_estimate, "Mean": mean_estimate},
-    }
-    figures = []
-    monkeypatch.setattr(
-        report,
-        "fig_data_uri",
-        lambda fig: figures.append(fig) or "data:image/png;base64,test",
-    )
-
-    try:
-        assert (
-            report.nuisance_correlation_figure(case, bins=4)
-            == "data:image/png;base64,test"
-        )
-        assert len(figures[0].axes) == 3
-        for axis, (name, nuisance_error) in zip(
-            figures[0].axes, nuisance_errors.items()
-        ):
-            # ``errorbar`` places its public label on the container rather than
-            # the central Line2D; the first two lines are the g+ and gx curves,
-            # followed by the horizontal and vertical zero references.
-            plotted = axis.lines[:2]
-            assert len(axis.containers) == 2
-            expected_x, expected_plus, expected_plus_se = report.quantile_binned(
-                nuisance_error, plus_residual, bins=4
-            )
-            _, expected_cross, expected_cross_se = report.quantile_binned(
-                nuisance_error, cross_residual, bins=4
-            )
-            np.testing.assert_allclose(plotted[0].get_xdata(), expected_x)
-            np.testing.assert_allclose(plotted[0].get_ydata(), expected_plus)
-            np.testing.assert_allclose(plotted[1].get_xdata(), expected_x)
-            np.testing.assert_allclose(plotted[1].get_ydata(), expected_cross)
-            segments = axis.collections
-            assert len(segments) == 2
-            plus_bounds = np.asarray(
-                [[segment[0, 1], segment[1, 1]] for segment in segments[0].get_segments()]
-            )
-            cross_bounds = np.asarray(
-                [[segment[0, 1], segment[1, 1]] for segment in segments[1].get_segments()]
-            )
-            np.testing.assert_allclose(
-                plus_bounds,
-                np.column_stack(
-                    [expected_plus - expected_plus_se, expected_plus + expected_plus_se]
-                ),
-            )
-            np.testing.assert_allclose(
-                cross_bounds,
-                np.column_stack(
-                    [expected_cross - expected_cross_se, expected_cross + expected_cross_se]
-                ),
-            )
-            assert "estimate - truth" in axis.get_xlabel()
-            assert axis.get_ylabel() == "shear estimate - truth"
-            assert name in axis.get_xlabel()
-    finally:
-        for figure in figures:
-            plt.close(figure)
-
-
-def test_posterior_pp_figure_shows_prior_matched_bins_and_retention(monkeypatch):
-    edges = np.linspace(-0.1, 0.1, 4)
-    # Include every bin edge exactly, values immediately below the interior
-    # edges, and values outside the plotted shear range. This makes the
-    # half-open/closed boundary convention observable in the plotted curves.
-    g1_truth = np.array(
-        [
-            edges[0],
-            edges[1] - 1.0e-6,
-            edges[1],
-            0.0,
-            edges[2] - 1.0e-6,
-            edges[2],
-            edges[3],
-            edges[0] - 1.0e-3,
-            edges[3] + 1.0e-3,
-        ]
-    )
-    truth = np.zeros((len(g1_truth), 8), dtype=float)
-    truth[:, 0] = g1_truth
-    truth[:, 1] = g1_truth[::-1]
-    pits = {
-        "g1": np.array(
-            [0.12, 0.21, np.nan, 0.44, 0.52, 0.63, 0.78, np.nan, np.nan]
-        ),
-        "g2": np.array(
-            [np.nan, np.nan, 0.73, 0.64, 0.55, 0.46, 0.37, 0.28, np.nan]
-        ),
-        "g1_retained": np.array([5, 7, 0, 9, 11, 13, 15, 0, 0]),
-        "g2_retained": np.array([0, 0, 21, 23, 25, 27, 29, 31, 0]),
-    }
-    figures = []
-    monkeypatch.setattr(
-        report,
-        "fig_data_uri",
-        lambda fig: figures.append(fig) or "data:image/png;base64,test",
-    )
-
-    try:
-        assert (
-            report.posterior_pp_figure(pits, truth)
-            == "data:image/png;base64,test"
-        )
-        axes = figures[0].axes
-        assert len(axes) == 2
-        assert "Prior-matched conditional" in figures[0]._suptitle.get_text()
-        for component_index, (axis, component) in enumerate(
-            zip(axes, ("g1", "g2"))
-        ):
-            component_truth = truth[:, component_index]
-            retained = pits[f"{component}_retained"]
-            masks = [
-                (component_truth >= edges[0]) & (component_truth < edges[1]),
-                (component_truth >= edges[1]) & (component_truth < edges[2]),
-                (component_truth >= edges[2]) & (component_truth <= edges[3]),
-            ]
-            empirical_lines = [
-                line for line in axis.lines if line.get_label() != "Uniform"
-            ]
-            assert len(empirical_lines) == 3
-            assert len(axis.collections) == 3  # one DKW band per shear bin
-            for bin_index, (line, mask) in enumerate(zip(empirical_lines, masks)):
-                finite_rank = mask & np.isfinite(pits[component])
-                expected_x, expected_y, expected_distance = (
-                    report.posterior_pp_curve(pits[component][mask])
-                )
-                np.testing.assert_allclose(line.get_xdata(), expected_x)
-                np.testing.assert_allclose(line.get_ydata(), expected_y)
-                assert f"N={finite_rank.sum():,}" in line.get_label()
-                assert f"KS D={expected_distance:.3f}" in line.get_label()
-                assert f"{edges[bin_index]:.4f}" in line.get_label()
-                assert f"{edges[bin_index + 1]:.4f}" in line.get_label()
-                label = line.get_label().lower()
-                expected_median = np.median(retained[finite_rank])
-                assert f"median retained={expected_median:,.0f}" in label
-                zero_retained = np.count_nonzero(mask & (retained == 0))
-                assert f"zero retained={zero_retained:,}" in label
-
-            assert axis.get_xlim()[0] <= 0.0 and axis.get_xlim()[1] >= 1.0
-            assert axis.get_ylim()[0] <= 0.0 and axis.get_ylim()[1] >= 1.0
-            reference_lines = [
-                line
-                for line in axis.lines
-                if line.get_label() == "Uniform"
-                and np.array_equal(line.get_xdata(), line.get_ydata())
-            ]
-            assert len(reference_lines) == 1
-
-        # Exact interior boundaries go to the bin on their right, while the
-        # outer endpoints are included and out-of-range objects are excluded.
-        assert [
-            np.count_nonzero(
-                (truth[:, 0] >= edges[index])
-                & (
-                    truth[:, 0] <= edges[index + 1]
-                    if index == 2
-                    else truth[:, 0] < edges[index + 1]
-                )
-            )
-            for index in range(3)
-        ] == [2, 3, 2]
-    finally:
-        for figure in figures:
-            plt.close(figure)
-
-
-def test_main_describes_prior_matched_conditional_pp(monkeypatch, tmp_path):
-    output = tmp_path / "report.html"
-    args = SimpleNamespace(
-        case=["model:dataset"],
-        cache_root=tmp_path,
-        mode=0,
-        max_galaxies=None,
-        low_g=0.02,
-        bins=2,
-        conditional_bins=2,
-        sample_root=tmp_path,
-        output=output,
-    )
-    truth = np.zeros((2, 8), dtype=float)
-    case = {
-        "case": "model:dataset",
-        "root": tmp_path / "model" / "dataset",
-        "truth": truth,
-        "estimates": {"Mean": truth.copy()},
-        "summaries": {"Mean": np.zeros((2, 3, 8), dtype=float)},
-        "support_retention": None,
-        "support_manifest": None,
-    }
-    pits = {
-        "g1": np.array([0.25, 0.75]),
-        "g2": np.array([0.25, 0.75]),
-        "g1_retained": np.array([10, 10]),
-        "g2_retained": np.array([10, 10]),
-    }
-    monkeypatch.setattr(report, "parse_args", lambda: args)
-    monkeypatch.setattr(report, "load_case", lambda *unused, **also_unused: case)
-    monkeypatch.setattr(report, "compute_metrics", lambda *unused: [])
-    monkeypatch.setattr(
-        report, "galaxy_frame_diagnostics", lambda *unused: ([], [])
-    )
-    monkeypatch.setattr(report, "coverage_metrics", lambda *unused: [])
-    monkeypatch.setattr(
-        report,
-        "load_conditional_diagnostic_axes",
-        lambda *unused: {
-            "rmag_true": np.ones(2),
-            "spectral_snr": np.ones(2),
-            "hlr_true": np.ones(2),
+            "sample": samples,
+            "posterior_tf_log_weight": log_weight,
+            "posterior_tf_weight": np.exp(log_weight),
         },
     )
-    monkeypatch.setattr(report, "conditional_shear_calibration", lambda *unused: {})
-    monkeypatch.setattr(
-        report,
-        "conditional_shear_calibration_figure",
-        lambda *unused: "data:image/png;base64,conditional",
-    )
-    monkeypatch.setattr(report, "load_shear_pit_values", lambda *unused: pits)
-    theta_diagnostic = {
-        "true_branch_mass": np.ones(2),
-        "opposite_branch_mass": np.zeros(2),
-        "middle_mass": np.zeros(2),
-        "mode_count": np.ones(2, dtype=int),
-        "aggregate_mode_indices": np.array([0]),
+    if proposal_weight is None:
+        proposal_weight = np.full(n, 1.0 / n)
+    if target_weight is None:
+        target_weight = np.full(n, 1.0 / n)
+    zeros = np.zeros((n, len(FEATURES)))
+    summary = np.stack((zeros - 1, zeros, zeros + 1), axis=1)
+    return {
+        "case": "model:dataset",
+        "root": root,
+        "cache_partitions": report.load_cache_partitions(root),
+        "truth": truth,
+        "feature_names": FEATURES,
+        "rmag_true": np.full(n, 20.0),
+        "spectral_reference_quality": np.full(n, 10.0),
+        "populations": {
+            "Proposal population / base posterior": {
+                "key": "proposal", "map": zeros, "mean": zeros,
+                "summary": summary, "galaxy_weight": proposal_weight,
+            },
+            "TF target population / TF posterior": {
+                "key": "tf_target", "map": zeros, "mean": zeros,
+                "summary": summary, "galaxy_weight": target_weight,
+            },
+        },
     }
-    monkeypatch.setattr(
-        report, "load_theta_posterior_diagnostics", lambda *unused: theta_diagnostic
+
+
+def test_component_metrics_recover_weighted_linear_bias():
+    report = _report()
+    truth = np.linspace(-0.015, 0.015, 40)
+    estimate = truth + 2.0e-4 + 0.03 * truth
+    weight = np.linspace(1.0, 4.0, len(truth))
+    result = report.component_metrics(truth, estimate, 0.02, weight)
+    np.testing.assert_allclose(result["low_c"], 2.0e-4, atol=1e-14)
+    np.testing.assert_allclose(result["low_m"], 0.03, atol=1e-13)
+    assert result["ess"] < len(truth)
+
+
+def test_load_case_normalizes_population_ratio_after_all_partitions(tmp_path):
+    report = _report()
+    root = tmp_path / "m" / "d"
+    n, f = 3, len(FEATURES)
+    truth = np.zeros((n, f), dtype=np.float32)
+    summary = np.zeros((n, 3, f), dtype=np.float32)
+    _write_complete_cache(
+        root,
+        n=n,
+        overrides={
+            "truth": truth,
+            "proposal_map_estimates": truth,
+            "proposal_mean_estimates": summary,
+            "tf_target_map_estimates": truth,
+            "tf_target_mean_estimates": summary,
+            "population_tf_log_ratio": np.log([1.0, 2.0, 7.0]),
+            "posterior_tf_ess": np.full(n, 50.0),
+            "posterior_tf_ess_fraction": np.full(n, 0.5),
+            "posterior_tf_max_weight": np.full(n, 0.1),
+        },
     )
-    monkeypatch.setattr(
-        report, "theta_diagnostic_figure", lambda *unused: "data:image/png;base64,theta"
+    case = report.load_case(tmp_path, "m:d")
+    target = case["populations"]["TF target population / TF posterior"]
+    np.testing.assert_allclose(target["galaxy_weight"], [0.1, 0.2, 0.7])
+    proposal = case["populations"]["Proposal population / base posterior"]
+    np.testing.assert_allclose(proposal["galaxy_weight"], np.full(3, 1 / 3))
+
+
+def test_flat_candidate_pp_ranks_use_tf_candidate_weights(tmp_path):
+    report = _report()
+    truth = np.zeros((1, len(FEATURES)), dtype=np.float32)
+    samples = np.zeros((1, 4, len(FEATURES)), dtype=np.float32)
+    samples[0, :, 0] = [-0.02, -0.01, 0.01, 0.02]
+    samples[0, :, 1] = samples[0, :, 0]
+    log_weight = np.log(np.asarray([[0.1, 0.1, 0.7, 0.1]]))
+    case = _manual_case(
+        report, tmp_path, truth, samples, log_weight
     )
-    monkeypatch.setattr(
-        report, "posterior_pp_figure", lambda *unused: "data:image/png;base64,pp"
-    )
-    for function_name in (
-        "bias_figure",
-        "galaxy_frame_figure",
-        "nuisance_correlation_figure",
-    ):
-        monkeypatch.setattr(
-            report,
-            function_name,
-            lambda *unused: "data:image/png;base64,diagnostic",
-        )
-
-    report.main()
-
-    document = output.read_text().lower()
-    assert "prior-matched conditional posterior p-p diagnostic" in document
-    assert "restricted to the same true-shear interval" in document
-    assert "renormal" in document
-    assert "zero retained draws" in document
-    assert "directed theta_int bias and posterior modality" in document
-    assert "spin-1 angle" in document
-    assert "conditional mean shear calibration" in document
-    assert "g_hat - g = c + m g" in document
-    assert "coupled nuisance-error diagnostic" not in document
-    assert "need not be uniform even for an exact bayesian posterior" not in document
+    proposal = report.load_shear_pit_values(case, "proposal")
+    target = report.load_shear_pit_values(case, "tf_target")
+    np.testing.assert_allclose(proposal["g1"], [0.5])
+    np.testing.assert_allclose(target["g1"], [0.2])
+    np.testing.assert_allclose(target["g1_retained_mass"], [1.0])
 
 
-def test_shear_pp_bin_masks_snap_all_float32_edges_to_right_hand_bins():
-    edges = report.SHEAR_PP_BIN_EDGES.astype(np.float32)
-    true_shear = np.array(
-        [-0.101, edges[0], edges[1], 0.0, edges[2], edges[3], 0.101],
-        dtype=np.float32,
-    )
+def test_theta_modality_uses_proposal_or_tf_posterior_mass(tmp_path):
+    report = _report()
+    truth = np.zeros((1, len(FEATURES)), dtype=np.float32)
+    samples = np.zeros((1, 8, len(FEATURES)), dtype=np.float32)
+    samples[0, :, 2] = [-0.08, -0.04, 0.0, 0.04, 3.04, 3.08, 3.12, -3.12]
+    log_weight = np.log(np.asarray([[0.2475] * 4 + [0.0025] * 4]))
+    case = _manual_case(report, tmp_path, truth, samples, log_weight)
+    proposal = report.load_theta_posterior_diagnostics(case, "proposal")
+    target = report.load_theta_posterior_diagnostics(case, "tf_target")
+    np.testing.assert_allclose(proposal["opposite_branch_mass"], [0.5])
+    np.testing.assert_allclose(target["opposite_branch_mass"], [0.01])
+    assert proposal["mode_count"][0] >= 2
+    assert target["mode_count"][0] == 1
 
-    masks = report.shear_pp_bin_masks(true_shear)
 
-    assert [np.flatnonzero(mask).tolist() for mask in masks] == [
-        [1],
-        [2, 3],
-        [4, 5],
-    ]
+def test_coverage_uses_global_galaxy_weights():
+    report = _report()
+    truth = np.zeros((2, 1))
+    summary = np.asarray([[[-1.0], [0.0], [1.0]], [[1.0], [2.0], [3.0]]])
+    row = report.coverage_metrics(
+        truth, summary, np.asarray([0.2, 0.8]), ("g1",), "target"
+    )[0]
+    np.testing.assert_allclose(row["coverage"], 0.2)
+    assert row["ess"] < 2.0

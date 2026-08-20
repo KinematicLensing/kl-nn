@@ -1,2 +1,30 @@
-data_generate/missing_tng_fits.txt
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebook scratch state
+.ipynb_checkpoints/
+
+# Local environments and build products
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime output lives outside the repository
+*.log
+*.out
+checkpoints/
+models/
+cache/
+
+# Generated local diagnostics
 tests/plots/
+model_report/*.html
+repo_reports/*.html

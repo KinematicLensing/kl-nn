@@ -17,8 +17,8 @@ source ~/.bashrc
 conda activate kl-nn
 set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-valid_1m_simv2_galaxyaxis}"
-DATASET_NAME="${DATASET_NAME:-valid_1m_simv2_galaxyaxis}"
+SAMPLE_NAME="${SAMPLE_NAME:-valid_1m_simv2_galaxyaxis_halpha}"
+DATASET_NAME="${DATASET_NAME:-valid_1m_simv2_galaxyaxis_halpha}"
 TOTAL="${TOTAL:-100000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 
@@ -27,10 +27,16 @@ if (( TOTAL <= 0 || CHUNK_SIZE <= 0 || TOTAL % CHUNK_SIZE != 0 )); then
     exit 2
 fi
 PART_COUNT="$((TOTAL / CHUNK_SIZE))"
+ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"
 SHARD_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
-if (( SHARD_INDEX >= PART_COUNT )); then
-    echo "Task ${SLURM_ARRAY_TASK_ID} is beyond ${PART_COUNT}; nothing to do."
-    exit 0
+if (( PART_COUNT != ARRAY_TASK_COUNT )); then
+    echo "TOTAL=${TOTAL} and CHUNK_SIZE=${CHUNK_SIZE} require ${PART_COUNT} array tasks, but this job has ${ARRAY_TASK_COUNT};" \
+        "submit with --array=1-${PART_COUNT}" >&2
+    exit 2
+fi
+if (( SHARD_INDEX < 0 || SHARD_INDEX >= PART_COUNT )); then
+    echo "Task ${SLURM_ARRAY_TASK_ID} is outside the required range 1-${PART_COUNT}" >&2
+    exit 2
 fi
 
 cd /jet/home/xwang30/kl-nn/data_generate

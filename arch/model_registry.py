@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import hashlib
 import os
 import re
 import shutil
 import sys
+from contextlib import contextmanager
 from os.path import basename, dirname, isfile, join
 from types import ModuleType
 
-import config
+try:
+    from . import config
+except ImportError:  # Direct execution with arch/ on sys.path.
+    import config
 
 DEFAULT_SHARED_ROOT = "/ocean/projects/phy250048p/shared"
 DEFAULT_CONFIGS_ROOT = join(DEFAULT_SHARED_ROOT, "configs")
@@ -40,12 +45,12 @@ def get_circular_spline_snapshot_path(
     return join(networks_root, f"circular_spline_{model_name}.py")
 
 
-def _archived_module_name(prefix: str, snapshot_path: str) -> str:
+def _snapshot_module_name(prefix: str, snapshot_path: str) -> str:
     """Return a deterministic, import-safe name for an artifact module."""
     digest = hashlib.sha256(os.path.abspath(snapshot_path).encode("utf-8")).hexdigest()[
         :20
     ]
-    return f"_archived_{prefix}_{digest}"
+    return f"_snapshot_{prefix}_{digest}"
 
 
 def _load_module_from_path(module_name: str, path: str) -> ModuleType:
@@ -66,22 +71,54 @@ def _load_module_from_path(module_name: str, path: str) -> ModuleType:
     return module
 
 
+@contextmanager
+def _snapshot_import_context(helper_module: ModuleType):
+    """Expose current sibling modules only while executing a saved snapshot."""
+
+    source_dir = dirname(__file__)
+    inserted_source_dir = source_dir not in sys.path
+    previous: dict[str, object] = {}
+    installed: list[str] = []
+    if inserted_source_dir:
+        sys.path.insert(0, source_dir)
+    try:
+        package = config.__package__ or ""
+        aliases = {
+            "config": config,
+            "circular_spline": helper_module,
+        }
+        for name in ("data", "utils"):
+            qualified = f"{package}.{name}" if package else name
+            aliases[name] = importlib.import_module(qualified)
+        for name, module in aliases.items():
+            previous[name] = sys.modules.get(name, _MISSING_MODULE)
+            sys.modules[name] = module
+            installed.append(name)
+        yield
+    finally:
+        for name in reversed(installed):
+            prior = previous[name]
+            if prior is _MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
+        if inserted_source_dir:
+            try:
+                sys.path.remove(source_dir)
+            except ValueError:
+                pass
+
+
 def load_model_config(
     model_name: str,
     *,
     configs_root: str = DEFAULT_CONFIGS_ROOT,
-    allow_fallback_current: bool = True,
 ) -> config.ModelConfig:
     path = get_model_config_path(model_name, configs_root=configs_root)
     if isfile(path):
         return config.ModelConfig.from_json(path)
-
-    if allow_fallback_current and config.train["model_name"] == model_name:
-        return config.MODEL_CONFIG
-
     raise FileNotFoundError(
-        f"Model config JSON not found for '{model_name}' at {path}. "
-        "Train/snapshot the model first or provide a config path explicitly."
+        f"Current-schema model config not found for {model_name!r} at {path}"
     )
 
 
@@ -159,29 +196,24 @@ def load_networks_module_for_model(
 ) -> ModuleType:
     snapshot_path = get_network_snapshot_path(model_name, networks_root=networks_root)
     if not isfile(snapshot_path):
-        raise FileNotFoundError(f"Archived networks file not found: {snapshot_path}")
+        raise FileNotFoundError(f"Current networks snapshot not found: {snapshot_path}")
 
     helper_path = get_circular_spline_snapshot_path(
         model_name, networks_root=networks_root
     )
-    previous_circular_spline = _MISSING_MODULE
-    if isfile(helper_path):
-        helper_name = _archived_module_name("circular_spline", helper_path)
-        helper_module = _load_module_from_path(helper_name, helper_path)
-        previous_circular_spline = sys.modules.get("circular_spline", _MISSING_MODULE)
-        sys.modules["circular_spline"] = helper_module
+    if not isfile(helper_path):
+        raise FileNotFoundError(
+            "Current model snapshot is incomplete: missing circular-spline "
+            f"helper at {helper_path}"
+        )
+    helper_name = _snapshot_module_name("circular_spline", helper_path)
+    helper_module = _load_module_from_path(helper_name, helper_path)
 
     # Model names routinely contain hyphens and other punctuation, so derive
     # an import-safe module name from the artifact path.
-    module_name = _archived_module_name("networks", snapshot_path)
-    try:
+    module_name = _snapshot_module_name("networks", snapshot_path)
+    with _snapshot_import_context(helper_module):
         return _load_module_from_path(module_name, snapshot_path)
-    finally:
-        if isfile(helper_path):
-            if previous_circular_spline is _MISSING_MODULE:
-                sys.modules.pop("circular_spline", None)
-            else:
-                sys.modules["circular_spline"] = previous_circular_spline
 
 
 def infer_model_name_from_checkpoint_path(checkpoint_path: str | None) -> str | None:

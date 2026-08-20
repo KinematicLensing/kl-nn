@@ -20,8 +20,9 @@ source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 set -u
 
-MODEL_NAME="${MODEL_NAME:-CNN-SetAttn-D4_CCL_stage4_fixedgeo_s42_43420237}"
-CHECKPOINT_SUFFIX="${CHECKPOINT_SUFFIX:-latest}"
+: "${MODEL_NAME:?Set MODEL_NAME to the completed CCL pretraining run}"
+CHECKPOINT_SUFFIX="${CHECKPOINT_SUFFIX:-best}"
+MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-20000}"
 VALID_SAMPLES="${VALID_SAMPLES:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
@@ -30,7 +31,6 @@ LEARNING_RATE="${LEARNING_RATE:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
 HIDDEN_DIMS="${HIDDEN_DIMS:-512 256}"
 SEED="${SEED:-42}"
-NOISE_MODE="${NOISE_MODE:-log_uniform}"
 OVERWRITE="${OVERWRITE:-0}"
 
 export PYTHONHASHSEED="${SEED}"
@@ -39,11 +39,12 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 echo "model=${MODEL_NAME} checkpoint_suffix=${CHECKPOINT_SUFFIX}"
 echo "train_samples=${TRAIN_SAMPLES} valid_samples=${VALID_SAMPLES}"
-echo "batch_size=${BATCH_SIZE} probe_epochs=${PROBE_EPOCHS} seed=${SEED} noise=${NOISE_MODE}"
+echo "batch_size=${BATCH_SIZE} probe_epochs=${PROBE_EPOCHS} seed=${SEED}"
 echo "hidden_dims=${HIDDEN_DIMS} lr=${LEARNING_RATE} weight_decay=${WEIGHT_DECAY}"
 
 ARGS=(
     --model-name "${MODEL_NAME}"
+    --model-root "${MODEL_ROOT}"
     --checkpoint-suffix "${CHECKPOINT_SUFFIX}"
     --train-samples "${TRAIN_SAMPLES}"
     --valid-samples "${VALID_SAMPLES}"
@@ -52,7 +53,6 @@ ARGS=(
     --learning-rate "${LEARNING_RATE}"
     --weight-decay "${WEIGHT_DECAY}"
     --seed "${SEED}"
-    --noise-mode "${NOISE_MODE}"
     --device cuda
 )
 if [[ "${OVERWRITE}" == "1" ]]; then

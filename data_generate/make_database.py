@@ -101,6 +101,11 @@ def merge_shards(base_save_dir, num_shards, chunk_size):
             "Refusing to create or modify the merged database because expected "
             f"shards are missing: {missing}"
         )
+    if Path(base_save_dir).exists():
+        raise FileExistsError(
+            "Refusing to merge into an existing dataset; choose a new dataset "
+            f"name or explicitly remove the stale output: {base_save_dir}"
+        )
 
     logger.info(f"Initiating compilation of {num_shards} shards into target destination: {base_save_dir}")
     
@@ -171,10 +176,34 @@ def main(argv=None):
     # Split work arrays uniformly into equal parts across nodes
     all_indices = np.arange(N)
     indices_split = np.array_split(all_indices, num_shards)
+    if not 0 <= shard_idx < len(indices_split):
+        raise ValueError(
+            f"shard_idx must lie in [0, {len(indices_split)}), got {shard_idx}"
+        )
     shard_indices = indices_split[shard_idx]
     
     logger.info(f"Shard {shard_idx + 1}/{num_shards} live. Handling {len(shard_indices)} entries.")
         
+    current_path = Path(current_save_dir)
+    if current_path.exists():
+        raise FileExistsError(
+            "Refusing to append to an existing shard; explicitly remove or "
+            f"rename it before regenerating: {current_save_dir}"
+        )
+    expected_files = [
+        Path(data_dir) / f"part_{index + 1}" / f"gal_{sample_id}.fits"
+        for index in shard_indices
+        for sample_id in range(index * n, (index + 1) * n)
+    ]
+    missing_files = [str(path) for path in expected_files if not path.is_file()]
+    if missing_files:
+        preview = missing_files[:20]
+        suffix = "" if len(missing_files) <= 20 else f" ... and {len(missing_files) - 20} more"
+        raise FileNotFoundError(
+            "FITS preflight failed before opening the LMDB writer: "
+            f"{preview}{suffix}"
+        )
+
     with px.Writer(dirpath=current_save_dir, map_size_limit=200000, ram_gb_limit=2) as db:
         for index in shard_indices:
             start = time.time()

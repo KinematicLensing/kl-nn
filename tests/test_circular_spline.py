@@ -1,141 +1,107 @@
-import pytest
+"""Low-level tests for the periodic spline kernel used by theta_int."""
+
+import math
+
 import torch
 
-circular = pytest.importorskip("circular_spline")
+from circular_spline import (
+    DEFAULT_MIN_DERIVATIVE,
+    unconstrained_rational_quadratic_spline,
+)
 
 
-def test_circular_spline_roundtrip():
-    transform = circular.CircularAutoregressiveRationalQuadraticSpline(
-        num_input_channels=1,
-        num_blocks=2,
-        num_hidden_channels=16,
-        ind_circ=[0],
-        num_bins=8,
-        tail_bound=1.0,
-        identity_init=False,
+def _parameters(batch, bins=8, *, dtype=torch.float64, seed=17):
+    generator = torch.Generator().manual_seed(seed)
+    widths = torch.randn(batch, 1, bins, generator=generator, dtype=dtype) * 0.2
+    heights = torch.randn(batch, 1, bins, generator=generator, dtype=dtype) * 0.2
+    derivatives = (
+        torch.randn(batch, 1, bins, generator=generator, dtype=dtype) * 0.2
     )
-    x = torch.linspace(-0.9, 0.9, 11, dtype=torch.float32).unsqueeze(1)
-    y, logdet = transform.forward(x)
-    x_inv, logdet_inv = transform.inverse(y)
-
-    assert torch.allclose(x, x_inv, atol=1e-4, rtol=1e-4)
-    assert torch.allclose(logdet + logdet_inv, torch.zeros_like(logdet), atol=1e-4, rtol=1e-4)
+    return widths, heights, derivatives
 
 
-def test_circular_spline_logdet_continuity_at_bounds():
-    transform = circular.CircularAutoregressiveRationalQuadraticSpline(
-        num_input_channels=1,
-        num_blocks=2,
-        num_hidden_channels=16,
-        ind_circ=[0],
-        num_bins=8,
-        tail_bound=1.0,
-        identity_init=False,
+def _circular_residual(actual, expected):
+    return torch.remainder(actual - expected + 1.0, 2.0) - 1.0
+
+
+def test_periodic_spline_roundtrip_and_logdet_cancel():
+    inputs = torch.linspace(-0.99, 0.99, 41, dtype=torch.float64).unsqueeze(1)
+    widths, heights, derivatives = _parameters(inputs.shape[0])
+    outputs, forward_logdet = unconstrained_rational_quadratic_spline(
+        inputs,
+        widths,
+        heights,
+        derivatives,
+        tails="circular",
     )
-    edge_inputs = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
-    _, logdet = transform.forward(edge_inputs)
-
-    assert torch.allclose(logdet[0], logdet[1], atol=1e-4, rtol=1e-4)
-
-
-def test_mixed_circular_spline_roundtrip_with_context_and_linear_tails():
-    """Exercise the mixed-tail path used by the joint eight-parameter flow."""
-    torch.manual_seed(7)
-    transform = circular.CircularAutoregressiveRationalQuadraticSpline(
-        num_input_channels=4,
-        num_blocks=2,
-        num_hidden_channels=16,
-        ind_circ=[3],
-        num_context_channels=5,
-        num_bins=8,
-        tail_bound=1.0,
-        identity_init=False,
-    ).double().eval()
-    # Linear coordinates outside the spline interval must retain identity tails,
-    # while the circular coordinate always remains on its compact support.
-    inputs = torch.tensor(
-        [
-            [-0.7, 0.2, 1.3, 0.999],
-            [0.4, -1.2, 0.1, -0.999],
-        ],
-        dtype=torch.float64,
+    restored, inverse_logdet = unconstrained_rational_quadratic_spline(
+        outputs,
+        widths,
+        heights,
+        derivatives,
+        inverse=True,
+        tails="circular",
     )
-    context = torch.randn(2, 5, dtype=torch.float64)
 
-    outputs, logdet = transform(inputs, context=context)
-    restored, inverse_logdet = transform.inverse(outputs, context=context)
-
-    torch.testing.assert_close(restored, inputs, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(restored, inputs, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(
-        logdet + inverse_logdet,
-        torch.zeros_like(logdet),
-        atol=1e-10,
-        rtol=1e-10,
+        forward_logdet + inverse_logdet,
+        torch.zeros_like(forward_logdet),
+        atol=1e-9,
+        rtol=1e-9,
     )
-    torch.testing.assert_close(outputs[0, 2], inputs[0, 2])
-    torch.testing.assert_close(outputs[1, 1], inputs[1, 1])
-    assert torch.all((-1.0 <= outputs[:, 3]) & (outputs[:, 3] <= 1.0))
 
 
-def test_mixed_circular_spline_reports_full_autograd_jacobian():
-    """Guard the change-of-variables term, not only forward/inverse agreement."""
-    torch.manual_seed(11)
-    transform = circular.CircularAutoregressiveRationalQuadraticSpline(
-        num_input_channels=4,
-        num_blocks=2,
-        num_hidden_channels=16,
-        ind_circ=[3],
-        num_context_channels=3,
-        num_bins=8,
-        tail_bound=1.0,
-        identity_init=False,
-    ).double().eval()
-    point = torch.tensor(
-        [0.2, -0.4, 0.3, 0.1], dtype=torch.float64, requires_grad=True
+def test_periodic_spline_has_one_value_and_jacobian_at_seam():
+    inputs = torch.tensor([[-1.0], [1.0]], dtype=torch.float64)
+    widths, heights, derivatives = _parameters(1, seed=23)
+    widths = widths.expand(2, -1, -1)
+    heights = heights.expand(2, -1, -1)
+    derivatives = derivatives.expand(2, -1, -1)
+    outputs, logdet = unconstrained_rational_quadratic_spline(
+        inputs,
+        widths,
+        heights,
+        derivatives,
+        tails="circular",
     )
-    context = torch.randn(1, 3, dtype=torch.float64)
 
-    def forward_one(vector):
-        return transform(vector.unsqueeze(0), context=context)[0].squeeze(0)
+    assert _circular_residual(outputs[0], outputs[1]).abs().max() < 1e-12
+    torch.testing.assert_close(logdet[0], logdet[1], atol=1e-12, rtol=0.0)
 
-    jacobian = torch.autograd.functional.jacobian(forward_one, point)
-    sign, expected_logdet = torch.linalg.slogdet(jacobian)
-    _, actual_logdet = transform(point.unsqueeze(0), context=context)
 
-    assert sign > 0
+def test_identity_parameters_produce_identity_circle_map():
+    bins = 8
+    inputs = torch.linspace(-1.0, 1.0, 33, dtype=torch.float64).unsqueeze(1)
+    widths = torch.zeros(inputs.shape[0], 1, bins, dtype=torch.float64)
+    heights = torch.zeros_like(widths)
+    derivative_value = math.log(math.expm1(1.0 - DEFAULT_MIN_DERIVATIVE))
+    derivatives = torch.full_like(widths, derivative_value)
+    outputs, logdet = unconstrained_rational_quadratic_spline(
+        inputs,
+        widths,
+        heights,
+        derivatives,
+        tails="circular",
+    )
+
+    torch.testing.assert_close(outputs, inputs, atol=2e-10, rtol=0.0)
     torch.testing.assert_close(
-        actual_logdet[0], expected_logdet, atol=1e-10, rtol=1e-10
+        logdet, torch.zeros_like(logdet), atol=2e-10, rtol=0.0
     )
 
 
-def test_theta_last_mixed_spline_is_continuous_across_full_seam():
-    """Catch MADE coordinates downstream of theta breaking circular topology."""
-    torch.manual_seed(19)
-    transform = circular.CircularAutoregressiveRationalQuadraticSpline(
-        num_input_channels=4,
-        num_blocks=2,
-        num_hidden_channels=16,
-        ind_circ=[3],
-        num_context_channels=3,
-        num_bins=8,
-        tail_bound=1.0,
-    ).double().eval()
-    context = torch.randn(1, 3, dtype=torch.float64).expand(2, -1)
-    seam = torch.tensor(
-        [
-            [0.2, -0.4, 0.3, -1.0],
-            [0.2, -0.4, 0.3, 1.0],
-        ],
-        dtype=torch.float64,
+def test_periodic_spline_reports_autograd_jacobian():
+    point = torch.tensor([[0.17]], dtype=torch.float64, requires_grad=True)
+    widths, heights, derivatives = _parameters(1, seed=29)
+    output, logdet = unconstrained_rational_quadratic_spline(
+        point,
+        widths,
+        heights,
+        derivatives,
+        tails="circular",
     )
-
-    outputs, logdet = transform(seam, context=context)
-
-    # Endpoints represent the same angle, so neither the non-angular map nor
-    # the density Jacobian may distinguish them.
-    torch.testing.assert_close(outputs[0, :-1], outputs[1, :-1], atol=1e-10, rtol=0)
-    torch.testing.assert_close(logdet[0], logdet[1], atol=1e-10, rtol=0)
-    torch.testing.assert_close(outputs[0, -1], outputs[1, -1], atol=1e-10, rtol=0)
+    derivative = torch.autograd.grad(output.sum(), point)[0]
     torch.testing.assert_close(
-        outputs[:, -1], torch.full_like(outputs[:, -1], -1.0), atol=1e-10, rtol=0
+        logdet, torch.log(derivative.abs()), atol=1e-10, rtol=1e-10
     )

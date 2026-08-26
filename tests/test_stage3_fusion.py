@@ -219,7 +219,8 @@ def test_factory_and_ccl_use_stage3_with_nine_targets_and_oracle_context(
     labels = torch.rand(4, 9) * 2.0 - 1.0
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, 4),
-        "spectral_reference_quality": torch.linspace(5.0, 30.0, 4),
+        "image_snr": torch.linspace(5.0, 1000.0, 4),
+        "central_halpha_snr": torch.linspace(1.0, 200.0, 4),
     }
     loss = model(image, spectra, positions, labels, context)
     loss.backward()

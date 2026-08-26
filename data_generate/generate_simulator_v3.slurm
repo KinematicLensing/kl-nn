@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=kl_simv2_fits
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_simulator_v2_%A_%a.out
+#SBATCH --job-name=kl_simv3_fits
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_simulator_v3_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=4:00:00
 #SBATCH --nodes=1
@@ -9,16 +9,15 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -eo pipefail
+set -euo pipefail
 ulimit -c 0
 
 module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
-set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv2_galaxyaxis_halpha}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv2_galaxyaxis_halpha}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 SAMPLE_FILE="samples_${SAMPLE_NAME}.csv"
@@ -29,11 +28,10 @@ if (( TOTAL <= 0 || CHUNK_SIZE <= 0 )); then
     exit 2
 fi
 TASK_COUNT="$(((TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE))"
-ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"
+ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"
 TASK_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 if (( TASK_COUNT != ARRAY_TASK_COUNT )); then
-    echo "TOTAL=${TOTAL} and CHUNK_SIZE=${CHUNK_SIZE} require ${TASK_COUNT} array tasks, but this job has ${ARRAY_TASK_COUNT};" \
-        "submit with --array=1-${TASK_COUNT}" >&2
+    echo "TOTAL=${TOTAL} and CHUNK_SIZE=${CHUNK_SIZE} require ${TASK_COUNT} array tasks, but this job has ${ARRAY_TASK_COUNT}; submit with --array=1-${TASK_COUNT}" >&2
     exit 2
 fi
 if (( TASK_INDEX < 0 || TASK_INDEX >= TASK_COUNT )); then
@@ -41,7 +39,7 @@ if (( TASK_INDEX < 0 || TASK_INDEX >= TASK_COUNT )); then
     exit 2
 fi
 if [[ ! -f "${SAMPLE_PATH}" ]]; then
-    echo "Missing sample table: ${SAMPLE_PATH}" >&2
+    echo "Missing simulator-v3 sample table: ${SAMPLE_PATH}" >&2
     exit 2
 fi
 

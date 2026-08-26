@@ -26,14 +26,20 @@ CANONICAL_PARAMETER_RANGES = {
     "sini": [0.0, 1.0],
     "v0": [-30.0, 30.0],
     "vcirc": [60.0, 540.0],
-    "rscale": [0.1, 2.0],
-    "hlr": [0.1, 3.0],
-    "halpha_flux_true": [1.2e-16, 301.43e-16],
+    "rscale": [0.1, 5.0],
+    "hlr": [0.1, 5.0],
+    "halpha_flux_true": [1.0e-17, 1.0e-14],
+}
+
+TARGET_TRANSFORMS = {
+    name: "log10" if name == "halpha_flux_true" else "identity"
+    for name in TARGET_NAMES
 }
 
 ORACLE_CONTEXT_FIELDS = (
     "rmag_true",
-    "spectral_reference_quality",
+    "image_snr",
+    "central_halpha_snr",
 )
 
 
@@ -52,7 +58,7 @@ class PretrainConfig:
     eps: float = 1e-8
     batch_size: int = 100
     model_path: str = "/ocean/projects/phy250048p/shared/models/"
-    model_name: str = "SetAttn-CCL-simv2-r90"
+    model_name: str = "SetAttn-CCL-simv3-r90"
     use_amp: bool = False
     amp_dtype: str = "float16"
     use_compile: bool = False
@@ -82,8 +88,8 @@ class TrainConfig:
     batch_size: int = 50
     feature_names: list[str] = field(default_factory=lambda: list(TARGET_NAMES))
     model_path: str = "/ocean/projects/phy250048p/shared/models/"
-    model_name: str = "SetAttn-bounded-hybrid-simv2-r90"
-    pretrained_name: str = "SetAttn-CCL-simv2-r90"
+    model_name: str = "SetAttn-bounded-hybrid-simv3-r90"
+    pretrained_name: str = "SetAttn-CCL-simv3-r90"
     pretrain_from: int | str = "best"
     use_amp: bool = False
     amp_dtype: str = "float16"
@@ -121,27 +127,33 @@ class FlowConfig:
 
 @dataclass
 class ObservationConfig:
-    """The sole supported simulator-v2 observation and metadata schema."""
+    """The sole supported simulator-v3 observation and metadata schema."""
 
-    schema_version: int = 2
+    schema_version: int = 3
     fiber_layout: str = "galaxy_axis"
     context_fields: list[str] = field(
         default_factory=lambda: list(ORACLE_CONTEXT_FIELDS)
     )
     rmag_min: float = 15.0
     rmag_max: float = 23.4
-    halpha_flux_min: float = 1.2e-16
-    halpha_flux_max: float = 301.43e-16
-    halpha_flux_distribution: str = "uniform"
+    halpha_flux_min: float = 1.0e-17
+    halpha_flux_max: float = 1.0e-14
+    halpha_flux_distribution: str = "log_uniform"
     halpha_flux_units: str = "erg s^-1 cm^-2"
+    halpha_flux_semantics: str = (
+        "central_fiber_integrated_after_seeing_before_instrument"
+    )
+    halpha_flux_transform: str = "log10"
     image_band: str = "r"
     target_line: str = "Ha"
-    image_depth_5sigma_mag: float = 23.4
     image_reference_psf_fwhm_arcsec: float = 1.0
     image_pixel_scale_arcsec: float = 0.2637
-    spectral_quality_min: float = 3.0
-    spectral_quality_max: float = 100.0
-    spectral_quality_distribution: str = "log_uniform"
+    image_snr_min: float = 5.0
+    image_snr_max: float = 1000.0
+    image_snr_distribution: str = "uniform"
+    central_halpha_snr_min: float = 1.0
+    central_halpha_snr_max: float = 200.0
+    central_halpha_snr_distribution: str = "uniform"
     spectral_units: str = "counts"
     center_fiber_index: int = 2
     center_exposure_s: float = 180.0
@@ -189,20 +201,28 @@ class ModelConfig:
                 "the current simulator schema requires five spectra per galaxy"
             )
         observation = self.observation
-        if observation.schema_version != 2:
-            raise ValueError("only simulator schema version 2 is supported")
+        if observation.schema_version != 3:
+            raise ValueError("only simulator schema version 3 is supported")
         if observation.fiber_layout != "galaxy_axis":
             raise ValueError("the current pipeline requires galaxy_axis fibers")
         if observation.image_band != "r" or observation.target_line != "Ha":
             raise ValueError("the current observation schema requires r band and H-alpha")
         if observation.spectral_units != "counts":
             raise ValueError("the current spectral schema requires count units")
-        if observation.halpha_flux_distribution != "uniform":
-            raise ValueError("the H-alpha proposal must be uniform")
+        if observation.halpha_flux_distribution != "log_uniform":
+            raise ValueError("the H-alpha proposal must be log-uniform")
         if observation.halpha_flux_units != "erg s^-1 cm^-2":
             raise ValueError("H-alpha must use integrated flux units")
-        if observation.spectral_quality_distribution != "log_uniform":
-            raise ValueError("spectral reference quality must be log-uniform")
+        if observation.halpha_flux_semantics != (
+            "central_fiber_integrated_after_seeing_before_instrument"
+        ):
+            raise ValueError("H-alpha must use central-fiber flux semantics")
+        if observation.halpha_flux_transform != "log10":
+            raise ValueError("H-alpha target normalization must use log10 flux")
+        if observation.image_snr_distribution != "uniform":
+            raise ValueError("the image-S/N proposal must be uniform")
+        if observation.central_halpha_snr_distribution != "uniform":
+            raise ValueError("the central H-alpha S/N proposal must be uniform")
         fixed_simulator_metadata = {
             "rmag_min": 15.0,
             "rmag_max": 23.4,
@@ -215,7 +235,7 @@ class ModelConfig:
         for name, expected in fixed_simulator_metadata.items():
             if getattr(observation, name) != expected:
                 raise ValueError(
-                    f"observation {name} is fixed by simulator schema v2 at "
+                    f"observation {name} is fixed by simulator schema v3 at "
                     f"{expected!r}"
                 )
         if (
@@ -230,20 +250,28 @@ class ModelConfig:
         for name in (
             "rmag_min",
             "rmag_max",
-            "image_depth_5sigma_mag",
             "image_reference_psf_fwhm_arcsec",
             "image_pixel_scale_arcsec",
-            "spectral_quality_min",
-            "spectral_quality_max",
+            "image_snr_min",
+            "image_snr_max",
+            "central_halpha_snr_min",
+            "central_halpha_snr_max",
             "center_exposure_s",
             "offset_exposure_s",
         ):
             if not np.isfinite(getattr(observation, name)):
                 raise ValueError(f"observation {name} must be finite")
-        if observation.spectral_quality_min <= 0 or (
-            observation.spectral_quality_min >= observation.spectral_quality_max
+        if observation.image_snr_min <= 0 or (
+            observation.image_snr_min >= observation.image_snr_max
         ):
-            raise ValueError("spectral-quality bounds must be positive and increasing")
+            raise ValueError("image-S/N bounds must be positive and increasing")
+        if observation.central_halpha_snr_min <= 0 or (
+            observation.central_halpha_snr_min
+            >= observation.central_halpha_snr_max
+        ):
+            raise ValueError(
+                "central H-alpha S/N bounds must be positive and increasing"
+            )
         if not (
             self.train.pretrain_from == "best"
             or (
@@ -327,19 +355,19 @@ class ModelConfig:
 def _default_model_config() -> ModelConfig:
     return ModelConfig(
         data=DatasetConfig(
+            size=1_000_000,
+            nspec=5,
+            data_dir=(
+                "/ocean/projects/phy250048p/shared/datasets/"
+                "train_1m_simv3_galaxyaxis_central_halpha/"
+            ),
+        ),
+        test=DatasetConfig(
             size=100_000,
             nspec=5,
             data_dir=(
                 "/ocean/projects/phy250048p/shared/datasets/"
-                "valid_1m_simv2_galaxyaxis_halpha/"
-            ),
-        ),
-        test=DatasetConfig(
-            size=10_000,
-            nspec=5,
-            data_dir=(
-                "/ocean/projects/phy250048p/shared/datasets/"
-                "small_1m_simv2_galaxyaxis_halpha/"
+                "valid_100k_simv3_galaxyaxis_central_halpha/"
             ),
         ),
         par_ranges={
@@ -354,12 +382,13 @@ MODEL_CONFIG: ModelConfig = _default_model_config()
 
 def _publish_runtime_views(model_config: ModelConfig) -> None:
     """Publish current dataclass values as runtime dictionaries."""
-    global data, test, par_ranges, pretrain, train, flow, observation
+    global data, test, par_ranges, target_transforms, pretrain, train, flow, observation
     data = asdict(model_config.data)
     test = asdict(model_config.test)
     par_ranges = {
         name: list(bounds) for name, bounds in model_config.par_ranges.items()
     }
+    target_transforms = dict(TARGET_TRANSFORMS)
     pretrain = asdict(model_config.pretrain)
     train = asdict(model_config.train)
     train["feature_number"] = len(model_config.train.feature_names)

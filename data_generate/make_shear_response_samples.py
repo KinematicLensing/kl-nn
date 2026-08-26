@@ -11,15 +11,19 @@ import pandas as pd
 
 try:
     from .observation_schema import (
+        CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
     )
 except ImportError:  # Support direct execution from data_generate/.
     from observation_schema import (
+        CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
     )
@@ -31,6 +35,8 @@ PARAMETERS = [
 AUXILIARY_COLUMNS = (
     RMAG_TRUE_COLUMN,
     HALPHA_FLUX_TRUE_COLUMN,
+    IMAGE_SNR_COLUMN,
+    CENTRAL_HALPHA_SNR_COLUMN,
     FIBER_LAYOUT_COLUMN,
     OBSERVATION_MODEL_VERSION_COLUMN,
 )

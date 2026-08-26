@@ -3,7 +3,7 @@
 There is deliberately one production path:
 
 * a Stage-3 image/spectrum Set-Attention feature extractor;
-* continuous-contrastive pretraining with the two oracle context scalars; and
+* continuous-contrastive pretraining with three oracle context scalars; and
 * a nine-dimensional bounded hybrid posterior, with eight compact scalar
   coordinates and a directed circular ``theta_int`` coordinate.
 
@@ -51,7 +51,7 @@ except ImportError:  # Direct execution with arch/ on sys.path or a snapshot.
 
 FEATURE_DIM = 1024
 TARGET_COUNT = 9
-ORACLE_CONTEXT_FIELDS = ("rmag_true", "spectral_reference_quality")
+ORACLE_CONTEXT_FIELDS = tuple(config.ORACLE_CONTEXT_FIELDS)
 
 
 def _configured_nspec() -> int:
@@ -115,9 +115,9 @@ class MLP(nn.Module):
 
 
 class OracleContextNormalizer(nn.Module):
-    """Validate and normalize the two independent, perfectly known scalars."""
+    """Validate and normalize the three recorded observation scalars."""
 
-    output_dim = 2
+    output_dim = 3
 
     def __init__(
         self,
@@ -125,8 +125,10 @@ class OracleContextNormalizer(nn.Module):
         *,
         rmag_min=None,
         rmag_max=None,
-        spectral_quality_min=None,
-        spectral_quality_max=None,
+        image_snr_min=None,
+        image_snr_max=None,
+        central_halpha_snr_min=None,
+        central_halpha_snr_max=None,
     ):
         super().__init__()
         fields = tuple(
@@ -147,27 +149,45 @@ class OracleContextNormalizer(nn.Module):
         rmag_max = float(
             config.observation["rmag_max"] if rmag_max is None else rmag_max
         )
-        quality_min = float(
-            config.observation["spectral_quality_min"]
-            if spectral_quality_min is None
-            else spectral_quality_min
+        image_snr_min = float(
+            config.observation["image_snr_min"]
+            if image_snr_min is None
+            else image_snr_min
         )
-        quality_max = float(
-            config.observation["spectral_quality_max"]
-            if spectral_quality_max is None
-            else spectral_quality_max
+        image_snr_max = float(
+            config.observation["image_snr_max"]
+            if image_snr_max is None
+            else image_snr_max
+        )
+        central_halpha_snr_min = float(
+            config.observation["central_halpha_snr_min"]
+            if central_halpha_snr_min is None
+            else central_halpha_snr_min
+        )
+        central_halpha_snr_max = float(
+            config.observation["central_halpha_snr_max"]
+            if central_halpha_snr_max is None
+            else central_halpha_snr_max
         )
         if not math.isfinite(rmag_min) or not math.isfinite(rmag_max) or rmag_min >= rmag_max:
             raise ValueError("rmag bounds must be finite and increasing")
-        if (
-            not math.isfinite(quality_min)
-            or not math.isfinite(quality_max)
-            or quality_min <= 0
-            or quality_min >= quality_max
+        for name, lower, upper in (
+            ("image S/N", image_snr_min, image_snr_max),
+            (
+                "central H-alpha S/N",
+                central_halpha_snr_min,
+                central_halpha_snr_max,
+            ),
         ):
-            raise ValueError(
-                "spectral-quality bounds must be finite, positive, and increasing"
-            )
+            if (
+                not math.isfinite(lower)
+                or not math.isfinite(upper)
+                or lower <= 0
+                or lower >= upper
+            ):
+                raise ValueError(
+                    f"{name} bounds must be finite, positive, and increasing"
+                )
 
         self.register_buffer(
             "rmag_midpoint", torch.tensor(0.5 * (rmag_min + rmag_max))
@@ -176,21 +196,33 @@ class OracleContextNormalizer(nn.Module):
             "rmag_half_range", torch.tensor(0.5 * (rmag_max - rmag_min))
         )
         self.register_buffer(
-            "quality_log_midpoint",
-            torch.tensor(0.5 * (math.log(quality_min) + math.log(quality_max))),
+            "image_snr_midpoint",
+            torch.tensor(0.5 * (image_snr_min + image_snr_max)),
         )
         self.register_buffer(
-            "quality_log_half_range",
-            torch.tensor(0.5 * math.log(quality_max / quality_min)),
+            "image_snr_half_range",
+            torch.tensor(0.5 * (image_snr_max - image_snr_min)),
+        )
+        self.register_buffer(
+            "central_halpha_snr_midpoint",
+            torch.tensor(
+                0.5 * (central_halpha_snr_min + central_halpha_snr_max)
+            ),
+        )
+        self.register_buffer(
+            "central_halpha_snr_half_range",
+            torch.tensor(
+                0.5 * (central_halpha_snr_max - central_halpha_snr_min)
+            ),
         )
 
     def _mapping_to_tensor(self, context, batch_size, reference):
         supplied = set(context)
-        latent_halpha = sorted(name for name in supplied if "halpha" in name.lower())
-        if latent_halpha:
+        latent_targets = sorted(supplied.intersection(config.TARGET_NAMES))
+        if latent_targets:
             raise ValueError(
-                "H-alpha truth is a posterior target and must not appear in "
-                f"observation_context: {latent_halpha!r}"
+                "posterior targets must not appear in observation_context: "
+                f"{latent_targets!r}"
             )
         expected = set(self.context_fields)
         if supplied != expected:
@@ -234,16 +266,19 @@ class OracleContextNormalizer(nn.Module):
                 )
         if not bool(torch.isfinite(values).all()):
             raise ValueError("observation_context must be finite")
-        if not bool((values[:, 1] > 0).all()):
-            raise ValueError("spectral_reference_quality must be positive")
+        if not bool((values[:, 1:] > 0).all()):
+            raise ValueError("image_snr and central_halpha_snr must be positive")
 
         normalized = values.clone()
         normalized[:, 0] = (
             values[:, 0] - self.rmag_midpoint.to(values)
         ) / self.rmag_half_range.to(values)
         normalized[:, 1] = (
-            torch.log(values[:, 1]) - self.quality_log_midpoint.to(values)
-        ) / self.quality_log_half_range.to(values)
+            values[:, 1] - self.image_snr_midpoint.to(values)
+        ) / self.image_snr_half_range.to(values)
+        normalized[:, 2] = (
+            values[:, 2] - self.central_halpha_snr_midpoint.to(values)
+        ) / self.central_halpha_snr_half_range.to(values)
         return normalized
 
 
@@ -1317,10 +1352,15 @@ class ContinuousContrastiveLoss(nn.Module):
             ),
         )
 
-    def pairwise_label_distance_sq(self, labels):
+    def pairwise_label_distance_sq(self, labels, candidates=None):
+        candidates = labels if candidates is None else candidates
         if labels.ndim != 2 or labels.shape[1] != TARGET_COUNT:
             raise ValueError(
                 f"labels must have shape (batch, {TARGET_COUNT})"
+            )
+        if candidates.ndim != 2 or candidates.shape[1] != TARGET_COUNT:
+            raise ValueError(
+                f"candidates must have shape (batch, {TARGET_COUNT})"
             )
         if self.label_scales.numel() not in (1, labels.shape[1]):
             raise ValueError(
@@ -1329,7 +1369,7 @@ class ContinuousContrastiveLoss(nn.Module):
         if not 0 <= self.theta_idx < labels.shape[1]:
             raise ValueError("theta_idx is outside the target dimension")
 
-        difference = labels.unsqueeze(1) - labels.unsqueeze(0)
+        difference = labels.unsqueeze(1) - candidates.unsqueeze(0)
         theta_delta = difference[..., self.theta_idx]
         theta_delta = torch.atan2(
             torch.sin(math.pi * theta_delta),
@@ -1340,18 +1380,25 @@ class ContinuousContrastiveLoss(nn.Module):
         squared = (difference / self.label_scales) ** 2
         return squared.mean(dim=-1) if self.distance_reduction == "mean" else squared.sum(dim=-1)
 
-    def _target_distribution(self, labels):
-        batch_size = labels.shape[0]
-        if batch_size < 2:
+    def _target_distribution(
+        self, anchor_labels, candidate_labels, anchor_indices
+    ):
+        candidate_count = candidate_labels.shape[0]
+        if candidate_count < 2:
             raise ValueError("continuous contrastive loss requires at least two rows")
-        distances = self.pairwise_label_distance_sq(labels).float()
+        distances = self.pairwise_label_distance_sq(
+            anchor_labels, candidate_labels
+        ).float()
         weights = torch.exp(-distances / (2 * self.sigma_label**2))
-        diagonal = torch.eye(
-            batch_size, dtype=torch.bool, device=labels.device
+        candidates = torch.arange(
+            candidate_count, device=candidate_labels.device
         )
+        diagonal = anchor_indices[:, None] == candidates[None, :]
         weights = weights.masked_fill(diagonal, 0.0)
         row_sum = weights.sum(dim=1, keepdim=True)
-        delta_bg = self.delta_bg.to(device=labels.device, dtype=weights.dtype)
+        delta_bg = self.delta_bg.to(
+            device=candidate_labels.device, dtype=weights.dtype
+        )
         target_mass = row_sum / (row_sum + delta_bg)
         positive_probs = weights / row_sum.clamp_min(
             torch.finfo(weights.dtype).tiny
@@ -1385,21 +1432,46 @@ class ContinuousContrastiveLoss(nn.Module):
         }
 
     def target_statistics(self, labels):
-        _, _, positive_probs, target_mass = self._target_distribution(labels)
+        indices = torch.arange(labels.shape[0], device=labels.device)
+        _, _, positive_probs, target_mass = self._target_distribution(
+            labels, labels, indices
+        )
         return self._target_statistics(positive_probs, target_mass)
 
-    def forward(self, embeddings, labels, return_diagnostics=False):
+    def forward(
+        self,
+        embeddings,
+        labels,
+        return_diagnostics=False,
+        *,
+        anchor_start=0,
+        anchor_count=None,
+    ):
         if embeddings.ndim != 2:
             raise ValueError("embeddings must have shape (batch, features)")
         if labels.shape != (embeddings.shape[0], TARGET_COUNT):
             raise ValueError(
                 f"labels must have shape ({embeddings.shape[0]}, {TARGET_COUNT})"
             )
-        embeddings = F.normalize(embeddings, dim=1)
-        diagonal, target, positive_probs, target_mass = (
-            self._target_distribution(labels)
+        anchor_start = int(anchor_start)
+        anchor_count = (
+            embeddings.shape[0] if anchor_count is None else int(anchor_count)
         )
-        similarities = embeddings @ embeddings.T / self.temperature
+        anchor_stop = anchor_start + anchor_count
+        if not 0 <= anchor_start < anchor_stop <= embeddings.shape[0]:
+            raise ValueError("anchor rows must be a non-empty in-bounds slice")
+        # Keep the quadratic similarity and softmax arithmetic in float32 even
+        # when the encoders/projector run under CUDA autocast.
+        embeddings = F.normalize(embeddings.float(), dim=1)
+        anchor_embeddings = embeddings[anchor_start:anchor_stop]
+        anchor_labels = labels[anchor_start:anchor_stop]
+        anchor_indices = torch.arange(
+            anchor_start, anchor_stop, device=labels.device
+        )
+        diagonal, target, positive_probs, target_mass = (
+            self._target_distribution(anchor_labels, labels, anchor_indices)
+        )
+        similarities = anchor_embeddings @ embeddings.T / self.temperature
         log_prob = F.log_softmax(
             similarities.masked_fill(diagonal, -torch.inf), dim=1
         ).masked_fill(diagonal, 0.0)
@@ -1423,10 +1495,6 @@ class CCLPretrain(nn.Module):
         context_fields=None,
     ):
         super().__init__()
-        self.register_buffer("image_noise_sigma", torch.tensor(float("nan")))
-        self.register_buffer(
-            "spectral_reference_line_norm", torch.tensor(float("nan"))
-        )
         self.backbone = (
             build_feature_extractor() if backbone is None else backbone
         )
@@ -1506,11 +1574,23 @@ class CCLPretrain(nn.Module):
                 fiber_mask=fiber_mask,
             )
         )
+        anchor_start = 0
+        anchor_count = projected.shape[0]
         if dist.is_initialized():
-            projected = torch.cat(all_gather(projected), dim=0)
-            labels = torch.cat(all_gather(labels), dim=0)
+            projected_parts = all_gather(projected)
+            label_parts = all_gather(labels)
+            rank = dist.get_rank()
+            anchor_start = sum(
+                part.shape[0] for part in projected_parts[:rank]
+            )
+            projected = torch.cat(projected_parts, dim=0)
+            labels = torch.cat(label_parts, dim=0)
         return self.ccl_loss(
-            projected, labels, return_diagnostics=return_diagnostics
+            projected,
+            labels,
+            return_diagnostics=return_diagnostics,
+            anchor_start=anchor_start,
+            anchor_count=anchor_count,
         )
 
     def extract_features(
@@ -1536,10 +1616,6 @@ class KLNPE(nn.Module):
         context_fields=None,
     ):
         super().__init__()
-        self.register_buffer("image_noise_sigma", torch.tensor(float("nan")))
-        self.register_buffer(
-            "spectral_reference_line_norm", torch.tensor(float("nan"))
-        )
         feature_names = _validate_feature_schema(
             _configured_feature_names()
             if feature_names is None
@@ -1626,10 +1702,30 @@ class KLNPE(nn.Module):
         raw_features = self._raw_features(
             image, spectra, fiber_positions, fiber_mask=fiber_mask
         )
-        context = self._flow_context(raw_features, observation_context)
-        log_prob = self.flow.log_prob(true, context=context)
+        flow_reference = next(
+            (
+                parameter
+                for parameter in self.flow.parameters()
+                if parameter.is_floating_point()
+            ),
+            None,
+        )
+        flow_dtype = (
+            torch.float32
+            if flow_reference is None
+            else flow_reference.dtype
+        )
+        with torch.autocast(
+            device_type=raw_features.device.type, enabled=False
+        ):
+            flow_features = raw_features.to(dtype=flow_dtype)
+            context = self._flow_context(flow_features, observation_context)
+            flow_targets = true.to(dtype=flow_dtype)
+            log_prob = self.flow.log_prob(flow_targets, context=context)
         diagnostics = {
-            "raw_feature_rms": raw_features.detach().square().mean().sqrt(),
+            "raw_feature_rms": (
+                raw_features.detach().float().square().mean().sqrt()
+            ),
             **getattr(self.flow, "last_component_diagnostics", {}),
             **getattr(
                 getattr(self.flow, "theta_transform", None),

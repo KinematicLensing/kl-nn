@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 from torch import nn
@@ -35,10 +33,9 @@ class _RecordingFlow(nn.Module):
 
 def _oracle_context(batch_size=3):
     return {
-        "rmag_true": torch.linspace(16.0, 22.0, batch_size),
-        "spectral_reference_quality": torch.logspace(
-            math.log10(4.0), math.log10(80.0), batch_size
-        ),
+        "rmag_true": torch.linspace(15.0, 23.4, batch_size),
+        "image_snr": torch.linspace(5.0, 1000.0, batch_size),
+        "central_halpha_snr": torch.linspace(1.0, 200.0, batch_size),
     }
 
 
@@ -56,7 +53,8 @@ def _dummy_datavector(batch_size=2):
 def test_oracle_context_schema_is_exact_and_independent():
     assert ORACLE_CONTEXT_FIELDS == (
         "rmag_true",
-        "spectral_reference_quality",
+        "image_snr",
+        "central_halpha_snr",
     )
     assert tuple(config.ORACLE_CONTEXT_FIELDS) == ORACLE_CONTEXT_FIELDS
 
@@ -69,62 +67,58 @@ def test_oracle_context_schema_is_exact_and_independent():
 
 
 def test_mapping_and_tensor_contexts_share_field_order_and_normalization():
-    normalizer = OracleContextNormalizer(
-        rmag_min=10.0,
-        rmag_max=20.0,
-        spectral_quality_min=1.0,
-        spectral_quality_max=100.0,
-    )
+    normalizer = OracleContextNormalizer()
     reference = torch.zeros((3, FEATURE_DIM), dtype=torch.float64)
     mapping = {
-        "rmag_true": torch.tensor([10.0, 15.0, 20.0]),
-        "spectral_reference_quality": torch.tensor([1.0, 10.0, 100.0]),
+        "rmag_true": torch.tensor([15.0, 19.2, 23.4]),
+        "image_snr": torch.tensor([5.0, 502.5, 1000.0]),
+        "central_halpha_snr": torch.tensor([1.0, 100.5, 200.0]),
     }
     tensor = torch.stack([mapping[name] for name in ORACLE_CONTEXT_FIELDS], dim=-1)
 
     from_mapping = normalizer(mapping, 3, reference)
     from_tensor = normalizer(tensor, 3, reference)
     expected = torch.tensor(
-        [[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]], dtype=torch.float64
+        [[-1.0, -1.0, -1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+        dtype=torch.float64,
     )
 
     assert from_mapping.dtype == reference.dtype
     torch.testing.assert_close(from_mapping, from_tensor)
-    torch.testing.assert_close(from_mapping, expected, atol=5e-8, rtol=5e-8)
+    torch.testing.assert_close(from_mapping, expected, atol=5e-7, rtol=5e-7)
 
 
 def test_scalar_and_singleton_columns_expand_to_batch():
-    normalizer = OracleContextNormalizer(
-        rmag_min=10.0,
-        rmag_max=20.0,
-        spectral_quality_min=1.0,
-        spectral_quality_max=100.0,
-    )
+    normalizer = OracleContextNormalizer()
     reference = torch.zeros((2, FEATURE_DIM))
 
     result = normalizer(
         {
-            "rmag_true": 15.0,
-            "spectral_reference_quality": torch.tensor([[10.0], [10.0]]),
+            "rmag_true": 19.2,
+            "image_snr": torch.tensor([[502.5], [502.5]]),
+            "central_halpha_snr": 100.5,
         },
         2,
         reference,
     )
 
-    torch.testing.assert_close(result, torch.zeros((2, 2)), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(result, torch.zeros((2, 3)), atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize(
     ("context", "message"),
     [
         (None, "required"),
-        ({"rmag_true": [18.0, 19.0]}, "missing=.*spectral_reference_quality"),
+        (
+            {"rmag_true": [18.0, 19.0]},
+            "missing=.*central_halpha_snr.*image_snr",
+        ),
         (
             {
                 **_oracle_context(2),
-                "image_snr": torch.ones(2),
+                "spectral_reference_quality": torch.ones(2),
             },
-            "extra=.*image_snr",
+            "extra=.*spectral_reference_quality",
         ),
         (
             {
@@ -136,25 +130,36 @@ def test_scalar_and_singleton_columns_expand_to_batch():
         (
             {
                 "rmag_true": torch.tensor([18.0, torch.nan]),
-                "spectral_reference_quality": torch.ones(2),
+                "image_snr": torch.ones(2),
+                "central_halpha_snr": torch.ones(2),
             },
             "finite",
         ),
         (
             {
                 "rmag_true": torch.tensor([18.0, 19.0]),
-                "spectral_reference_quality": torch.tensor([5.0, 0.0]),
+                "image_snr": torch.tensor([5.0, 0.0]),
+                "central_halpha_snr": torch.ones(2),
+            },
+            "must be positive",
+        ),
+        (
+            {
+                "rmag_true": torch.tensor([18.0, 19.0]),
+                "image_snr": torch.ones(2),
+                "central_halpha_snr": torch.tensor([1.0, 0.0]),
             },
             "must be positive",
         ),
         (
             {
                 "rmag_true": torch.ones(3),
-                "spectral_reference_quality": torch.ones(2),
+                "image_snr": torch.ones(2),
+                "central_halpha_snr": torch.ones(3),
             },
             r"shape \(2,\)",
         ),
-        (torch.ones((2, 3)), r"field order.*shape \(2, 2\)"),
+        (torch.ones((2, 2)), r"field order.*shape \(2, 3\)"),
     ],
 )
 def test_invalid_oracle_context_is_rejected(context, message):
@@ -167,8 +172,10 @@ def test_invalid_oracle_context_is_rejected(context, message):
 def test_invalid_context_normalization_bounds_are_rejected():
     with pytest.raises(ValueError, match="rmag bounds"):
         OracleContextNormalizer(rmag_min=20.0, rmag_max=20.0)
-    with pytest.raises(ValueError, match="spectral-quality bounds"):
-        OracleContextNormalizer(spectral_quality_min=0.0)
+    with pytest.raises(ValueError, match="image S/N bounds"):
+        OracleContextNormalizer(image_snr_min=0.0)
+    with pytest.raises(ValueError, match="central H-alpha S/N bounds"):
+        OracleContextNormalizer(central_halpha_snr_min=0.0)
 
 
 def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
@@ -186,8 +193,8 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert torch.isfinite(loss)
-    assert flow.log_prob_contexts[-1].shape == (2, FEATURE_DIM + 2)
-    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -2:], expected)
+    assert flow.log_prob_contexts[-1].shape == (2, FEATURE_DIM + 3)
+    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -3:], expected)
 
     density = model.posterior_log_prob(
         image,
@@ -197,7 +204,7 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert density.shape == (2,)
-    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -2:], expected)
+    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -3:], expected)
 
     samples = model.sample(
         image,
@@ -207,4 +214,4 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert samples.shape == (2, 5, TARGET_COUNT)
-    torch.testing.assert_close(flow.sample_contexts[-1][:, -2:], expected)
+    torch.testing.assert_close(flow.sample_contexts[-1][:, -3:], expected)

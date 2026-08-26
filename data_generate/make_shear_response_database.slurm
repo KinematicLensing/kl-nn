@@ -15,8 +15,8 @@ KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 
-SAMPLE="${SAMPLE:-shear_response_simv2_galaxyaxis_halpha_5k}"
-DATASET="${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}"
+SAMPLE="${SAMPLE:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
+DATASET="${DATASET:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
 NBASE="${NBASE:-1000}"
 NFOLDERS=100
 NSHARDS=10

@@ -18,7 +18,9 @@ from typing import Any
 import numpy as np
 
 
-CACHE_SCHEMA = "klnn-posterior-cache-v1"
+CACHE_SCHEMA = "klnn-posterior-cache-v2"
+LEGACY_CACHE_SCHEMA = "klnn-posterior-cache-v1"
+SUPPORTED_CACHE_SCHEMAS = (LEGACY_CACHE_SCHEMA, CACHE_SCHEMA)
 CURRENT_FEATURE_NAMES = (
     "g1",
     "g2",
@@ -30,7 +32,27 @@ CURRENT_FEATURE_NAMES = (
     "hlr",
     "halpha_flux_true",
 )
-REQUIRED_CACHE_ARRAYS = (
+CURRENT_TARGET_TRANSFORMS = {
+    name: "log10" if name == "halpha_flux_true" else "identity"
+    for name in CURRENT_FEATURE_NAMES
+}
+EXPECTED_DENSITY_COORDINATES = {
+    "stored_base_log_prob": "normalized_target_coordinates",
+    "map_selection": "physical_target_coordinates",
+    "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
+}
+EXPECTED_OBSERVATION_MODEL = {
+    "schema_version": 3,
+    "context_fields": ["rmag_true", "image_snr", "central_halpha_snr"],
+    "halpha_flux_semantics": (
+        "central_fiber_integrated_after_seeing_before_instrument"
+    ),
+    "image_snr_distribution": "uniform",
+    "central_halpha_snr_distribution": "uniform",
+    "center_exposure_s": 180.0,
+    "offset_exposure_s": 600.0,
+}
+LEGACY_REQUIRED_CACHE_ARRAYS = (
     "sample",
     "base_log_prob",
     "posterior_tf_log_ratio",
@@ -48,6 +70,16 @@ REQUIRED_CACHE_ARRAYS = (
     "proposal_mean_estimates",
     "tf_target_map_estimates",
     "tf_target_mean_estimates",
+)
+REQUIRED_CACHE_ARRAYS = tuple(
+    name
+    for name in LEGACY_REQUIRED_CACHE_ARRAYS
+    if name != "spectral_reference_quality"
+) + (
+    "image_snr",
+    "central_halpha_snr",
+    "image_noise_sigma",
+    "central_spectral_noise_sigma",
 )
 EXPECTED_SYMMETRY = {
     "policy": "original_plus_r90_equal_mixture",
@@ -67,10 +99,22 @@ REQUIRED_TF_FIELDS = {
     "population_log_ratio_normalization",
     "resampling",
 }
-REQUIRED_PROVENANCE_FIELDS = {
+LEGACY_REQUIRED_PROVENANCE_FIELDS = {
     "image_noise_sigma",
     "spectral_reference_line_norm",
     "matched_group_size",
+    "posterior_sample_seed",
+    "image_noise_seed",
+    "spectral_noise_seed",
+    "spectral_quality_seed",
+}
+REQUIRED_PROVENANCE_FIELDS = {
+    "matched_group_size",
+    "posterior_sample_seed",
+    "image_noise_seed",
+    "spectral_noise_seed",
+}
+LEGACY_SEED_FIELDS = {
     "posterior_sample_seed",
     "image_noise_seed",
     "spectral_noise_seed",
@@ -80,7 +124,6 @@ SEED_FIELDS = {
     "posterior_sample_seed",
     "image_noise_seed",
     "spectral_noise_seed",
-    "spectral_quality_seed",
 }
 PART_RE = re.compile(r"^part(\d+)of(\d+)\.(json|npy)$")
 PARTITION_SEED_STRIDE = 1_000_003
@@ -164,18 +207,32 @@ def _validate_populations(populations: dict[str, Any], path: Path) -> None:
         raise _fail(path, "posterior population descriptions must be non-empty strings")
 
 
-def _validate_provenance(provenance: dict[str, Any], path: Path) -> None:
-    missing = REQUIRED_PROVENANCE_FIELDS - set(provenance)
+def _validate_provenance(
+    provenance: dict[str, Any], path: Path, schema: str
+) -> None:
+    required = (
+        LEGACY_REQUIRED_PROVENANCE_FIELDS
+        if schema == LEGACY_CACHE_SCHEMA
+        else REQUIRED_PROVENANCE_FIELDS
+    )
+    seed_fields = (
+        LEGACY_SEED_FIELDS if schema == LEGACY_CACHE_SCHEMA else SEED_FIELDS
+    )
+    missing = required - set(provenance)
     if missing:
         raise _fail(
             path, f"observation_provenance is missing fields {sorted(missing)}"
         )
-    for name in ("image_noise_sigma", "spectral_reference_line_norm"):
-        value = provenance[name]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise _fail(path, f"observation_provenance.{name} must be numeric")
-        if not math.isfinite(float(value)) or float(value) <= 0.0:
-            raise _fail(path, f"observation_provenance.{name} must be positive and finite")
+    if schema == LEGACY_CACHE_SCHEMA:
+        for name in ("image_noise_sigma", "spectral_reference_line_norm"):
+            value = provenance[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise _fail(path, f"observation_provenance.{name} must be numeric")
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise _fail(
+                    path,
+                    f"observation_provenance.{name} must be positive and finite",
+                )
     matched_group_size = _require_int(
         provenance["matched_group_size"],
         name="observation_provenance.matched_group_size",
@@ -183,7 +240,7 @@ def _validate_provenance(provenance: dict[str, Any], path: Path) -> None:
     )
     if matched_group_size <= 0:
         raise _fail(path, "observation_provenance.matched_group_size must be positive")
-    for name in SEED_FIELDS:
+    for name in seed_fields:
         _require_int(
             provenance[name],
             name=f"observation_provenance.{name}",
@@ -211,6 +268,10 @@ def _expected_array_shape(
         "population_tf_log_ratio",
         "rmag_true",
         "spectral_reference_quality",
+        "image_snr",
+        "central_halpha_snr",
+        "image_noise_sigma",
+        "central_spectral_noise_sigma",
     }:
         return (rows,)
     if name in {
@@ -259,6 +320,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
     row_ranges: list[tuple[int, int]] = []
     reference: dict[str, str] | None = None
     reference_non_seed_provenance: str | None = None
+    reference_schema: str | None = None
     reference_base_seed: int | None = None
     reference_sample_tail: tuple[int, int] | None = None
     reference_dataset_size: int | None = None
@@ -271,8 +333,13 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
             raise ValueError(f"Cannot read cache manifest {path}: {exc}") from exc
         if not isinstance(payload, dict):
             raise _fail(path, "top level must be an object")
-        if payload.get("schema") != CACHE_SCHEMA:
-            raise _fail(path, f"schema must be {CACHE_SCHEMA!r}")
+        schema = payload.get("schema")
+        if schema not in SUPPORTED_CACHE_SCHEMAS:
+            raise _fail(path, f"schema must be one of {SUPPORTED_CACHE_SCHEMAS!r}")
+        if reference_schema is None:
+            reference_schema = schema
+        elif schema != reference_schema:
+            raise _fail(path, "cache schema differs across partitions")
 
         for name in ("model_name", "checkpoint", "dataset"):
             value = payload.get(name)
@@ -316,6 +383,46 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         feature_names = payload.get("feature_names")
         if not isinstance(feature_names, list) or tuple(feature_names) != CURRENT_FEATURE_NAMES:
             raise _fail(path, f"feature_names must equal {CURRENT_FEATURE_NAMES!r}")
+        if schema == CACHE_SCHEMA:
+            parameter_ranges = _require_mapping(
+                payload, "physical_parameter_ranges", path
+            )
+            if tuple(parameter_ranges) != CURRENT_FEATURE_NAMES:
+                raise _fail(
+                    path,
+                    "physical_parameter_ranges must follow feature_names order",
+                )
+            for name, bounds in parameter_ranges.items():
+                if (
+                    not isinstance(bounds, list)
+                    or len(bounds) != 2
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in bounds
+                    )
+                    or float(bounds[0]) >= float(bounds[1])
+                ):
+                    raise _fail(
+                        path,
+                        f"physical_parameter_ranges.{name} must increase finitely",
+                    )
+            if payload.get("target_transforms") != CURRENT_TARGET_TRANSFORMS:
+                raise _fail(
+                    path,
+                    f"target_transforms must equal {CURRENT_TARGET_TRANSFORMS!r}",
+                )
+            if payload.get("density_coordinates") != EXPECTED_DENSITY_COORDINATES:
+                raise _fail(
+                    path,
+                    f"density_coordinates must equal {EXPECTED_DENSITY_COORDINATES!r}",
+                )
+            if payload.get("observation_model") != EXPECTED_OBSERVATION_MODEL:
+                raise _fail(
+                    path,
+                    f"observation_model must equal {EXPECTED_OBSERVATION_MODEL!r}",
+                )
         sample_shape = payload.get("sample_shape")
         if (
             not isinstance(sample_shape, list)
@@ -340,7 +447,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         populations = _require_mapping(payload, "posterior_populations", path)
         _validate_populations(populations, path)
         provenance = _require_mapping(payload, "observation_provenance", path)
-        _validate_provenance(provenance, path)
+        _validate_provenance(provenance, path, schema)
 
         invariant = {
             "model_name": payload["model_name"],
@@ -351,9 +458,30 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
             "symmetry": _canonical(symmetry),
             "tf": _canonical(tf),
             "posterior_populations": _canonical(populations),
+            "schema": schema,
         }
+        if schema == CACHE_SCHEMA:
+            invariant.update(
+                {
+                    "physical_parameter_ranges": _canonical(
+                        payload["physical_parameter_ranges"]
+                    ),
+                    "target_transforms": _canonical(
+                        payload["target_transforms"]
+                    ),
+                    "density_coordinates": _canonical(
+                        payload["density_coordinates"]
+                    ),
+                    "observation_model": _canonical(
+                        payload["observation_model"]
+                    ),
+                }
+            )
+        seed_fields = (
+            LEGACY_SEED_FIELDS if schema == LEGACY_CACHE_SCHEMA else SEED_FIELDS
+        )
         non_seed_provenance = _canonical(
-            {key: value for key, value in provenance.items() if key not in SEED_FIELDS}
+            {key: value for key, value in provenance.items() if key not in seed_fields}
         )
         if reference is None:
             reference = invariant
@@ -371,7 +499,10 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
             raise _fail(path, "posterior and image seed must identify the same partition stream")
         if int(provenance["spectral_noise_seed"]) != image_seed + 101:
             raise _fail(path, "spectral noise seed must equal image seed + 101")
-        if int(provenance["spectral_quality_seed"]) != image_seed + 307:
+        if (
+            schema == LEGACY_CACHE_SCHEMA
+            and int(provenance["spectral_quality_seed"]) != image_seed + 307
+        ):
             raise _fail(path, "spectral quality seed must equal image seed + 307")
         base_seed = posterior_seed - PARTITION_SEED_STRIDE * expected_index
         if reference_base_seed is None:
@@ -381,7 +512,12 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
 
         files = _require_mapping(payload, "files", path)
         supplied_arrays = set(files)
-        expected_arrays = set(REQUIRED_CACHE_ARRAYS)
+        required_arrays = (
+            LEGACY_REQUIRED_CACHE_ARRAYS
+            if schema == LEGACY_CACHE_SCHEMA
+            else REQUIRED_CACHE_ARRAYS
+        )
+        expected_arrays = set(required_arrays)
         if supplied_arrays != expected_arrays:
             raise _fail(
                 path,
@@ -389,7 +525,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
                 f"missing={sorted(expected_arrays - supplied_arrays)}, "
                 f"extra={sorted(supplied_arrays - expected_arrays)}",
             )
-        for name in REQUIRED_CACHE_ARRAYS:
+        for name in required_arrays:
             expected_relative = f"{name}/{expected_label}.npy"
             if files[name] != expected_relative:
                 raise _fail(
@@ -409,7 +545,13 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         )
 
     ordered_files: dict[str, tuple[Path, ...]] = {}
-    for name in REQUIRED_CACHE_ARRAYS:
+    assert reference_schema is not None
+    required_arrays = (
+        LEGACY_REQUIRED_CACHE_ARRAYS
+        if reference_schema == LEGACY_CACHE_SCHEMA
+        else REQUIRED_CACHE_ARRAYS
+    )
+    for name in required_arrays:
         paths = tuple(root / name / f"{label}.npy" for label in labels)
         found = []
         for path in (root / name).glob("part*of*.npy"):
@@ -450,10 +592,15 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         ordered_files[name] = paths
 
     assert reference is not None and reference_non_seed_provenance is not None
+    seed_fields = (
+        LEGACY_SEED_FIELDS
+        if reference_schema == LEGACY_CACHE_SCHEMA
+        else SEED_FIELDS
+    )
     non_seed_provenance = {
         key: value
         for key, value in payloads[0]["observation_provenance"].items()
-        if key not in SEED_FIELDS
+        if key not in seed_fields
     }
     return CachePartitions(
         root=root,

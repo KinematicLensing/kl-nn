@@ -11,9 +11,14 @@ from data_generate.latin_hypercube import (
     parse_args,
 )
 from data_generate.observation_schema import (
+    CENTRAL_HALPHA_SNR_COLUMN,
+    DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
     DEFAULT_HALPHA_FLUX_RANGE,
+    DEFAULT_HALPHA_LOG10_FLUX_RANGE,
+    DEFAULT_IMAGE_SNR_RANGE,
     FIBER_LAYOUT_COLUMN,
     HALPHA_FLUX_TRUE_COLUMN,
+    IMAGE_SNR_COLUMN,
     OBSERVATION_MODEL_VERSION_COLUMN,
     RMAG_TRUE_COLUMN,
 )
@@ -24,13 +29,15 @@ FIXED_CENTERING = ("dx_disk", "dy_disk", "dx_spec", "dy_spec")
 TARGETS_8 = ("g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr")
 
 
-def test_proposal_is_exactly_eight_parameters_plus_two_independent_latents():
+def test_proposal_has_eight_targets_plus_independent_observation_controls():
     samples = generate_samples(4096, seed=23017)
     assert tuple(PARAMETER_LIMITS) == TARGETS_8
     assert tuple(samples) == (
         *TARGETS_8,
         RMAG_TRUE_COLUMN,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
+        CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
     )
@@ -41,10 +48,40 @@ def test_proposal_is_exactly_eight_parameters_plus_two_independent_latents():
     assert samples[HALPHA_FLUX_TRUE_COLUMN].between(
         *DEFAULT_HALPHA_FLUX_RANGE, inclusive="neither"
     ).all()
+    assert samples[IMAGE_SNR_COLUMN].between(
+        *DEFAULT_IMAGE_SNR_RANGE, inclusive="neither"
+    ).all()
+    assert samples[CENTRAL_HALPHA_SNR_COLUMN].between(
+        *DEFAULT_CENTRAL_HALPHA_SNR_RANGE, inclusive="neither"
+    ).all()
     assert (samples[FIBER_LAYOUT_COLUMN] == "galaxy_axis").all()
-    assert (samples[OBSERVATION_MODEL_VERSION_COLUMN] == 2).all()
-    correlations = samples[["vcirc", RMAG_TRUE_COLUMN, HALPHA_FLUX_TRUE_COLUMN]].corr()
-    assert np.max(np.abs(correlations.to_numpy()[np.triu_indices(3, 1)])) < 0.06
+    assert (samples[OBSERVATION_MODEL_VERSION_COLUMN] == 3).all()
+    independent = samples[
+        [
+            "vcirc",
+            RMAG_TRUE_COLUMN,
+            IMAGE_SNR_COLUMN,
+            CENTRAL_HALPHA_SNR_COLUMN,
+        ]
+    ]
+    correlations = independent.corr()
+    assert np.max(np.abs(correlations.to_numpy()[np.triu_indices(4, 1)])) < 0.06
+
+
+def test_halpha_is_lhs_uniform_in_log_flux_and_snrs_are_linear_uniform():
+    count = 257
+    samples = generate_samples(count, seed=381)
+    quantities = (
+        (
+            np.log10(samples[HALPHA_FLUX_TRUE_COLUMN]),
+            DEFAULT_HALPHA_LOG10_FLUX_RANGE,
+        ),
+        (samples[IMAGE_SNR_COLUMN], DEFAULT_IMAGE_SNR_RANGE),
+        (samples[CENTRAL_HALPHA_SNR_COLUMN], DEFAULT_CENTRAL_HALPHA_SNR_RANGE),
+    )
+    for values, (lower, upper) in quantities:
+        strata = np.floor(count * (values - lower) / (upper - lower)).astype(int)
+        np.testing.assert_array_equal(np.sort(strata), np.arange(count))
 
 
 @pytest.mark.parametrize("name", ("rmag_range", "halpha_flux_range"))
@@ -65,7 +102,7 @@ def test_generation_is_seed_reproducible_and_cli_has_no_schema_switches():
     assert not hasattr(args, "halpha_flux_min")
     assert args.nsamples == 100_000
     assert args.output.endswith(
-        "samples_valid_1m_simv2_galaxyaxis_halpha.csv"
+        "samples_train_1m_simv3_galaxyaxis_central_halpha.csv"
     )
     for removed in (
         "--rmag-min", "--rmag-max", "--halpha-flux-min", "--halpha-flux-max"

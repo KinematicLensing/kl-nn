@@ -95,8 +95,11 @@ def _observations(batch_size=1, dtype=torch.float64):
     positions = torch.randn(batch_size, 5, 2, dtype=dtype)
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, batch_size, dtype=dtype),
-        "spectral_reference_quality": torch.linspace(
-            5.0, 30.0, batch_size, dtype=dtype
+        "image_snr": torch.linspace(
+            5.0, 1000.0, batch_size, dtype=dtype
+        ),
+        "central_halpha_snr": torch.linspace(
+            1.0, 200.0, batch_size, dtype=dtype
         ),
     }
     return image, spectra, positions, context
@@ -358,7 +361,7 @@ def test_klnpe_rejects_halpha_truth_as_context_and_supports_batched_banks():
 
     leaked = dict(context)
     leaked["halpha_flux_true"] = torch.ones(2, dtype=torch.float64)
-    with pytest.raises(ValueError, match="H-alpha truth"):
+    with pytest.raises(ValueError, match="posterior targets.*halpha_flux_true"):
         model.posterior_log_prob(
             image,
             spectra,

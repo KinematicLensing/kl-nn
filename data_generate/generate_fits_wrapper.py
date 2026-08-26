@@ -1,4 +1,4 @@
-"""Generate simulator-v2 FITS files from the strict proposal table."""
+"""Generate simulator-v3 FITS files from the strict proposal table."""
 
 from __future__ import annotations
 
@@ -13,24 +13,32 @@ import pandas as pd
 
 try:
     from .observation_schema import (
+        CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
         validate_halpha_flux,
+        validate_central_halpha_snr,
+        validate_image_snr,
         validate_rmag_true,
     )
 except ImportError:
     from observation_schema import (
+        CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
         validate_halpha_flux,
+        validate_central_halpha_snr,
+        validate_image_snr,
         validate_rmag_true,
     )
 
@@ -52,6 +60,8 @@ REQUIRED_COLUMNS = (
     *SIMULATION_PARAMETERS,
     RMAG_TRUE_COLUMN,
     HALPHA_FLUX_TRUE_COLUMN,
+    IMAGE_SNR_COLUMN,
+    CENTRAL_HALPHA_SNR_COLUMN,
     FIBER_LAYOUT_COLUMN,
     OBSERVATION_MODEL_VERSION_COLUMN,
 )
@@ -90,6 +100,10 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
         raise ValueError(f"Expected fiber_layout={GALAXY_AXIS_FIBER_LAYOUT!r}")
     magnitude = validate_rmag_true(row[RMAG_TRUE_COLUMN])
     halpha_flux = validate_halpha_flux(row[HALPHA_FLUX_TRUE_COLUMN])
+    image_snr = validate_image_snr(row[IMAGE_SNR_COLUMN])
+    central_halpha_snr = validate_central_halpha_snr(
+        row[CENTRAL_HALPHA_SNR_COLUMN]
+    )
     command = [
         sys.executable,
         join(SCRIPT_DIR, "generate_fits.py"),
@@ -102,6 +116,8 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
         (
             f"--rmag-true={magnitude}",
             f"--halpha-flux-true={halpha_flux}",
+            f"--image-snr={image_snr}",
+            f"--central-halpha-snr={central_halpha_snr}",
         )
     )
     return command

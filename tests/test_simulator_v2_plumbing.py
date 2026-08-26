@@ -28,15 +28,25 @@ def _row(sample_id=17):
         "hlr": 1.2,
         "rmag_true": 20.125,
         "halpha_flux_true": 4.2e-15,
+        "image_snr": 240.0,
+        "central_halpha_snr": 37.0,
         "fiber_layout": "galaxy_axis",
-        "observation_model_version": 2,
+        "observation_model_version": 3,
     }
 
 
 def test_wrapper_forwards_only_current_simulator_inputs():
     command = build_generate_command(pd.Series(_row()), part=4, dataset="pilot")
     assert command[0] == sys.executable
-    for item in ("-n=4", "-d=pilot", "-ID=17", "--rmag-true=20.125", "--halpha-flux-true=4.2e-15"):
+    for item in (
+        "-n=4",
+        "-d=pilot",
+        "-ID=17",
+        "--rmag-true=20.125",
+        "--halpha-flux-true=4.2e-15",
+        "--image-snr=240.0",
+        "--central-halpha-snr=37.0",
+    ):
         assert item in command
     assert SIMULATION_PARAMETERS == tuple(config.TARGET_NAMES[:8])
     assert not any("version" in item or "fiber-layout" in item or "low_psf" in item for item in command)
@@ -48,6 +58,8 @@ def test_wrapper_forwards_only_current_simulator_inputs():
     [
         ("rmag_true", np.nan),
         ("halpha_flux_true", 0.0),
+        ("image_snr", 0.0),
+        ("central_halpha_snr", np.nan),
         ("fiber_layout", "detector_axis"),
         ("observation_model_version", 99),
     ],
@@ -92,8 +104,17 @@ def test_merge_refuses_missing_or_existing_outputs_before_writer(tmp_path, monke
         merge_shards(str(base), num_shards=2, chunk_size=8)
 
 
-def test_matched_shear_samples_preserve_magnitude_and_halpha(tmp_path, monkeypatch):
-    source = pd.DataFrame([_row(0), {**_row(1), "rmag_true": 22.1, "halpha_flux_true": 7.4e-15}])
+def test_matched_shear_samples_preserve_observation_metadata(tmp_path, monkeypatch):
+    source = pd.DataFrame([
+        _row(0),
+        {
+            **_row(1),
+            "rmag_true": 22.1,
+            "halpha_flux_true": 7.4e-15,
+            "image_snr": 712.0,
+            "central_halpha_snr": 111.0,
+        },
+    ])
     source_path = tmp_path / "source.csv"
     output = tmp_path / "response.csv"
     manifest = tmp_path / "manifest.csv"
@@ -107,15 +128,17 @@ def test_matched_shear_samples_preserve_magnitude_and_halpha(tmp_path, monkeypat
         assert len(group) == 5
         assert group["rmag_true"].nunique() == 1
         assert group["halpha_flux_true"].nunique() == 1
+        assert group["image_snr"].nunique() == 1
+        assert group["central_halpha_snr"].nunique() == 1
 
 
 def test_all_canonical_launchers_are_current_and_syntax_valid():
     paths = [
         ROOT / "data_generate" / name
         for name in (
-            "generate_simulator_v2.slurm",
-            "make_database_simulator_v2.slurm",
-            "merge_database_simulator_v2.slurm",
+            "generate_simulator_v3.slurm",
+            "make_database_simulator_v3.slurm",
+            "merge_database_simulator_v3.slurm",
             "generate_shear_response.slurm",
             "make_shear_response_database.slurm",
             "merge_shear_response_database.slurm",
@@ -141,12 +164,15 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert '--model-root "${MODEL_ROOT}"' in npe
     pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
     assert '--model-root "${MODEL_ROOT}"' in pretrain
-    assert "valid_1m_simv2_galaxyaxis_halpha/" in pretrain
-    assert "small_1m_simv2_galaxyaxis_halpha/" in pretrain
+    assert "train_1m_simv3_galaxyaxis_central_halpha/" in pretrain
+    assert "valid_100k_simv3_galaxyaxis_central_halpha/" in pretrain
+    assert "simv2" not in pretrain
     assert "Missing current nine-target dataset" in pretrain
-    generate = (ROOT / "data_generate/generate_simulator_v2.slurm").read_text()
-    package = (ROOT / "data_generate/make_database_simulator_v2.slurm").read_text()
-    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"' in generate
+    generate = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()
+    package = (ROOT / "data_generate/make_database_simulator_v3.slurm").read_text()
+    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"' in generate
     assert "TASK_COUNT != ARRAY_TASK_COUNT" in generate
-    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"' in package
+    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"' in package
     assert "PART_COUNT != ARRAY_TASK_COUNT" in package
+    assert "simv2" not in generate
+    assert "simv2" not in package

@@ -30,7 +30,11 @@ try:
         posterior_importance_weights,
     )
     from .train import load_model, sample_density, seed_everything
-    from .utils import denormalize, resolve_feature_index
+    from .utils import (
+        denormalization_logabsdet,
+        denormalize,
+        resolve_feature_index,
+    )
 except ImportError:  # Direct execution from arch/.
     import config
     from model_registry import load_model_config
@@ -41,7 +45,7 @@ except ImportError:  # Direct execution from arch/.
         posterior_importance_weights,
     )
     from train import load_model, sample_density, seed_everything
-    from utils import denormalize, resolve_feature_index
+    from utils import denormalization_logabsdet, denormalize, resolve_feature_index
 
 
 DEFAULT_SHARED_ROOT = Path("/ocean/projects/phy250048p/shared")
@@ -59,7 +63,10 @@ CACHE_ARRAY_TYPES = (
     "population_tf_log_ratio",
     "truth",
     "rmag_true",
-    "spectral_reference_quality",
+    "image_snr",
+    "central_halpha_snr",
+    "image_noise_sigma",
+    "central_spectral_noise_sigma",
     "proposal_map_estimates",
     "proposal_mean_estimates",
     "tf_target_map_estimates",
@@ -322,6 +329,30 @@ def posterior_summaries(
     }
 
 
+def physical_log_prob_from_normalized(
+    samples_normalized,
+    normalized_log_prob,
+    *,
+    par_ranges,
+    feature_names,
+    target_transforms,
+):
+    """Convert density scores to physical coordinates for MAP selection."""
+
+    samples_normalized = np.asarray(samples_normalized)
+    normalized_log_prob = np.asarray(normalized_log_prob)
+    if normalized_log_prob.shape != samples_normalized.shape[:-1]:
+        raise ValueError(
+            "normalized_log_prob must match every non-feature sample dimension"
+        )
+    return normalized_log_prob - denormalization_logabsdet(
+        samples_normalized,
+        par_ranges=par_ranges,
+        feature_names=feature_names,
+        target_transforms=target_transforms,
+    )
+
+
 def _save_array(
     root: Path, name: str, label: str, value: np.ndarray
 ) -> str:
@@ -419,12 +450,7 @@ def main(argv=None) -> None:
         device=str(device),
         matched_group_size=args.matched_group_size,
         noise_seed=partition_seed,
-        spectral_noise_seed=(
-            partition_seed + 101
-        ),
-        spectral_quality_seed=(
-            partition_seed + 307
-        ),
+        spectral_noise_seed=partition_seed + 101,
         return_log_prob=True,
         return_observation_metadata=True,
     )
@@ -461,7 +487,10 @@ def main(argv=None) -> None:
     required_metadata = (
         "truth",
         "rmag_true",
-        "spectral_reference_quality",
+        "image_snr",
+        "central_halpha_snr",
+        "image_noise_sigma",
+        "central_spectral_noise_sigma",
     )
     missing = [name for name in required_metadata if name not in metadata]
     if missing:
@@ -470,24 +499,50 @@ def main(argv=None) -> None:
     rmag_true = _to_numpy(
         metadata["rmag_true"], name="rmag_true"
     ).astype(np.float64)
-    spectral_quality = _to_numpy(
-        metadata["spectral_reference_quality"],
-        name="spectral_reference_quality",
+    image_snr = _to_numpy(metadata["image_snr"], name="image_snr").astype(
+        np.float64
+    )
+    central_halpha_snr = _to_numpy(
+        metadata["central_halpha_snr"], name="central_halpha_snr"
+    ).astype(np.float64)
+    image_noise_sigma = _to_numpy(
+        metadata["image_noise_sigma"], name="image_noise_sigma"
+    ).astype(np.float64)
+    central_spectral_noise_sigma = _to_numpy(
+        metadata["central_spectral_noise_sigma"],
+        name="central_spectral_noise_sigma",
     ).astype(np.float64)
     if truth_normalized.shape != (args.ngals, len(feature_names)):
         raise RuntimeError(
             f"unexpected truth shape {truth_normalized.shape}"
         )
     if (
-        rmag_true.shape != (args.ngals,)
-        or spectral_quality.shape != (args.ngals,)
+        any(
+            value.shape != (args.ngals,)
+            for value in (
+                rmag_true,
+                image_snr,
+                central_halpha_snr,
+                image_noise_sigma,
+                central_spectral_noise_sigma,
+            )
+        )
     ):
         raise RuntimeError(
             "observation metadata must contain one scalar per galaxy"
         )
     if (
-        not np.all(np.isfinite(rmag_true))
-        or not np.all(np.isfinite(spectral_quality))
+        any(
+            not np.all(np.isfinite(value))
+            or np.any(value <= 0.0)
+            for value in (
+                image_snr,
+                central_halpha_snr,
+                image_noise_sigma,
+                central_spectral_noise_sigma,
+            )
+        )
+        or not np.all(np.isfinite(rmag_true))
     ):
         raise RuntimeError("observation metadata contains non-finite values")
 
@@ -495,12 +550,21 @@ def main(argv=None) -> None:
         samples_normalized,
         par_ranges=config.par_ranges,
         feature_names=feature_names,
+        target_transforms=config.TARGET_TRANSFORMS,
     ).astype(np.float32, copy=False)
     truth = denormalize(
         truth_normalized,
         par_ranges=config.par_ranges,
         feature_names=feature_names,
+        target_transforms=config.TARGET_TRANSFORMS,
     ).astype(np.float32, copy=False)
+    physical_base_log_prob = physical_log_prob_from_normalized(
+        samples_normalized,
+        base_log_prob,
+        par_ranges=config.par_ranges,
+        feature_names=feature_names,
+        target_transforms=config.TARGET_TRANSFORMS,
+    )
     importance = posterior_importance_weights(
         samples[..., vcirc_index], rmag_true, tf_prior
     )
@@ -511,7 +575,7 @@ def main(argv=None) -> None:
     )
     summaries = posterior_summaries(
         samples,
-        base_log_prob,
+        physical_base_log_prob,
         importance.log_ratio,
         importance.weight,
         feature_names,
@@ -560,7 +624,12 @@ def main(argv=None) -> None:
         ),
         "truth": truth,
         "rmag_true": rmag_true.astype(np.float32),
-        "spectral_reference_quality": spectral_quality.astype(np.float32),
+        "image_snr": image_snr.astype(np.float32),
+        "central_halpha_snr": central_halpha_snr.astype(np.float32),
+        "image_noise_sigma": image_noise_sigma.astype(np.float32),
+        "central_spectral_noise_sigma": central_spectral_noise_sigma.astype(
+            np.float32
+        ),
         **{
             name: value.astype(np.float32)
             for name, value in summaries.items()
@@ -583,11 +652,10 @@ def main(argv=None) -> None:
             "posterior_sample_seed": partition_seed,
             "image_noise_seed": partition_noise_seed,
             "spectral_noise_seed": partition_noise_seed + 101,
-            "spectral_quality_seed": partition_noise_seed + 307,
         }
     )
     manifest = {
-        "schema": "klnn-posterior-cache-v1",
+        "schema": "klnn-posterior-cache-v2",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "model_name": args.model_name,
         "checkpoint": str(checkpoint),
@@ -601,6 +669,37 @@ def main(argv=None) -> None:
             "galaxy_end": end,
         },
         "feature_names": list(feature_names),
+        "physical_parameter_ranges": {
+            name: [float(value) for value in config.par_ranges[name]]
+            for name in feature_names
+        },
+        "target_transforms": {
+            name: config.TARGET_TRANSFORMS[name] for name in feature_names
+        },
+        "density_coordinates": {
+            "stored_base_log_prob": "normalized_target_coordinates",
+            "map_selection": "physical_target_coordinates",
+            "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
+        },
+        "observation_model": {
+            "schema_version": int(config.observation["schema_version"]),
+            "context_fields": list(config.observation["context_fields"]),
+            "halpha_flux_semantics": config.observation[
+                "halpha_flux_semantics"
+            ],
+            "image_snr_distribution": config.observation[
+                "image_snr_distribution"
+            ],
+            "central_halpha_snr_distribution": config.observation[
+                "central_halpha_snr_distribution"
+            ],
+            "center_exposure_s": float(
+                config.observation["center_exposure_s"]
+            ),
+            "offset_exposure_s": float(
+                config.observation["offset_exposure_s"]
+            ),
+        },
         "sample_shape": list(samples.shape),
         "symmetry": {
             "policy": "original_plus_r90_equal_mixture",

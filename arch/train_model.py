@@ -53,6 +53,13 @@ def parse_args(argv=None):
         action=argparse.BooleanOptionalAction, default=None,
     )
     parser.add_argument(
+        "--amp", dest="use_amp",
+        action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        "--amp-dtype", choices=("float16", "bfloat16")
+    )
+    parser.add_argument(
         "--fixed-validation-streams",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -126,6 +133,8 @@ def apply_overrides(args):
     _set_if_not_none(stage, "seed", args.seed)
     _set_if_not_none(stage, "deterministic", args.deterministic)
     _set_if_not_none(stage, "use_compile", args.use_compile)
+    _set_if_not_none(stage, "use_amp", args.use_amp)
+    _set_if_not_none(stage, "amp_dtype", args.amp_dtype)
     _set_if_not_none(
         stage, "fixed_validation_streams", args.fixed_validation_streams
     )
@@ -203,6 +212,8 @@ def _validate_current_config(stage_name):
         raise ValueError("dataset sizes must be positive")
     if stage.epoch_number <= 0 or stage.batch_size <= 0:
         raise ValueError("epochs and batch size must be positive")
+    if stage.amp_dtype not in ("float16", "bfloat16"):
+        raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
     if not 0 <= stage.seed <= 2**32 - 1:
         raise ValueError("seed must lie in [0, 2**32-1]")
     _positive_finite(stage.initial_learning_rate, "initial learning rate")
@@ -210,17 +221,27 @@ def _validate_current_config(stage_name):
         raise ValueError("weight decay must be finite and non-negative")
 
     observation = model.observation
-    if observation.schema_version != 2:
-        raise ValueError("only simulator schema version 2 is supported")
+    if observation.schema_version != 3:
+        raise ValueError("only simulator schema version 3 is supported")
     if observation.fiber_layout != "galaxy_axis":
         raise ValueError("the current pipeline requires galaxy_axis fibers")
     if tuple(observation.context_fields) != config.ORACLE_CONTEXT_FIELDS:
-        raise ValueError("the current pipeline requires the two oracle contexts")
-    if observation.halpha_flux_distribution != "uniform":
-        raise ValueError("H-alpha proposal must be uniform")
+        raise ValueError("the current pipeline requires the three oracle contexts")
+    if observation.halpha_flux_distribution != "log_uniform":
+        raise ValueError("H-alpha proposal must be log-uniform")
+    if observation.halpha_flux_transform != "log10":
+        raise ValueError("H-alpha target transform must be log10")
     _positive_finite(observation.halpha_flux_min, "H-alpha minimum")
     if observation.halpha_flux_max <= observation.halpha_flux_min:
         raise ValueError("H-alpha bounds must be increasing")
+    for name in ("image_snr", "central_halpha_snr"):
+        if getattr(observation, f"{name}_distribution") != "uniform":
+            raise ValueError(f"{name} proposal must be uniform")
+        minimum = getattr(observation, f"{name}_min")
+        maximum = getattr(observation, f"{name}_max")
+        _positive_finite(minimum, f"{name} minimum")
+        if maximum <= minimum:
+            raise ValueError(f"{name} bounds must be increasing")
 
     if stage_name == "pretrain":
         _positive_finite(stage.ccl_sigma_label, "CCL sigma")
@@ -271,11 +292,13 @@ def main(argv=None):
     )
     print(f"Saved model config: {artifacts['config_path']}")
     print(f"Saved network source: {artifacts['network_path']}")
+    view_mode = (
+        "identity+r90" if args.stage == "pretrain" else "random(identity,r90)"
+    )
     print(
         "Current pipeline: "
         f"stage={args.stage}, targets={len(config.TARGET_NAMES)}, "
-        "views=identity+r90, contexts="
-        f"{list(config.ORACLE_CONTEXT_FIELDS)}, "
+        f"views={view_mode}, contexts={list(config.ORACLE_CONTEXT_FIELDS)}, "
         f"train={config.MODEL_CONFIG.data.data_dir}, "
         f"valid={config.MODEL_CONFIG.test.data_dir}"
     )

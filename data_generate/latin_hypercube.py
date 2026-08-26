@@ -1,4 +1,4 @@
-"""Generate the sole simulator-v2 proposal without a Tully--Fisher relation."""
+"""Generate the simulator-v3 coverage proposal without a Tully--Fisher relation."""
 
 from argparse import ArgumentParser
 from os.path import join
@@ -9,20 +9,28 @@ from scipy.stats.qmc import LatinHypercube
 
 try:
     from .observation_schema import (
-        DEFAULT_HALPHA_FLUX_RANGE,
+        CENTRAL_HALPHA_SNR_COLUMN,
+        DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
+        DEFAULT_HALPHA_LOG10_FLUX_RANGE,
+        DEFAULT_IMAGE_SNR_RANGE,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
     )
 except ImportError:
     from observation_schema import (
-        DEFAULT_HALPHA_FLUX_RANGE,
+        CENTRAL_HALPHA_SNR_COLUMN,
+        DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
+        DEFAULT_HALPHA_LOG10_FLUX_RANGE,
+        DEFAULT_IMAGE_SNR_RANGE,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
         HALPHA_FLUX_TRUE_COLUMN,
+        IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         RMAG_TRUE_COLUMN,
@@ -37,8 +45,8 @@ PARAMETER_LIMITS = {
     "sini": (0.0, 1.0),
     "v0": (-30.0, 30.0),
     "vcirc": (60.0, 540.0),
-    "rscale": (0.1, 2.0),
-    "hlr": (0.1, 3.0),
+    "rscale": (0.1, 5.0),
+    "hlr": (0.1, 5.0),
 }
 DEFAULT_RMAG_RANGE = (15.0, 23.4)
 
@@ -57,11 +65,22 @@ def generate_samples(
     *,
     seed: int | None = None,
 ) -> pd.DataFrame:
-    """Draw eight physical parameters, magnitude, and H-alpha independently."""
+    """Draw targets and observation-quality controls independently.
+
+    H-alpha flux is Latin-hypercube-uniform in log10 physical flux. Image and
+    central-line S/N are Latin-hypercube-uniform in linear S/N and are stored
+    once per galaxy for reuse across noise realizations and matched shears.
+    """
 
     if nsamples <= 0:
         raise ValueError("nsamples must be positive")
-    parameter_seed, magnitude_seed, halpha_seed = np.random.SeedSequence(seed).spawn(3)
+    (
+        parameter_seed,
+        magnitude_seed,
+        halpha_seed,
+        image_snr_seed,
+        central_halpha_snr_seed,
+    ) = np.random.SeedSequence(seed).spawn(5)
     names = tuple(PARAMETER_LIMITS)
     unit = LatinHypercube(
         len(names),
@@ -74,8 +93,17 @@ def generate_samples(
     result[RMAG_TRUE_COLUMN] = _lhs_column(
         nsamples, magnitude_seed, *DEFAULT_RMAG_RANGE
     )
-    result[HALPHA_FLUX_TRUE_COLUMN] = _lhs_column(
-        nsamples, halpha_seed, *DEFAULT_HALPHA_FLUX_RANGE
+    log10_halpha_flux = _lhs_column(
+        nsamples, halpha_seed, *DEFAULT_HALPHA_LOG10_FLUX_RANGE
+    )
+    result[HALPHA_FLUX_TRUE_COLUMN] = np.power(10.0, log10_halpha_flux)
+    result[IMAGE_SNR_COLUMN] = _lhs_column(
+        nsamples, image_snr_seed, *DEFAULT_IMAGE_SNR_RANGE
+    )
+    result[CENTRAL_HALPHA_SNR_COLUMN] = _lhs_column(
+        nsamples,
+        central_halpha_snr_seed,
+        *DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
     )
     result[FIBER_LAYOUT_COLUMN] = GALAXY_AXIS_FIBER_LAYOUT
     result[OBSERVATION_MODEL_VERSION_COLUMN] = np.int16(
@@ -92,7 +120,7 @@ def parse_args(argv=None):
         "--output",
         default=join(
             SAMPLE_ROOT,
-            "samples_valid_1m_simv2_galaxyaxis_halpha.csv",
+            "samples_train_1m_simv3_galaxyaxis_central_halpha.csv",
         ),
     )
     return parser.parse_args(argv)

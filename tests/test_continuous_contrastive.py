@@ -68,6 +68,41 @@ def test_continuous_contrastive_loss_is_finite_and_differentiable():
     assert torch.isfinite(z.grad).all()
 
 
+def test_local_anchor_shards_match_full_loss_and_gradient():
+    generator = torch.Generator().manual_seed(456)
+    labels = torch.rand((16, 9), generator=generator) * 2.0 - 1.0
+    initial = torch.randn((16, 24), generator=generator)
+
+    full_embeddings = initial.clone().requires_grad_()
+    full_loss = _loss()(full_embeddings, labels)
+    full_loss.backward()
+
+    sharded_embeddings = initial.clone().requires_grad_()
+    shard_losses = [
+        _loss()(
+            sharded_embeddings,
+            labels,
+            anchor_start=start,
+            anchor_count=4,
+        )
+        for start in range(0, labels.shape[0], 4)
+    ]
+    sharded_loss = torch.stack(shard_losses).mean()
+    sharded_loss.backward()
+
+    torch.testing.assert_close(sharded_loss, full_loss)
+    torch.testing.assert_close(
+        sharded_embeddings.grad, full_embeddings.grad, atol=1e-6, rtol=1e-5
+    )
+
+
+def test_local_anchor_slice_must_be_nonempty_and_in_bounds():
+    embeddings = torch.randn(4, 8)
+    labels = torch.randn(4, 9)
+    with pytest.raises(ValueError, match="non-empty in-bounds"):
+        _loss()(embeddings, labels, anchor_start=4, anchor_count=1)
+
+
 def test_invalid_label_scale_configuration_is_rejected():
     with pytest.raises(ValueError, match="positive"):
         ContinuousContrastiveLoss(label_scales=[1.0, 0.0], theta_idx=1)

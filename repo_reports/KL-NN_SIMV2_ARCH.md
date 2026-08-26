@@ -2,7 +2,8 @@
 
 **Updated:** 2026-08-20
 
-**Status:** current design contract
+**Status:** archived design contract; the current breaking schema is documented
+in `KL-NN_SIMV3_ARCH.md`
 
 **Scope:** data generation, observation model, feature pretraining, neural
 posterior estimation, posterior caching, and post-training TF weighting
@@ -204,7 +205,9 @@ an invalid draw. Training diagnostics should separately track non-angular and
 angular log probability, spline derivative extrema, transform logits,
 gradient norms, invalid batches, and support violations.
 
-The identity and R90 observations are included during NPE training. At
+During NPE training, every row independently selects either its identity or
+R90 representation from a reproducible balanced random stream. This estimates
+the equal-view objective without doubling the feature-extractor batch. At
 inference, candidate counts must be even: half are drawn from each observation
 branch, and samples from the rotated branch are inverse-transformed into the
 original coordinate system before concatenation. The result is one equal

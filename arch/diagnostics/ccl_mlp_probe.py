@@ -17,12 +17,16 @@ if str(ARCH_DIR) not in sys.path:
     sys.path.insert(0, str(ARCH_DIR))
 
 import config
-from data import apply_fixed_gaussian_image_noise, apply_spectral_noise
+from data import (
+    apply_central_halpha_snr_noise,
+    apply_image_noise_for_snr,
+    central_halpha_line_norm,
+    image_matched_filter_norm,
+)
 from model_registry import load_model_config
 from networks import CCLPretrain
 from train import (
     build_observation_levels,
-    checkpoint_scalar,
     load_model,
     seed_everything,
     validate_observation_record,
@@ -112,13 +116,8 @@ def extract_features(
         raise ValueError("batch_size must be positive")
 
     generator_device = device if device.type == "cuda" else torch.device("cpu")
-    quality_generator = torch.Generator(device=generator_device).manual_seed(seed + 11)
     img_generator = torch.Generator(device=generator_device).manual_seed(seed + 23)
     spec_generator = torch.Generator(device=generator_device).manual_seed(seed + 37)
-    image_sigma = checkpoint_scalar(model, "image_noise_sigma").to(device)
-    line_reference = checkpoint_scalar(
-        model, "spectral_reference_line_norm"
-    ).to(device)
 
     all_features = []
     all_labels = []
@@ -138,19 +137,28 @@ def extract_features(
         rmag = torch.tensor(
             [item[0] for item in metadata], device=device, dtype=torch.float32
         )
+        image_snr, central_halpha_snr = build_observation_levels(
+            torch.tensor(
+                [item[2] for item in metadata], device=device, dtype=torch.float32
+            ),
+            torch.tensor(
+                [item[3] for item in metadata], device=device, dtype=torch.float32
+            ),
+        )
         labels = torch.stack(
             [torch.as_tensor(row["fid_pars"]) for row in rows]
         ).float()
-        _, quality = build_observation_levels(
-            rmag, spectral_generator=quality_generator
+        image_norm = image_matched_filter_norm(img)
+        line_norm = central_halpha_line_norm(
+            spec, center_fiber_index=config.observation["center_fiber_index"]
         )
-        img = apply_fixed_gaussian_image_noise(
-            img, image_sigma, randgen=img_generator
+        img = apply_image_noise_for_snr(
+            img, image_snr, clean_norm=image_norm, randgen=img_generator
         )
-        spec = apply_spectral_noise(
+        spec = apply_central_halpha_snr_noise(
             spec,
-            quality,
-            line_reference,
+            central_halpha_snr,
+            clean_line_norm=line_norm,
             center_fiber_index=config.observation["center_fiber_index"],
             center_exposure_s=config.observation["center_exposure_s"],
             offset_exposure_s=config.observation["offset_exposure_s"],
@@ -167,7 +175,8 @@ def extract_features(
         oracle = model.context_normalizer(
             {
                 "rmag_true": rmag,
-                "spectral_reference_quality": quality,
+                "image_snr": image_snr,
+                "central_halpha_snr": central_halpha_snr,
             },
             len(rows),
             features,

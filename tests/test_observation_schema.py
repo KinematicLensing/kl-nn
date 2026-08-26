@@ -6,9 +6,17 @@ from data_generate import observation_schema as schema
 
 def _header(**overrides):
     header = {
-        schema.FITS_OBSERVATION_MODEL_VERSION_KEY: 2,
+        schema.FITS_OBSERVATION_MODEL_VERSION_KEY: 3,
         schema.FITS_RMAG_TRUE_KEY: 20.25,
         schema.FITS_HALPHA_FLUX_TRUE_KEY: 4.2e-15,
+        schema.FITS_IMAGE_SNR_KEY: 240.0,
+        schema.FITS_CENTER_HALPHA_SNR_KEY: 37.0,
+        schema.FITS_HALPHA_FLUX_UNITS_KEY: schema.HALPHA_FLUX_UNITS,
+        schema.FITS_HALPHA_FLUX_SEMANTICS_KEY: schema.HALPHA_FLUX_SEMANTICS,
+        schema.FITS_HALPHA_FLUX_TRANSFORM_KEY: schema.HALPHA_FLUX_TRANSFORM,
+        schema.FITS_HALPHA_FLUX_API_VERSION_KEY: schema.HALPHA_FLUX_API_VERSION,
+        schema.FITS_HALPHA_TOTAL_FLUX_KEY: 2.0e-14,
+        schema.FITS_CENTER_HALPHA_APERTURE_KEY: 0.21,
         schema.FITS_FIBER_LAYOUT_KEY: "galaxy_axis",
         schema.FITS_PHOTOMETRY_BAND_KEY: "r",
         schema.FITS_TARGET_LINE_KEY: "Ha",
@@ -23,7 +31,7 @@ def _header(**overrides):
     return header
 
 
-def test_sed_uses_true_magnitude_and_integrated_halpha_only():
+def test_sed_uses_true_magnitude_and_central_fiber_halpha_only():
     base = {
         "cont_norm_method": "flux",
         "obs_cont_norm_wave": 850.0,
@@ -36,11 +44,14 @@ def test_sed_uses_true_magnitude_and_integrated_halpha_only():
         rmag_true=20.75,
         halpha_flux_true=4.2e-15,
         r_bandpass="DECam.r.dat",
+        center_fiber_obsindex=2,
     )
     assert configured["cont_norm_method"] == "mag"
     assert configured["obs_norm_mag"] == pytest.approx(20.75)
     assert configured["obs_norm_band"] == "DECam.r.dat"
     assert configured["em_Ha_flux"] == pytest.approx(4.2e-15)
+    assert configured["em_Ha_flux_semantics"] == "central_fiber"
+    assert configured["em_Ha_flux_reference_obsindex"] == 2
     assert "obs_cont_norm_wave" not in configured
     assert "obs_cont_norm_flam" not in configured
     for name in schema.NON_TARGET_EMISSION_LINES:
@@ -73,7 +84,12 @@ def test_galaxy_axis_offsets_have_one_center_and_fixed_radius():
 
 def test_strict_header_round_trip_and_lmdb_arrays():
     header = _header()
-    assert schema.observation_metadata_from_header(header) == (2, 20.25)
+    assert schema.observation_metadata_from_header(header) == (
+        3,
+        20.25,
+        240.0,
+        37.0,
+    )
     assert schema.halpha_flux_from_header(header) == pytest.approx(4.2e-15)
     assert schema.fiber_layout_from_header(header) == ("galaxy_axis", 1)
     decoded = schema.observation_instrument_metadata_from_header(header)
@@ -82,6 +98,8 @@ def test_strict_header_round_trip_and_lmdb_arrays():
     assert set(arrays) == {
         schema.RMAG_TRUE_COLUMN,
         schema.HALPHA_FLUX_TRUE_COLUMN,
+        schema.IMAGE_SNR_COLUMN,
+        schema.CENTRAL_HALPHA_SNR_COLUMN,
         schema.OBSERVATION_MODEL_VERSION_COLUMN,
         schema.FIBER_LAYOUT_COLUMN,
         schema.IMAGE_BAND_CODE_COLUMN,
@@ -92,9 +110,22 @@ def test_strict_header_round_trip_and_lmdb_arrays():
         schema.OFFSET_EXPOSURE_COLUMN,
         schema.IMAGE_PSF_FWHM_COLUMN,
         schema.IMAGE_PIXEL_SCALE_COLUMN,
+        schema.HALPHA_FLUX_UNITS_CODE_COLUMN,
+        schema.HALPHA_FLUX_SEMANTICS_CODE_COLUMN,
+        schema.HALPHA_FLUX_TRANSFORM_CODE_COLUMN,
+        schema.HALPHA_FLUX_API_VERSION_COLUMN,
+        schema.HALPHA_TOTAL_FLUX_COLUMN,
+        schema.CENTRAL_HALPHA_APERTURE_FRACTION_COLUMN,
     }
     np.testing.assert_allclose(arrays[schema.RMAG_TRUE_COLUMN], [20.25, 19.5])
     assert arrays[schema.OBSERVATION_MODEL_VERSION_COLUMN].dtype == np.int16
+    np.testing.assert_allclose(arrays[schema.IMAGE_SNR_COLUMN], [240.0, 240.0])
+    np.testing.assert_allclose(
+        arrays[schema.CENTRAL_HALPHA_SNR_COLUMN], [37.0, 37.0]
+    )
+    np.testing.assert_allclose(
+        arrays[schema.HALPHA_TOTAL_FLUX_COLUMN], [2.0e-14, 2.0e-14]
+    )
 
 
 @pytest.mark.parametrize(
@@ -108,6 +139,12 @@ def test_strict_header_round_trip_and_lmdb_arrays():
         {"CENFIB": 1},
         {"CENEXPS": 200.0},
         {"IMGPSF": 0.5},
+        {"IMGSNR": 0.0},
+        {"CENHASNR": np.nan},
+        {"HAFSEM": "total"},
+        {"HAFTRAN": "identity"},
+        {"HAFAPI": 99},
+        {"HACENAP": 0.5},
     ],
 )
 def test_mixed_or_wrong_schema_fails_closed(change):

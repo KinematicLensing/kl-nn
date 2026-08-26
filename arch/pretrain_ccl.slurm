@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/pretrain_ccl_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
-#SBATCH --time=0:30:00
+#SBATCH --time=9:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
@@ -18,22 +18,22 @@ source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 
 SEED="${SEED:-42}"
-EPOCHS="${EPOCHS:-10}"
+EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 CCL_SIGMA_LABEL="${CCL_SIGMA_LABEL:-0.15}"
 CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_1m_simv2_galaxyaxis_halpha/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_1m_simv2_galaxyaxis_halpha/}"
-TRAIN_SIZE="${TRAIN_SIZE:-100000}"
-VALID_SIZE="${VALID_SIZE:-10000}"
+TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_galaxyaxis_central_halpha/}"
+VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_galaxyaxis_central_halpha/}"
+TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
+VALID_SIZE="${VALID_SIZE:-100000}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_NAME="${MODEL_NAME:-SetAttn-CCL-simv2-r90_s${SEED}_${JOB_TAG}}"
+MODEL_NAME="${MODEL_NAME:-Pretrain_CCL_1m}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 
 for DATA_DIR in "${TRAIN_DATA}" "${VALID_DATA}"; do
     if [[ ! -d "${DATA_DIR}" ]]; then
         echo "Missing current nine-target dataset: ${DATA_DIR}" >&2
-        echo "Build and merge it with the simulator-v2 database launchers before training." >&2
+        echo "Build and merge it with the simulator-v3 database launchers before training." >&2
         exit 2
     fi
 done
@@ -65,7 +65,9 @@ python train_model.py \
     --seed "${SEED}" \
     --deterministic \
     --fixed-validation-streams \
-    --no-compile
+    --amp \
+    --amp-dtype float16 \
+    --compile
 
 echo "Pretraining complete."
 echo "PRETRAINED_NAME=${MODEL_NAME} PRETRAIN_FROM=best sbatch arch/train_npe.slurm"

@@ -1,4 +1,4 @@
-"""Strict schema for the sole KL-NN simulator-v2 observation model."""
+"""Strict schema for the KL-NN simulator-v3 observation model."""
 
 from __future__ import annotations
 
@@ -8,15 +8,25 @@ from typing import Any
 import numpy as np
 
 
-OBSERVATION_MODEL_VERSION = 2
+OBSERVATION_MODEL_VERSION = 3
 RMAG_TRUE_COLUMN = "rmag_true"
 HALPHA_FLUX_TRUE_COLUMN = "halpha_flux_true"
+IMAGE_SNR_COLUMN = "image_snr"
+CENTRAL_HALPHA_SNR_COLUMN = "central_halpha_snr"
 OBSERVATION_MODEL_VERSION_COLUMN = "observation_model_version"
 FIBER_LAYOUT_COLUMN = "fiber_layout"
 
 FITS_OBSERVATION_MODEL_VERSION_KEY = "OBSMODV"
 FITS_RMAG_TRUE_KEY = "RMAGTRUE"
 FITS_HALPHA_FLUX_TRUE_KEY = "HAFLUX"
+FITS_IMAGE_SNR_KEY = "IMGSNR"
+FITS_CENTER_HALPHA_SNR_KEY = "CENHASNR"
+FITS_HALPHA_FLUX_UNITS_KEY = "HAFLXUNT"
+FITS_HALPHA_FLUX_SEMANTICS_KEY = "HAFSEM"
+FITS_HALPHA_FLUX_TRANSFORM_KEY = "HAFTRAN"
+FITS_HALPHA_FLUX_API_VERSION_KEY = "HAFAPI"
+FITS_HALPHA_TOTAL_FLUX_KEY = "HATOTFLX"
+FITS_CENTER_HALPHA_APERTURE_KEY = "HACENAP"
 FITS_PHOTOMETRY_BAND_KEY = "PHOTBAND"
 FITS_TARGET_LINE_KEY = "TARGLINE"
 FITS_FIBER_LAYOUT_KEY = "FIBLAY"
@@ -36,7 +46,16 @@ OFFSET_EXPOSURE_S = 600.0
 IMAGE_REFERENCE_PSF_FWHM_ARCSEC = 1.0
 IMAGE_PIXEL_SCALE_ARCSEC = 0.2637
 NON_TARGET_EMISSION_LINES = ("O2", "Hb", "O3_1", "O3_2")
-DEFAULT_HALPHA_FLUX_RANGE = (1.2e-16, 301.43e-16)
+DEFAULT_HALPHA_LOG10_FLUX_RANGE = (-17.0, -14.0)
+DEFAULT_HALPHA_FLUX_RANGE = tuple(
+    10.0**bound for bound in DEFAULT_HALPHA_LOG10_FLUX_RANGE
+)
+DEFAULT_IMAGE_SNR_RANGE = (5.0, 1000.0)
+DEFAULT_CENTRAL_HALPHA_SNR_RANGE = (1.0, 200.0)
+HALPHA_FLUX_UNITS = "erg s^-1 cm^-2"
+HALPHA_FLUX_SEMANTICS = "central_fiber_integrated_after_seeing_before_instrument"
+HALPHA_FLUX_TRANSFORM = "log10"
+HALPHA_FLUX_API_VERSION = 1
 GALAXY_AXIS_FIBER_LAYOUT = "galaxy_axis"
 FIBER_LAYOUT_CODE = 1
 
@@ -48,6 +67,14 @@ CENTER_EXPOSURE_COLUMN = "center_exposure_s"
 OFFSET_EXPOSURE_COLUMN = "offset_exposure_s"
 IMAGE_PSF_FWHM_COLUMN = "image_reference_psf_fwhm_arcsec"
 IMAGE_PIXEL_SCALE_COLUMN = "image_pixel_scale_arcsec"
+HALPHA_FLUX_UNITS_CODE_COLUMN = "halpha_flux_units_code"
+HALPHA_FLUX_SEMANTICS_CODE_COLUMN = "halpha_flux_semantics_code"
+HALPHA_FLUX_TRANSFORM_CODE_COLUMN = "halpha_flux_transform_code"
+HALPHA_FLUX_API_VERSION_COLUMN = "halpha_flux_api_version"
+HALPHA_TOTAL_FLUX_COLUMN = "halpha_total_flux_derived"
+CENTRAL_HALPHA_APERTURE_FRACTION_COLUMN = (
+    "central_halpha_aperture_fraction"
+)
 
 
 def validate_rmag_true(value: float) -> float:
@@ -58,12 +85,51 @@ def validate_rmag_true(value: float) -> float:
 
 
 def validate_halpha_flux(value: float) -> float:
-    """Validate integrated observer-frame H-alpha flux [erg s^-1 cm^-2]."""
+    """Validate an integrated observer-frame H-alpha flux in cgs units."""
 
     value = float(value)
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError("halpha_flux_true must be finite and positive")
     return value
+
+
+def validate_image_snr(value: float) -> float:
+    """Validate a positive nominal image matched-filter S/N."""
+
+    value = float(value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("image_snr must be finite and positive")
+    return value
+
+
+def validate_central_halpha_snr(value: float) -> float:
+    """Validate a positive nominal central-fiber H-alpha matched-filter S/N."""
+
+    value = float(value)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("central_halpha_snr must be finite and positive")
+    return value
+
+
+def validate_central_halpha_flux_conversion(
+    *,
+    central_flux: float,
+    total_flux: float,
+    aperture_fraction: float,
+) -> tuple[float, float, float]:
+    """Validate the auditable total-to-central H-alpha flux conversion."""
+
+    central = validate_halpha_flux(central_flux)
+    total = validate_halpha_flux(total_flux)
+    fraction = float(aperture_fraction)
+    if not np.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("central H-alpha aperture fraction must lie in (0, 1]")
+    if not np.isclose(total * fraction, central, rtol=5e-6, atol=0.0):
+        raise ValueError(
+            "derived total H-alpha flux and aperture fraction do not reproduce "
+            "halpha_flux_true"
+        )
+    return central, total, fraction
 
 
 def configure_sed(
@@ -72,11 +138,15 @@ def configure_sed(
     rmag_true: float,
     halpha_flux_true: float,
     r_bandpass: str,
+    center_fiber_obsindex: int,
 ) -> dict[str, Any]:
-    """Configure a magnitude-normalized continuum and H-alpha-only spectrum."""
+    """Configure continuum and explicitly request central-fiber H-alpha flux."""
 
     magnitude = validate_rmag_true(rmag_true)
     halpha_flux = validate_halpha_flux(halpha_flux_true)
+    center_fiber_obsindex = int(center_fiber_obsindex)
+    if center_fiber_obsindex < 0:
+        raise ValueError("center_fiber_obsindex must be non-negative")
     sed = dict(base_sed)
     sed.update(
         {
@@ -84,6 +154,8 @@ def configure_sed(
             "obs_norm_band": str(r_bandpass),
             "obs_norm_mag": magnitude,
             "em_Ha_flux": halpha_flux,
+            "em_Ha_flux_semantics": "central_fiber",
+            "em_Ha_flux_reference_obsindex": center_fiber_obsindex,
         }
     )
     sed.pop("obs_cont_norm_wave", None)
@@ -145,21 +217,40 @@ def compute_fiber_offsets(
 
 def _required(header: Mapping[str, Any], key: str) -> Any:
     if key not in header:
-        raise ValueError(f"Simulator-v2 FITS header is missing required {key}")
+        raise ValueError(f"Simulator-v3 FITS header is missing required {key}")
     return header[key]
 
 
-def observation_metadata_from_header(header: Mapping[str, Any]) -> tuple[int, float]:
+def observation_metadata_from_header(
+    header: Mapping[str, Any],
+) -> tuple[int, float, float, float]:
     version = int(_required(header, FITS_OBSERVATION_MODEL_VERSION_KEY))
     if version != OBSERVATION_MODEL_VERSION:
         raise ValueError(
             f"Expected observation model {OBSERVATION_MODEL_VERSION}, got {version}"
         )
-    return version, validate_rmag_true(_required(header, FITS_RMAG_TRUE_KEY))
+    return (
+        version,
+        validate_rmag_true(_required(header, FITS_RMAG_TRUE_KEY)),
+        validate_image_snr(_required(header, FITS_IMAGE_SNR_KEY)),
+        validate_central_halpha_snr(
+            _required(header, FITS_CENTER_HALPHA_SNR_KEY)
+        ),
+    )
 
 
 def halpha_flux_from_header(header: Mapping[str, Any]) -> float:
     return validate_halpha_flux(_required(header, FITS_HALPHA_FLUX_TRUE_KEY))
+
+
+def halpha_flux_conversion_from_header(
+    header: Mapping[str, Any],
+) -> tuple[float, float, float]:
+    return validate_central_halpha_flux_conversion(
+        central_flux=_required(header, FITS_HALPHA_FLUX_TRUE_KEY),
+        total_flux=_required(header, FITS_HALPHA_TOTAL_FLUX_KEY),
+        aperture_fraction=_required(header, FITS_CENTER_HALPHA_APERTURE_KEY),
+    )
 
 
 def fiber_layout_from_header(header: Mapping[str, Any]) -> tuple[str, int]:
@@ -178,6 +269,16 @@ def observation_instrument_metadata_from_header(
     offset_exposure = float(_required(header, FITS_OFFSET_EXPOSURE_KEY))
     image_psf_fwhm = float(_required(header, FITS_IMAGE_PSF_FWHM_KEY))
     image_pixel_scale = float(_required(header, FITS_IMAGE_PIXEL_SCALE_KEY))
+    halpha_units = str(_required(header, FITS_HALPHA_FLUX_UNITS_KEY)).strip()
+    halpha_semantics = str(
+        _required(header, FITS_HALPHA_FLUX_SEMANTICS_KEY)
+    ).strip()
+    halpha_transform = str(
+        _required(header, FITS_HALPHA_FLUX_TRANSFORM_KEY)
+    ).strip()
+    halpha_api_version = int(
+        _required(header, FITS_HALPHA_FLUX_API_VERSION_KEY)
+    )
 
     expected = {
         FITS_PHOTOMETRY_BAND_KEY: (image_band, PHOTOMETRY_BAND),
@@ -194,6 +295,19 @@ def observation_instrument_metadata_from_header(
             image_pixel_scale,
             IMAGE_PIXEL_SCALE_ARCSEC,
         ),
+        FITS_HALPHA_FLUX_UNITS_KEY: (halpha_units, HALPHA_FLUX_UNITS),
+        FITS_HALPHA_FLUX_SEMANTICS_KEY: (
+            halpha_semantics,
+            HALPHA_FLUX_SEMANTICS,
+        ),
+        FITS_HALPHA_FLUX_TRANSFORM_KEY: (
+            halpha_transform,
+            HALPHA_FLUX_TRANSFORM,
+        ),
+        FITS_HALPHA_FLUX_API_VERSION_KEY: (
+            halpha_api_version,
+            HALPHA_FLUX_API_VERSION,
+        ),
     }
     mismatches = []
     for key, (actual, wanted) in expected.items():
@@ -205,7 +319,7 @@ def observation_instrument_metadata_from_header(
         if not matches:
             mismatches.append(f"{key}={actual!r} (expected {wanted!r})")
     if mismatches:
-        raise ValueError("Simulator-v2 schema mismatch: " + "; ".join(mismatches))
+        raise ValueError("Simulator-v3 schema mismatch: " + "; ".join(mismatches))
     return {
         IMAGE_BAND_CODE_COLUMN: 0,
         TARGET_LINE_CODE_COLUMN: 0,
@@ -215,6 +329,10 @@ def observation_instrument_metadata_from_header(
         OFFSET_EXPOSURE_COLUMN: offset_exposure,
         IMAGE_PSF_FWHM_COLUMN: image_psf_fwhm,
         IMAGE_PIXEL_SCALE_COLUMN: image_pixel_scale,
+        HALPHA_FLUX_UNITS_CODE_COLUMN: 0,
+        HALPHA_FLUX_SEMANTICS_CODE_COLUMN: 1,
+        HALPHA_FLUX_TRANSFORM_CODE_COLUMN: 1,
+        HALPHA_FLUX_API_VERSION_COLUMN: halpha_api_version,
     }
 
 
@@ -227,6 +345,8 @@ def observation_metadata_arrays(
     result = {
         RMAG_TRUE_COLUMN: np.empty(count, dtype=np.float32),
         HALPHA_FLUX_TRUE_COLUMN: np.empty(count, dtype=np.float32),
+        IMAGE_SNR_COLUMN: np.empty(count, dtype=np.float32),
+        CENTRAL_HALPHA_SNR_COLUMN: np.empty(count, dtype=np.float32),
         OBSERVATION_MODEL_VERSION_COLUMN: np.full(
             count, OBSERVATION_MODEL_VERSION, dtype=np.int16
         ),
@@ -239,10 +359,28 @@ def observation_metadata_arrays(
         OFFSET_EXPOSURE_COLUMN: np.empty(count, dtype=np.float32),
         IMAGE_PSF_FWHM_COLUMN: np.empty(count, dtype=np.float32),
         IMAGE_PIXEL_SCALE_COLUMN: np.empty(count, dtype=np.float32),
+        HALPHA_FLUX_UNITS_CODE_COLUMN: np.zeros(count, dtype=np.int8),
+        HALPHA_FLUX_SEMANTICS_CODE_COLUMN: np.ones(count, dtype=np.int8),
+        HALPHA_FLUX_TRANSFORM_CODE_COLUMN: np.ones(count, dtype=np.int8),
+        HALPHA_FLUX_API_VERSION_COLUMN: np.full(
+            count, HALPHA_FLUX_API_VERSION, dtype=np.int8
+        ),
+        HALPHA_TOTAL_FLUX_COLUMN: np.empty(count, dtype=np.float32),
+        CENTRAL_HALPHA_APERTURE_FRACTION_COLUMN: np.empty(
+            count, dtype=np.float32
+        ),
     }
     for index, header in enumerate(headers):
-        _, result[RMAG_TRUE_COLUMN][index] = observation_metadata_from_header(header)
-        result[HALPHA_FLUX_TRUE_COLUMN][index] = halpha_flux_from_header(header)
+        (
+            _,
+            result[RMAG_TRUE_COLUMN][index],
+            result[IMAGE_SNR_COLUMN][index],
+            result[CENTRAL_HALPHA_SNR_COLUMN][index],
+        ) = observation_metadata_from_header(header)
+        central, total, fraction = halpha_flux_conversion_from_header(header)
+        result[HALPHA_FLUX_TRUE_COLUMN][index] = central
+        result[HALPHA_TOTAL_FLUX_COLUMN][index] = total
+        result[CENTRAL_HALPHA_APERTURE_FRACTION_COLUMN][index] = fraction
         fiber_layout_from_header(header)
         instrument = observation_instrument_metadata_from_header(header)
         for name, value in instrument.items():

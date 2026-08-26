@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=kl_simv2_merge
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/merge_database_simulator_v2_%j.out
+#SBATCH --job-name=kl_simv3_merge
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/merge_database_simulator_v3_%j.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=1:00:00
 #SBATCH --nodes=1
@@ -10,16 +10,15 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -eo pipefail
+set -euo pipefail
 ulimit -c 0
 
 module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
-set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv2_galaxyaxis_halpha}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv2_galaxyaxis_halpha}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 

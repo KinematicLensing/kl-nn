@@ -1,10 +1,11 @@
-"""CCL oracle-context and persistent calibration contracts."""
+"""CCL oracle-context and checkpoint-state contracts."""
 
 import copy
 
 import torch
 from torch import nn
 
+import networks
 from networks import CCLPretrain, KLNPE
 
 
@@ -39,8 +40,9 @@ def _inputs():
     labels = torch.rand((8, len(FEATURE_NAMES)), generator=generator) * 2.0 - 1.0
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, features.shape[0]),
-        "spectral_reference_quality": torch.linspace(
-            5.0, 30.0, features.shape[0]
+        "image_snr": torch.linspace(5.0, 1000.0, features.shape[0]),
+        "central_halpha_snr": torch.linspace(
+            1.0, 200.0, features.shape[0]
         ),
     }
     return features, labels, context
@@ -49,7 +51,9 @@ def _inputs():
 def _ccl_model():
     return CCLPretrain(
         backbone=IdentityBackbone(),
-        projector=nn.Linear(1026, 16),
+        projector=nn.Linear(
+            networks.FEATURE_DIM + len(networks.ORACLE_CONTEXT_FIELDS), 16
+        ),
     )
 
 
@@ -88,6 +92,37 @@ def test_ccl_pretrain_matches_direct_oracle_context_loss():
     assert diagnostics.keys() == expected_diagnostics.keys()
 
 
+def test_distributed_ccl_uses_only_rank_local_anchor_rows(monkeypatch):
+    model = _ccl_model().eval()
+    features, labels, context = _inputs()
+    normalized_context = model.context_normalizer(
+        context, features.shape[0], features
+    )
+    local_projected = model.projector(
+        torch.cat((features, normalized_context), dim=-1)
+    )
+    remote_projected = local_projected.detach() + 0.25
+    remote_labels = torch.roll(labels, shifts=1, dims=0)
+    expected = model.ccl_loss(
+        torch.cat((remote_projected, local_projected), dim=0),
+        torch.cat((remote_labels, labels), dim=0),
+        anchor_start=labels.shape[0],
+        anchor_count=labels.shape[0],
+    )
+
+    def fake_all_gather(value):
+        if value.shape[-1] == local_projected.shape[-1]:
+            return remote_projected, value
+        return remote_labels, value
+
+    monkeypatch.setattr(networks.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(networks.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(networks, "all_gather", fake_all_gather)
+    actual = model(features, None, None, labels, context)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_ccl_pretrain_backbone_extraction_and_strict_reload():
     model = _ccl_model().eval()
     reloaded = _ccl_model().eval()
@@ -97,20 +132,16 @@ def test_ccl_pretrain_backbone_extraction_and_strict_reload():
     torch.testing.assert_close(extracted, features)
 
 
-def test_calibration_buffers_are_persistent_for_pretraining_and_npe():
+def test_retired_global_calibration_buffers_are_not_persisted():
     for make_model in (_ccl_model, _npe_model):
         model = make_model()
-        assert torch.isnan(model.image_noise_sigma)
-        assert torch.isnan(model.spectral_reference_line_norm)
-        with torch.no_grad():
-            model.image_noise_sigma.copy_(torch.tensor(0.125))
-            model.spectral_reference_line_norm.copy_(torch.tensor(3.5))
+        assert not hasattr(model, "image_noise_sigma")
+        assert not hasattr(model, "spectral_reference_line_norm")
+        state = copy.deepcopy(model.state_dict())
+        assert "image_noise_sigma" not in state
+        assert "spectral_reference_line_norm" not in state
 
         restored = make_model()
-        restored.load_state_dict(
-            copy.deepcopy(model.state_dict()), strict=True
-        )
-        assert restored.image_noise_sigma.item() == 0.125
-        assert restored.spectral_reference_line_norm.item() == 3.5
-        assert restored.image_noise_sigma.item() > 0.0
-        assert restored.spectral_reference_line_norm.item() > 0.0
+        restored.load_state_dict(state, strict=True)
+        assert not hasattr(restored, "image_noise_sigma")
+        assert not hasattr(restored, "spectral_reference_line_norm")

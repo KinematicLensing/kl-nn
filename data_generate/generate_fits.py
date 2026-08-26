@@ -14,10 +14,18 @@ from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
 
 try:
     from .observation_schema import (
+        FITS_CENTER_HALPHA_APERTURE_KEY,
+        FITS_CENTER_HALPHA_SNR_KEY,
         FITS_CENTER_EXPOSURE_KEY,
         FITS_CENTER_FIBER_INDEX_KEY,
         FITS_FIBER_LAYOUT_KEY,
         FITS_HALPHA_FLUX_TRUE_KEY,
+        FITS_HALPHA_FLUX_SEMANTICS_KEY,
+        FITS_HALPHA_FLUX_API_VERSION_KEY,
+        FITS_HALPHA_FLUX_TRANSFORM_KEY,
+        FITS_HALPHA_FLUX_UNITS_KEY,
+        FITS_HALPHA_TOTAL_FLUX_KEY,
+        FITS_IMAGE_SNR_KEY,
         FITS_IMAGE_PIXEL_SCALE_KEY,
         FITS_IMAGE_PSF_FWHM_KEY,
         FITS_OBSERVATION_MODEL_VERSION_KEY,
@@ -27,6 +35,10 @@ try:
         FITS_SPECTRAL_UNITS_KEY,
         FITS_TARGET_LINE_KEY,
         GALAXY_AXIS_FIBER_LAYOUT,
+        HALPHA_FLUX_SEMANTICS,
+        HALPHA_FLUX_API_VERSION,
+        HALPHA_FLUX_TRANSFORM,
+        HALPHA_FLUX_UNITS,
         OBSERVATION_MODEL_VERSION,
         PHOTOMETRY_BAND,
         SPECTRAL_UNITS,
@@ -34,14 +46,25 @@ try:
         compute_fiber_offsets,
         configure_sed,
         validate_halpha_flux,
+        validate_central_halpha_flux_conversion,
+        validate_central_halpha_snr,
+        validate_image_snr,
         validate_rmag_true,
     )
 except ImportError:  # Support direct execution from data_generate/.
     from observation_schema import (
+        FITS_CENTER_HALPHA_APERTURE_KEY,
+        FITS_CENTER_HALPHA_SNR_KEY,
         FITS_CENTER_EXPOSURE_KEY,
         FITS_CENTER_FIBER_INDEX_KEY,
         FITS_FIBER_LAYOUT_KEY,
         FITS_HALPHA_FLUX_TRUE_KEY,
+        FITS_HALPHA_FLUX_SEMANTICS_KEY,
+        FITS_HALPHA_FLUX_API_VERSION_KEY,
+        FITS_HALPHA_FLUX_TRANSFORM_KEY,
+        FITS_HALPHA_FLUX_UNITS_KEY,
+        FITS_HALPHA_TOTAL_FLUX_KEY,
+        FITS_IMAGE_SNR_KEY,
         FITS_IMAGE_PIXEL_SCALE_KEY,
         FITS_IMAGE_PSF_FWHM_KEY,
         FITS_OBSERVATION_MODEL_VERSION_KEY,
@@ -51,6 +74,10 @@ except ImportError:  # Support direct execution from data_generate/.
         FITS_SPECTRAL_UNITS_KEY,
         FITS_TARGET_LINE_KEY,
         GALAXY_AXIS_FIBER_LAYOUT,
+        HALPHA_FLUX_SEMANTICS,
+        HALPHA_FLUX_API_VERSION,
+        HALPHA_FLUX_TRANSFORM,
+        HALPHA_FLUX_UNITS,
         OBSERVATION_MODEL_VERSION,
         PHOTOMETRY_BAND,
         SPECTRAL_UNITS,
@@ -58,6 +85,9 @@ except ImportError:  # Support direct execution from data_generate/.
         compute_fiber_offsets,
         configure_sed,
         validate_halpha_flux,
+        validate_central_halpha_flux_conversion,
+        validate_central_halpha_snr,
+        validate_image_snr,
         validate_rmag_true,
     )
 
@@ -80,8 +110,12 @@ parser.add_argument(
     '--halpha-flux-true',
     type=float,
     required=True,
-    help='integrated observed-frame H-alpha flux in erg/s/cm^2',
+    help='clean integrated central-fiber H-alpha flux in erg/s/cm^2',
 )
+parser.add_argument('--image-snr', type=float, required=True,
+                    help='nominal image matched-filter S/N')
+parser.add_argument('--central-halpha-snr', type=float, required=True,
+                    help='nominal central-fiber H-alpha matched-filter S/N')
 args = parser.parse_args()
 n = args.n
 d = args.d
@@ -96,6 +130,8 @@ rscale = args.rscale
 hlr = args.hlr
 rmag_true = validate_rmag_true(args.rmag_true)
 halpha_flux_true = validate_halpha_flux(args.halpha_flux_true)
+image_snr = validate_image_snr(args.image_snr)
+central_halpha_snr = validate_central_halpha_snr(args.central_halpha_snr)
 
 # Some global observation variables
 fiber_blur = 3.4 # pixels
@@ -276,6 +312,7 @@ def main():
         rmag_true=rmag_true,
         halpha_flux_true=halpha_flux_true,
         r_bandpass=R_BANDPASS,
+        center_fiber_obsindex=center_fiber_index,
     )
 
     meta_pars = {
@@ -338,19 +375,62 @@ def main():
             'lambda_unit': 'nm',
         },
         ### SED model
-        # V2 normalizes this continuum by rmag_true and zeroes non-Ha lines.
+        # V3 normalizes the continuum by rmag_true, zeroes non-Ha lines, and
+        # asks kl-tools to interpret em_Ha_flux as clean central-fiber flux.
         'sed': sed_config,
         ### observation configurations
         'obs_conf': default_obs_conf,
     }
     pars = Pars(sampled_pars, meta_pars)
      
-    FiberLikelihood(
+    likelihood = FiberLikelihood(
         pars,
         None,
         sampled_theta_fid=sampled_pars_value,
         pickle_cubes=False,
     )
+    calibration_getter = getattr(
+        likelihood, "get_central_fiber_flux_calibration", None
+    )
+    if not callable(calibration_getter):
+        raise RuntimeError(
+            "Simulator v3 requires a kl-tools version with central-fiber "
+            "H-alpha flux calibration support"
+        )
+    calibration = calibration_getter()
+    if not isinstance(calibration, dict):
+        raise RuntimeError(
+            "kl-tools did not apply the requested central-fiber H-alpha "
+            "flux semantics"
+        )
+    if calibration.get("semantics") != "central_fiber" or int(
+        calibration.get("reference_obsindex", -1)
+    ) != center_fiber_index:
+        raise RuntimeError(
+            "kl-tools central-fiber calibration provenance does not match "
+            "the configured central fiber"
+        )
+    if int(calibration.get("api_version", -1)) != HALPHA_FLUX_API_VERSION:
+        raise RuntimeError(
+            "kl-tools central-fiber calibration API version does not match "
+            f"simulator schema v3: {calibration.get('api_version')!r}"
+        )
+    _, halpha_total_flux, central_halpha_aperture_fraction = (
+        validate_central_halpha_flux_conversion(
+            central_flux=calibration.get("requested_central_flux"),
+            total_flux=calibration.get("derived_total_flux"),
+            aperture_fraction=calibration.get("central_aperture_fraction"),
+        )
+    )
+    if not np.isclose(
+        calibration["requested_central_flux"],
+        halpha_flux_true,
+        rtol=1e-12,
+        atol=0.0,
+    ):
+        raise RuntimeError(
+            "kl-tools central-fiber calibration changed the requested H-alpha flux"
+        )
     datavector = get_GlobalDataVector(0)
     datavector.header[FITS_OBSERVATION_MODEL_VERSION_KEY] = OBSERVATION_MODEL_VERSION
     datavector.header[FITS_PHOTOMETRY_BAND_KEY] = PHOTOMETRY_BAND
@@ -370,6 +450,18 @@ def main():
     )
     datavector.header[FITS_RMAG_TRUE_KEY] = rmag_true
     datavector.header[FITS_HALPHA_FLUX_TRUE_KEY] = halpha_flux_true
+    datavector.header[FITS_IMAGE_SNR_KEY] = image_snr
+    datavector.header[FITS_CENTER_HALPHA_SNR_KEY] = central_halpha_snr
+    datavector.header[FITS_HALPHA_FLUX_UNITS_KEY] = HALPHA_FLUX_UNITS
+    datavector.header[FITS_HALPHA_FLUX_SEMANTICS_KEY] = HALPHA_FLUX_SEMANTICS
+    datavector.header[FITS_HALPHA_FLUX_TRANSFORM_KEY] = HALPHA_FLUX_TRANSFORM
+    datavector.header[FITS_HALPHA_FLUX_API_VERSION_KEY] = (
+        HALPHA_FLUX_API_VERSION
+    )
+    datavector.header[FITS_HALPHA_TOTAL_FLUX_KEY] = halpha_total_flux
+    datavector.header[FITS_CENTER_HALPHA_APERTURE_KEY] = (
+        central_halpha_aperture_fraction
+    )
     print(f'Dataset {d} #{ID} generated')
     datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)
     

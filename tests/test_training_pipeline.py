@@ -90,13 +90,16 @@ def _bare_batch_trainer(trainer_type, model):
     trainer.fibpos_valid = trainer.fibpos_train.clone()
     trainer.rmag_train = torch.tensor([18.0, 20.0])
     trainer.rmag_valid = trainer.rmag_train.clone()
+    trainer.image_snr_train = torch.tensor([50.0, 500.0])
+    trainer.image_snr_valid = trainer.image_snr_train.clone()
+    trainer.central_halpha_snr_train = torch.tensor([10.0, 100.0])
+    trainer.central_halpha_snr_valid = trainer.central_halpha_snr_train.clone()
+    trainer.train_npe_view_generator = torch.Generator().manual_seed(11)
+    trainer.valid_npe_view_generator = torch.Generator().manual_seed(12)
 
     image = torch.arange(8, dtype=torch.float32).reshape(2, 1, 2, 2)
     spectra = torch.zeros(2, 1, 5, 8)
-    quality = torch.tensor([5.0, 20.0])
-    trainer._noisy_batch = lambda indices, split: (
-        image[indices], spectra[indices], quality[indices]
-    )
+    trainer._noisy_batch = lambda indices, split: (image[indices], spectra[indices])
     trainer._all_ranks_true = lambda value: bool(value)
     return trainer
 
@@ -167,7 +170,12 @@ def test_multigpu_ccl_converts_batch_norm_and_checkpoint_remains_loadable():
     ) is npe
 
 
-def _matched_analysis_records(*, corrupt_nuisance=False, corrupt_stencil=False):
+def _matched_analysis_records(
+    *,
+    corrupt_nuisance=False,
+    corrupt_stencil=False,
+    corrupt_image_snr=False,
+):
     shear = ((0.0, 0.0), (0.1, 0.0), (-0.1, 0.0), (0.0, 0.1), (0.0, -0.1))
     records = []
     for index, (g1, g2) in enumerate(shear):
@@ -178,17 +186,29 @@ def _matched_analysis_records(*, corrupt_nuisance=False, corrupt_stencil=False):
             truth[5] += 0.25
         if corrupt_stencil and index == 4:
             truth[1] = -0.2
+        image_snr = 125.0 if not (corrupt_image_snr and index == 4) else 126.0
+        image = torch.full((1, 4, 4), float(index + 1))
+        spectra = torch.zeros(1, 5, 8)
+        spectra[..., :6] = 1.0
+        spectra[0, 2, 3:5] += float(index + 1)
         records.append(
-            {"fid_pars": truth, "rmag_true": 20.0, "halpha_flux_true": 1e-15}
+            {
+                "fid_pars": truth,
+                "rmag_true": 20.0,
+                "halpha_flux_true": 1e-15,
+                "image_snr": image_snr,
+                "central_halpha_snr": 50.0,
+                "observation_model_version": 3,
+                "img": image,
+                "spec": spectra,
+                "fib_pos": torch.zeros(5, 2),
+            }
         )
     return records
 
 
 class _AnalysisModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.register_buffer("image_noise_sigma", torch.tensor(1.0))
-        self.register_buffer("spectral_reference_line_norm", torch.tensor(1.0))
+    pass
 
 
 @pytest.mark.parametrize(
@@ -202,12 +222,121 @@ def test_matched_analysis_rejects_corrupt_truth_groups(monkeypatch, records, mes
     monkeypatch.setattr(
         train,
         "validate_observation_record",
-        lambda record, **_: (record["rmag_true"], record["halpha_flux_true"]),
+        lambda record, **_: (
+            record["rmag_true"],
+            record["halpha_flux_true"],
+            record["image_snr"],
+            record["central_halpha_snr"],
+        ),
     )
     with pytest.raises(ValueError, match=message):
         train.sample_density(
             _AnalysisModel(), records, 2, matched_group_size=5
         )
+
+
+def test_matched_analysis_rejects_nonshared_record_snr(monkeypatch):
+    records = _matched_analysis_records(corrupt_image_snr=True)
+    monkeypatch.setattr(
+        train,
+        "validate_observation_record",
+        lambda record, **_: (
+            record["rmag_true"],
+            record["halpha_flux_true"],
+            record["image_snr"],
+            record["central_halpha_snr"],
+        ),
+    )
+    with pytest.raises(ValueError, match="share image_snr"):
+        train.sample_density(_AnalysisModel(), records, 2, matched_group_size=5)
+
+
+class _RecordingAnalysisModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.original_images = []
+        self.original_spectra = []
+        self._sample_calls = 0
+
+    def sample(
+        self,
+        image,
+        spectra,
+        nsamples,
+        *,
+        fiber_positions,
+        observation_context,
+    ):
+        del fiber_positions
+        assert set(observation_context) == set(config.ORACLE_CONTEXT_FIELDS)
+        if self._sample_calls % 2 == 0:
+            self.original_images.append(image.detach().clone())
+            self.original_spectra.append(spectra.detach().clone())
+        self._sample_calls += 1
+        return torch.zeros(nsamples, len(config.TARGET_NAMES), device=image.device)
+
+    def posterior_log_prob(
+        self,
+        image,
+        spectra,
+        targets,
+        *,
+        fiber_positions,
+        observation_context,
+    ):
+        del image, spectra, fiber_positions, observation_context
+        return torch.zeros(targets.shape[0], device=targets.device)
+
+
+def test_matched_analysis_reuses_noise_and_base_signal_norm(monkeypatch):
+    records = _matched_analysis_records()
+    monkeypatch.setattr(
+        train,
+        "validate_observation_record",
+        lambda record, **_: (
+            record["rmag_true"],
+            record["halpha_flux_true"],
+            record["image_snr"],
+            record["central_halpha_snr"],
+        ),
+    )
+    model = _RecordingAnalysisModel()
+    _, _, metadata = train.sample_density(
+        model,
+        records,
+        2,
+        matched_group_size=5,
+        noise_seed=17,
+        spectral_noise_seed=23,
+    )
+
+    base_image = records[0]["img"].unsqueeze(0)
+    base_spectra = records[0]["spec"].unsqueeze(0)
+    expected_image_sigma = train.image_matched_filter_norm(base_image)[0] / 125.0
+    expected_line_sigma = train.central_halpha_line_norm(
+        base_spectra, center_fiber_index=config.observation["center_fiber_index"]
+    )[0] / 50.0
+    torch.testing.assert_close(
+        torch.as_tensor(metadata["image_noise_sigma"]),
+        expected_image_sigma.expand(5),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(metadata["central_spectral_noise_sigma"]),
+        expected_line_sigma.expand(5),
+    )
+
+    image_noise = [
+        observed - record["img"].unsqueeze(0)
+        for observed, record in zip(model.original_images, records)
+    ]
+    spectral_noise = [
+        observed - record["spec"].unsqueeze(0)
+        for observed, record in zip(model.original_spectra, records)
+    ]
+    for realization in image_noise[1:]:
+        torch.testing.assert_close(realization, image_noise[0])
+    for realization in spectral_noise[1:]:
+        torch.testing.assert_close(realization, spectral_noise[0])
 
 
 def test_global_mean_reduces_float64_sum_and_count(monkeypatch):
@@ -270,7 +399,7 @@ def test_ccl_invalid_global_gradient_skips_optimizer_step(monkeypatch):
     assert not steps
 
 
-def test_npe_pair_is_one_step_and_invalid_global_gradient_skips(monkeypatch):
+def test_npe_random_view_is_one_step_and_invalid_global_gradient_skips(monkeypatch):
     model = _TinyNPE()
     trainer = _bare_batch_trainer(train.NPETrainer, model)
     steps = []
@@ -283,7 +412,7 @@ def test_npe_pair_is_one_step_and_invalid_global_gradient_skips(monkeypatch):
 
     loss, valid = trainer._batch_loss(torch.tensor([0, 1]), "train", train=True)
     assert torch.isfinite(loss) and valid
-    assert model.seen_batch_sizes == [4]
+    assert model.seen_batch_sizes == [2]
     assert len(steps) == 1
     assert trainer.preclip_grad_norm_history
     assert trainer.training_diagnostic_history[-1]["bounded_logdet_min"] == -2.0
@@ -425,7 +554,9 @@ def test_best_checkpoint_persists_current_metadata(tmp_path):
     assert metadata["next_epoch_learning_rates"] == pytest.approx([0.01])
 
 
-def test_epoch_diagnostics_are_logged_and_saved_with_losses(tmp_path):
+def test_epoch_diagnostics_are_logged_and_saved_with_losses(
+    tmp_path, caplog, monkeypatch
+):
     trainer = object.__new__(train.Trainer)
     trainer.stage_config = {
         "model_path": str(tmp_path),
@@ -462,7 +593,28 @@ def test_epoch_diagnostics_are_logged_and_saved_with_losses(tmp_path):
 
     trainer._train_epoch = train_epoch
     trainer._valid_epoch = valid_epoch
-    trainer.train(1)
+    elapsed_clock = iter((100.0, 165.4))
+    monkeypatch.setattr(train.time, "perf_counter", lambda: next(elapsed_clock))
+    with caplog.at_level(logging.INFO, logger="diagnostic-test"):
+        trainer.train(1)
+
+    assert caplog.messages == [
+        "\n".join(
+            (
+                "Epoch 1/1",
+                "  elapsed: 00:01:05.4",
+                "  loss:",
+                "    train: 2",
+                "    valid: 1.8",
+                "  train diagnostics:",
+                "    target_entropy: 1.25",
+                "    excess_loss: 0.75",
+                "  valid diagnostics:",
+                "    target_entropy: 1.5",
+                "    excess_loss: 0.5",
+            )
+        )
+    ]
 
     loss_path = tmp_path / "losses" / "losses_diagnostic-run.csv"
     rows = loss_path.read_text()

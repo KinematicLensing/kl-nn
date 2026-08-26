@@ -1,5 +1,8 @@
 # Spectral noise scope for simulator-v2
 
+> Archived contract. Simulator v3 replaces `spectral_reference_quality` with
+> explicit linear `central_halpha_snr`; see `KL-NN_SIMV3_ARCH.md`.
+
 The proof-of-concept keeps a Gaussian observation model. The goal of the
 current update is to make the requested noise *level* scientifically
 defensible without adding detector physics that is unnecessary for the NPE

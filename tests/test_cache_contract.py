@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 
 from cache_contract import (
+    CACHE_SCHEMA,
     CURRENT_FEATURE_NAMES,
+    CURRENT_TARGET_TRANSFORMS,
+    EXPECTED_DENSITY_COORDINATES,
+    EXPECTED_OBSERVATION_MODEL,
+    LEGACY_CACHE_SCHEMA,
+    LEGACY_REQUIRED_CACHE_ARRAYS,
     PARTITION_SEED_STRIDE,
     REQUIRED_CACHE_ARRAYS,
     load_cache_partitions,
@@ -31,8 +37,12 @@ def _array(name, rows, draws, start):
         "population_tf_log_ratio",
         "rmag_true",
         "spectral_reference_quality",
+        "image_snr",
+        "central_halpha_snr",
+        "image_noise_sigma",
+        "central_spectral_noise_sigma",
     }:
-        return np.zeros(rows, dtype=np.float64)
+        return np.ones(rows, dtype=np.float64)
     if name in {
         "truth",
         "proposal_map_estimates",
@@ -47,11 +57,30 @@ def _array(name, rows, draws, start):
     raise AssertionError(name)
 
 
-def _manifest(index, total, start, end, draws):
+def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
     label = f"part{index}of{total}"
     seed = 42 + PARTITION_SEED_STRIDE * index
-    return {
-        "schema": "klnn-posterior-cache-v1",
+    if schema == LEGACY_CACHE_SCHEMA:
+        provenance = {
+            "image_noise_sigma": 1.0,
+            "spectral_reference_line_norm": 2.0,
+            "matched_group_size": 1,
+            "posterior_sample_seed": seed,
+            "image_noise_seed": seed,
+            "spectral_noise_seed": seed + 101,
+            "spectral_quality_seed": seed + 307,
+        }
+        required_arrays = LEGACY_REQUIRED_CACHE_ARRAYS
+    else:
+        provenance = {
+            "matched_group_size": 1,
+            "posterior_sample_seed": seed,
+            "image_noise_seed": seed,
+            "spectral_noise_seed": seed + 101,
+        }
+        required_arrays = REQUIRED_CACHE_ARRAYS
+    payload = {
+        "schema": schema,
         "model_name": "current-model",
         "checkpoint": "/models/current-model/current-modelbest",
         "dataset": "/datasets/current",
@@ -89,35 +118,52 @@ def _manifest(index, total, start, end, draws):
             "proposal": "base posterior",
             "tf_target": "TF-weighted posterior",
         },
-        "observation_provenance": {
-            "image_noise_sigma": 1.0,
-            "spectral_reference_line_norm": 2.0,
-            "matched_group_size": 1,
-            "posterior_sample_seed": seed,
-            "image_noise_seed": seed,
-            "spectral_noise_seed": seed + 101,
-            "spectral_quality_seed": seed + 307,
-        },
+        "observation_provenance": provenance,
         "files": {
-            name: f"{name}/{label}.npy" for name in REQUIRED_CACHE_ARRAYS
+            name: f"{name}/{label}.npy" for name in required_arrays
         },
     }
+    if schema == CACHE_SCHEMA:
+        payload.update(
+            {
+                "physical_parameter_ranges": {
+                    "g1": [-0.1, 0.1],
+                    "g2": [-0.1, 0.1],
+                    "theta_int": [0.0, np.pi],
+                    "sini": [0.1, 1.0],
+                    "v0": [0.0, 20.0],
+                    "vcirc": [60.0, 540.0],
+                    "rscale": [0.1, 5.0],
+                    "hlr": [0.1, 5.0],
+                    "halpha_flux_true": [1.0e-17, 1.0e-14],
+                },
+                "target_transforms": dict(CURRENT_TARGET_TRANSFORMS),
+                "density_coordinates": dict(EXPECTED_DENSITY_COORDINATES),
+                "observation_model": dict(EXPECTED_OBSERVATION_MODEL),
+            }
+        )
+    return payload
 
 
-def _write_cache(root, *, total=2, rows=2, draws=4):
+def _write_cache(root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA):
     (root / "meta").mkdir(parents=True)
+    required_arrays = (
+        LEGACY_REQUIRED_CACHE_ARRAYS
+        if schema == LEGACY_CACHE_SCHEMA
+        else REQUIRED_CACHE_ARRAYS
+    )
     for index in range(total):
         start = index * rows
         end = start + rows
         label = f"part{index}of{total}"
-        for name in REQUIRED_CACHE_ARRAYS:
+        for name in required_arrays:
             directory = root / name
             directory.mkdir(exist_ok=True)
             np.save(
                 directory / f"{label}.npy",
                 _array(name, rows, draws, start),
             )
-        payload = _manifest(index, total, start, end, draws)
+        payload = _manifest(index, total, start, end, draws, schema=schema)
         (root / "meta" / f"{label}.json").write_text(
             json.dumps(payload), encoding="utf-8"
         )
@@ -139,8 +185,25 @@ def test_complete_cache_contract_orders_parts_and_concatenates_rows(tmp_path):
     assert partitions.feature_names == CURRENT_FEATURE_NAMES
     assert partitions.dataset_size == 4
     assert partitions.total_rows == 4
+    assert set(partitions.files) == set(REQUIRED_CACHE_ARRAYS)
+    assert "spectral_reference_quality" not in partitions.files
+    assert partitions.observation_provenance == {"matched_group_size": 1}
     truth = load_partitioned_array(partitions, "truth")
     np.testing.assert_array_equal(truth[:, 0], np.arange(4))
+
+
+def test_legacy_v1_cache_remains_readable(tmp_path):
+    root = _write_cache(
+        tmp_path / "legacy-cache", schema=LEGACY_CACHE_SCHEMA
+    )
+    partitions = load_cache_partitions(root)
+    assert "spectral_reference_quality" in partitions.files
+    assert "image_snr" not in partitions.files
+    assert partitions.observation_provenance == {
+        "image_noise_sigma": 1.0,
+        "spectral_reference_line_norm": 2.0,
+        "matched_group_size": 1,
+    }
 
 
 def test_numeric_partition_order_supports_more_than_ten_parts(tmp_path):
@@ -172,7 +235,7 @@ def test_numeric_partition_order_supports_more_than_ten_parts(tmp_path):
         ),
         (
             lambda payload: payload["observation_provenance"].__setitem__(
-                "image_noise_sigma", 3.0
+                "matched_group_size", 3
             ),
             "non-seed observation provenance differs",
         ),

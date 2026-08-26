@@ -87,3 +87,19 @@ def test_partition_seed_changes_candidate_streams():
     base = 42
     seeds = [base + 1_000_003 * index for index in range(3)]
     assert len(set(seeds)) == 3
+
+
+def test_physical_map_scores_include_log_flux_jacobian():
+    module = _module()
+    names = ("halpha_flux_true",)
+    normalized = np.asarray([[[-1.0], [1.0]]], dtype=np.float64)
+    equal_normalized_density = np.zeros((1, 2), dtype=np.float64)
+    scores = module.physical_log_prob_from_normalized(
+        normalized,
+        equal_normalized_density,
+        par_ranges={"halpha_flux_true": [1.0e-17, 1.0e-14]},
+        feature_names=names,
+        target_transforms={"halpha_flux_true": "log10"},
+    )
+    assert scores[0, 0] > scores[0, 1]
+    np.testing.assert_allclose(scores[0, 0] - scores[0, 1], np.log(1000.0))

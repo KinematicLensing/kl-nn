@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=kl_simv2_db
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_simulator_v2_%A_%a.out
+#SBATCH --job-name=kl_simv3_db
+#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_simulator_v3_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=0:30:00
 #SBATCH --nodes=1
@@ -9,16 +9,15 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -eo pipefail
+set -euo pipefail
 ulimit -c 0
 
 module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
-set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv2_galaxyaxis_halpha}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv2_galaxyaxis_halpha}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 
@@ -27,11 +26,10 @@ if (( TOTAL <= 0 || CHUNK_SIZE <= 0 || TOTAL % CHUNK_SIZE != 0 )); then
     exit 2
 fi
 PART_COUNT="$((TOTAL / CHUNK_SIZE))"
-ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-50}"
+ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"
 SHARD_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 if (( PART_COUNT != ARRAY_TASK_COUNT )); then
-    echo "TOTAL=${TOTAL} and CHUNK_SIZE=${CHUNK_SIZE} require ${PART_COUNT} array tasks, but this job has ${ARRAY_TASK_COUNT};" \
-        "submit with --array=1-${PART_COUNT}" >&2
+    echo "TOTAL=${TOTAL} and CHUNK_SIZE=${CHUNK_SIZE} require ${PART_COUNT} array tasks, but this job has ${ARRAY_TASK_COUNT}; submit with --array=1-${PART_COUNT}" >&2
     exit 2
 fi
 if (( SHARD_INDEX < 0 || SHARD_INDEX >= PART_COUNT )); then

@@ -19,7 +19,7 @@ conda activate kl-nn
 
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
 EPOCH="${EPOCH:-}"
-DATASET="${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}"
+DATASET="${DATASET:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
 NBASE="${NBASE:-1000}"
 NPARTS="${NPARTS:-10}"
 NSAMPLES="${NSAMPLES:-5000}"

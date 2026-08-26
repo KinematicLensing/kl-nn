@@ -15,8 +15,8 @@ KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 
-SAMPFILE="${SAMPFILE:-samples_shear_response_simv2_galaxyaxis_halpha_5k.csv}"
-DATASET="${DATASET:-shear_response_simv2_galaxyaxis_halpha_5k}"
+SAMPFILE="${SAMPFILE:-samples_shear_response_simv3_galaxyaxis_central_halpha_5k.csv}"
+DATASET="${DATASET:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
 NBASE="${NBASE:-1000}"
 NTASKS=100
 TOTAL=$((5 * NBASE))

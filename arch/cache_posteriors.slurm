@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/cache_posteriors_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=2:00:00
+#SBATCH --time=1:00:00
 #SBATCH --nodes=1
 #SBATCH --array=1-10
 #SBATCH --mail-type=ALL
@@ -23,7 +23,7 @@ conda activate kl-nn
 EPOCH="${EPOCH:-}"
 NPARTS="${NPARTS:-10}"
 NGALS="${NGALS:-1000}"
-NSAMPLES="${NSAMPLES:-5000}"
+NSAMPLES="${NSAMPLES:-10000}"
 SEED="${SEED:-42}"
 CACHE_TAG="${CACHE_TAG:-${MODEL_NAME}_posterior_candidates}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"

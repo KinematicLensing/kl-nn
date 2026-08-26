@@ -46,7 +46,7 @@ def test_r90_datavector_geometry_and_inverse_are_exact():
         torch.testing.assert_close(actual, expected)
 
 
-def test_training_batches_are_one_identity_r90_averaged_objective():
+def test_ccl_batch_contains_identity_and_r90_views():
     batch = 3
     image = torch.randn(batch, 1, 4, 4)
     spectra = torch.randn(batch, 1, 5, 8)
@@ -57,12 +57,46 @@ def test_training_batches_are_one_identity_r90_averaged_objective():
         "spectral_reference_quality": torch.tensor([5.0, 20.0, 80.0]),
     }
     ccl = make_ccl_training_batch(image, spectra, targets, positions, context)
-    npe = make_npe_training_batch(image, spectra, targets, positions, context)
-    for left, right in zip(ccl[:4], npe[:4]):
-        torch.testing.assert_close(left, right)
+
     assert ccl[0].shape[0] == 2 * batch
     torch.testing.assert_close(ccl[0][:batch], image)
     torch.testing.assert_close(ccl[0][batch:], torch.rot90(image, 1, (-2, -1)))
     torch.testing.assert_close(ccl[4]["rmag_true"], context["rmag_true"].repeat(2))
-    torch.testing.assert_close(ccl[4]["spectral_reference_quality"], context["spectral_reference_quality"].repeat(2))
+    torch.testing.assert_close(
+        ccl[4]["spectral_reference_quality"],
+        context["spectral_reference_quality"].repeat(2),
+    )
     assert math.isfinite(float(ccl[2].mean()))
+
+
+def test_npe_batch_selects_exactly_one_reproducible_view_per_row():
+    batch = 3
+    image = torch.randn(batch, 1, 4, 4)
+    spectra = torch.randn(batch, 1, 5, 8)
+    targets = torch.rand(batch, 9) * 2 - 1
+    positions = torch.randn(batch, 5, 2)
+    context = {
+        "rmag_true": torch.tensor([18.0, 20.0, 22.0]),
+        "spectral_reference_quality": torch.tensor([5.0, 20.0, 80.0]),
+    }
+    rotate_mask = torch.tensor([False, True, False])
+    rotated = rotate_90_datavector(image, spectra, targets, positions)
+    npe = make_npe_training_batch(
+        image,
+        spectra,
+        targets,
+        positions,
+        context,
+        rotate_mask=rotate_mask,
+    )
+
+    assert npe[0].shape[0] == batch
+    for actual, identity, rotated_value in zip(
+        npe[:4], (image, spectra, targets, positions), rotated
+    ):
+        shape = (batch,) + (1,) * (identity.ndim - 1)
+        expected = torch.where(
+            rotate_mask.reshape(shape), rotated_value, identity
+        )
+        torch.testing.assert_close(actual, expected)
+    assert npe[4] is context

@@ -31,8 +31,8 @@ def test_current_config_json_roundtrip_is_exact(tmp_path):
     configured.train.non_theta_learning_rate = 2.0e-4
     configured.train.theta_learning_rate = 7.0e-5
     configured.flow.num_layers = 6
-    configured.observation.image_depth_5sigma_mag = 23.2
-    configured.observation.spectral_quality_min = 4.0
+    configured.observation.image_snr_min = 6.0
+    configured.observation.central_halpha_snr_min = 2.0
 
     path = tmp_path / "current.json"
     configured.to_json(str(path))
@@ -44,7 +44,7 @@ def test_current_config_json_roundtrip_is_exact(tmp_path):
     assert tuple(restored.observation.context_fields) == config.ORACLE_CONTEXT_FIELDS
 
 
-def test_current_target_ranges_are_immutable_and_match_halpha_metadata():
+def test_current_target_ranges_and_transforms_are_immutable():
     payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
     payload["par_ranges"]["vcirc"] = [50.0, 550.0]
     with pytest.raises(ValueError, match="immutable"):
@@ -54,6 +54,10 @@ def test_current_target_ranges_are_immutable_and_match_halpha_metadata():
     payload["observation"]["halpha_flux_max"] *= 0.9
     with pytest.raises(ValueError, match="H-alpha bounds"):
         config.ModelConfig.from_dict(payload)
+
+    assert tuple(config.TARGET_TRANSFORMS) == config.TARGET_NAMES
+    assert config.TARGET_TRANSFORMS["halpha_flux_true"] == "log10"
+    assert set(config.TARGET_TRANSFORMS.values()) == {"identity", "log10"}
 
 
 @pytest.mark.parametrize(
@@ -71,7 +75,7 @@ def test_current_target_ranges_are_immutable_and_match_halpha_metadata():
 def test_generator_metadata_is_immutable(field, value):
     payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
     payload["observation"][field] = value
-    with pytest.raises(ValueError, match="fixed by simulator schema v2"):
+    with pytest.raises(ValueError, match="fixed by simulator schema v3"):
         config.ModelConfig.from_dict(payload)
 
 
@@ -134,6 +138,9 @@ def test_pretrain_cli_applies_only_shared_and_ccl_overrides():
             "31415",
             "--deterministic",
             "--no-compile",
+            "--amp",
+            "--amp-dtype",
+            "float16",
             "--fixed-validation-streams",
             "--initial-learning-rate",
             "0.0004",
@@ -162,6 +169,8 @@ def test_pretrain_cli_applies_only_shared_and_ccl_overrides():
     assert spawned.pretrain.seed == 31415
     assert spawned.pretrain.deterministic is True
     assert spawned.pretrain.use_compile is False
+    assert spawned.pretrain.use_amp is True
+    assert spawned.pretrain.amp_dtype == "float16"
     assert spawned.pretrain.fixed_validation_streams is True
     assert spawned.pretrain.initial_learning_rate == pytest.approx(4.0e-4)
     assert spawned.pretrain.weight_decay == pytest.approx(2.0e-4)
@@ -181,6 +190,10 @@ def test_npe_cli_applies_only_posterior_overrides():
             "current-ccl",
             "--pretrain-from",
             "8",
+            "--compile",
+            "--amp",
+            "--amp-dtype",
+            "bfloat16",
             "--flow-num-layers",
             "7",
             "--flow-num-bins",
@@ -218,6 +231,9 @@ def test_npe_cli_applies_only_posterior_overrides():
     assert spawned.train.model_name == "current-npe"
     assert spawned.train.pretrained_name == "current-ccl"
     assert spawned.train.pretrain_from == 8
+    assert spawned.train.use_compile is True
+    assert spawned.train.use_amp is True
+    assert spawned.train.amp_dtype == "bfloat16"
     assert spawned.flow.num_layers == 7
     assert spawned.flow.num_bins == 12
     assert spawned.flow.theta_num_layers == 2

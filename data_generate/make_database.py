@@ -46,30 +46,55 @@ def normalize(form, data, pars=None):
         else:
             raise ValueError("Invalid form, must be '01', '-11', or 'std'.")
 
-def load_default_par_ranges():
-    config_path = Path(__file__).resolve().parents[1] / 'arch' / 'config.py'
-    spec = importlib.util.spec_from_file_location('arch_config', config_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Failed to load config module from {config_path}')
-    arch_config = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = arch_config
-    spec.loader.exec_module(arch_config)
-    return arch_config.MODEL_CONFIG.par_ranges.copy()
+def load_arch_module(filename, module_name):
+    """Load an arch module when this script is launched from data_generate/."""
 
-par_ranges = load_default_par_ranges()
+    module_path = Path(__file__).resolve().parents[1] / 'arch' / filename
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Failed to load module from {module_path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_default_target_schema():
+    config_path = Path(__file__).resolve().parents[1] / 'arch' / 'config.py'
+    arch_config = load_arch_module(config_path.name, 'arch_config')
+    return (
+        arch_config.MODEL_CONFIG.par_ranges.copy(),
+        dict(arch_config.TARGET_TRANSFORMS),
+    )
+
+par_ranges, target_transforms = load_default_target_schema()
+arch_utils = load_arch_module('utils.py', 'arch_utils')
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def normalize_sample_table(samples, parameter_ranges):
-    """Normalize only named inference targets, leaving metadata untouched."""
+def normalize_sample_table(
+    samples,
+    parameter_ranges,
+    parameter_transforms=None,
+):
+    """Normalize named inference targets, leaving observation metadata untouched."""
 
     missing = [name for name in parameter_ranges if name not in samples.columns]
     if missing:
         raise ValueError(f'Sample table is missing inference targets: {missing}')
     normalized = samples.copy()
-    for name, values in parameter_ranges.items():
-        normalized[name] = normalize('-11', normalized[name], values)
+    names = tuple(parameter_ranges)
+    normalized.loc[:, names] = arch_utils.normalize_targets(
+        normalized.loc[:, names].to_numpy(dtype=np.float64),
+        parameter_ranges,
+        feature_names=names,
+        target_transforms=(
+            target_transforms
+            if parameter_transforms is None
+            else parameter_transforms
+        ),
+    )
     return normalized
 
 

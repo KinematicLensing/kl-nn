@@ -7,6 +7,7 @@ import argparse
 import base64
 from io import BytesIO
 import html
+import logging
 import math
 from pathlib import Path
 
@@ -30,15 +31,39 @@ from utils import img_to_gal_axis
 SHEAR_PP_BIN_EDGES = np.asarray(
     [-0.1, -1.0 / 30.0, 1.0 / 30.0, 0.1], dtype=np.float64
 )
-SINI_CUTS = (np.inf, 0.9, 0.8, 0.7, 0.6)
 LOW_G_DEFAULT = 0.02
 ADDITIVE_DISPLAY_SCALE = 1.0e4
 MULTIPLICATIVE_DISPLAY_SCALE = 1.0e2
+DEFAULT_PRECISION_CAP_PERCENTILE = 95.0
+PRECISION_CAP_SWEEP = (90.0, 95.0, 99.0, None)
+LOGGER = logging.getLogger(__name__)
+
+NUISANCE_DISPLAY = {
+    "theta_int": (1.0, "rad"),
+    "sini": (1.0, ""),
+    "v0": (1.0, "km s<sup>-1</sup>"),
+    "vcirc": (1.0, "km s<sup>-1</sup>"),
+    "rscale": (1.0, "arcsec"),
+    "hlr": (1.0, "arcsec"),
+    "halpha_flux_true": (
+        1.0e16,
+        "10<sup>-16</sup> erg s<sup>-1</sup> cm<sup>-2</sup>",
+    ),
+}
+NUISANCE_PLOT_UNIT = {
+    "theta_int": "rad",
+    "sini": "",
+    "v0": r"km s$^{-1}$",
+    "vcirc": r"km s$^{-1}$",
+    "rscale": "arcsec",
+    "hlr": "arcsec",
+    "halpha_flux_true": r"$10^{-16}$ erg s$^{-1}$ cm$^{-2}$",
+}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cache-root", type=Path, required=True)
+    parser.add_argument("--cache-root", type=Path, default=Path('/ocean/projects/phy250048p/shared/cache/'))
     parser.add_argument(
         "--case",
         action="append",
@@ -48,7 +73,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-galaxies", type=int, default=None)
     parser.add_argument("--low-g", type=float, default=LOW_G_DEFAULT)
-    parser.add_argument("--bins", type=int, default=8)
+    parser.add_argument("--bins", type=int, default=10)
+    parser.add_argument(
+        "--weighted",
+        action="store_true",
+        help=(
+            "Compose each population weight with posterior shear precision, "
+            "capped at its population-weighted 95th percentile."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -84,10 +117,22 @@ def load_case(
     rmag_true = np.asarray(
         load_partitioned_array(cache_partitions, "rmag_true"), dtype=float
     )
-    spectral_quality = np.asarray(
-        load_partitioned_array(cache_partitions, "spectral_reference_quality"),
-        dtype=float,
-    )
+    if "central_halpha_snr" in cache_partitions.files:
+        spectral_condition = np.asarray(
+            load_partitioned_array(cache_partitions, "central_halpha_snr"),
+            dtype=float,
+        )
+        spectral_condition_name = "central H-alpha S/N"
+        spectral_condition_log_scale = False
+    else:
+        spectral_condition = np.asarray(
+            load_partitioned_array(
+                cache_partitions, "spectral_reference_quality"
+            ),
+            dtype=float,
+        )
+        spectral_condition_name = "spectral reference quality"
+        spectral_condition_log_scale = True
     posterior_ess = np.asarray(
         load_partitioned_array(cache_partitions, "posterior_tf_ess"), dtype=float
     )
@@ -113,7 +158,7 @@ def load_case(
     vectors = (
         population_log_ratio,
         rmag_true,
-        spectral_quality,
+        spectral_condition,
         posterior_ess,
         posterior_ess_fraction,
         posterior_max_weight,
@@ -131,7 +176,7 @@ def load_case(
         target_summary = target_summary[:take]
         population_log_ratio = population_log_ratio[:take]
         rmag_true = rmag_true[:take]
-        spectral_quality = spectral_quality[:take]
+        spectral_condition = spectral_condition[:take]
         posterior_ess = posterior_ess[:take]
         posterior_ess_fraction = posterior_ess_fraction[:take]
         posterior_max_weight = posterior_max_weight[:take]
@@ -148,7 +193,9 @@ def load_case(
         "feature_names": feature_names,
         "truth": truth,
         "rmag_true": rmag_true,
-        "spectral_reference_quality": spectral_quality,
+        "spectral_condition": spectral_condition,
+        "spectral_condition_name": spectral_condition_name,
+        "spectral_condition_log_scale": spectral_condition_log_scale,
         "posterior_tf_ess": posterior_ess,
         "posterior_tf_ess_fraction": posterior_ess_fraction,
         "posterior_tf_max_weight": posterior_max_weight,
@@ -159,6 +206,7 @@ def load_case(
                 "summary": proposal_summary,
                 "mean": proposal_summary[:, 1],
                 "galaxy_weight": proposal_weight,
+                "population_weight": proposal_weight.copy(),
             },
             "TF target population / TF posterior": {
                 "key": "tf_target",
@@ -166,6 +214,7 @@ def load_case(
                 "summary": target_summary,
                 "mean": target_summary[:, 1],
                 "galaxy_weight": target_weight,
+                "population_weight": target_weight.copy(),
             },
         },
     }
@@ -203,6 +252,34 @@ def weighted_mean_and_se(
     variance = float(np.sum(normalized * np.square(selected - mean)))
     se = math.sqrt(variance / max(ess - 1.0, 1.0))
     return mean, se, ess
+
+
+def posterior_component_variance(
+    values: np.ndarray, log_weight: np.ndarray | None = None
+) -> float:
+    """Marginal posterior variance with optional normalized log weights."""
+
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    if log_weight is None:
+        selected = values[finite]
+        if not len(selected):
+            return float("nan")
+        weight = np.full(len(selected), 1.0 / len(selected))
+    else:
+        log_weight = np.asarray(log_weight, dtype=np.float64)
+        if log_weight.shape != values.shape:
+            raise ValueError("values and log_weight must have matching shapes")
+        finite &= np.isfinite(log_weight)
+        selected = values[finite]
+        selected_log_weight = log_weight[finite]
+        if not len(selected):
+            return float("nan")
+        maximum = float(np.max(selected_log_weight))
+        scaled = np.exp(selected_log_weight - maximum)
+        weight = scaled / np.sum(scaled)
+    mean = float(np.sum(weight * selected))
+    return float(np.sum(weight * np.square(selected - mean)))
 
 
 def fit_design(
@@ -258,6 +335,103 @@ def weighted_quantile(
     )
 
 
+def population_weight(population: dict) -> np.ndarray:
+    """Return the population-only weights, before optional precision weighting."""
+
+    return np.asarray(
+        population.get("population_weight", population["galaxy_weight"]),
+        dtype=np.float64,
+    )
+
+
+def compose_precision_weights(
+    base_weight: np.ndarray,
+    g1_variance: np.ndarray,
+    g2_variance: np.ndarray,
+    cap_percentile: float | None,
+) -> tuple[np.ndarray, dict]:
+    """Compose population mass with common spin-symmetric shear precision.
+
+    The precision is ``2 / (Var(g1) + Var(g2))``. A percentile cap is
+    evaluated with respect to the valid base-population mass, rather than row
+    count, which is important for the TF target population. Galaxies with
+    non-finite or non-positive total posterior variance receive zero analysis
+    weight and are reported explicitly in the returned diagnostics.
+    """
+
+    base_weight = np.asarray(base_weight, dtype=np.float64)
+    g1_variance = np.asarray(g1_variance, dtype=np.float64)
+    g2_variance = np.asarray(g2_variance, dtype=np.float64)
+    if base_weight.ndim != 1 or not (
+        g1_variance.shape == g2_variance.shape == base_weight.shape
+    ):
+        raise ValueError("population weights and shear variances must be vectors")
+    if cap_percentile is not None and not 0.0 < cap_percentile < 100.0:
+        raise ValueError("precision cap percentile must lie strictly between 0 and 100")
+
+    valid_base = np.isfinite(base_weight) & (base_weight >= 0.0)
+    variance_sum = g1_variance + g2_variance
+    valid_variance = (
+        np.isfinite(g1_variance)
+        & np.isfinite(g2_variance)
+        & (g1_variance >= 0.0)
+        & (g2_variance >= 0.0)
+        & np.isfinite(variance_sum)
+        & (variance_sum > 0.0)
+    )
+    usable = valid_base & valid_variance
+    if not np.any(usable) or np.sum(base_weight[usable]) <= 0.0:
+        raise ValueError("no positive population mass has a valid shear variance")
+
+    precision = np.full(base_weight.shape, np.nan, dtype=np.float64)
+    precision[usable] = 2.0 / variance_sum[usable]
+    if cap_percentile is None:
+        threshold = float("inf")
+        capped = np.zeros(base_weight.shape, dtype=bool)
+        clipped_precision = precision.copy()
+    else:
+        threshold = float(
+            weighted_quantile(
+                precision[usable],
+                np.asarray([cap_percentile / 100.0]),
+                base_weight[usable],
+            )[0]
+        )
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError("precision percentile cap is not finite and positive")
+        capped = usable & (precision > threshold)
+        clipped_precision = np.minimum(precision, threshold)
+
+    combined = np.zeros(base_weight.shape, dtype=np.float64)
+    combined[usable] = base_weight[usable] * clipped_precision[usable]
+    total = float(np.sum(combined))
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("precision-weighted population mass is not positive")
+    combined /= total
+
+    valid_base_mass = float(np.sum(base_weight[valid_base]))
+    usable_base_mass = float(np.sum(base_weight[usable]))
+    capped_mass = float(np.sum(base_weight[capped]))
+    invalid_variance = ~valid_variance
+    invalid_mass = float(np.sum(base_weight[valid_base & invalid_variance]))
+    diagnostics = {
+        "cap_percentile": cap_percentile,
+        "precision_threshold": threshold,
+        "shape_noise_floor": 0.0 if cap_percentile is None else 1.0 / math.sqrt(threshold),
+        "capped_count": int(np.count_nonzero(capped)),
+        "capped_fraction": float(np.count_nonzero(capped) / np.count_nonzero(usable)),
+        "capped_population_mass": capped_mass / usable_base_mass,
+        "invalid_variance_count": int(np.count_nonzero(invalid_variance)),
+        "invalid_variance_fraction": float(np.mean(invalid_variance)),
+        "invalid_variance_population_mass": (
+            invalid_mass / valid_base_mass if valid_base_mass > 0.0 else float("nan")
+        ),
+        "usable_count": int(np.count_nonzero(usable)),
+        "ess": effective_sample_size(combined),
+    }
+    return combined, diagnostics
+
+
 def component_metrics(
     truth: np.ndarray,
     estimate: np.ndarray,
@@ -311,6 +485,73 @@ def component_metrics(
     }
 
 
+def precision_cap_sweep(
+    case: dict,
+    posterior_diagnostics: dict[str, dict[str, np.ndarray]],
+    low_g: float,
+) -> list[dict]:
+    """Evaluate Mean-estimator low-|g| calibration across precision caps."""
+
+    rows = []
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    for population_label, population in case["populations"].items():
+        posterior = posterior_diagnostics[population["key"]]
+        base_weight = population_weight(population)
+        for percentile in PRECISION_CAP_SWEEP:
+            weight, diagnostics = compose_precision_weights(
+                base_weight,
+                posterior["g1_variance"],
+                posterior["g2_variance"],
+                percentile,
+            )
+            component_rows = [
+                component_metrics(
+                    truth[:, index], population["mean"][:, index], low_g, weight
+                )
+                for index in range(2)
+            ]
+            rows.append(
+                {
+                    "population": population_label,
+                    "population_key": population["key"],
+                    **diagnostics,
+                    "g1_m": component_rows[0]["low_m"],
+                    "g1_m_se": component_rows[0]["low_m_se"],
+                    "g1_ess": component_rows[0]["ess_low"],
+                    "g1_n": component_rows[0]["n_low"],
+                    "g2_m": component_rows[1]["low_m"],
+                    "g2_m_se": component_rows[1]["low_m_se"],
+                    "g2_ess": component_rows[1]["ess_low"],
+                    "g2_n": component_rows[1]["n_low"],
+                }
+            )
+    return rows
+
+
+def apply_precision_weighting(
+    case: dict,
+    posterior_diagnostics: dict[str, dict[str, np.ndarray]],
+    cap_percentile: float = DEFAULT_PRECISION_CAP_PERCENTILE,
+) -> dict[str, dict]:
+    """Install capped precision-composed weights for all downstream sections."""
+
+    applied = {}
+    for population_label, population in case["populations"].items():
+        posterior = posterior_diagnostics[population["key"]]
+        weight, diagnostics = compose_precision_weights(
+            population_weight(population),
+            posterior["g1_variance"],
+            posterior["g2_variance"],
+            cap_percentile,
+        )
+        population["galaxy_weight"] = weight
+        population["precision_weighting"] = diagnostics
+        applied[population_label] = diagnostics
+    case["precision_weighted"] = True
+    case["precision_cap_percentile"] = cap_percentile
+    return applied
+
+
 def galaxy_frame_components(
     truth: np.ndarray, estimate: np.ndarray
 ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
@@ -327,8 +568,6 @@ def galaxy_frame_components(
 def compute_metrics(case: dict, low_g: float) -> list[dict]:
     rows = []
     truth = case["truth"]
-    sini_index = case["feature_names"].index("sini")
-    sini = truth[:, sini_index]
     for population_label, population in case["populations"].items():
         weight = population["galaxy_weight"]
         for estimator, estimate in (
@@ -351,34 +590,55 @@ def compute_metrics(case: dict, low_g: float) -> list[dict]:
                     row = component_metrics(
                         component_truth, component_estimate, low_g, weight
                     )
-                    cuts = {}
-                    for cut in SINI_CUTS:
-                        cut_mask = (
-                            np.ones(len(sini), dtype=bool)
-                            if np.isinf(cut)
-                            else sini < cut
-                        )
-                        cut_metrics = component_metrics(
-                            component_truth[cut_mask],
-                            component_estimate[cut_mask],
-                            low_g,
-                            weight[cut_mask],
-                        )
-                        cuts["all" if np.isinf(cut) else f"{cut:.1f}"] = {
-                            "m": cut_metrics["low_m"],
-                            "m_se": cut_metrics["low_m_se"],
-                            "n": cut_metrics["n_low"],
-                            "ess": cut_metrics["ess_low"],
-                        }
                     row.update(
                         population=population_label,
                         population_key=population["key"],
                         estimator=estimator,
                         frame=frame,
                         component=component,
-                        sini_cuts=cuts,
                     )
                     rows.append(row)
+    return rows
+
+
+def nuisance_bias_metrics(case: dict) -> list[dict]:
+    """Population-weighted additive biases for every non-shear target."""
+
+    rows = []
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    for population_label, population in case["populations"].items():
+        weight = np.asarray(population["galaxy_weight"], dtype=np.float64)
+        for estimator, estimate in (
+            ("Mean", population["mean"]),
+            ("MAP", population["map"]),
+        ):
+            estimate = np.asarray(estimate, dtype=np.float64)
+            for index, parameter in enumerate(case["feature_names"]):
+                if parameter in {"g1", "g2"}:
+                    continue
+                residual = estimate[:, index] - truth[:, index]
+                if parameter == "theta_int":
+                    residual = wrap_angle(residual)
+                finite = (
+                    np.isfinite(truth[:, index])
+                    & np.isfinite(estimate[:, index])
+                    & np.isfinite(weight)
+                    & (weight >= 0.0)
+                )
+                bias, bias_se, ess = weighted_mean_and_se(
+                    residual[finite], weight[finite]
+                )
+                rows.append(
+                    {
+                        "population": population_label,
+                        "estimator": estimator,
+                        "parameter": parameter,
+                        "bias": bias,
+                        "bias_se": bias_se,
+                        "n": int(np.count_nonzero(finite)),
+                        "ess": ess,
+                    }
+                )
     return rows
 
 
@@ -475,22 +735,148 @@ def quantile_binned(
     )
 
 
+def nuisance_bias_curves(case: dict, bins: int) -> dict[str, dict]:
+    """Mean-estimator nuisance residuals in common proposal-truth bins."""
+
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    proposal = next(
+        (
+            population
+            for population in case["populations"].values()
+            if population["key"] == "proposal"
+        ),
+        None,
+    )
+    if proposal is None:
+        raise ValueError("nuisance plots require a proposal population")
+    proposal_weight = population_weight(proposal)
+    curves = {}
+    for index, parameter in enumerate(case["feature_names"]):
+        if parameter in {"g1", "g2"}:
+            continue
+        true = truth[:, index]
+        finite_truth = (
+            np.isfinite(true)
+            & np.isfinite(proposal_weight)
+            & (proposal_weight >= 0.0)
+        )
+        if not np.any(finite_truth) or np.sum(proposal_weight[finite_truth]) <= 0.0:
+            continue
+        edges = weighted_quantile(
+            true[finite_truth],
+            np.linspace(0.0, 1.0, bins + 1),
+            proposal_weight[finite_truth],
+        )
+        assignment_edges = edges.copy()
+        assignment_edges[0], assignment_edges[-1] = -np.inf, np.inf
+        assignment = np.full(len(true), -1, dtype=int)
+        assignment[finite_truth] = np.searchsorted(
+            assignment_edges[1:-1], true[finite_truth], side="right"
+        )
+
+        centers = np.full(bins, np.nan, dtype=np.float64)
+        for bin_index in range(bins):
+            selected = finite_truth & (assignment == bin_index)
+            mask, normalized = normalize_subset_weights(
+                proposal_weight, selected
+            )
+            if len(normalized):
+                centers[bin_index] = float(np.sum(normalized * true[mask]))
+
+        parameter_curves = {"edges": edges, "center": centers, "populations": {}}
+        for population_label, population in case["populations"].items():
+            estimate = np.asarray(population["mean"], dtype=np.float64)[:, index]
+            weight = np.asarray(population["galaxy_weight"], dtype=np.float64)
+            residual = estimate - true
+            if parameter == "theta_int":
+                residual = wrap_angle(residual)
+            mean = np.full(bins, np.nan, dtype=np.float64)
+            error = np.full(bins, np.nan, dtype=np.float64)
+            count = np.zeros(bins, dtype=int)
+            ess = np.zeros(bins, dtype=np.float64)
+            for bin_index in range(bins):
+                selected = assignment == bin_index
+                value, se, bin_ess = weighted_mean_and_se(
+                    residual[selected], weight[selected]
+                )
+                mean[bin_index] = value
+                error[bin_index] = se
+                count[bin_index] = np.count_nonzero(
+                    selected & np.isfinite(residual) & np.isfinite(weight)
+                )
+                ess[bin_index] = bin_ess
+            finite = np.isfinite(true) & np.isfinite(residual)
+            regression_truth = true[finite]
+            truth_scale = float(np.ptp(regression_truth))
+            if np.isfinite(truth_scale) and truth_scale > 0.0:
+                truth_center = 0.5 * float(
+                    np.min(regression_truth) + np.max(regression_truth)
+                )
+                scaled_truth = (regression_truth - truth_center) / truth_scale
+                coefficient, uncertainty, slope_ess = fit_design(
+                    residual[finite],
+                    np.column_stack(
+                        (np.ones(np.count_nonzero(finite)), scaled_truth)
+                    ),
+                    weight[finite],
+                )
+                slope = float(coefficient[1] / truth_scale)
+                slope_se = float(uncertainty[1] / truth_scale)
+            else:
+                slope = float("nan")
+                slope_se = float("nan")
+                slope_ess = 0.0
+            parameter_curves["populations"][population_label] = {
+                "population_key": population["key"],
+                "mean": mean,
+                "se": error,
+                "n": count,
+                "ess": ess,
+                "m": slope,
+                "m_se": slope_se,
+                "slope_ess": slope_ess,
+            }
+        curves[parameter] = parameter_curves
+    return curves
+
+
 def conditional_shear_calibration(
-    case: dict, population_label: str, bins: int
+    case: dict,
+    population_label: str,
+    estimator: str,
+    bins: int,
+    shape_noise: np.ndarray,
 ) -> dict:
-    """Weighted full-range Mean-estimator m and c in nuisance bins."""
+    """Weighted full-range m, c, and posterior shape noise in condition bins."""
 
     population = case["populations"][population_label]
-    truth, estimate = case["truth"], population["mean"]
-    weights = population["galaxy_weight"]
+    estimator_key = estimator.lower()
+    if estimator_key not in {"mean", "map"}:
+        raise ValueError("estimator must be Mean or MAP")
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    estimate = np.asarray(population[estimator_key], dtype=np.float64)
+    weights = np.asarray(population["galaxy_weight"], dtype=np.float64)
+    shape_noise = np.asarray(shape_noise, dtype=np.float64)
+    if shape_noise.shape != (len(truth),):
+        raise ValueError("shape_noise must contain one value per galaxy")
     names = case["feature_names"]
+    spectral_condition_name = case.get(
+        "spectral_condition_name", "spectral reference quality"
+    )
+    spectral_condition = case.get(
+        "spectral_condition", case.get("spectral_reference_quality")
+    )
     conditions = {
         "true magnitude": case["rmag_true"],
-        "spectral reference quality": case["spectral_reference_quality"],
+        spectral_condition_name: spectral_condition,
         "true hlr": truth[:, names.index("hlr")],
+        "true sini": truth[:, names.index("sini")],
     }
     result = {}
     for condition, axis in conditions.items():
+        axis = np.asarray(axis, dtype=np.float64)
         finite = np.isfinite(axis) & np.isfinite(weights) & (weights >= 0)
         edges = weighted_quantile(
             axis[finite], np.linspace(0.0, 1.0, bins + 1), weights[finite]
@@ -531,6 +917,33 @@ def conditional_shear_calibration(
             result[condition][component] = {
                 key: np.asarray(value) for key, value in curve.items()
             }
+        shape_curve = {
+            key: [] for key in ("x", "value", "se", "n", "ess")
+        }
+        for bin_index in range(bins):
+            selected = assignment == bin_index
+            mask, normalized = normalize_subset_weights(
+                weights, selected & np.isfinite(shape_noise)
+            )
+            center = (
+                float(np.sum(normalized * axis[mask]))
+                if len(normalized)
+                else float("nan")
+            )
+            value, se, ess = weighted_mean_and_se(
+                shape_noise[mask], normalized
+            )
+            for key, item in (
+                ("x", center),
+                ("value", value),
+                ("se", se),
+                ("n", int(np.count_nonzero(mask))),
+                ("ess", ess),
+            ):
+                shape_curve[key].append(item)
+        result[condition]["shape_noise"] = {
+            key: np.asarray(value) for key, value in shape_curve.items()
+        }
     return result
 
 
@@ -573,19 +986,43 @@ def shear_pp_bin_masks(
     return [indices == index for index in range(len(edges) - 1)]
 
 
-def load_shear_pit_values(
-    case: dict, population_key: str, block_size: int = 64
-) -> dict[str, np.ndarray]:
-    """Stream prior-matched conditional ranks from the joint candidate bank.
+def _empty_shear_posterior_diagnostic(size: int) -> dict[str, np.ndarray]:
+    return {
+        "pit": np.full((size, 2), np.nan, dtype=np.float64),
+        "posterior_variance": np.full((size, 2), np.nan, dtype=np.float64),
+        "retained_count": np.zeros((size, 2), dtype=np.int64),
+        "retained_mass": np.zeros((size, 2), dtype=np.float64),
+        "conditional_ess": np.zeros((size, 2), dtype=np.float64),
+    }
 
-    Proposal ranks give every candidate equal mass. TF-target ranks instead use
-    the cached, within-galaxy TF weights. In both cases the selected shear
-    component is restricted to the same fixed prior bin as its truth and the
-    retained mass is renormalized before evaluating the rank.
-    """
 
-    if population_key not in {"proposal", "tf_target"}:
-        raise ValueError("population_key must be proposal or tf_target")
+def _conditional_candidate_mass(
+    values: np.ndarray,
+    keep: np.ndarray,
+    log_weight: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return the retained mask, normalized conditional weights, and mass."""
+
+    if log_weight is None:
+        count = int(np.count_nonzero(keep))
+        conditional = np.full(count, 1.0 / count) if count else np.array([])
+        return keep, conditional, count / len(values)
+    keep = keep & np.isfinite(log_weight)
+    selected_log_weight = log_weight[keep]
+    if not len(selected_log_weight):
+        return keep, np.array([]), 0.0
+    maximum = float(np.max(selected_log_weight))
+    scaled = np.exp(selected_log_weight - maximum)
+    conditional = scaled / np.sum(scaled)
+    log_mass = maximum + math.log(float(np.sum(scaled)))
+    return keep, conditional, float(np.exp(log_mass))
+
+
+def load_shear_posterior_diagnostics(
+    case: dict, block_size: int = 64
+) -> dict[str, dict[str, np.ndarray]]:
+    """Stream proposal and TF shear ranks and variances in one candidate pass."""
+
     if block_size <= 0:
         raise ValueError("block_size must be positive")
     truth = np.asarray(case["truth"])
@@ -595,24 +1032,21 @@ def load_shear_pit_values(
         cache_partitions = load_cache_partitions(root)
     sample_files = cache_partitions.files["sample"]
     truth_files = cache_partitions.files["truth"]
-    weight_files = (
-        cache_partitions.files["posterior_tf_log_weight"]
-        if population_key == "tf_target"
-        else None
-    )
+    weight_files = cache_partitions.files["posterior_tf_log_weight"]
+    result = {
+        key: _empty_shear_posterior_diagnostic(len(truth))
+        for key in ("proposal", "tf_target")
+    }
 
-    pit = np.full((len(truth), 2), np.nan, dtype=np.float64)
-    retained_count = np.zeros((len(truth), 2), dtype=np.int64)
-    retained_mass = np.zeros((len(truth), 2), dtype=np.float64)
-    conditional_ess = np.zeros((len(truth), 2), dtype=np.float64)
     offset = 0
-    for part_index, (sample_path, truth_path) in enumerate(
-        zip(sample_files, truth_files)
+    for part_index, (sample_path, truth_path, weight_path) in enumerate(
+        zip(sample_files, truth_files, weight_files)
     ):
         if offset >= len(truth):
             break
         samples = np.load(sample_path, mmap_mode="r")
         stored_truth = np.load(truth_path, mmap_mode="r")
+        cached_log_weight = np.load(weight_path, mmap_mode="r")
         if samples.ndim != 3 or samples.shape[-1] != len(case["feature_names"]):
             raise ValueError(
                 f"Expected flat candidate shape (galaxy, draw, feature), got "
@@ -620,13 +1054,8 @@ def load_shear_pit_values(
             )
         if stored_truth.shape != (samples.shape[0], samples.shape[-1]):
             raise ValueError(f"Truth/sample shape mismatch in {sample_path}")
-        candidate_weight = (
-            np.load(weight_files[part_index], mmap_mode="r")
-            if weight_files is not None
-            else None
-        )
-        if candidate_weight is not None and candidate_weight.shape != samples.shape[:2]:
-            raise ValueError(f"Candidate-weight shape mismatch in {weight_files[part_index]}")
+        if cached_log_weight.shape != samples.shape[:2]:
+            raise ValueError(f"Candidate-weight shape mismatch in {weight_path}")
         take = min(samples.shape[0], len(truth) - offset)
         expected_truth = truth[offset : offset + take]
         if not np.array_equal(
@@ -635,75 +1064,97 @@ def load_shear_pit_values(
             raise ValueError(
                 f"Truth rows in {truth_path} do not align with the report prefix"
             )
+
         for local_start in range(0, take, block_size):
             local_end = min(take, local_start + block_size)
-            draws = np.asarray(samples[local_start:local_end, :, :2], dtype=np.float64)
-            n_draw = draws.shape[1]
-            log_weights = (
-                np.asarray(candidate_weight[local_start:local_end], dtype=np.float64)
-                if candidate_weight is not None
-                else None
+            draws = np.asarray(
+                samples[local_start:local_end, :, :2], dtype=np.float64
+            )
+            tf_log_weight = np.asarray(
+                cached_log_weight[local_start:local_end], dtype=np.float64
             )
             targets = expected_truth[local_start:local_end, :2]
             truth_bins = shear_pp_bin_indices(targets)
             draw_bins = shear_pp_bin_indices(draws)
             for row in range(len(targets)):
+                global_row = offset + local_start + row
+                candidate_logs = {
+                    "proposal": None,
+                    "tf_target": tf_log_weight[row],
+                }
                 for component in range(2):
-                    selected_bin = truth_bins[row, component]
-                    if selected_bin < 0:
-                        continue
-                    keep = (
+                    finite_in_bin = (
                         np.isfinite(draws[row, :, component])
-                        & (draw_bins[row, :, component] == selected_bin)
+                        & (draw_bins[row, :, component] == truth_bins[row, component])
                     )
-                    if log_weights is None:
-                        count = int(np.count_nonzero(keep))
-                        conditional = (
-                            np.full(count, 1.0 / count) if count else np.array([])
+                    for population_key, log_weight in candidate_logs.items():
+                        diagnostic = result[population_key]
+                        diagnostic["posterior_variance"][global_row, component] = (
+                            posterior_component_variance(
+                                draws[row, :, component], log_weight
+                            )
                         )
-                        mass = count / n_draw
-                    else:
-                        keep &= np.isfinite(log_weights[row])
-                        selected_log_weight = log_weights[row, keep]
-                        if len(selected_log_weight):
-                            maximum = float(np.max(selected_log_weight))
-                            scaled = np.exp(selected_log_weight - maximum)
-                            conditional = scaled / np.sum(scaled)
-                            log_mass = maximum + math.log(float(np.sum(scaled)))
-                            mass = float(np.exp(log_mass))
-                        else:
-                            conditional = np.array([])
-                            mass = 0.0
-                    global_row = offset + local_start + row
-                    retained_count[global_row, component] = int(np.count_nonzero(keep))
-                    retained_mass[global_row, component] = mass
-                    if not len(conditional):
-                        continue
-                    values = draws[row, keep, component]
-                    target = targets[row, component]
-                    pit[global_row, component] = float(
-                        np.sum(conditional[values < target])
-                        + 0.5 * np.sum(conditional[values == target])
-                    )
-                    conditional_ess[global_row, component] = effective_sample_size(
-                        conditional
-                    )
+                        if truth_bins[row, component] < 0:
+                            continue
+                        keep, conditional, mass = _conditional_candidate_mass(
+                            draws[row, :, component], finite_in_bin, log_weight
+                        )
+                        diagnostic["retained_count"][global_row, component] = (
+                            np.count_nonzero(keep)
+                        )
+                        diagnostic["retained_mass"][global_row, component] = mass
+                        if not len(conditional):
+                            continue
+                        values = draws[row, keep, component]
+                        target = targets[row, component]
+                        rank = (
+                            np.sum(conditional[values < target])
+                            + 0.5 * np.sum(conditional[values == target])
+                        )
+                        diagnostic["pit"][global_row, component] = np.clip(
+                            rank, 0.0, 1.0
+                        )
+                        diagnostic["conditional_ess"][global_row, component] = (
+                            effective_sample_size(conditional)
+                        )
         offset += take
-        del samples, stored_truth, candidate_weight
+        del samples, stored_truth, cached_log_weight
     if offset != len(truth):
         raise ValueError(
             f"Sample cache has {offset} galaxies, report uses {len(truth)}"
         )
-    return {
-        "g1": pit[:, 0],
-        "g2": pit[:, 1],
-        "g1_retained": retained_count[:, 0],
-        "g2_retained": retained_count[:, 1],
-        "g1_retained_mass": retained_mass[:, 0],
-        "g2_retained_mass": retained_mass[:, 1],
-        "g1_conditional_ess": conditional_ess[:, 0],
-        "g2_conditional_ess": conditional_ess[:, 1],
-    }
+
+    flattened = {}
+    for population_key, diagnostic in result.items():
+        pit = diagnostic["pit"]
+        variance = diagnostic["posterior_variance"]
+        retained = diagnostic["retained_count"]
+        retained_mass = diagnostic["retained_mass"]
+        conditional_ess = diagnostic["conditional_ess"]
+        flattened[population_key] = {
+            "g1": pit[:, 0],
+            "g2": pit[:, 1],
+            "g1_retained": retained[:, 0],
+            "g2_retained": retained[:, 1],
+            "g1_retained_mass": retained_mass[:, 0],
+            "g2_retained_mass": retained_mass[:, 1],
+            "g1_conditional_ess": conditional_ess[:, 0],
+            "g2_conditional_ess": conditional_ess[:, 1],
+            "g1_variance": variance[:, 0],
+            "g2_variance": variance[:, 1],
+            "shape_noise": np.sqrt(np.mean(variance, axis=1)),
+        }
+    return flattened
+
+
+def load_shear_pit_values(
+    case: dict, population_key: str, block_size: int = 64
+) -> dict[str, np.ndarray]:
+    """Compatibility wrapper returning one population's streamed diagnostics."""
+
+    if population_key not in {"proposal", "tf_target"}:
+        raise ValueError("population_key must be proposal or tf_target")
+    return load_shear_posterior_diagnostics(case, block_size)[population_key]
 
 
 def posterior_pp_curve(
@@ -775,17 +1226,80 @@ def bias_figure(case: dict, bins: int) -> str:
     return fig_data_uri(fig)
 
 
+def nuisance_bias_figure(case: dict, bins: int) -> str:
+    """Overlay proposal and TF posterior-mean nuisance residual trends."""
+
+    curves = nuisance_bias_curves(case, bins)
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8.5), squeeze=False)
+    colors = {"proposal": "tab:blue", "tf_target": "tab:orange"}
+    short_labels = {"proposal": "Original", "tf_target": "TF"}
+    for axis, (parameter, parameter_curves) in zip(axes.flat, curves.items()):
+        scale, _ = NUISANCE_DISPLAY[parameter]
+        unit = NUISANCE_PLOT_UNIT[parameter]
+        for population_label, curve in parameter_curves["populations"].items():
+            population_key = curve["population_key"]
+            label = short_labels.get(population_key, population_label)
+            label += (
+                f": m={curve['m']:.3g}±{curve['m_se']:.2g}"
+                if np.isfinite(curve["m"])
+                else ": m=n/a"
+            )
+            axis.errorbar(
+                scale * parameter_curves["center"],
+                scale * curve["mean"],
+                yerr=scale * curve["se"],
+                marker="o",
+                ms=3,
+                lw=1,
+                color=colors.get(population_key),
+                label=label,
+            )
+        axis.axhline(0.0, color="black", ls="--", lw=0.8)
+        suffix = f" [{unit}]" if unit else ""
+        axis.set_xlabel(f"true {parameter}{suffix}")
+        residual_label = (
+            "wrapped posterior mean - truth"
+            if parameter == "theta_int"
+            else "posterior mean - truth"
+        )
+        axis.set_ylabel(f"{residual_label}{suffix}")
+        axis.set_title(parameter)
+        axis.legend(fontsize="x-small")
+    for axis in axes.flat[len(curves):]:
+        axis.set_visible(False)
+    weighting = (
+        f"precision weighted (p{case['precision_cap_percentile']:g} cap)"
+        if case.get("precision_weighted")
+        else "population weighted"
+    )
+    fig.suptitle(
+        f"{case['case']} — nuisance bias vs truth, Mean estimator — {weighting}"
+    )
+    fig.tight_layout()
+    return fig_data_uri(fig)
+
+
 def conditional_shear_calibration_figure(
-    case: dict, population_label: str, curves: dict
+    case: dict, population_label: str, estimator: str, curves: dict
 ) -> str:
-    fig, axes = plt.subplots(2, 3, figsize=(14, 7.5), squeeze=False)
+    spectral_condition_name = case.get(
+        "spectral_condition_name", "spectral reference quality"
+    )
+    spectral_condition = np.asarray(
+        case.get("spectral_condition", case.get("spectral_reference_quality"))
+    )
+    spectral_condition_log_scale = case.get(
+        "spectral_condition_log_scale", True
+    )
+    fig, axes = plt.subplots(3, 4, figsize=(18, 11), squeeze=False)
     colors = {"g1": "tab:blue", "g2": "tab:orange"}
     for column, (condition, components) in enumerate(curves.items()):
         for row, (metric, scale, ylabel) in enumerate(
             (("m", 100.0, r"$10^2 m$"), ("c", 1.0e4, r"$10^4 c$"))
         ):
             axis = axes[row, column]
-            for component, curve in components.items():
+            for component in ("g1", "g2"):
+                curve = components[component]
                 axis.errorbar(
                     curve["x"],
                     scale * curve[metric],
@@ -797,12 +1311,32 @@ def conditional_shear_calibration_figure(
             axis.set_xlabel(condition)
             axis.set_ylabel(ylabel)
             axis.set_title(f"{metric} vs {condition}")
-            if condition == "spectral reference quality" and np.all(
-                np.asarray(case["spectral_reference_quality"]) > 0
+            if (
+                condition == spectral_condition_name
+                and spectral_condition_log_scale
+                and np.all(spectral_condition > 0)
             ):
                 axis.set_xscale("log")
             axis.legend()
-    fig.suptitle(f"{case['case']} — {population_label} — Mean estimator")
+        axis = axes[2, column]
+        curve = components["shape_noise"]
+        axis.errorbar(
+            curve["x"],
+            curve["value"],
+            yerr=curve["se"],
+            marker="o", ms=3, lw=1,
+            color="tab:green",
+        )
+        axis.set_xlabel(condition)
+        axis.set_ylabel(r"$\sigma_\epsilon$")
+        axis.set_title(f"shape noise vs {condition}")
+        if (
+            condition == spectral_condition_name
+            and spectral_condition_log_scale
+            and np.all(spectral_condition > 0)
+        ):
+            axis.set_xscale("log")
+    fig.suptitle(f"{case['case']} — {population_label} — {estimator} estimator")
     fig.tight_layout()
     return fig_data_uri(fig)
 
@@ -1155,25 +1689,70 @@ def metrics_table(rows: list[dict]) -> str:
     )
 
 
-def cuts_table(rows: list[dict]) -> str:
+def precision_cap_sweep_table(rows: list[dict]) -> str:
+    """Render precision caps, invalid-variance diagnostics, ESS, and Mean m."""
+
     body = []
     for row in rows:
-        if row["frame"] != "image":
-            continue
-        for cut, values in row["sini_cuts"].items():
-            body.append(
-                "<tr>"
-                f"<td>{html.escape(row['population'])}</td>"
-                f"<td>{row['estimator']}</td><td>{row['component']}</td>"
-                f"<td>{cut}</td>"
-                f"<td>{_format_scaled(values['m'], 1e2)} ± "
-                f"{_format_scaled(values['m_se'], 1e2)}</td>"
-                f"<td>{values['n']:,} / {values['ess']:.1f}</td>"
-                "</tr>"
-            )
+        percentile = row["cap_percentile"]
+        cap_label = "uncapped / all" if percentile is None else f"{percentile:g}th"
+        threshold = (
+            "∞"
+            if percentile is None
+            else f"{row['precision_threshold']:.5g}"
+        )
+        floor = (
+            "0"
+            if percentile is None
+            else f"{row['shape_noise_floor']:.5g}"
+        )
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(row['population'])}</td>"
+            f"<td>{cap_label}</td><td>{threshold}</td><td>{floor}</td>"
+            f"<td>{row['capped_count']:,} / {100 * row['capped_fraction']:.2f}% "
+            f"rows / {100 * row['capped_population_mass']:.2f}% mass</td>"
+            f"<td>{row['invalid_variance_count']:,} / "
+            f"{100 * row['invalid_variance_fraction']:.3f}% rows / "
+            f"{100 * row['invalid_variance_population_mass']:.3f}% mass</td>"
+            f"<td>{row['ess']:.1f}</td>"
+            f"<td>{_format_scaled(row['g1_m'], 1e2)} ± "
+            f"{_format_scaled(row['g1_m_se'], 1e2)}</td>"
+            f"<td>{row['g1_n']:,} / {row['g1_ess']:.1f}</td>"
+            f"<td>{_format_scaled(row['g2_m'], 1e2)} ± "
+            f"{_format_scaled(row['g2_m_se'], 1e2)}</td>"
+            f"<td>{row['g2_n']:,} / {row['g2_ess']:.1f}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Population / posterior</th><th>Precision cap</th>"
+        "<th>max p</th><th>equivalent σ<sub>ε</sub> floor</th>"
+        "<th>Capped</th><th>Invalid variance</th><th>Overall ESS</th>"
+        "<th>10<sup>2</sup> g1 m</th><th>g1 N / fit ESS</th>"
+        "<th>10<sup>2</sup> g2 m</th><th>g2 N / fit ESS</th>"
+        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+    )
+
+
+def nuisance_bias_table(rows: list[dict]) -> str:
+    body = []
+    for row in rows:
+        scale, unit = NUISANCE_DISPLAY[row["parameter"]]
+        unit_display = unit or "dimensionless"
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(row['population'])}</td>"
+            f"<td>{row['estimator']}</td>"
+            f"<td><code>{row['parameter']}</code></td>"
+            f"<td>{_format_scaled(row['bias'], scale)} ± "
+            f"{_format_scaled(row['bias_se'], scale)}</td>"
+            f"<td>{unit_display}</td>"
+            f"<td>{row['n']:,} / {row['ess']:.1f}</td>"
+            "</tr>"
+        )
     return (
         "<table><thead><tr><th>Population / posterior</th><th>Estimator</th>"
-        "<th>Component</th><th>sin i cut</th><th>10<sup>2</sup> low-|g| m</th>"
+        "<th>Parameter</th><th>weighted additive bias ± SE</th><th>Units</th>"
         "<th>N / galaxy ESS</th></tr></thead><tbody>" + "".join(body)
         + "</tbody></table>"
     )
@@ -1202,7 +1781,7 @@ def coverage_table(rows: list[dict]) -> str:
 
 def importance_table(case: dict) -> str:
     target_label = "TF target population / TF posterior"
-    target_weight = case["populations"][target_label]["galaxy_weight"]
+    target_weight = population_weight(case["populations"][target_label])
     population_ess = effective_sample_size(target_weight)
     rows = []
     for label, values in (
@@ -1230,6 +1809,10 @@ def importance_table(case: dict) -> str:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     if args.bins < 2:
         raise ValueError("bins must be at least 2")
     if args.low_g <= 0.0:
@@ -1240,7 +1823,46 @@ def main(argv=None) -> None:
     ]
     sections = []
     for case in cases:
+        case_name = case["case"]
+        LOGGER.info("%s: starting report", case_name)
+        importance_html = importance_table(case)
+        LOGGER.info("%s: finished section: importance-sampling health", case_name)
+
+        LOGGER.info("%s: streaming posterior candidate diagnostics", case_name)
+        pits = load_shear_posterior_diagnostics(case)
+        LOGGER.info("%s: finished posterior candidate diagnostics", case_name)
+        cap_sweep_rows = precision_cap_sweep(case, pits, args.low_g)
+        cap_sweep_html = precision_cap_sweep_table(cap_sweep_rows)
+        if args.weighted:
+            applied = apply_precision_weighting(
+                case, pits, DEFAULT_PRECISION_CAP_PERCENTILE
+            )
+            for population_label, diagnostic in applied.items():
+                LOGGER.info(
+                    "%s: %s p95 precision weighting: ESS %.1f, capped %d, "
+                    "invalid variance %d",
+                    case_name,
+                    population_label,
+                    diagnostic["ess"],
+                    diagnostic["capped_count"],
+                    diagnostic["invalid_variance_count"],
+                )
+
         metric_rows = compute_metrics(case, args.low_g)
+        shear_html = (
+            metrics_table(metric_rows)
+            + f'<img src="{bias_figure(case, args.bins)}" '
+            'alt="weighted residual trends">'
+        )
+        LOGGER.info("%s: finished section: shear calibration", case_name)
+        nuisance_rows = nuisance_bias_metrics(case)
+        nuisance_html = (
+            nuisance_bias_table(nuisance_rows)
+            + f'<img src="{nuisance_bias_figure(case, args.bins)}" '
+            'alt="nuisance posterior-mean bias versus truth">'
+        )
+        LOGGER.info("%s: finished section: nuisance calibration", case_name)
+
         coverage_rows = []
         for population_label, population in case["populations"].items():
             coverage_rows.extend(
@@ -1250,72 +1872,103 @@ def main(argv=None) -> None:
                     population_label,
                 )
             )
-        pits = {
-            population["key"]: load_shear_pit_values(case, population["key"])
-            for population in case["populations"].values()
-        }
-        theta_diagnostics = {
-            population["key"]: load_theta_posterior_diagnostics(
-                case, population["key"]
+        coverage_html = coverage_table(coverage_rows)
+        LOGGER.info("%s: finished section: posterior coverage", case_name)
+
+        conditional_html = {}
+        for estimator in ("Mean", "MAP"):
+            panels = []
+            for population_label, population in case["populations"].items():
+                curves = conditional_shear_calibration(
+                    case,
+                    population_label,
+                    estimator,
+                    args.bins,
+                    pits[population["key"]]["shape_noise"],
+                )
+                figure = conditional_shear_calibration_figure(
+                    case, population_label, estimator, curves
+                )
+                panels.append(
+                    f"<h4>{html.escape(population_label)}</h4>"
+                    f"<img src=\"{figure}\" "
+                    "alt=\"conditional shear and shape-noise calibration\">"
+                )
+            conditional_html[estimator] = "".join(panels)
+            LOGGER.info(
+                "%s: finished section: conditional %s calibration",
+                case_name,
+                estimator,
             )
-            for population in case["populations"].values()
-        }
-        conditional = []
-        for population_label in case["populations"]:
-            curves = conditional_shear_calibration(
-                case, population_label, args.bins
-            )
-            conditional.append(
-                f"<h4>{html.escape(population_label)}</h4>"
-                f"<img src=\"{conditional_shear_calibration_figure(case, population_label, curves)}\" "
-                "alt=\"conditional shear calibration\">"
-            )
+        pp_html = (
+            f"<img src=\"{posterior_pp_figure(case, pits)}\" "
+            "alt=\"weighted posterior P-P plots\">"
+        )
+        LOGGER.info("%s: finished section: conditional P-P diagnostic", case_name)
         sections.append(
             f"<section><h2>{html.escape(case['case'])}</h2>"
             "<h3>Importance-sampling health</h3>"
-            + importance_table(case)
+            + importance_html
+            + "<h3>Posterior-precision cap sweep</h3>"
+            "<p>For each galaxy, p = 2 / [Var(g1) + Var(g2)]. Population "
+            "weights are multiplied by p after clipping p at the named "
+            "population-mass percentile; <i>uncapped / all</i> retains the "
+            "full finite precision. These are caps, not sample cuts. The "
+            "equivalent σ<sub>ε</sub> floor is 1/√p<sub>max</sub>. Invalid "
+            "variances receive zero precision-analysis weight. The m fits use "
+            "the posterior Mean in the image frame and the same low-|g| range "
+            "as the main table.</p>"
+            + cap_sweep_html
             + "<h3>Shear calibration</h3>"
             "<p>Every number is an ensemble statistic with the galaxy weights "
             "appropriate to the named population. Low-|g| fits use "
-            f"|g| &lt; {args.low_g:g}; cubic fits use the full range.</p>"
-            + metrics_table(metric_rows)
-            + f"<img src=\"{bias_figure(case, args.bins)}\" alt=\"weighted residual trends\">"
-            "<h3>Inclination-cut statistics</h3>"
-            "<p>Weights are renormalized inside each cut before fitting.</p>"
-            + cuts_table(metric_rows)
+            f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
+            + (
+                "This report applies posterior precision with a "
+                "population-weighted 95th-percentile cap."
+                if args.weighted
+                else "This report does not apply posterior-precision weights."
+            )
+            + "</p>"
+            + shear_html
+            + "<h3>Nuisance-parameter calibration</h3>"
+            "<p>Entries are population-weighted means of estimate minus truth. "
+            "The combined 2×4 figure uses the posterior Mean only and overlays "
+            "the original/base and TF/TF populations in common truth bins "
+            "defined from the original proposal. Error bars are weighted "
+            "standard errors; legend values are full-range residual slopes. "
+            "The <code>theta_int</code> residual is wrapped to [-π, π).</p>"
+            + nuisance_html
             + "<h3>Conditional Mean calibration</h3>"
             "<p>Bin edges, fit coefficients, and errors are population-weighted. "
             "Spectral reference quality is the independently drawn noise-level "
             "control (an SNR-like reference), not a claim that every galaxy has "
             "that achieved emission-line SNR. "
             "The TF-target panel therefore describes the target population, not "
-            "the uniform simulator proposal.</p>"
-            + "".join(conditional)
-            + "<h3>Directed theta_int bias</h3>"
-            + f"<img src=\"{theta_bias_figure(case, args.bins)}\" alt=\"theta bias versus truth\">"
-            "<p>The mode audit treats theta_int as directed on a 2π domain; "
-            "mass near theta+π is not folded onto the true branch. Candidate "
-            "histograms use equal proposal mass or the within-galaxy TF weights, "
-            "and reported galaxy fractions use the corresponding population "
-            "weights. Peaks are descriptive: a twice-smoothed 72-bin circular "
-            "histogram requires 10% relative height and 5% local prominence.</p>"
-            + theta_modality_table(case, theta_diagnostics)
-            + f"<img src=\"{theta_modality_figure(case, theta_diagnostics)}\" alt=\"theta posterior modality\">"
-            "<h3>Posterior coverage</h3>"
+            "the uniform simulator proposal. Shape noise follows KL-I equation 20: "
+            "σ<sub>ε,j</sub> = √[(σ²<sub>g1,j</sub> + σ²<sub>g2,j</sub>)/2]. "
+            "Per-galaxy values are population-weighted inside each bin.</p>"
+            + conditional_html["Mean"]
+            + "<h3>Conditional MAP calibration</h3>"
+            "<p>The m and c panels use MAP point estimates. Shape noise is a property "
+            "of the corresponding posterior, so its panels match the Mean section.</p>"
+            + conditional_html["MAP"]
+            + "<h3>Posterior coverage</h3>"
             "<p>The base posterior uses equal candidate mass and equal galaxy "
             "mass. The TF posterior uses within-galaxy TF candidate weights; its "
             "coverage average additionally uses globally normalized TF population "
             "weights.</p>"
-            + coverage_table(coverage_rows)
+            + coverage_html
             + "<h3>Prior-matched conditional P-P diagnostic</h3>"
             "<p>For each component, candidates are restricted to the same one of "
             "three true-shear intervals as the truth. TF-target ranks use the "
             "within-galaxy TF weights and their curves use global target-population "
             "galaxy weights. Candidate retention mass and conditional candidate "
             "ESS are reported separately from galaxy ESS.</p>"
-            + f"<img src=\"{posterior_pp_figure(case, pits)}\" alt=\"weighted posterior P-P plots\">"
-            "</section>"
+            + pp_html
+            + "</section>"
         )
+        LOGGER.info("%s: finished report assembly", case_name)
 
     document = (
         "<!doctype html><html><head><meta charset=\"utf-8\">"

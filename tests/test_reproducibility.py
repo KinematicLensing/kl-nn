@@ -53,6 +53,8 @@ def test_current_rng_stream_ids_are_stable_distinct_and_tf_free():
         "valid_spec_noise": 6,
         "train_spec_quality": 7,
         "valid_spec_quality": 8,
+        "train_npe_view": 9,
+        "valid_npe_view": 10,
     }
     first = {
         stream: derive_stream_seed(20260810, rank=2, epoch=7, stream=stream)

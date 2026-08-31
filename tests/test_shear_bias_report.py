@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
+from scipy.stats import truncnorm
 
 
 def _report():
@@ -117,6 +119,252 @@ def _write_complete_cache(root, *, n, draws=4, overrides=None):
     return arrays
 
 
+def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
+    rmag = np.linspace(18.0, 22.0, n, dtype=np.float32)
+    truth = np.zeros((n, len(FEATURES)), dtype=np.float32)
+    truth[:, 0] = np.linspace(-0.019, 0.019, n)
+    truth[:, 1] = np.linspace(0.019, -0.019, n)
+    truth[:, FEATURES.index("theta_int")] = np.linspace(-2.5, 2.5, n)
+    cosi = np.linspace(0.01, 0.99, n)
+    truth[:, FEATURES.index("sini")] = np.sqrt(1.0 - cosi**2)
+    truth[:, FEATURES.index("v0")] = np.linspace(-30.0, 30.0, n)
+    mean_log10_vcirc = (rmag.astype(np.float64) - 36.0) / -7.22
+    lower = (np.log10(60.0) - mean_log10_vcirc) / 0.1
+    upper = (np.log10(540.0) - mean_log10_vcirc) / 0.1
+    tf_probability = (np.arange(n, dtype=np.float64) + 0.5) / n
+    tf_residual = 0.1 * truncnorm.ppf(
+        tf_probability, lower, upper
+    )
+    truth[:, FEATURES.index("vcirc")] = 10 ** (
+        mean_log10_vcirc + tf_residual
+    )
+    truth[:, FEATURES.index("rscale")] = np.linspace(0.2, 4.8, n)
+    truth[:, FEATURES.index("hlr")] = np.linspace(0.2, 5.0, n)
+    truth[:, FEATURES.index("halpha_flux_true")] = np.geomspace(1e-17, 1e-14, n)
+
+    shear_sample = np.repeat(truth[:, None, :2], draws, axis=1)
+    offsets = np.linspace(-0.006, 0.006, draws, dtype=np.float32)
+    shear_sample[:, :, 0] += offsets
+    shear_sample[:, :, 1] += offsets[::-1]
+    mean = truth.copy()
+    mean[:, :2] += 1.0e-4 + 0.02 * truth[:, :2]
+    width = np.full_like(truth, 0.01)
+    summary = np.stack((mean - width, mean, mean + width), axis=1)
+    candidate_weight = np.arange(1, draws + 1, dtype=np.float64)
+    candidate_weight /= np.sum(candidate_weight)
+    candidate_weight = np.broadcast_to(candidate_weight, (n, draws)).copy()
+    candidate_log_weight = np.log(candidate_weight)
+    candidate_ess = 1.0 / np.sum(candidate_weight**2, axis=1)
+    tf_summary = summary.copy()
+    tf_summary[:, 1, :2] = np.sum(
+        candidate_weight[:, :, None] * shear_sample, axis=1
+    )
+    if combined_prior:
+        tf_summary[:, :, FEATURES.index("vcirc")] += 7.0
+        weight_arrays = {
+            "posterior_target_log_weight": candidate_log_weight,
+            "posterior_target_ess": candidate_ess,
+            "posterior_target_ess_fraction": candidate_ess / draws,
+            "posterior_target_max_weight": np.max(candidate_weight, axis=1),
+            "target_mean_estimates": tf_summary,
+        }
+    else:
+        weight_arrays = {
+            "posterior_tf_log_weight": candidate_log_weight,
+            "posterior_tf_ess": candidate_ess,
+            "posterior_tf_ess_fraction": candidate_ess / draws,
+            "posterior_tf_max_weight": np.max(candidate_weight, axis=1),
+            "tf_target_mean_estimates": tf_summary,
+        }
+    arrays = {
+        "shear_sample": shear_sample,
+        "truth": truth,
+        "rmag_true": rmag,
+        "image_snr": np.linspace(8.0, 800.0, n, dtype=np.float32),
+        "central_halpha_snr": np.linspace(2.0, 180.0, n, dtype=np.float32),
+        "image_noise_sigma": np.linspace(0.01, 0.1, n, dtype=np.float32),
+        "central_spectral_noise_sigma": np.linspace(0.02, 0.2, n, dtype=np.float32),
+        "proposal_mean_estimates": summary,
+        **weight_arrays,
+    }
+    label = "part0of1"
+    for name, value in arrays.items():
+        _write_part(root, name, value, label)
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": (
+            "klnn-posterior-cache-test-v3"
+            if combined_prior
+            else "klnn-posterior-cache-test-v2"
+        ),
+        "analysis_mode": "test_set",
+        "model_name": "model",
+        "checkpoint": "/models/model/modelbest",
+        "dataset": "/datasets/catalog-test",
+        "dataset_size": n,
+        "partition": {
+            "index": 0,
+            "total": 1,
+            "label": label,
+            "galaxy_start": 0,
+            "galaxy_end": n,
+        },
+        "feature_names": list(FEATURES),
+        "physical_parameter_ranges": {
+            "g1": [-0.1, 0.1],
+            "g2": [-0.1, 0.1],
+            "theta_int": [-3.141592653589793, 3.141592653589793],
+            "sini": [0.0, 1.0],
+            "v0": [-100.0, 100.0],
+            "vcirc": [60.0, 540.0],
+            "rscale": [0.1, 5.0],
+            "hlr": [0.1, 5.0],
+            "halpha_flux_true": [1.0e-17, 1.0e-14],
+        },
+        "target_transforms": {
+            name: "log10" if name == "halpha_flux_true" else "identity"
+            for name in FEATURES
+        },
+        "density_coordinates": {
+            "stored_shear_samples": "physical_target_coordinates",
+            "posterior_summary": "physical_target_coordinates",
+            "map_selection": "not_computed",
+        },
+        "observation_model": {
+            "schema_version": 3,
+            "context_fields": ["rmag_true", "image_snr", "central_halpha_snr"],
+            "halpha_flux_semantics": (
+                "central_fiber_integrated_after_seeing_before_instrument"
+            ),
+            "image_snr_distribution": "uniform",
+            "central_halpha_snr_distribution": "uniform",
+            "center_exposure_s": 180.0,
+            "offset_exposure_s": 600.0,
+        },
+        "sample_shape": [n, draws, len(FEATURES)],
+        "symmetry": {
+            "policy": "original_plus_r90_equal_mixture",
+            "rotated_joint_rows_inverse_aligned": True,
+        },
+        "tf": {
+            "slope": -7.22,
+            "intercept": 36.0,
+            "scatter_dex": 0.1,
+            "vcirc_min": 60.0,
+            "vcirc_max": 540.0,
+            "magnitude": "rmag_true",
+            "magnitude_measurement_error": 0.0,
+            "posterior_log_ratio": "raw log prior ratio",
+            "posterior_log_weight": "within-galaxy normalized log weight",
+            "posterior_weight_normalization": "within_galaxy",
+            "population_log_ratio_normalization": (
+                "not_applicable_already_tf_conformed"
+            ),
+            "resampling": False,
+        },
+        "test_set": {
+            "population": "tf_conformed_catalog",
+            "posterior_candidate_weighting": (
+                "tf_x_isotropic_inclination_importance"
+                if combined_prior
+                else "tf_importance"
+            ),
+            "population_weighting": "uniform",
+            "point_estimator": "mean",
+            "map_computed": False,
+            "tf_importance_weighting": True,
+            "shape_noise_regularization": "report_time",
+            "snr_source": "dataset_record",
+            "snr_policy": "used_as_stored_without_redraw_or_clipping",
+            "stored_candidate_parameters": ["g1", "g2"],
+            "tf": {
+                "slope": -7.22,
+                "intercept": 36.0,
+                "scatter_dex": 0.1,
+                "vcirc_min": 60.0,
+                "vcirc_max": 540.0,
+            },
+            "generation_manifest": {
+                "schema": "klnn-generation-manifest-v1",
+                "analysis_mode": "test_set",
+                "population": "tf_conformed_catalog",
+                "redshift": 0.3,
+                "simulation_redshift": 0.3,
+                "sample_count": n,
+                "path": "/samples/xu_sample_1_test_100k.manifest.json",
+                "sha256": "a" * 64,
+                "source_catalog": {
+                    "path": "/catalogs/xu_sample_1_fullfootprint.fits"
+                },
+                "catalog_sampling": {
+                    "eligible_row_count": 36_536_538,
+                    "eligibility": {
+                        "hlr": {
+                            "finite": True,
+                            "minimum": 0.1,
+                            "maximum": 5.0,
+                            "bounds": "inclusive",
+                        }
+                    },
+                },
+                "parameter_sampling": {
+                    "inclination": {
+                        "distribution": "cosi_uniform_0_1_latin_hypercube"
+                    }
+                },
+                "tf": {
+                    "slope": -7.22,
+                    "intercept": 36.0,
+                    "scatter_dex": 0.1,
+                    "vcirc_min": 60.0,
+                    "vcirc_max": 540.0,
+                },
+                "sample_table": {
+                    "path": "/samples/xu_sample_1_test_100k.csv",
+                    "sha256": "b" * 64,
+                    "row_count": n,
+                    "id_policy": "zero_based_contiguous_row_index",
+                },
+            },
+        },
+        "posterior_populations": {
+            "test_set": (
+                "TF-conformed catalog truth / TF + isotropic-inclination posterior"
+                if combined_prior
+                else "TF-conformed catalog truth / TF posterior"
+            )
+        },
+        "observation_provenance": {
+            "matched_group_size": 1,
+            "posterior_sample_seed": 42,
+            "image_noise_seed": 42,
+            "spectral_noise_seed": 143,
+        },
+        "files": {name: f"{name}/{label}.npy" for name in arrays},
+    }
+    if combined_prior:
+        manifest["test_set"].update(
+            inclination_importance_weighting=True,
+            inclination_prior={
+                "training": "uniform_sini",
+                "target": "uniform_cosi_0_1",
+                "parameter": "sini",
+                "composition": (
+                    "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
+                ),
+                "resampling": False,
+                "bounds": [0.0, 1.0],
+            },
+        )
+        manifest["test_set"]["generation_manifest"]["parameter_sampling"][
+            "inclination"
+        ]["transform"] = "sini=sqrt(1-cosi**2)"
+    (root / "meta" / f"{label}.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return arrays
+
+
 def _manual_case(
     report, root, truth, samples, log_weight,
     proposal_weight=None, target_weight=None,
@@ -217,6 +465,9 @@ def test_load_case_uses_linear_central_halpha_snr_for_v2_cache(
     class _Partitions:
         feature_names = FEATURES
         files = {name: () for name in arrays}
+        manifests = ({},)
+        analysis_mode = "proposal_and_tf"
+        dataset_size = 3
 
     monkeypatch.setattr(report, "load_cache_partitions", lambda _: _Partitions())
     monkeypatch.setattr(
@@ -284,6 +535,8 @@ def test_nuisance_bias_metrics_include_mean_map_and_wrapped_theta():
     report = _report()
     n = 6
     truth = np.zeros((n, len(FEATURES)), dtype=np.float64)
+    truth[:, 0] = np.linspace(-0.015, 0.015, n)
+    truth[:, 1] = np.linspace(0.015, -0.015, n)
     truth[:, FEATURES.index("theta_int")] = np.linspace(-2.5, 2.5, n)
     mean = truth.copy()
     map_estimate = truth.copy()
@@ -296,6 +549,7 @@ def test_nuisance_bias_metrics_include_mean_map_and_wrapped_theta():
         "feature_names": FEATURES,
         "populations": {
             "population": {
+                "key": "proposal",
                 "mean": mean,
                 "map": map_estimate,
                 "galaxy_weight": np.full(n, 1.0 / n),
@@ -319,6 +573,14 @@ def test_nuisance_bias_metrics_include_mean_map_and_wrapped_theta():
     rendered = report.nuisance_bias_table(rows)
     assert "weighted additive bias" in rendered
     assert "halpha_flux_true" in rendered
+    assert {
+        row["estimator"] for row in report.compute_metrics(case, 0.02)
+    } == {"Mean", "MAP"}
+    case["report_map"] = False
+    assert {row["estimator"] for row in report.nuisance_bias_metrics(case)} == {
+        "Mean"
+    }
+    assert {row["estimator"] for row in report.compute_metrics(case, 0.02)} == {"Mean"}
 
 
 def test_conditional_calibration_has_sini_shape_noise_and_map_panels():
@@ -339,6 +601,7 @@ def test_conditional_calibration_has_sini_shape_noise_and_map_panels():
         "truth": truth,
         "feature_names": FEATURES,
         "rmag_true": np.linspace(16.0, 23.0, n),
+        "image_snr": np.linspace(10.0, 900.0, n),
         "spectral_reference_quality": np.geomspace(3.0, 100.0, n),
         "populations": {
             population_label: {
@@ -359,6 +622,7 @@ def test_conditional_calibration_has_sini_shape_noise_and_map_panels():
 
     assert tuple(mean_curves) == (
         "true magnitude",
+        "image S/N",
         "spectral reference quality",
         "true hlr",
         "true sini",
@@ -376,7 +640,7 @@ def test_conditional_calibration_has_sini_shape_noise_and_map_panels():
     assert figure.startswith("data:image/png;base64,")
 
 
-def test_weighted_flag_and_precision_cap_exclude_invalid_variance(tmp_path):
+def test_weighted_flag_regularizes_precision_with_ensemble_shape_noise(tmp_path):
     report = _report()
     args = report.parse_args(
         ["--case", "model:dataset", "--output", str(tmp_path / "report.html"),
@@ -384,24 +648,29 @@ def test_weighted_flag_and_precision_cap_exclude_invalid_variance(tmp_path):
     )
     assert args.weighted
 
-    weight, diagnostics = report.compose_precision_weights(
-        np.full(4, 0.25),
-        np.asarray([1.0, 0.5, 0.25, np.nan]),
-        np.asarray([1.0, 0.5, 0.25, 1.0]),
-        50.0,
+    weight, diagnostics = report.compose_shape_noise_regularized_weights(
+        np.full(3, 1.0 / 3.0),
+        np.asarray([1.0, 4.0, np.nan]),
+        np.asarray([1.0, 4.0, 1.0]),
     )
-    np.testing.assert_allclose(weight, [0.2, 0.4, 0.4, 0.0])
-    np.testing.assert_allclose(diagnostics["precision_threshold"], 2.0)
-    np.testing.assert_allclose(diagnostics["shape_noise_floor"], 1 / np.sqrt(2))
-    assert diagnostics["capped_count"] == 1
-    assert diagnostics["invalid_variance_count"] == 1
-    np.testing.assert_allclose(diagnostics["capped_population_mass"], 1 / 3)
+    expected = np.asarray([1.0 / (1.0 + 1.5**2), 1.0 / (4.0 + 1.5**2), 0.0])
+    expected /= np.sum(expected)
+    np.testing.assert_allclose(weight, expected)
+    np.testing.assert_allclose(diagnostics["shape_noise"], 1.5)
+    np.testing.assert_allclose(diagnostics["shape_noise_variance"], 1.5**2)
     np.testing.assert_allclose(
-        diagnostics["invalid_variance_population_mass"], 0.25
+        diagnostics["weighted_shape_noise"], np.sum(expected[:2] * [1.0, 2.0])
     )
+    assert diagnostics["weighted_shape_noise"] < diagnostics["shape_noise"]
+    assert diagnostics["invalid_variance_count"] == 1
+    np.testing.assert_allclose(
+        diagnostics["invalid_variance_population_mass"], 1.0 / 3.0
+    )
+    np.testing.assert_allclose(diagnostics["population_ess"], 3.0)
+    assert diagnostics["ess"] < 2.0
 
 
-def test_precision_cap_sweep_reports_mean_m_and_ess_for_both_populations():
+def test_shape_noise_weight_comparison_reports_m_shape_noise_and_ess():
     report = _report()
     n = 80
     truth = np.zeros((n, len(FEATURES)), dtype=np.float64)
@@ -436,18 +705,28 @@ def test_precision_cap_sweep_reports_mean_m_and_ess_for_both_populations():
         },
     }
 
-    rows = report.precision_cap_sweep(case, posterior, 0.02)
-    assert len(rows) == 8
+    rows = report.shape_noise_weight_comparison(case, posterior, 0.02)
+    assert len(rows) == 4
     for row in rows:
         expected = 0.03 if row["population_key"] == "proposal" else -0.04
         np.testing.assert_allclose(row["g1_m"], expected, atol=1e-12)
         np.testing.assert_allclose(row["g2_m"], expected, atol=1e-12)
         assert row["g1_ess"] > 0
         assert row["g2_ess"] > 0
-    proposal_rows = [row for row in rows if row["population_key"] == "proposal"]
-    assert proposal_rows[-1]["ess"] < proposal_rows[0]["ess"]
-    rendered = report.precision_cap_sweep_table(rows)
-    assert "uncapped / all" in rendered
+    proposal_rows = [
+        row for row in rows if row["population_key"] == "proposal"
+    ]
+    assert [row["weighting"] for row in proposal_rows] == [
+        "Population only", "Shape-noise regularized"
+    ]
+    assert proposal_rows[-1]["reported_ess"] < proposal_rows[0]["reported_ess"]
+    assert (
+        proposal_rows[-1]["reported_shape_noise"]
+        < proposal_rows[0]["reported_shape_noise"]
+    )
+    rendered = report.shape_noise_weight_comparison_table(rows)
+    assert "fixed first-pass" in rendered
+    assert "Shape-noise regularized" in rendered
     assert "Invalid variance" in rendered
     assert "g1 N / fit ESS" in rendered
 
@@ -531,7 +810,7 @@ def test_importance_table_keeps_raw_tf_population_ess_after_precision_weighting(
     assert "effective sample size <b>2.0</b>" in rendered
 
 
-def test_weighted_report_smoke_includes_cap_sweep_and_nuisance_plot(tmp_path):
+def test_weighted_report_smoke_includes_regularization_and_nuisance_plot(tmp_path):
     report = _report()
     n, draws = 36, 6
     truth = np.zeros((n, len(FEATURES)), dtype=np.float32)
@@ -589,7 +868,363 @@ def test_weighted_report_smoke_includes_cap_sweep_and_nuisance_plot(tmp_path):
     )
 
     document = output.read_text()
-    assert "Posterior-precision cap sweep" in document
-    assert "uncapped / all" in document
-    assert "population-weighted 95th-percentile cap" in document
+    assert "Shape-noise-regularized precision comparison" in document
+    assert "fixed first-pass" in document
+    assert "Shape-noise regularized" in document
+    assert "There are no caps or percentile cuts" in document
     assert "nuisance posterior-mean bias versus truth" in document
+    assert "MAP diagnostics are omitted" in document
+    assert "Conditional MAP calibration" not in document
+    assert ">MAP<" not in document
+
+
+def test_test_set_cli_can_select_weighted_or_unweighted_ensemble(tmp_path):
+    report = _report()
+    args = report.parse_args(
+        [
+            "--case", "model:catalog",
+            "--output", str(tmp_path / "report.html"),
+            "--test-set",
+        ]
+    )
+    assert args.test_set
+    assert not args.weighted
+    weighted_args = report.parse_args(
+        [
+            "--case", "model:catalog",
+            "--output", str(tmp_path / "weighted-report.html"),
+            "--test-set",
+            "--weighted",
+        ]
+    )
+    assert weighted_args.test_set
+    assert weighted_args.weighted
+
+
+def test_compact_test_set_loads_one_tf_posterior_with_uniform_galaxy_mass(
+    tmp_path,
+):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "catalog"
+    arrays = _write_compact_test_cache(root)
+
+    case = report.load_case(
+        tmp_path / "cache", "model:catalog", test_set=True
+    )
+
+    assert case["analysis_mode"] == "test_set"
+    assert case["candidate_array"] == "shear_sample"
+    assert case["report_map"] is False
+    assert case["tf_conformance_audit"]["uniformity_status"] == "PASS"
+    assert case["tf_conformance_audit"]["row_count"] == len(arrays["truth"])
+    assert tuple(case["populations"]) == (
+        "TF-conformed test set / TF posterior",
+    )
+    population = next(iter(case["populations"].values()))
+    assert population["key"] == "test_set"
+    assert "map" not in population
+    np.testing.assert_allclose(
+        population["mean"], arrays["tf_target_mean_estimates"][:, 1]
+    )
+    assert not np.array_equal(
+        population["mean"][:, :2],
+        arrays["proposal_mean_estimates"][:, 1, :2],
+    )
+    np.testing.assert_allclose(
+        population["population_weight"],
+        np.full(len(arrays["truth"]), 1.0 / len(arrays["truth"])),
+    )
+    assert set(case["cache_partitions"].files) == {
+        "shear_sample",
+        "posterior_tf_log_weight",
+        "posterior_tf_ess",
+        "posterior_tf_ess_fraction",
+        "posterior_tf_max_weight",
+        "truth",
+        "rmag_true",
+        "image_snr",
+        "central_halpha_snr",
+        "image_noise_sigma",
+        "central_spectral_noise_sigma",
+        "proposal_mean_estimates",
+        "tf_target_mean_estimates",
+    }
+    assert "population_tf_log_ratio" not in case["cache_partitions"].files
+    diagnostics = report.load_shear_posterior_diagnostics(case)
+    assert tuple(diagnostics) == ("test_set",)
+    assert np.all(np.isfinite(diagnostics["test_set"]["shape_noise"]))
+    row = len(arrays["truth"]) // 2
+    np.testing.assert_allclose(
+        diagnostics["test_set"]["g1"][row],
+        np.sum(np.arange(1.0, 4.0)) / np.sum(np.arange(1.0, 7.0)),
+    )
+    np.testing.assert_allclose(
+        diagnostics["test_set"]["g2"][row],
+        np.sum(np.arange(4.0, 7.0)) / np.sum(np.arange(1.0, 7.0)),
+    )
+
+    with pytest.raises(ValueError, match="rerun with --test-set"):
+        report.load_case(tmp_path / "cache", "model:catalog")
+
+
+def test_compact_combined_prior_cache_selects_target_arrays_and_weights(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "catalog"
+    arrays = _write_compact_test_cache(root, combined_prior=True)
+
+    case = report.load_case(
+        tmp_path / "cache", "model:catalog", test_set=True
+    )
+
+    label = "TF-conformed test set / TF + isotropic-inclination posterior"
+    assert tuple(case["populations"]) == (label,)
+    assert case["candidate_log_weight_array"] == "posterior_target_log_weight"
+    assert case["target_summary_array"] == "target_mean_estimates"
+    assert case["candidate_weight_name"] == "combined prior-replacement"
+    assert case["report_map"] is False
+    assert "posterior_tf_log_weight" not in case["cache_partitions"].files
+    np.testing.assert_allclose(
+        case["posterior_candidate_ess"], arrays["posterior_target_ess"]
+    )
+    population = case["populations"][label]
+    np.testing.assert_allclose(
+        population["summary"], arrays["target_mean_estimates"]
+    )
+    vcirc = FEATURES.index("vcirc")
+    np.testing.assert_allclose(
+        population["mean"][:, vcirc] - case["truth"][:, vcirc], 7.0
+    )
+
+    diagnostics = report.load_shear_posterior_diagnostics(case)
+    weights = np.arange(1.0, 7.0)
+    weights /= np.sum(weights)
+    offsets = np.linspace(-0.006, 0.006, 6)
+    expected_g1_variance = np.sum(
+        weights * np.square(offsets - np.sum(weights * offsets))
+    )
+    reverse = offsets[::-1]
+    expected_g2_variance = np.sum(
+        weights * np.square(reverse - np.sum(weights * reverse))
+    )
+    np.testing.assert_allclose(
+        diagnostics["test_set"]["g1_variance"], expected_g1_variance,
+        rtol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        diagnostics["test_set"]["g2_variance"], expected_g2_variance,
+        rtol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        diagnostics["test_set"]["shape_noise"],
+        np.sqrt(0.5 * (expected_g1_variance + expected_g2_variance)),
+        rtol=2.0e-6,
+    )
+
+
+def test_tf_conformance_audit_recovers_truncated_conditional_pit():
+    report = _report()
+    tf = {
+        "slope": -7.22,
+        "intercept": 36.0,
+        "scatter_dex": 0.1,
+        "vcirc_min": 60.0,
+        "vcirc_max": 540.0,
+    }
+    n = 200
+    rmag = np.linspace(15.0, 23.4, n)
+    probability = (np.arange(n, dtype=np.float64) + 0.5) / n
+    mean_log10 = (rmag - tf["intercept"]) / tf["slope"]
+    lower = (np.log10(tf["vcirc_min"]) - mean_log10) / tf["scatter_dex"]
+    upper = (np.log10(tf["vcirc_max"]) - mean_log10) / tf["scatter_dex"]
+    standardized = truncnorm.ppf(probability, lower, upper)
+    vcirc = 10 ** (mean_log10 + tf["scatter_dex"] * standardized)
+
+    audit = report.compute_test_set_tf_conformance_audit(
+        vcirc, rmag, tf, generation_tf=dict(tf)
+    )
+
+    assert audit["uniformity_status"] == "PASS"
+    assert audit["quantile_status"] == "PASS"
+    assert audit["residual_status"] == "PASS"
+    assert audit["row_count"] == n
+    np.testing.assert_allclose(audit["ks_distance"], 0.5 / n, atol=2e-13)
+    np.testing.assert_allclose(
+        audit["pit_quantiles"],
+        np.quantile(probability, report.TF_AUDIT_QUANTILES),
+        atol=2e-13,
+    )
+    rendered = report.test_set_tf_conformance_table(
+        {"case": "model:xu1", "tf_conformance_audit": audit}
+    )
+    assert "uniform KS distance D" in rendered
+    assert "TF residual [dex]" in rendered
+    assert "truncated-CDF PIT" in rendered
+
+
+def test_tf_conformance_audit_flags_nonconforming_in_support_rows():
+    report = _report()
+    tf = {
+        "slope": -7.22,
+        "intercept": 36.0,
+        "scatter_dex": 0.1,
+        "vcirc_min": 60.0,
+        "vcirc_max": 540.0,
+    }
+    rmag = np.linspace(18.0, 22.0, 100)
+    mean_log10 = (rmag - tf["intercept"]) / tf["slope"]
+    lower = (np.log10(tf["vcirc_min"]) - mean_log10) / tf["scatter_dex"]
+    upper = (np.log10(tf["vcirc_max"]) - mean_log10) / tf["scatter_dex"]
+    standardized = truncnorm.ppf(np.full(len(rmag), 0.5), lower, upper)
+    vcirc = 10 ** (mean_log10 + tf["scatter_dex"] * standardized)
+
+    audit = report.compute_test_set_tf_conformance_audit(vcirc, rmag, tf)
+
+    assert audit["uniformity_status"] == "FAIL"
+    assert audit["quantile_status"] == "FAIL"
+    np.testing.assert_allclose(audit["ks_distance"], 0.5, atol=2e-13)
+
+
+def test_tf_conformance_audit_fails_closed_on_config_and_cached_values():
+    report = _report()
+    tf = {
+        "slope": -7.22,
+        "intercept": 36.0,
+        "scatter_dex": 0.1,
+        "vcirc_min": 60.0,
+        "vcirc_max": 540.0,
+    }
+    with pytest.raises(ValueError, match="contain exactly"):
+        report.compute_test_set_tf_conformance_audit(
+            np.asarray([200.0]), np.asarray([20.0]), {"slope": -7.22}
+        )
+    invalid_scatter = {**tf, "scatter_dex": 0.0}
+    with pytest.raises(ValueError, match="scatter_dex must be positive"):
+        report.compute_test_set_tf_conformance_audit(
+            np.asarray([200.0]), np.asarray([20.0]), invalid_scatter
+        )
+    with pytest.raises(ValueError, match="outside embedded.*support"):
+        report.compute_test_set_tf_conformance_audit(
+            np.asarray([59.0]), np.asarray([20.0]), tf
+        )
+    with pytest.raises(ValueError, match="must be finite"):
+        report.compute_test_set_tf_conformance_audit(
+            np.asarray([200.0]), np.asarray([np.nan]), tf
+        )
+    with pytest.raises(ValueError, match="must exactly match"):
+        report.compute_test_set_tf_conformance_audit(
+            np.asarray([200.0]),
+            np.asarray([20.0]),
+            tf,
+            generation_tf={**tf, "scatter_dex": 0.2},
+        )
+
+
+def test_test_set_rejects_standard_cache(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "standard"
+    _write_complete_cache(root, n=4)
+    with pytest.raises(ValueError, match="not a compact test-set cache"):
+        report.load_case(
+            tmp_path / "cache", "model:standard", test_set=True
+        )
+
+
+def test_test_set_report_is_mean_only_and_uses_tf_candidate_weights(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    _write_compact_test_cache(root)
+    output = tmp_path / "test-set.html"
+
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+
+    document = output.read_text(encoding="utf-8")
+    assert "TF-conformed catalog test-set diagnostics" in document
+    assert "Cross-cut operative shear summary" in document
+    assert "Test-set provenance and generation contract" in document
+    assert "Independent TF-conformance audit" in document
+    assert "uniform KS distance D" in document
+    assert "uniformity status" in document
+    assert "xu_sample_1_fullfootprint.fits" in document
+    assert "Image and central H-alpha S/N are record-backed" in document
+    assert "image S/N" in document
+    assert "Mean only" in document
+    assert "Galaxy-weighting and shape-noise comparison" in document
+    assert "subsequent ensemble statistics is <b>Population only</b>" in document
+    assert "equal truth-galaxy mass without posterior-precision weighting" in document
+    assert "equal over generated test galaxies (population only)" in document
+    assert "TF posterior candidate-weight health" in document
+    assert "posterior candidate ESS fraction" in document
+    assert "TF importance weights normalized within each galaxy" in document
+    assert "tf_importance_weighting" in document
+    assert "no TF population ratio is applied across" in document
+    assert "TF target population / TF posterior" not in document
+    assert "Conditional MAP calibration" not in document
+    assert ">MAP<" not in document
+    assert "map_computed" not in document
+
+
+def test_combined_prior_report_uses_dynamic_labels_and_keeps_tf_truth_audit(
+    tmp_path,
+):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    _write_compact_test_cache(root, combined_prior=True)
+    output = tmp_path / "combined-test-set.html"
+
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+
+    document = output.read_text(encoding="utf-8")
+    assert "TF-conformed test set / TF + isotropic-inclination posterior" in document
+    assert "Combined prior-replacement candidate-weight health" in document
+    assert "combined prior-replacement weights over posterior candidates" in document
+    assert "combined prior-replacement weights normalized within each galaxy" in document
+    assert "TF + isotropic-inclination prior-replaced posterior" in document
+    assert "Independent TF-conformance audit" in document
+    assert "TF audit field" in document
+    assert "TF-conformed test set / TF posterior" not in document
+    assert "Conditional MAP calibration" not in document
+    assert ">MAP<" not in document
+
+
+def test_weighted_test_set_report_uses_regularized_galaxy_weights(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    _write_compact_test_cache(root)
+    output = tmp_path / "weighted-test-set.html"
+
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+            "--weighted",
+        ]
+    )
+
+    document = output.read_text(encoding="utf-8")
+    assert "subsequent ensemble statistics is <b>Shape-noise regularized</b>" in document
+    assert "shape-noise-regularized posterior precision" in document
+    assert (
+        "1 / (posterior shear variance + fixed ensemble shape-noise variance)"
+        in document
+    )
+    assert "Operative galaxy weighting" in document
+    assert "Conditional MAP calibration" not in document

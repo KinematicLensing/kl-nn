@@ -5,20 +5,24 @@
 #SBATCH --time=1:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=10
-#SBATCH --mem=19G
+###SBATCH --cpus-per-task=8
+###SBATCH --mem=15G
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -euo pipefail
+set -eo pipefail
 ulimit -c 0
+
+source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+setup_shared_job_scratch simulator-v3-merge
 
 module load anaconda3
 source ~/.bashrc
 conda activate kl-nn
+set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv3_galaxyaxis_central_halpha}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 

@@ -2,10 +2,13 @@
 
 ## Supported surface
 
-Work only against the current simulator-v2 pipeline described in `README.md`
-and `repo_reports/KL-NN_SIMV2_ARCH.md`. Do not add compatibility branches for
-removed architectures or inference modes. If an old artifact needs analysis,
-use its checkpointed repository revision instead of expanding the live API.
+Work only against the current simulator-v3 pipeline described in
+`repo_reports/KL-NN_SIMV3_ARCH.md` and
+`repo_reports/METHODS_MANUSCRIPT.md`. The README and simulator-v2 report are
+archival and are not authoritative for the live observation or model schema.
+Do not add compatibility branches for removed architectures or inference
+modes. If an old artifact needs analysis, use its checkpointed repository
+revision instead of expanding the live API.
 
 The canonical entry points are:
 
@@ -21,7 +24,7 @@ The canonical entry points are:
 - Target order is exactly `config.TARGET_NAMES` and includes
   `halpha_flux_true`.
 - Scalar context is exactly `config.ORACLE_CONTEXT_FIELDS`:
-  `rmag_true` and `spectral_reference_quality`.
+  `rmag_true`, `image_snr`, and `central_halpha_snr`.
 - The feature extractor receives the identity/R90 pair. Parameters and fiber
   positions must be transformed with the image and returned posterior samples
   must be inverse-aligned before mixing.
@@ -39,6 +42,15 @@ The canonical entry points are:
 Activate the `kl-nn` environment and run `pytest -q tests`. A focused test can
 be run as `pytest -q tests/<file>.py -k <case>`. Several tests import modules
 directly from `arch/` through `tests/conftest.py`.
+
+`repo_reports/METHODS_MANUSCRIPT.md` is a required co-change for any edit to
+the monitored data-generation, architecture, training, or production-launcher
+surface. Update every affected scientific statement before acknowledging the
+new source fingerprint. Check with
+`python repo_reports/check_methods_manuscript.py --check`; after review, refresh
+it with `python repo_reports/check_methods_manuscript.py --update
+--acknowledge-review`. Never refresh the fingerprint merely to silence the
+test.
 
 Do not commit `__pycache__`, notebook checkpoints, generated plots, local model
 checkpoints, cache arrays, or scheduler logs. Preserve user data under

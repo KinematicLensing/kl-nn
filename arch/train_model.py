@@ -23,7 +23,10 @@ except ImportError:  # Direct execution from arch/.
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train the current Stage3 CCL or bounded-hybrid KL-NN model",
+        description=(
+            "Train the simulator-v3 CNN-CNN-Meta CCL or bounded-hybrid "
+            "KL-NN model"
+        ),
         allow_abbrev=False,
     )
     parser.add_argument("--stage", choices=("pretrain", "npe"), required=True)

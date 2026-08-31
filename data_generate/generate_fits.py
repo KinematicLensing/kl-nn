@@ -13,6 +13,14 @@ from kl_tools.parameters import Pars
 from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
 
 try:
+    from .generation_integrity import (
+        FITS_SCIENCE_ROW_FINGERPRINT_KEY,
+        FITS_SCIENCE_ROW_FINGERPRINT_VERSION_KEY,
+        FITS_SCIENCE_ROW_ID_KEY,
+        SCIENCE_ROW_FINGERPRINT_VERSION,
+        atomic_write_simulator_v3_fits,
+        simulator_v3_science_row_fingerprint,
+    )
     from .observation_schema import (
         FITS_CENTER_HALPHA_APERTURE_KEY,
         FITS_CENTER_HALPHA_SNR_KEY,
@@ -52,6 +60,14 @@ try:
         validate_rmag_true,
     )
 except ImportError:  # Support direct execution from data_generate/.
+    from generation_integrity import (
+        FITS_SCIENCE_ROW_FINGERPRINT_KEY,
+        FITS_SCIENCE_ROW_FINGERPRINT_VERSION_KEY,
+        FITS_SCIENCE_ROW_ID_KEY,
+        SCIENCE_ROW_FINGERPRINT_VERSION,
+        atomic_write_simulator_v3_fits,
+        simulator_v3_science_row_fingerprint,
+    )
     from observation_schema import (
         FITS_CENTER_HALPHA_APERTURE_KEY,
         FITS_CENTER_HALPHA_SNR_KEY,
@@ -462,8 +478,40 @@ def main():
     datavector.header[FITS_CENTER_HALPHA_APERTURE_KEY] = (
         central_halpha_aperture_fraction
     )
+    science_row = {
+        "g1": g1,
+        "g2": g2,
+        "theta_int": theta_int,
+        "sini": sini,
+        "v0": v0,
+        "vcirc": vcirc,
+        "rscale": rscale,
+        "hlr": hlr,
+        "rmag_true": rmag_true,
+        "halpha_flux_true": halpha_flux_true,
+        "image_snr": image_snr,
+        "central_halpha_snr": central_halpha_snr,
+        "fiber_layout": GALAXY_AXIS_FIBER_LAYOUT,
+        "observation_model_version": OBSERVATION_MODEL_VERSION,
+    }
+    row_fingerprint = simulator_v3_science_row_fingerprint(ID, science_row)
+    datavector.header[FITS_SCIENCE_ROW_ID_KEY] = ID
+    datavector.header[FITS_SCIENCE_ROW_FINGERPRINT_VERSION_KEY] = (
+        SCIENCE_ROW_FINGERPRINT_VERSION
+    )
+    datavector.header[FITS_SCIENCE_ROW_FINGERPRINT_KEY] = row_fingerprint
+    output_path = os.path.join(FITS_DIR, f'gal_{ID}.fits')
+    atomic_write_simulator_v3_fits(
+        output_path,
+        lambda temporary_path: datavector.to_fits(
+            str(temporary_path),
+            overwrite=True,
+            write_noise=False,
+        ),
+        expected_sample_id=ID,
+        expected_row_fingerprint=row_fingerprint,
+    )
     print(f'Dataset {d} #{ID} generated')
-    datavector.to_fits(os.path.join(FITS_DIR, f'gal_{ID}.fits'), overwrite=True, write_noise=False)
     
     return 0
 

@@ -158,7 +158,7 @@ def extract_features(
         spec = apply_central_halpha_snr_noise(
             spec,
             central_halpha_snr,
-            clean_line_norm=line_norm,
+            clean_central_line_norm=line_norm,
             center_fiber_index=config.observation["center_fiber_index"],
             center_exposure_s=config.observation["center_exposure_s"],
             offset_exposure_s=config.observation["offset_exposure_s"],
@@ -171,17 +171,18 @@ def extract_features(
             img = img.contiguous(memory_format=torch.channels_last)
             spec = spec.contiguous(memory_format=torch.channels_last)
 
-        features = model.extract_features(img, spec, fp).float()
-        oracle = model.context_normalizer(
-            {
-                "rmag_true": rmag,
-                "image_snr": image_snr,
-                "central_halpha_snr": central_halpha_snr,
-            },
-            len(rows),
-            features,
-        )
-        all_features.append(torch.cat((features, oracle), dim=-1).cpu())
+        observation_context = {
+            "rmag_true": rmag,
+            "image_snr": image_snr,
+            "central_halpha_snr": central_halpha_snr,
+        }
+        features = model.extract_features(
+            img,
+            spec,
+            fp,
+            observation_context=observation_context,
+        ).float()
+        all_features.append(features.cpu())
         all_labels.append(labels)
         if batch_number == 1 or batch_number == total_batches or batch_number % 20 == 0:
             print(f"{split_name}: extracted batch {batch_number}/{total_batches}", flush=True)
@@ -491,7 +492,10 @@ def main(argv=None):
         "train_samples": len(train_indices),
         "valid_samples": len(valid_indices),
         "observation_context": list(model_config.observation.context_fields),
-        "noise_model": "fixed-depth image Gaussian plus independent spectral quality",
+        "noise_model": (
+            "record-backed independent image_snr and central_halpha_snr "
+            "Gaussian controls"
+        ),
         "probe": {
             "type": "mlp",
             "hidden_dims": list(args.hidden_dims),

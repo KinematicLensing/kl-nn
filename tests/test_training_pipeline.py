@@ -128,6 +128,77 @@ def test_fixed_validation_streams_repeat_while_training_streams_change():
     assert torch.equal(valid_first, valid_second)
 
 
+def test_prepare_epoch_redraws_training_snr_and_fixes_validation_snr(monkeypatch):
+    trainer = object.__new__(train.Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.base_seed = 1234
+    trainer.gpu_id = 0
+    trainer.fixed_validation_streams = True
+    trainer.channels_last = False
+    trainer.ntrain = 512
+    trainer.nvalid = 128
+    trainer.rmag_train = torch.linspace(18.0, 22.0, trainer.ntrain)
+    trainer.rmag_valid = torch.linspace(18.0, 22.0, trainer.nvalid)
+    trainer.img_train = torch.ones(trainer.ntrain, 1, 2, 2)
+    trainer.img_valid = torch.ones(trainer.nvalid, 1, 2, 2)
+    trainer.spec_train = torch.ones(trainer.ntrain, 1, 5, 4)
+    trainer.spec_valid = torch.ones(trainer.nvalid, 1, 5, 4)
+    trainer.image_norm_train = torch.ones(trainer.ntrain)
+    trainer.image_norm_valid = torch.ones(trainer.nvalid)
+    trainer.central_line_norm_train = torch.ones(trainer.ntrain)
+    trainer.central_line_norm_valid = torch.ones(trainer.nvalid)
+
+    trainer._prepare_epoch(3)
+    train_first = (
+        trainer.image_snr_train.clone(),
+        trainer.central_halpha_snr_train.clone(),
+    )
+    valid_first = (
+        trainer.image_snr_valid.clone(),
+        trainer.central_halpha_snr_valid.clone(),
+    )
+    for values, lower, upper in (
+        (
+            train_first[0],
+            config.observation["image_snr_min"],
+            config.observation["image_snr_max"],
+        ),
+        (
+            train_first[1],
+            config.observation["central_halpha_snr_min"],
+            config.observation["central_halpha_snr_max"],
+        ),
+    ):
+        assert bool(((values >= lower) & (values <= upper)).all())
+
+    trainer._prepare_epoch(4)
+    assert not torch.equal(trainer.image_snr_train, train_first[0])
+    assert not torch.equal(trainer.central_halpha_snr_train, train_first[1])
+    torch.testing.assert_close(trainer.image_snr_valid, valid_first[0])
+    torch.testing.assert_close(trainer.central_halpha_snr_valid, valid_first[1])
+
+    trainer._prepare_epoch(3)
+    torch.testing.assert_close(trainer.image_snr_train, train_first[0])
+    torch.testing.assert_close(trainer.central_halpha_snr_train, train_first[1])
+
+    captured = {}
+    monkeypatch.setattr(
+        train,
+        "apply_image_noise_for_snr",
+        lambda data, snr, **kwargs: (captured.__setitem__("image", snr.clone()), data)[1],
+    )
+    monkeypatch.setattr(
+        train,
+        "apply_central_halpha_snr_noise",
+        lambda data, snr, **kwargs: (captured.__setitem__("line", snr.clone()), data)[1],
+    )
+    indices = torch.tensor([3, 17, 101])
+    context = trainer._context(indices, "train")
+    trainer._noisy_batch(indices, "train")
+    torch.testing.assert_close(captured["image"], context["image_snr"])
+    torch.testing.assert_close(captured["line"], context["central_halpha_snr"])
+
+
 def test_configured_dataset_size_selects_a_prefix_and_rejects_oversize():
     dataset = list(range(7))
     limited = train.limit_dataset(dataset, 4, split="training")

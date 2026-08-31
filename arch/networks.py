@@ -2,13 +2,15 @@
 
 There is deliberately one production path:
 
-* a Stage-3 image/spectrum Set-Attention feature extractor;
-* continuous-contrastive pretraining with three oracle context scalars; and
+* independent image-CNN, joint spectral-CNN, and metadata-MLP branches;
+* direct concatenation of the three branches for CCL pretraining; and
 * a nine-dimensional bounded hybrid posterior, with eight compact scalar
   coordinates and a directed circular ``theta_int`` coordinate.
 
-Alternate backbones, point-estimate heads, training-time population weighting,
-and alternate flow families are intentionally absent.
+The spectral branch intentionally assumes the fixed five-fiber, 64-bin
+observation used by the current simulator. Alternate backbones, point-estimate
+heads, training-time population weighting, and alternate flow families are
+intentionally absent.
 """
 
 from __future__ import annotations
@@ -37,7 +39,6 @@ try:
         DEFAULT_MIN_DERIVATIVE,
         unconstrained_rational_quadratic_spline,
     )
-    from .data import deterministic_lower_median
     from .utils import resolve_feature_index
 except ImportError:  # Direct execution with arch/ on sys.path or a snapshot.
     import config
@@ -45,11 +46,13 @@ except ImportError:  # Direct execution with arch/ on sys.path or a snapshot.
         DEFAULT_MIN_DERIVATIVE,
         unconstrained_rational_quadratic_spline,
     )
-    from data import deterministic_lower_median
     from utils import resolve_feature_index
 
 
-FEATURE_DIM = 1024
+IMAGE_FEATURE_DIM = 512
+SPECTRAL_FEATURE_DIM = 512
+METADATA_FEATURE_DIM = 128
+FEATURE_DIM = IMAGE_FEATURE_DIM + SPECTRAL_FEATURE_DIM + METADATA_FEATURE_DIM
 TARGET_COUNT = 9
 ORACLE_CONTEXT_FIELDS = tuple(config.ORACLE_CONTEXT_FIELDS)
 
@@ -611,7 +614,7 @@ class BoundedHybridCircularFlow(nn.Module):
         *,
         features=TARGET_COUNT,
         theta_index=2,
-        context_features=FEATURE_DIM + len(ORACLE_CONTEXT_FIELDS),
+        context_features=FEATURE_DIM,
         num_bounded_layers=4,
         num_theta_layers=1,
         num_bins=8,
@@ -966,139 +969,129 @@ class ImgCNN(nn.Module):
         return self.cnn_img(inputs)
 
 
-class DivisibleMeanPool1d(nn.Module):
-    """Deterministic adaptive-mean equivalent for evenly divisible bins."""
+class JointSpecCNN(nn.Module):
+    """Joint CNN for the fixed ordered five-fiber by 64-bin spectrum."""
 
-    def __init__(self, output_size):
+    output_dim = SPECTRAL_FEATURE_DIM
+    wavelength_count = 64
+
+    def __init__(self, nspec=None):
         super().__init__()
-        if output_size <= 0:
-            raise ValueError("output_size must be positive")
-        self.output_size = int(output_size)
-
-    def forward(self, inputs):
-        input_size = inputs.shape[-1]
-        if input_size < self.output_size or input_size % self.output_size:
-            raise ValueError(
-                "spectral feature length must be a positive multiple of "
-                f"{self.output_size}; got {input_size}"
-            )
-        bin_size = input_size // self.output_size
-        return inputs.reshape(
-            *inputs.shape[:-1], self.output_size, bin_size
-        ).mean(dim=-1)
-
-
-class SharedSpecCNN(nn.Module):
-    """Encode every fiber with the same wavelength-aware Conv1d network."""
-
-    def __init__(self, embedding_dim=128, pooled_length=8):
-        super().__init__()
-        if embedding_dim <= 0 or pooled_length <= 0:
-            raise ValueError("embedding_dim and pooled_length must be positive")
-        self.embedding_dim = int(embedding_dim)
-        self.pooled_length = int(pooled_length)
-        self.encoder = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=7, padding=3, bias=False),
-            nn.GroupNorm(4, 32),
-            nn.GELU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8, 128),
-            nn.GELU(),
-            DivisibleMeanPool1d(self.pooled_length),
-        )
-        self.projection = nn.Sequential(
-            nn.Flatten(start_dim=1),
-            nn.Linear(128 * self.pooled_length, self.embedding_dim),
-            nn.LayerNorm(self.embedding_dim),
-            nn.GELU(),
+        nspec = _configured_nspec() if nspec is None else int(nspec)
+        if nspec <= 0:
+            raise ValueError("nspec must be positive")
+        self.nspecs = nspec
+        self.cnn_spec = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                256,
+                self.output_dim,
+                kernel_size=(self.nspecs, 4),
+                bias=False,
+            ),
+            nn.BatchNorm2d(self.output_dim),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, spectra):
-        if spectra.ndim != 4 or spectra.shape[1] != 1:
-            raise ValueError(
-                "spectra must have shape (batch, 1, fibers, wavelength)"
-            )
-        batch_size, _, fiber_count, wavelength_count = spectra.shape
-        if wavelength_count < 4:
-            raise ValueError("spectra must contain at least four wavelength samples")
-        shared = spectra[:, 0].reshape(
-            batch_size * fiber_count, 1, wavelength_count
+        expected = (
+            spectra.shape[0],
+            1,
+            self.nspecs,
+            self.wavelength_count,
         )
-        encoded = self.projection(self.encoder(shared))
-        return encoded.reshape(batch_size, fiber_count, self.embedding_dim)
+        if tuple(spectra.shape) != expected:
+            raise ValueError(
+                "spectra must have shape "
+                f"(batch, 1, {self.nspecs}, {self.wavelength_count}); "
+                f"got {tuple(spectra.shape)}"
+            )
+        features = self.cnn_spec(spectra).flatten(start_dim=1)
+        if features.shape != (spectra.shape[0], self.output_dim):
+            raise RuntimeError(
+                "joint spectral CNN produced an unexpected feature shape "
+                f"{tuple(features.shape)}"
+            )
+        return features
 
 
-class FiberSetAttention(nn.Module):
-    """Position-free self-attention over physical fiber tokens."""
+class MetadataMLP(nn.Module):
+    """Encode ordered fiber coordinates and the three catalog scalars."""
 
-    def __init__(self, token_dim=128, num_heads=4, feedforward_dim=256):
+    output_dim = METADATA_FEATURE_DIM
+
+    def __init__(self, nspec=None, hidden_dim=64):
         super().__init__()
-        if token_dim <= 0 or token_dim % num_heads:
-            raise ValueError(
-                "token_dim must be positive and divisible by num_heads"
-            )
-        if feedforward_dim <= 0:
-            raise ValueError("feedforward_dim must be positive")
-        self.self_attention = nn.MultiheadAttention(
-            token_dim, num_heads, dropout=0.0, batch_first=True
-        )
-        self.attention_norm = nn.LayerNorm(token_dim)
-        self.feedforward = nn.Sequential(
-            nn.Linear(token_dim, feedforward_dim),
+        nspec = _configured_nspec() if nspec is None else int(nspec)
+        if nspec <= 0 or hidden_dim <= 0:
+            raise ValueError("nspec and hidden_dim must be positive")
+        self.nspecs = nspec
+        self.input_dim = 2 * nspec + len(ORACLE_CONTEXT_FIELDS)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(feedforward_dim, token_dim),
+            nn.Linear(hidden_dim, self.output_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.output_dim),
         )
-        self.feedforward_norm = nn.LayerNorm(token_dim)
 
-    def forward(self, tokens, observed_mask, key_padding_mask=None):
-        if tokens.ndim != 3:
-            raise ValueError("tokens must have shape (batch, fibers, token_dim)")
-        if observed_mask.shape != tokens.shape[:2]:
+    def forward(self, metadata):
+        if metadata.ndim != 2 or metadata.shape[1] != self.input_dim:
             raise ValueError(
-                "observed_mask shape must match the token batch and fibers"
+                "metadata must have shape "
+                f"(batch, {self.input_dim}); got {tuple(metadata.shape)}"
             )
-        if observed_mask.dtype != torch.bool:
-            raise TypeError("observed_mask must be a bool tensor")
-        if key_padding_mask is not None:
-            if key_padding_mask.shape != observed_mask.shape:
-                raise ValueError(
-                    "key_padding_mask shape must match observed_mask"
-                )
-            if key_padding_mask.dtype != torch.bool:
-                raise TypeError("key_padding_mask must be a bool tensor")
-        attended, _ = self.self_attention(
-            tokens,
-            tokens,
-            tokens,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        observed = observed_mask.unsqueeze(-1).to(dtype=tokens.dtype)
-        tokens = self.attention_norm(tokens + attended) * observed
-        return self.feedforward_norm(
-            tokens + self.feedforward(tokens)
-        ) * observed
+        return self.mlp(metadata)
 
 
-class Stage3FeatureExtractor(nn.Module):
-    """Permutation-aware image/spectra fusion used by all current models."""
+class SimpleFusionFeatureExtractor(nn.Module):
+    """Concatenate independent image, joint-spectrum, and metadata features."""
 
     output_dim = FEATURE_DIM
 
     def __init__(
         self,
         nspec=None,
-        spectral_embedding_dim=128,
-        token_dim=128,
-        num_heads=4,
+        *,
         fiber_position_scale=1.5,
         img_net=None,
         spec_net=None,
+        metadata_net=None,
+        context_normalizer=None,
+        context_fields=None,
     ):
         super().__init__()
         nspec = _configured_nspec() if nspec is None else int(nspec)
@@ -1106,198 +1099,103 @@ class Stage3FeatureExtractor(nn.Module):
             raise ValueError("nspec must be positive")
         if fiber_position_scale <= 0 or not math.isfinite(fiber_position_scale):
             raise ValueError("fiber_position_scale must be positive and finite")
+        if context_normalizer is not None and context_fields is not None:
+            raise ValueError(
+                "pass context_normalizer or context_fields, not both"
+            )
         self.nspecs = nspec
         self.fiber_position_scale = float(fiber_position_scale)
         self.img_net = ImgCNN() if img_net is None else img_net
-        self.spec_net = (
-            SharedSpecCNN(embedding_dim=spectral_embedding_dim)
-            if spec_net is None
-            else spec_net
+        self.spec_net = JointSpecCNN(nspec=nspec) if spec_net is None else spec_net
+        self.metadata_net = (
+            MetadataMLP(nspec=nspec) if metadata_net is None else metadata_net
+        )
+        self.context_normalizer = (
+            OracleContextNormalizer(context_fields=context_fields)
+            if context_normalizer is None
+            else context_normalizer
         )
 
-        coordinate_dim = 5
-        relative_strength_dim = 1
-        absolute_strength_dim = 1
-        observation_dim = 1
-        self.token_projection = nn.Sequential(
-            nn.Linear(
-                spectral_embedding_dim
-                + coordinate_dim
-                + relative_strength_dim
-                + absolute_strength_dim
-                + observation_dim,
-                token_dim,
-            ),
-            nn.LayerNorm(token_dim),
-            nn.GELU(),
-        )
-        self.fiber_set_encoder = FiberSetAttention(
-            token_dim=token_dim,
-            num_heads=num_heads,
-            feedforward_dim=2 * token_dim,
-        )
-        self.image_query = nn.Sequential(
-            nn.LayerNorm(512), nn.Linear(512, token_dim)
-        )
-        self.image_fiber_attention = nn.MultiheadAttention(
-            token_dim, num_heads, dropout=0.0, batch_first=True
-        )
-        self.attended_norm = nn.LayerNorm(token_dim)
-        self.fiber_projection = nn.Sequential(
-            nn.Linear(token_dim, 512), nn.GELU(), nn.LayerNorm(512)
-        )
-        self.fusion_norm = nn.LayerNorm(self.output_dim)
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(self.output_dim, 512),
-            nn.GELU(),
-            nn.Linear(512, self.output_dim),
-        )
-        self.output_norm = nn.LayerNorm(self.output_dim)
-
-    @staticmethod
-    def _validate_inputs(image, spectra, fiber_positions, fiber_mask):
+    def _validate_inputs(self, image, spectra, fiber_positions, fiber_mask):
         if image.ndim != 4 or image.shape[1] != 1:
             raise ValueError("image must have shape (batch, 1, height, width)")
-        if spectra.ndim != 4 or spectra.shape[1] != 1:
+        expected_spectra = (
+            image.shape[0],
+            1,
+            self.nspecs,
+            JointSpecCNN.wavelength_count,
+        )
+        if tuple(spectra.shape) != expected_spectra:
             raise ValueError(
-                "spectra must have shape (batch, 1, fibers, wavelength)"
+                "spectra must have shape "
+                f"(batch, 1, {self.nspecs}, "
+                f"{JointSpecCNN.wavelength_count}); got {tuple(spectra.shape)}"
             )
-        if fiber_positions.ndim != 3 or fiber_positions.shape[-1] != 2:
+        expected_positions = (image.shape[0], self.nspecs, 2)
+        if tuple(fiber_positions.shape) != expected_positions:
             raise ValueError(
-                "fiber_positions must have shape (batch, fibers, 2)"
-            )
-        if not (
-            image.shape[0] == spectra.shape[0] == fiber_positions.shape[0]
-        ):
-            raise ValueError(
-                "image, spectra, and fiber_positions batch sizes must match"
-            )
-        if spectra.shape[2] != fiber_positions.shape[1]:
-            raise ValueError(
-                "spectra and fiber_positions must have the same fiber count"
+                "fiber_positions must have shape "
+                f"(batch, {self.nspecs}, 2); got {tuple(fiber_positions.shape)}"
             )
         if fiber_mask is not None:
             if fiber_mask.dtype != torch.bool:
                 raise TypeError("fiber_mask must be a bool tensor")
-            if fiber_mask.shape != (spectra.shape[0], spectra.shape[2]):
-                raise ValueError("fiber_mask must have shape (batch, fibers)")
-
-    @staticmethod
-    def _coordinate_features(fiber_positions):
-        x_coord, y_coord = fiber_positions.unbind(dim=-1)
-        return torch.stack(
-            (
-                x_coord,
-                y_coord,
-                x_coord.square() + y_coord.square(),
-                x_coord.square() - y_coord.square(),
-                2.0 * x_coord * y_coord,
-            ),
-            dim=-1,
-        )
-
-    @staticmethod
-    def _relative_spectral_strength(spectra):
-        fiber_norms = torch.linalg.vector_norm(spectra, dim=-1, keepdim=True)
-        total_norm = torch.linalg.vector_norm(fiber_norms, dim=2, keepdim=True)
-        return fiber_norms / total_norm.clamp_min(
-            torch.finfo(spectra.dtype).tiny
-        )
-
-    @staticmethod
-    def _absolute_spectral_strength(spectra):
-        """Per-fiber observed line amplitude before spectral normalization."""
-        continuum = deterministic_lower_median(
-            spectra, dim=-1, keepdim=True
-        )
-        line_norm = torch.linalg.vector_norm(
-            spectra - continuum, dim=-1, keepdim=True
-        )
-        return torch.log1p(line_norm)
-
-    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
-        self._validate_inputs(image, spectra, fiber_positions, fiber_mask)
-        batch_size, _, fiber_count, _ = spectra.shape
-        explicit_mask = fiber_mask is not None
-        if fiber_mask is None:
-            fiber_mask = torch.ones(
-                (batch_size, fiber_count),
-                dtype=torch.bool,
-                device=spectra.device,
-            )
-        else:
-            fiber_mask = fiber_mask.to(device=spectra.device)
-            if bool((~fiber_mask.any(dim=1)).any()):
+            if tuple(fiber_mask.shape) != expected_positions[:2]:
                 raise ValueError(
-                    "every sample must contain at least one observed fiber"
+                    "fiber_mask must have shape "
+                    f"(batch, {self.nspecs})"
                 )
-        key_padding_mask = ~fiber_mask if explicit_mask else None
+            if not bool(fiber_mask.all()):
+                raise ValueError(
+                    "the fixed-order extractor requires all configured fibers"
+                )
 
-        spectra = torch.where(
-            fiber_mask[:, None, :, None], spectra, torch.zeros_like(spectra)
-        )
-        fiber_positions = torch.where(
-            fiber_mask.unsqueeze(-1),
-            fiber_positions,
-            torch.zeros_like(fiber_positions),
-        )
-        image = F.normalize(image, dim=(-2, -1))
-        relative_strength = self._relative_spectral_strength(spectra)
-        absolute_strength = self._absolute_spectral_strength(spectra)
-        spectra = F.normalize(spectra, dim=-1)
-        normalized_positions = fiber_positions / self.fiber_position_scale
+    def forward(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
+    ):
+        self._validate_inputs(image, spectra, fiber_positions, fiber_mask)
+        batch_size = image.shape[0]
 
-        image_features = self.img_net(image).reshape(batch_size, -1)
-        if image_features.shape[1] != 512:
-            raise ValueError(
-                "image encoder must return 512 features; got "
-                f"{image_features.shape[1]}"
-            )
-        spectral_features = self.spec_net(spectra)
-        coordinate_features = self._coordinate_features(normalized_positions)
-        relative_strength = relative_strength[:, 0].to(
-            spectral_features.dtype
+        image_features = self.img_net(
+            F.normalize(image, dim=(-2, -1))
+        ).reshape(batch_size, -1)
+        spectral_features = self.spec_net(
+            F.normalize(spectra, dim=(-2, -1))
+        ).reshape(batch_size, -1)
+        normalized_context = self.context_normalizer(
+            observation_context, batch_size, image_features
         )
-        absolute_strength = absolute_strength[:, 0].to(
-            spectral_features.dtype
-        )
-        observed = fiber_mask.unsqueeze(-1).to(spectral_features.dtype)
-        tokens = self.token_projection(
-            torch.cat(
-                (
-                    spectral_features,
-                    coordinate_features,
-                    relative_strength,
-                    absolute_strength,
-                    observed,
-                ),
-                dim=-1,
-            )
-        ) * observed
-        tokens = self.fiber_set_encoder(
-            tokens, fiber_mask, key_padding_mask=key_padding_mask
+        normalized_positions = (
+            fiber_positions / self.fiber_position_scale
+        ).reshape(batch_size, -1)
+        metadata_features = self.metadata_net(
+            torch.cat((normalized_positions, normalized_context), dim=-1)
         )
 
-        query = self.image_query(image_features).unsqueeze(1)
-        attended, _ = self.image_fiber_attention(
-            query,
-            tokens,
-            tokens,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
+        expected_shapes = (
+            ("image", image_features, IMAGE_FEATURE_DIM),
+            ("spectral", spectral_features, SPECTRAL_FEATURE_DIM),
+            ("metadata", metadata_features, METADATA_FEATURE_DIM),
         )
-        fiber_features = self.fiber_projection(
-            self.attended_norm(attended.squeeze(1))
-        )
-        joint = torch.cat((image_features, fiber_features), dim=-1)
-        return self.output_norm(
-            joint + self.fusion_mlp(self.fusion_norm(joint))
+        for name, features, width in expected_shapes:
+            if features.shape != (batch_size, width):
+                raise ValueError(
+                    f"{name} branch must return shape "
+                    f"({batch_size}, {width}); got {tuple(features.shape)}"
+                )
+        return torch.cat(
+            (image_features, spectral_features, metadata_features), dim=-1
         )
 
 
 def build_feature_extractor(nspec=None, **kwargs):
     """Construct the sole supported feature extractor."""
-    return Stage3FeatureExtractor(nspec=nspec, **kwargs)
+    return SimpleFusionFeatureExtractor(nspec=nspec, **kwargs)
 
 
 class ContinuousContrastiveLoss(nn.Module):
@@ -1484,7 +1382,7 @@ class ContinuousContrastiveLoss(nn.Module):
 
 
 class CCLPretrain(nn.Module):
-    """Stage-3 CCL pretraining model informed by the oracle scalar context."""
+    """CCL pretraining over the fully fused observation representation."""
 
     def __init__(
         self,
@@ -1495,18 +1393,27 @@ class CCLPretrain(nn.Module):
         context_fields=None,
     ):
         super().__init__()
-        self.backbone = (
-            build_feature_extractor() if backbone is None else backbone
-        )
-        self.context_normalizer = (
-            OracleContextNormalizer(context_fields=context_fields)
-            if context_normalizer is None
-            else context_normalizer
-        )
-        context_dim = int(self.context_normalizer.output_dim)
+        if backbone is None:
+            self.backbone = build_feature_extractor(
+                context_normalizer=context_normalizer,
+                context_fields=context_fields,
+            )
+        else:
+            if context_normalizer is not None or context_fields is not None:
+                raise ValueError(
+                    "context options belong to the supplied backbone"
+                )
+            self.backbone = backbone
+        declared_feature_dim = getattr(self.backbone, "output_dim", None)
+        if declared_feature_dim != FEATURE_DIM:
+            raise ValueError(
+                "CCL backbone must declare output_dim="
+                f"{FEATURE_DIM}; got {declared_feature_dim!r}. "
+                "Archived feature extractors are incompatible."
+            )
         self.projector = (
             MLP(
-                [FEATURE_DIM + context_dim, 2048, 512, projector_dim],
+                [FEATURE_DIM, 2048, 512, projector_dim],
                 use_batchnorm=True,
                 use_dropout=False,
             )
@@ -1539,17 +1446,18 @@ class CCLPretrain(nn.Module):
         fiber_mask=None,
     ):
         features = self.backbone(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
         if features.shape != (image.shape[0], FEATURE_DIM):
             raise ValueError(
                 "feature extractor must return shape "
                 f"({image.shape[0]}, {FEATURE_DIM}); got {tuple(features.shape)}"
             )
-        context = self.context_normalizer(
-            observation_context, image.shape[0], features
-        )
-        return torch.cat((features, context), dim=-1)
+        return features
 
     def forward(
         self,
@@ -1594,10 +1502,19 @@ class CCLPretrain(nn.Module):
         )
 
     def extract_features(
-        self, image, spectra, fiber_positions, fiber_mask=None
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
     ):
         return self.backbone(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
 
 
@@ -1629,25 +1546,34 @@ class KLNPE(nn.Module):
         self.nfeatures = nfeatures
         self.feature_names = feature_names
         self.theta_idx = resolve_feature_index(feature_names, "theta_int")
-        self.feature_extractor = (
-            build_feature_extractor(nspec=nspec)
-            if feature_extractor is None
-            else feature_extractor
+        if feature_extractor is None:
+            self.feature_extractor = build_feature_extractor(
+                nspec=nspec,
+                context_normalizer=context_normalizer,
+                context_fields=context_fields,
+            )
+        else:
+            if context_normalizer is not None or context_fields is not None:
+                raise ValueError(
+                    "context options belong to the supplied feature extractor"
+                )
+            self.feature_extractor = feature_extractor
+        declared_feature_dim = getattr(
+            self.feature_extractor, "output_dim", None
         )
-        self.context_normalizer = (
-            OracleContextNormalizer(context_fields=context_fields)
-            if context_normalizer is None
-            else context_normalizer
-        )
+        if declared_feature_dim != FEATURE_DIM:
+            raise ValueError(
+                "pretrained feature extractor is incompatible with the current "
+                f"{FEATURE_DIM}-feature CNN-CNN-metadata architecture; "
+                f"got output_dim={declared_feature_dim!r}"
+            )
         self.layer_norm = nn.LayerNorm(FEATURE_DIM)
         if not bool(config.train.get("feature_norm_trainable", True)):
             with torch.no_grad():
                 self.layer_norm.weight.fill_(1.0)
                 self.layer_norm.bias.zero_()
             self.layer_norm.requires_grad_(False)
-        self.flow_context_features = (
-            FEATURE_DIM + int(self.context_normalizer.output_dim)
-        )
+        self.flow_context_features = FEATURE_DIM
         self.flow = (
             BoundedHybridCircularFlow(
                 features=self.nfeatures,
@@ -1667,10 +1593,19 @@ class KLNPE(nn.Module):
         self.last_training_diagnostics = {}
 
     def _raw_features(
-        self, image, spectra, fiber_positions, fiber_mask=None
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
     ):
         features = self.feature_extractor(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
         if features.shape != (image.shape[0], FEATURE_DIM):
             raise ValueError(
@@ -1679,11 +1614,8 @@ class KLNPE(nn.Module):
             )
         return features
 
-    def _flow_context(self, raw_features, observation_context):
-        oracle = self.context_normalizer(
-            observation_context, raw_features.shape[0], raw_features
-        )
-        return torch.cat((self.layer_norm(raw_features), oracle), dim=-1)
+    def _flow_context(self, raw_features):
+        return self.layer_norm(raw_features)
 
     def forward(
         self,
@@ -1700,7 +1632,11 @@ class KLNPE(nn.Module):
                 f"({image.shape[0]}, {self.nfeatures}); got {tuple(true.shape)}"
             )
         raw_features = self._raw_features(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
         flow_reference = next(
             (
@@ -1719,7 +1655,7 @@ class KLNPE(nn.Module):
             device_type=raw_features.device.type, enabled=False
         ):
             flow_features = raw_features.to(dtype=flow_dtype)
-            context = self._flow_context(flow_features, observation_context)
+            context = self._flow_context(flow_features)
             flow_targets = true.to(dtype=flow_dtype)
             log_prob = self.flow.log_prob(flow_targets, context=context)
         diagnostics = {
@@ -1753,9 +1689,13 @@ class KLNPE(nn.Module):
         posterior mixture.
         """
         raw_features = self._raw_features(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
-        context = self._flow_context(raw_features, observation_context)
+        context = self._flow_context(raw_features)
         batch_size = context.shape[0]
 
         if parameters.ndim == 2:
@@ -1809,9 +1749,13 @@ class KLNPE(nn.Module):
         if fiber_positions is None:
             raise ValueError("fiber_positions is required")
         raw_features = self._raw_features(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
-        context = self._flow_context(raw_features, observation_context)
+        context = self._flow_context(raw_features)
         if return_log_prob:
             samples, log_prob = self.flow.sample_and_log_prob(
                 num_samples, context=context
@@ -1834,9 +1778,13 @@ class KLNPE(nn.Module):
                 f"({image.shape[0]}, {self.nfeatures})"
             )
         raw_features = self._raw_features(
-            image, spectra, fiber_positions, fiber_mask=fiber_mask
+            image,
+            spectra,
+            fiber_positions,
+            observation_context,
+            fiber_mask=fiber_mask,
         )
-        context = self._flow_context(raw_features, observation_context)
+        context = self._flow_context(raw_features)
         return self.flow.transform_to_noise(parameters, context=context)
 
     def posterior_mean(self, samples):

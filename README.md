@@ -37,9 +37,11 @@ ground-based survey range.
 
 The trained base posterior uses the independent uniform proposal. TF
 information enters only after training through importance ratios. Candidate
-weights are normalized within each galaxy for TF-adjusted posterior summaries;
-truth-level population ratios must be normalized globally after all cache
-partitions are joined for ensemble statistics.
+weights are normalized within each galaxy for TF-adjusted posterior summaries.
+For rectangular proposal datasets, truth-level population ratios are normalized
+globally after all cache partitions are joined. Already-TF-conformed catalog
+test sets instead retain uniform truth-population mass before posterior-
+precision weighting, avoiding a second TF population correction.
 
 ## Workflow
 
@@ -65,6 +67,8 @@ environment-variable overrides it supports for run-specific values.
 
 For matched finite-shear response calibration, follow
 [`repo_reports/SHEAR_RESPONSE_RUNBOOK.md`](repo_reports/SHEAR_RESPONSE_RUNBOOK.md).
+For catalog-backed, TF-conformed Xu-cut evaluation sets, follow
+[`repo_reports/DESI_TF_TEST_SET_RUNBOOK.md`](repo_reports/DESI_TF_TEST_SET_RUNBOOK.md).
 The detailed architecture contract is
 [`repo_reports/KL-NN_SIMV2_ARCH.md`](repo_reports/KL-NN_SIMV2_ARCH.md).
 

@@ -66,6 +66,10 @@ RNG_STREAM_IDS = {
     "valid_spec_quality": 8,
     "train_npe_view": 9,
     "valid_npe_view": 10,
+    "train_image_snr": 11,
+    "train_central_halpha_snr": 12,
+    "valid_image_snr": 13,
+    "valid_central_halpha_snr": 14,
 }
 
 GALAXY_AXIS_FIBER_LAYOUT_CODE = 1
@@ -208,7 +212,7 @@ def validate_observation_record(record, *, location="record"):
 
 
 def build_observation_levels(image_snr, central_halpha_snr):
-    """Validate and return the two record-backed observation S/N controls."""
+    """Validate and return two aligned observation S/N controls."""
 
     image = torch.as_tensor(image_snr)
     line = torch.as_tensor(
@@ -241,6 +245,42 @@ def build_observation_levels(image_snr, central_halpha_snr):
         ):
             raise ValueError(f"{name} must lie within [{lower}, {upper}]")
     return image, line
+
+
+def draw_uniform_observation_levels(
+    count,
+    *,
+    image_generator,
+    central_halpha_generator,
+    device,
+    dtype=torch.float32,
+):
+    """Draw independent image and central-H-alpha S/N levels for one epoch."""
+
+    count = int(count)
+    if count <= 0:
+        raise ValueError("count must be positive")
+    observation = config.observation
+    if observation["image_snr_distribution"] != "uniform" or (
+        observation["central_halpha_snr_distribution"] != "uniform"
+    ):
+        raise ValueError("epoch-level S/N draws currently require uniform bounds")
+
+    def draw(name, generator):
+        lower = float(observation[f"{name}_min"])
+        upper = float(observation[f"{name}_max"])
+        values = torch.rand(
+            count,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        return lower + values * (upper - lower)
+
+    return build_observation_levels(
+        draw("image_snr", image_generator),
+        draw("central_halpha_snr", central_halpha_generator),
+    )
 
 
 def make_ccl_training_batch(image, spectra, targets, positions, context):
@@ -559,6 +599,32 @@ class Trainer:
         )
 
     def _prepare_epoch(self, epoch):
+        (
+            self.image_snr_train,
+            self.central_halpha_snr_train,
+        ) = draw_uniform_observation_levels(
+            self.ntrain,
+            image_generator=self._generator(epoch, "train_image_snr"),
+            central_halpha_generator=self._generator(
+                epoch, "train_central_halpha_snr"
+            ),
+            device=self.device,
+            dtype=self.img_train.dtype,
+        )
+        (
+            self.image_snr_valid,
+            self.central_halpha_snr_valid,
+        ) = draw_uniform_observation_levels(
+            self.nvalid,
+            image_generator=self._generator(
+                epoch, "valid_image_snr", validation=True
+            ),
+            central_halpha_generator=self._generator(
+                epoch, "valid_central_halpha_snr", validation=True
+            ),
+            device=self.device,
+            dtype=self.img_valid.dtype,
+        )
         self.train_order = torch.randperm(
             self.ntrain,
             device=self.device,

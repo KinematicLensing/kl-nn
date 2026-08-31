@@ -19,19 +19,43 @@ cube once. FITS provenance records the requested central flux, derived total
 flux, aperture fraction, semantics, transform, units, and calibration API
 version (`HAFAPI=1`).
 
-The independent observation controls are sampled once per galaxy:
+Training draws the observation controls independently for every galaxy in
+every epoch:
 
 - `image_snr ~ Uniform(5, 1000)`
 - `central_halpha_snr ~ Uniform(1, 200)`
 
-Together with `rmag_true`, these are the model's three oracle context fields.
-Both S/N fields use linear min-max normalization. No target truth is admitted
-through the context path.
+The same draw controls noise amplitude and the metadata supplied to the model.
+Validation uses deterministic epoch-zero draws so validation losses remain
+comparable across epochs. Existing v3 sample, FITS, and LMDB S/N fields are
+retained as legacy compatibility metadata but are ignored by CCL and NPE
+training. Together with `rmag_true`, the active S/N draws are the model's
+three oracle context fields. Both S/N fields use linear min-max normalization;
+no target truth is admitted through the context path.
+
+## Feature-extraction architecture
+
+The simulator-v3 model uses three deliberately simple branches:
+
+- The unchanged image CNN produces 512 features.
+- A fixed-order, joint 2D spectral CNN produces 512 features from the complete
+  `5 x 64` fiber-by-wavelength array. Spectra receive one global L2
+  normalization per galaxy, preserving relative amplitudes between fibers.
+- The metadata MLP maps 13 inputs through `13 -> 64 -> 128`: the ten flattened
+  fiber-position coordinates followed by exactly `rmag_true`, `image_snr`, and
+  `central_halpha_snr`.
+
+The three branch outputs are concatenated directly into a 1152-dimensional
+feature vector. There is no Set Attention block and no per-fiber spectral
+normalization. This replacement changes parameter names and tensor shapes, so
+older feature-extractor and CCL checkpoints are intentionally incompatible and
+must not be partially loaded into this architecture.
 
 ## Runtime noise
 
-FITS/LMDB data remain clean. Every training epoch draws a fresh noise
-realization while retaining each galaxy's recorded S/N controls.
+FITS/LMDB data remain clean. Every training epoch draws fresh S/N controls and
+fresh Gaussian noise realizations independently. The epoch S/N draw is reused
+consistently by noise scaling and the metadata context.
 
 - Image white-noise RMS is `||I_clean||_2 / image_snr`.
 - Central spectral white-noise RMS is the continuum-subtracted central-line

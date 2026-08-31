@@ -1,4 +1,4 @@
-"""Generate the simulator-v3 coverage proposal without a Tully--Fisher relation."""
+"""Generate simulator-v3 training proposals or catalog-backed test sets."""
 
 from argparse import ArgumentParser
 from os.path import join
@@ -38,6 +38,10 @@ except ImportError:
 
 
 SAMPLE_ROOT = "/ocean/projects/phy250048p/shared/samples"
+DEFAULT_OUTPUT = join(
+    SAMPLE_ROOT,
+    "samples_train_1m_simv3_galaxyaxis_central_halpha.csv",
+)
 PARAMETER_LIMITS = {
     "g1": (-0.1, 0.1),
     "g2": (-0.1, 0.1),
@@ -112,27 +116,112 @@ def generate_samples(
     return result
 
 
+def generate_test_set_samples(
+    nsamples: int,
+    *,
+    catalog: str,
+    seed: int | None = None,
+    catalog_extension: str = "SELECTION",
+    catalog_block_size: int = 500_000,
+    tf_slope: float = -7.22,
+    tf_intercept: float = 36.0,
+    tf_scatter_dex: float = 0.1,
+):
+    """Draw the DESI-backed TF-conformed proposal and its manifest payload."""
+
+    try:
+        from .desi_test_set_sampling import generate_catalog_test_set
+    except ImportError:  # Support direct execution from data_generate/.
+        from desi_test_set_sampling import generate_catalog_test_set
+
+    try:
+        from arch.tf_prior import TFPrior
+    except ModuleNotFoundError:  # Direct execution is handled by the sampler module.
+        from desi_test_set_sampling import TFPrior
+
+    prior = TFPrior(
+        slope=tf_slope,
+        intercept=tf_intercept,
+        scatter_dex=tf_scatter_dex,
+        vcirc_min=PARAMETER_LIMITS["vcirc"][0],
+        vcirc_max=PARAMETER_LIMITS["vcirc"][1],
+    )
+    return generate_catalog_test_set(
+        nsamples,
+        catalog_path=catalog,
+        parameter_limits=PARAMETER_LIMITS,
+        seed=seed,
+        catalog_extension=catalog_extension,
+        catalog_block_size=catalog_block_size,
+        tf_prior=prior,
+    )
+
+
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--nsamples", type=int, default=100_000)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
+        "--test-set",
+        action="store_true",
+        help="generate a DESI-backed TF-conformed test population",
+    )
+    parser.add_argument(
+        "--catalog",
+        help="DESI cut FITS catalog (required with --test-set)",
+    )
+    parser.add_argument("--catalog-extension", default="SELECTION")
+    parser.add_argument("--catalog-block-size", type=int, default=500_000)
+    parser.add_argument("--tf-slope", type=float, default=-7.22)
+    parser.add_argument("--tf-intercept", type=float, default=36.0)
+    parser.add_argument("--tf-scatter-dex", type=float, default=0.1)
+    parser.add_argument(
         "--output",
-        default=join(
-            SAMPLE_ROOT,
-            "samples_train_1m_simv3_galaxyaxis_central_halpha.csv",
+        help=(
+            "sample CSV; required with --test-set so a test population cannot "
+            "overwrite the default training proposal"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.test_set:
+        if args.catalog is None:
+            parser.error("--catalog is required with --test-set")
+        if args.output is None:
+            parser.error("--output is required with --test-set")
+    else:
+        if args.catalog is not None:
+            parser.error("--catalog requires --test-set")
+        if args.output is None:
+            args.output = DEFAULT_OUTPUT
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
-    samples = generate_samples(
-        args.nsamples,
-        seed=args.seed,
-    )
+    manifest = None
+    if args.test_set:
+        samples, manifest = generate_test_set_samples(
+            args.nsamples,
+            catalog=args.catalog,
+            seed=args.seed,
+            catalog_extension=args.catalog_extension,
+            catalog_block_size=args.catalog_block_size,
+            tf_slope=args.tf_slope,
+            tf_intercept=args.tf_intercept,
+            tf_scatter_dex=args.tf_scatter_dex,
+        )
+    else:
+        samples = generate_samples(
+            args.nsamples,
+            seed=args.seed,
+        )
     samples.to_csv(args.output, index_label="ID")
+    if manifest is not None:
+        try:
+            from .desi_test_set_sampling import write_generation_manifest
+        except ImportError:  # Support direct execution from data_generate/.
+            from desi_test_set_sampling import write_generation_manifest
+        write_generation_manifest(manifest, args.output)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ from tf_prior import (
     TFPrior,
     normalize_population_log_weights,
     population_log_importance_ratio,
+    posterior_importance_from_log_ratio,
     posterior_importance_weights,
+    sample_truncated_tf_vcirc,
     truncated_tf_log_prob,
 )
 
@@ -68,4 +70,82 @@ def test_no_finite_candidate_row_raises_instead_of_silent_fallback():
             np.asarray([[1.0, 2.0], [100.0, 200.0]]),
             np.asarray((20.0, 20.0)),
             TFPrior(),
+        )
+
+
+def test_generic_posterior_importance_normalizes_composed_log_ratios_once():
+    first = np.log(np.asarray([[1.0, 2.0, 4.0], [3.0, 1.0, 2.0]]))
+    second = np.log(np.asarray([[4.0, 1.0, 2.0], [1.0, 5.0, 2.0]]))
+    result = posterior_importance_from_log_ratio(first + second)
+    expected = np.exp(first + second)
+    expected /= np.sum(expected, axis=1, keepdims=True)
+    np.testing.assert_allclose(result.weight, expected, rtol=2e-14, atol=2e-14)
+    np.testing.assert_allclose(np.sum(result.weight, axis=1), 1.0)
+    np.testing.assert_allclose(
+        result.effective_sample_size,
+        1.0 / np.sum(np.square(expected), axis=1),
+    )
+    np.testing.assert_allclose(result.max_weight, np.max(expected, axis=1))
+
+
+def test_generic_posterior_importance_rejects_invalid_log_ratio_rows():
+    with pytest.raises(RuntimeError, match="no finite candidates"):
+        posterior_importance_from_log_ratio(
+            np.asarray([[0.0, -1.0], [-np.inf, -np.inf]])
+        )
+    with pytest.raises(ValueError, match="finite values or -inf"):
+        posterior_importance_from_log_ratio(np.asarray([[0.0, np.inf]]))
+
+
+def test_tf_sampler_is_the_inverse_of_the_truncated_conditional_cdf():
+    prior = TFPrior(scatter_dex=0.12)
+    magnitude = np.asarray((17.0, 20.0, 23.0))
+    quantiles = np.asarray((0.1, 0.5, 0.9))
+    velocity = sample_truncated_tf_vcirc(
+        magnitude,
+        prior,
+        quantiles=quantiles,
+    )
+    mean = (magnitude - prior.intercept) / prior.slope
+    lower = (np.log10(prior.vcirc_min) - mean) / prior.scatter_dex
+    upper = (np.log10(prior.vcirc_max) - mean) / prior.scatter_dex
+    standardized = (np.log10(velocity) - mean) / prior.scatter_dex
+    from scipy.stats import truncnorm
+
+    np.testing.assert_allclose(
+        truncnorm.cdf(standardized, lower, upper),
+        quantiles,
+        rtol=2e-13,
+        atol=2e-13,
+    )
+    assert np.all((velocity > prior.vcirc_min) & (velocity < prior.vcirc_max))
+    assert np.isfinite(truncated_tf_log_prob(velocity, magnitude, prior)).all()
+
+
+def test_tf_sampler_rng_is_reproducible_and_validates_quantiles():
+    magnitude = np.full(512, 20.0)
+    first = sample_truncated_tf_vcirc(
+        magnitude,
+        TFPrior(),
+        rng=np.random.default_rng(9),
+    )
+    second = sample_truncated_tf_vcirc(
+        magnitude,
+        TFPrior(),
+        rng=np.random.default_rng(9),
+    )
+    np.testing.assert_array_equal(first, second)
+    assert not np.any(np.isin(first, (60.0, 540.0)))
+    with pytest.raises(ValueError, match="strictly between"):
+        sample_truncated_tf_vcirc(
+            np.asarray((20.0, 20.0)),
+            TFPrior(),
+            quantiles=np.asarray((0.0, 1.0)),
+        )
+    with pytest.raises(ValueError, match="either rng or quantiles"):
+        sample_truncated_tf_vcirc(
+            np.asarray((20.0,)),
+            TFPrior(),
+            rng=np.random.default_rng(4),
+            quantiles=np.asarray((0.5,)),
         )

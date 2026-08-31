@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 import logging
 import shutil
+import hashlib
+import json
 
 import numpy as np
 import pandas as pd
@@ -72,6 +74,178 @@ arch_utils = load_arch_module('utils.py', 'arch_utils')
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+DATASET_MANIFEST_FILENAME = 'manifest.json'
+GENERATION_MANIFEST_SCHEMA = 'klnn-generation-manifest-v1'
+TEST_SET_ANALYSIS_MODE = 'test_set'
+TEST_SET_POPULATION = 'tf_conformed_catalog'
+REQUIRED_TF_KEYS = {
+    'slope',
+    'intercept',
+    'scatter_dex',
+    'vcirc_min',
+    'vcirc_max',
+}
+
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_generation_manifest(sample_path, expected_sample_count):
+    """Validate an optional sample sidecar before any LMDB is opened."""
+
+    sample_path = Path(sample_path).expanduser().resolve()
+    manifest_path = sample_path.with_suffix('.manifest.json')
+    if not manifest_path.is_file():
+        return None
+    if not sample_path.is_file():
+        raise FileNotFoundError(
+            f'Generation manifest exists but its sample CSV is missing: {sample_path}'
+        )
+    with manifest_path.open(encoding='utf-8') as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError(f'Generation manifest must be a JSON object: {manifest_path}')
+    required = {
+        'schema',
+        'analysis_mode',
+        'population',
+        'sample_count',
+        'redshift',
+        'tf',
+        'catalog_sampling',
+        'sample_table',
+    }
+    missing = sorted(required - payload.keys())
+    if missing:
+        raise ValueError(f'Generation manifest is missing required keys: {missing}')
+    if payload['schema'] != GENERATION_MANIFEST_SCHEMA:
+        raise ValueError(f"Unsupported generation manifest schema: {payload['schema']!r}")
+    if payload['analysis_mode'] != TEST_SET_ANALYSIS_MODE:
+        raise ValueError(
+            f"Unsupported generation analysis_mode: {payload['analysis_mode']!r}"
+        )
+    if payload['population'] != TEST_SET_POPULATION:
+        raise ValueError(
+            f"Unsupported generation population: {payload['population']!r}"
+        )
+    if int(payload['sample_count']) != int(expected_sample_count):
+        raise ValueError(
+            'Generation manifest sample_count does not match requested LMDB size: '
+            f"{payload['sample_count']} != {expected_sample_count}"
+        )
+    redshift = float(payload['redshift'])
+    if not np.isfinite(redshift) or redshift != 0.3:
+        raise ValueError(f'Expected generation redshift 0.3, got {redshift}')
+    tf_config = payload['tf']
+    if not isinstance(tf_config, dict) or set(tf_config) != REQUIRED_TF_KEYS:
+        raise ValueError(
+            'Generation manifest tf must contain exactly '
+            f'{sorted(REQUIRED_TF_KEYS)}'
+        )
+    catalog_sampling = payload['catalog_sampling']
+    if not isinstance(catalog_sampling, dict):
+        raise ValueError(
+            'Generation manifest catalog_sampling must be a JSON object'
+        )
+    eligibility = catalog_sampling.get('eligibility')
+    if not isinstance(eligibility, dict):
+        raise ValueError(
+            'Generation manifest catalog_sampling.eligibility must be a JSON '
+            'object'
+        )
+    hlr_eligibility = eligibility.get('hlr')
+    expected_hlr_keys = {'finite', 'minimum', 'maximum', 'bounds'}
+    if (
+        not isinstance(hlr_eligibility, dict)
+        or set(hlr_eligibility) != expected_hlr_keys
+    ):
+        raise ValueError(
+            'Generation manifest catalog_sampling.eligibility.hlr must '
+            'contain exactly finite, minimum, maximum, and bounds'
+        )
+    if hlr_eligibility['finite'] is not True:
+        raise ValueError(
+            'Generation manifest catalog_sampling.eligibility.hlr.finite '
+            'must be true'
+        )
+    if hlr_eligibility['bounds'] != 'inclusive':
+        raise ValueError(
+            'Generation manifest catalog_sampling.eligibility.hlr.bounds '
+            "must be 'inclusive'"
+        )
+    for name, expected_bound in zip(
+        ('minimum', 'maximum'),
+        par_ranges['hlr'],
+    ):
+        actual = hlr_eligibility[name]
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not np.isfinite(actual)
+            or not np.isclose(
+                float(actual),
+                float(expected_bound),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+        ):
+            raise ValueError(
+                'Generation manifest catalog_sampling.eligibility.hlr.'
+                f'{name} must equal {float(expected_bound)!r}'
+            )
+    legacy_hlr_cap_fields = {
+        'eligible_hlr_capped_count',
+        'selected_hlr_capped_count',
+    }
+    if legacy_hlr_cap_fields & catalog_sampling.keys():
+        raise ValueError(
+            'Generation manifest uses legacy HLR cap-after-selection '
+            'provenance; regenerate with the inclusive HLR eligibility cut'
+        )
+    sample_table = payload['sample_table']
+    if not isinstance(sample_table, dict):
+        raise ValueError('Generation manifest sample_table must be a JSON object')
+    recorded_count = int(sample_table.get('row_count', -1))
+    if recorded_count != int(expected_sample_count):
+        raise ValueError(
+            'Generation manifest sample_table row_count does not match requested '
+            f'LMDB size: {recorded_count} != {expected_sample_count}'
+        )
+    recorded_digest = sample_table.get('sha256')
+    if not isinstance(recorded_digest, str) or len(recorded_digest) != 64:
+        raise ValueError('Generation manifest has no valid sample_table sha256')
+    observed_digest = _sha256_file(sample_path)
+    if observed_digest != recorded_digest:
+        raise ValueError(
+            'Sample CSV SHA-256 does not match its generation manifest: '
+            f'{observed_digest} != {recorded_digest}'
+        )
+    return manifest_path
+
+
+def propagate_generation_manifest(manifest_path, dataset_dir):
+    """Copy a validated sidecar to the canonical completed-dataset location."""
+
+    if manifest_path is None:
+        return None
+    source = Path(manifest_path).resolve(strict=True)
+    destination = Path(dataset_dir) / DATASET_MANIFEST_FILENAME
+    if destination.exists():
+        raise FileExistsError(f'Refusing to overwrite dataset manifest: {destination}')
+    temporary = destination.with_name(f'.{destination.name}.{os.getpid()}.tmp')
+    try:
+        shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    logger.info(f'Installed generation manifest: {destination}')
+    return destination
+
 
 def normalize_sample_table(
     samples,
@@ -110,7 +284,14 @@ def extract_fiducial_parameters(samples, row_indices, parameter_names):
         copy=True,
     )
 
-def merge_shards(base_save_dir, num_shards, chunk_size):
+def merge_shards(
+    base_save_dir,
+    num_shards,
+    chunk_size,
+    *,
+    generation_manifest_path=None,
+    expected_sample_count=None,
+):
     """Combines all isolated LMDB shards sequentially into a master database and deletes the shards."""
     if num_shards <= 0:
         raise ValueError("num_shards must be positive")
@@ -134,6 +315,7 @@ def merge_shards(base_save_dir, num_shards, chunk_size):
 
     logger.info(f"Initiating compilation of {num_shards} shards into target destination: {base_save_dir}")
     
+    merged_sample_count = 0
     with px.Writer(dirpath=base_save_dir, map_size_limit=200000, ram_gb_limit=12) as final_db:
         for s_idx, shard_dir in enumerate(shard_dirs):
             logger.info(f"Reading and importing data from: {shard_dir}")
@@ -141,6 +323,7 @@ def merge_shards(base_save_dir, num_shards, chunk_size):
             reader = px.Reader(dirpath=str(shard_dir))
             try:
                 num_samples = len(reader)
+                merged_sample_count += num_samples
                 for start_i in range(0, num_samples, chunk_size):
                     end_i = min(start_i + chunk_size, num_samples)
                     batch_samples = reader[start_i:end_i]
@@ -156,7 +339,17 @@ def merge_shards(base_save_dir, num_shards, chunk_size):
                 reader.close()
                 
             logger.info(f"Successfully integrated shard {s_idx + 1}/{num_shards}")
-            
+
+    if (
+        expected_sample_count is not None
+        and merged_sample_count != expected_sample_count
+    ):
+        raise RuntimeError(
+            'Merged LMDB sample count does not match the generation manifest: '
+            f'{merged_sample_count} != {expected_sample_count}'
+        )
+    propagate_generation_manifest(generation_manifest_path, base_save_dir)
+
     # Automated Shard Post-Cleanup Sequence
     logger.info("Master database finalized. Starting cleanup of shard files...")
     for shard_dir in shard_dirs:
@@ -173,12 +366,23 @@ def main(argv=None):
     shard_idx = args.shard_idx
     num_shards = args.num_shards
     data_dir = f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
-    samp_dir = f'/ocean/projects/phy250048p/shared/samples/samples_{sample_name}.csv'
+    samp_dir = f'/ocean/projects/phy250048p/shared/samples/{sample_name}.csv'
     save_dir = f'/ocean/projects/phy250048p/shared/datasets/{dataset_name}'
+    expected_sample_count = n * N
+    generation_manifest_path = validate_generation_manifest(
+        samp_dir,
+        expected_sample_count,
+    )
     
     # Switch completely to merging mode if flag is activated
     if args.merge:
-        merge_shards(save_dir, num_shards, chunk_size=n)
+        merge_shards(
+            save_dir,
+            num_shards,
+            chunk_size=n,
+            generation_manifest_path=generation_manifest_path,
+            expected_sample_count=expected_sample_count,
+        )
         return
 
     # Establish dynamic database file path naming architectures
@@ -264,6 +468,9 @@ def main(argv=None):
             db.put_samples(batch)
             t = round(time.time() - start, 2)
             logger.info(f'Shard {shard_idx + 1}/{num_shards}: Entry {index+1}/{N} completed in {t}s.')
+
+    if num_shards == 1:
+        propagate_generation_manifest(generation_manifest_path, current_save_dir)
 
 if __name__ == '__main__':
     main()

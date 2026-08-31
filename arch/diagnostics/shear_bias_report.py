@@ -7,6 +7,7 @@ import argparse
 import base64
 from io import BytesIO
 import html
+import json
 import logging
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import kstwobign, truncnorm
 
 ARCH_DIR = Path(__file__).resolve().parents[1]
 import sys
@@ -34,8 +36,13 @@ SHEAR_PP_BIN_EDGES = np.asarray(
 LOW_G_DEFAULT = 0.02
 ADDITIVE_DISPLAY_SCALE = 1.0e4
 MULTIPLICATIVE_DISPLAY_SCALE = 1.0e2
-DEFAULT_PRECISION_CAP_PERCENTILE = 95.0
-PRECISION_CAP_SWEEP = (90.0, 95.0, 99.0, None)
+TF_AUDIT_ALPHA = 1.0e-6
+TF_AUDIT_QUANTILES = np.asarray(
+    [0.01, 0.16, 0.5, 0.84, 0.99], dtype=np.float64
+)
+COMBINED_TEST_SET_CANDIDATE_WEIGHTING = (
+    "tf_x_isotropic_inclination_importance"
+)
 LOGGER = logging.getLogger(__name__)
 
 NUISANCE_DISPLAY = {
@@ -78,8 +85,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--weighted",
         action="store_true",
         help=(
-            "Compose each population weight with posterior shear precision, "
-            "capped at its population-weighted 95th percentile."
+            "Compose each population weight with posterior shear precision "
+            "regularized by the population's cached-posterior shape noise."
+        ),
+    )
+    parser.add_argument(
+        "--test-set",
+        action="store_true",
+        help=(
+            "Analyze a compact TF-conformed catalog test cache: use only the "
+            "cached prior-replaced posterior Mean and uniform truth-population "
+            "mass. "
+            "Combine with --weighted to apply shape-noise-regularized "
+            "posterior precision across galaxies."
         ),
     )
     return parser.parse_args(argv)
@@ -89,6 +107,8 @@ def load_case(
     cache_root: Path,
     case: str,
     max_galaxies: int | None = None,
+    *,
+    test_set: bool = False,
 ) -> dict:
     try:
         model, dataset = case.split(":", 1)
@@ -96,26 +116,34 @@ def load_case(
         raise ValueError(f"Case must be MODEL:DATASET, got {case!r}") from exc
     root = cache_root / model / dataset
     cache_partitions = load_cache_partitions(root)
+    manifest = cache_partitions.manifests[0]
+    analysis_mode = getattr(cache_partitions, "analysis_mode", None)
+    if analysis_mode is None:
+        analysis_mode = manifest.get("analysis_mode", "standard")
+    if test_set and analysis_mode != "test_set":
+        raise ValueError(
+            f"{case} is not a compact test-set cache; its analysis mode is "
+            f"{analysis_mode!r}"
+        )
+    if not test_set and analysis_mode == "test_set":
+        raise ValueError(
+            f"{case} is a compact test-set cache; rerun with --test-set"
+        )
+
     feature_names = cache_partitions.feature_names
     truth = np.asarray(load_partitioned_array(cache_partitions, "truth"))
-    proposal_map = np.asarray(
-        load_partitioned_array(cache_partitions, "proposal_map_estimates")
-    )
     proposal_summary = np.asarray(
         load_partitioned_array(cache_partitions, "proposal_mean_estimates")
     )
-    target_map = np.asarray(
-        load_partitioned_array(cache_partitions, "tf_target_map_estimates")
-    )
-    target_summary = np.asarray(
-        load_partitioned_array(cache_partitions, "tf_target_mean_estimates")
-    )
-    population_log_ratio = np.asarray(
-        load_partitioned_array(cache_partitions, "population_tf_log_ratio"),
-        dtype=np.float64,
-    )
     rmag_true = np.asarray(
         load_partitioned_array(cache_partitions, "rmag_true"), dtype=float
+    )
+    image_snr = (
+        np.asarray(
+            load_partitioned_array(cache_partitions, "image_snr"), dtype=float
+        )
+        if "image_snr" in cache_partitions.files
+        else None
     )
     if "central_halpha_snr" in cache_partitions.files:
         spectral_condition = np.asarray(
@@ -133,58 +161,197 @@ def load_case(
         )
         spectral_condition_name = "spectral reference quality"
         spectral_condition_log_scale = True
-    posterior_ess = np.asarray(
-        load_partitioned_array(cache_partitions, "posterior_tf_ess"), dtype=float
-    )
-    posterior_ess_fraction = np.asarray(
-        load_partitioned_array(cache_partitions, "posterior_tf_ess_fraction"),
-        dtype=float,
-    )
-    posterior_max_weight = np.asarray(
-        load_partitioned_array(cache_partitions, "posterior_tf_max_weight"),
-        dtype=float,
-    )
 
     n = len(truth)
     expected_summary = (n, 3, len(feature_names))
-    for name, value, expected in (
-        ("proposal_map", proposal_map, truth.shape),
-        ("target_map", target_map, truth.shape),
-        ("proposal_summary", proposal_summary, expected_summary),
-        ("target_summary", target_summary, expected_summary),
-    ):
-        if value.shape != expected:
-            raise ValueError(f"{name} shape {value.shape}; expected {expected}")
-    vectors = (
-        population_log_ratio,
-        rmag_true,
-        spectral_condition,
-        posterior_ess,
-        posterior_ess_fraction,
-        posterior_max_weight,
-    )
+    if proposal_summary.shape != expected_summary:
+        raise ValueError(
+            f"proposal_summary shape {proposal_summary.shape}; "
+            f"expected {expected_summary}"
+        )
+    vectors = [rmag_true, spectral_condition]
+    if image_snr is not None:
+        vectors.append(image_snr)
     if any(value.shape != (n,) for value in vectors):
         raise ValueError(f"Scalar cache length mismatch for {case}")
+
+    proposal_map = target_map = target_summary = population_log_ratio = None
+    posterior_ess = posterior_ess_fraction = posterior_max_weight = None
+    test_set_provenance = tf_conformance_audit = None
+    posterior_candidate_weighting = None
+    candidate_log_weight_array = "posterior_tf_log_weight"
+    target_summary_array = "tf_target_mean_estimates"
+    test_set_population_label = "TF-conformed test set / TF posterior"
+    candidate_weight_name = "TF importance"
+    candidate_weight_health_heading = "TF posterior candidate-weight health"
+    if not test_set:
+        proposal_map = np.asarray(
+            load_partitioned_array(cache_partitions, "proposal_map_estimates")
+        )
+        target_map = np.asarray(
+            load_partitioned_array(cache_partitions, "tf_target_map_estimates")
+        )
+        target_summary = np.asarray(
+            load_partitioned_array(cache_partitions, "tf_target_mean_estimates")
+        )
+        population_log_ratio = np.asarray(
+            load_partitioned_array(cache_partitions, "population_tf_log_ratio"),
+            dtype=np.float64,
+        )
+        posterior_ess = np.asarray(
+            load_partitioned_array(cache_partitions, "posterior_tf_ess"),
+            dtype=float,
+        )
+        posterior_ess_fraction = np.asarray(
+            load_partitioned_array(cache_partitions, "posterior_tf_ess_fraction"),
+            dtype=float,
+        )
+        posterior_max_weight = np.asarray(
+            load_partitioned_array(cache_partitions, "posterior_tf_max_weight"),
+            dtype=float,
+        )
+        for name, value, expected in (
+            ("proposal_map", proposal_map, truth.shape),
+            ("target_map", target_map, truth.shape),
+            ("target_summary", target_summary, expected_summary),
+        ):
+            if value.shape != expected:
+                raise ValueError(f"{name} shape {value.shape}; expected {expected}")
+        for value in (
+            population_log_ratio,
+            posterior_ess,
+            posterior_ess_fraction,
+            posterior_max_weight,
+        ):
+            if value.shape != (n,):
+                raise ValueError(f"Scalar cache length mismatch for {case}")
+    else:
+        test_set_provenance = getattr(
+            cache_partitions, "mode_metadata", manifest.get("test_set")
+        )
+        if not isinstance(test_set_provenance, dict):
+            raise ValueError(
+                f"Compact test-set cache {case} is missing manifest.test_set provenance"
+            )
+        posterior_candidate_weighting = test_set_provenance.get(
+            "posterior_candidate_weighting"
+        )
+        combined_prior = (
+            posterior_candidate_weighting
+            == COMBINED_TEST_SET_CANDIDATE_WEIGHTING
+        )
+        if combined_prior:
+            target_summary_array = "target_mean_estimates"
+            candidate_log_weight_array = "posterior_target_log_weight"
+            posterior_ess_array = "posterior_target_ess"
+            posterior_ess_fraction_array = "posterior_target_ess_fraction"
+            posterior_max_weight_array = "posterior_target_max_weight"
+            test_set_population_label = (
+                "TF-conformed test set / TF + isotropic-inclination posterior"
+            )
+            candidate_weight_name = "combined prior-replacement"
+            candidate_weight_health_heading = (
+                "Combined prior-replacement candidate-weight health"
+            )
+        else:
+            posterior_ess_array = "posterior_tf_ess"
+            posterior_ess_fraction_array = "posterior_tf_ess_fraction"
+            posterior_max_weight_array = "posterior_tf_max_weight"
+        target_summary = np.asarray(
+            load_partitioned_array(cache_partitions, target_summary_array)
+        )
+        posterior_ess = np.asarray(
+            load_partitioned_array(cache_partitions, posterior_ess_array),
+            dtype=float,
+        )
+        posterior_ess_fraction = np.asarray(
+            load_partitioned_array(cache_partitions, posterior_ess_fraction_array),
+            dtype=float,
+        )
+        posterior_max_weight = np.asarray(
+            load_partitioned_array(cache_partitions, posterior_max_weight_array),
+            dtype=float,
+        )
+        if target_summary.shape != expected_summary:
+            raise ValueError(
+                f"target_summary shape {target_summary.shape}; "
+                f"expected {expected_summary}"
+            )
+        for value in (
+            posterior_ess,
+            posterior_ess_fraction,
+            posterior_max_weight,
+        ):
+            if value.shape != (n,):
+                raise ValueError(f"Scalar cache length mismatch for {case}")
+        generation_manifest = test_set_provenance.get("generation_manifest")
+        if not isinstance(generation_manifest, dict):
+            raise ValueError(
+                f"Compact test-set cache {case} is missing "
+                "manifest.test_set.generation_manifest provenance"
+            )
+        if not isinstance(generation_manifest.get("tf"), dict):
+            raise ValueError(
+                f"Compact test-set cache {case} is missing "
+                "manifest.test_set.generation_manifest.tf provenance"
+            )
+        if not np.all(np.isfinite(truth)):
+            raise ValueError(f"Test-set truth contains non-finite values for {case}")
+        sini = truth[:, feature_names.index("sini")]
+        if np.any((sini < 0.0) | (sini > 1.0)):
+            raise ValueError(f"Test-set sini lies outside [0, 1] for {case}")
+        hlr = truth[:, feature_names.index("hlr")]
+        if np.max(hlr) > 5.0 + 1.0e-6:
+            raise ValueError(
+                f"Test-set hlr exceeds the 5 arcsec model limit for {case}"
+            )
+        if image_snr is None:
+            raise ValueError(f"Compact test-set cache {case} is missing image_snr")
+        for name, value in (
+            ("rmag_true", rmag_true),
+            ("image_snr", image_snr),
+            ("central_halpha_snr", spectral_condition),
+        ):
+            if not np.all(np.isfinite(value)):
+                raise ValueError(
+                    f"Test-set {name} contains non-finite values for {case}"
+                )
+        if np.any(image_snr <= 0.0) or np.any(spectral_condition <= 0.0):
+            raise ValueError(f"Test-set S/N values must be positive for {case}")
+        tf_conformance_audit = compute_test_set_tf_conformance_audit(
+            truth[:, feature_names.index("vcirc")],
+            rmag_true,
+            test_set_provenance.get("tf"),
+            generation_tf=generation_manifest.get("tf"),
+        )
+
     if max_galaxies is not None:
         if max_galaxies <= 0:
             raise ValueError("max_galaxies must be positive")
         take = min(max_galaxies, n)
         truth = truth[:take]
-        proposal_map = proposal_map[:take]
         proposal_summary = proposal_summary[:take]
-        target_map = target_map[:take]
-        target_summary = target_summary[:take]
-        population_log_ratio = population_log_ratio[:take]
         rmag_true = rmag_true[:take]
+        if image_snr is not None:
+            image_snr = image_snr[:take]
         spectral_condition = spectral_condition[:take]
-        posterior_ess = posterior_ess[:take]
-        posterior_ess_fraction = posterior_ess_fraction[:take]
-        posterior_max_weight = posterior_max_weight[:take]
+        if not test_set:
+            proposal_map = proposal_map[:take]
+            target_map = target_map[:take]
+            target_summary = target_summary[:take]
+            population_log_ratio = population_log_ratio[:take]
+            posterior_ess = posterior_ess[:take]
+            posterior_ess_fraction = posterior_ess_fraction[:take]
+            posterior_max_weight = posterior_max_weight[:take]
+        else:
+            target_summary = target_summary[:take]
+            posterior_ess = posterior_ess[:take]
+            posterior_ess_fraction = posterior_ess_fraction[:take]
+            posterior_max_weight = posterior_max_weight[:take]
         n = take
 
     proposal_weight = np.full(n, 1.0 / n, dtype=np.float64)
-    target_weight = normalize_population_log_weights(population_log_ratio)
-    return {
+    common = {
         "case": case,
         "model": model,
         "dataset": dataset,
@@ -193,13 +360,54 @@ def load_case(
         "feature_names": feature_names,
         "truth": truth,
         "rmag_true": rmag_true,
+        "image_snr": image_snr,
         "spectral_condition": spectral_condition,
         "spectral_condition_name": spectral_condition_name,
         "spectral_condition_log_scale": spectral_condition_log_scale,
-        "posterior_tf_ess": posterior_ess,
-        "posterior_tf_ess_fraction": posterior_ess_fraction,
-        "posterior_tf_max_weight": posterior_max_weight,
-        "populations": {
+        "analysis_mode": analysis_mode,
+        "dataset_size": cache_partitions.dataset_size,
+        "analyzed_size": n,
+    }
+    if test_set:
+        common.update(
+            report_map=False,
+            candidate_array="shear_sample",
+            candidate_log_weight_array=candidate_log_weight_array,
+            posterior_candidate_weighting=posterior_candidate_weighting,
+            target_summary_array=target_summary_array,
+            test_set_population_label=test_set_population_label,
+            candidate_weight_name=candidate_weight_name,
+            candidate_weight_health_heading=candidate_weight_health_heading,
+            test_set_provenance=test_set_provenance,
+            tf_conformance_audit=tf_conformance_audit,
+            posterior_candidate_ess=posterior_ess,
+            posterior_candidate_ess_fraction=posterior_ess_fraction,
+            posterior_candidate_max_weight=posterior_max_weight,
+            base_summary=proposal_summary,
+            populations={
+                test_set_population_label: {
+                    "key": "test_set",
+                    "summary": target_summary,
+                    "mean": target_summary[:, 1],
+                    "galaxy_weight": proposal_weight,
+                    "population_weight": proposal_weight.copy(),
+                }
+            },
+        )
+        if posterior_candidate_weighting != COMBINED_TEST_SET_CANDIDATE_WEIGHTING:
+            common.update(
+                posterior_tf_ess=posterior_ess,
+                posterior_tf_ess_fraction=posterior_ess_fraction,
+                posterior_tf_max_weight=posterior_max_weight,
+            )
+        return common
+
+    target_weight = normalize_population_log_weights(population_log_ratio)
+    common.update(
+        posterior_tf_ess=posterior_ess,
+        posterior_tf_ess_fraction=posterior_ess_fraction,
+        posterior_tf_max_weight=posterior_max_weight,
+        populations={
             "Proposal population / base posterior": {
                 "key": "proposal",
                 "map": proposal_map,
@@ -217,7 +425,8 @@ def load_case(
                 "population_weight": target_weight.copy(),
             },
         },
-    }
+    )
+    return common
 
 
 def normalize_subset_weights(
@@ -344,19 +553,18 @@ def population_weight(population: dict) -> np.ndarray:
     )
 
 
-def compose_precision_weights(
+def compose_shape_noise_regularized_weights(
     base_weight: np.ndarray,
     g1_variance: np.ndarray,
     g2_variance: np.ndarray,
-    cap_percentile: float | None,
 ) -> tuple[np.ndarray, dict]:
-    """Compose population mass with common spin-symmetric shear precision.
+    """Compose population mass with shape-noise-regularized shear precision.
 
-    The precision is ``2 / (Var(g1) + Var(g2))``. A percentile cap is
-    evaluated with respect to the valid base-population mass, rather than row
-    count, which is important for the TF target population. Galaxies with
-    non-finite or non-positive total posterior variance receive zero analysis
-    weight and are reported explicitly in the returned diagnostics.
+    The per-galaxy posterior shape noise is
+    ``sqrt((Var(g1) + Var(g2)) / 2)``. Its population-weighted first-pass mean
+    is frozen as the ensemble shape-noise floor. The common spin-symmetric
+    precision is then ``1 / (sigma_gal**2 + sigma_shape**2)``. Galaxies with
+    non-finite or negative posterior variance receive zero analysis weight.
     """
 
     base_weight = np.asarray(base_weight, dtype=np.float64)
@@ -366,67 +574,68 @@ def compose_precision_weights(
         g1_variance.shape == g2_variance.shape == base_weight.shape
     ):
         raise ValueError("population weights and shear variances must be vectors")
-    if cap_percentile is not None and not 0.0 < cap_percentile < 100.0:
-        raise ValueError("precision cap percentile must lie strictly between 0 and 100")
 
     valid_base = np.isfinite(base_weight) & (base_weight >= 0.0)
-    variance_sum = g1_variance + g2_variance
+    galaxy_variance = 0.5 * (g1_variance + g2_variance)
     valid_variance = (
         np.isfinite(g1_variance)
         & np.isfinite(g2_variance)
         & (g1_variance >= 0.0)
         & (g2_variance >= 0.0)
-        & np.isfinite(variance_sum)
-        & (variance_sum > 0.0)
+        & np.isfinite(galaxy_variance)
     )
     usable = valid_base & valid_variance
     if not np.any(usable) or np.sum(base_weight[usable]) <= 0.0:
-        raise ValueError("no positive population mass has a valid shear variance")
+        raise ValueError("no positive population mass has valid shear variances")
 
-    precision = np.full(base_weight.shape, np.nan, dtype=np.float64)
-    precision[usable] = 2.0 / variance_sum[usable]
-    if cap_percentile is None:
-        threshold = float("inf")
-        capped = np.zeros(base_weight.shape, dtype=bool)
-        clipped_precision = precision.copy()
-    else:
-        threshold = float(
-            weighted_quantile(
-                precision[usable],
-                np.asarray([cap_percentile / 100.0]),
-                base_weight[usable],
-            )[0]
-        )
-        if not np.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("precision percentile cap is not finite and positive")
-        capped = usable & (precision > threshold)
-        clipped_precision = np.minimum(precision, threshold)
+    galaxy_shape_noise = np.sqrt(np.clip(galaxy_variance, 0.0, None))
+    shape_noise, shape_noise_se, shape_noise_ess = weighted_mean_and_se(
+        galaxy_shape_noise[usable], base_weight[usable]
+    )
+    if not np.isfinite(shape_noise) or shape_noise <= 0.0:
+        raise ValueError("ensemble posterior shape noise must be finite and positive")
+
+    regularized_variance = galaxy_variance + shape_noise**2
+    valid_regularized = usable & np.isfinite(regularized_variance) & (
+        regularized_variance > 0.0
+    )
+    precision = np.zeros(base_weight.shape, dtype=np.float64)
+    precision[valid_regularized] = 1.0 / regularized_variance[valid_regularized]
 
     combined = np.zeros(base_weight.shape, dtype=np.float64)
-    combined[usable] = base_weight[usable] * clipped_precision[usable]
+    combined[valid_regularized] = (
+        base_weight[valid_regularized] * precision[valid_regularized]
+    )
     total = float(np.sum(combined))
     if not np.isfinite(total) or total <= 0.0:
-        raise ValueError("precision-weighted population mass is not positive")
+        raise ValueError("regularized precision-weighted mass is not positive")
     combined /= total
 
+    weighted_shape_noise, weighted_shape_noise_se, weighted_shape_noise_ess = (
+        weighted_mean_and_se(galaxy_shape_noise, combined)
+    )
+
     valid_base_mass = float(np.sum(base_weight[valid_base]))
-    usable_base_mass = float(np.sum(base_weight[usable]))
-    capped_mass = float(np.sum(base_weight[capped]))
     invalid_variance = ~valid_variance
     invalid_mass = float(np.sum(base_weight[valid_base & invalid_variance]))
     diagnostics = {
-        "cap_percentile": cap_percentile,
-        "precision_threshold": threshold,
-        "shape_noise_floor": 0.0 if cap_percentile is None else 1.0 / math.sqrt(threshold),
-        "capped_count": int(np.count_nonzero(capped)),
-        "capped_fraction": float(np.count_nonzero(capped) / np.count_nonzero(usable)),
-        "capped_population_mass": capped_mass / usable_base_mass,
+        "shape_noise": shape_noise,
+        "shape_noise_se": shape_noise_se,
+        "shape_noise_ess": shape_noise_ess,
+        "shape_noise_variance": shape_noise**2,
+        "weighted_shape_noise": weighted_shape_noise,
+        "weighted_shape_noise_se": weighted_shape_noise_se,
+        "weighted_shape_noise_ess": weighted_shape_noise_ess,
         "invalid_variance_count": int(np.count_nonzero(invalid_variance)),
         "invalid_variance_fraction": float(np.mean(invalid_variance)),
         "invalid_variance_population_mass": (
             invalid_mass / valid_base_mass if valid_base_mass > 0.0 else float("nan")
         ),
-        "usable_count": int(np.count_nonzero(usable)),
+        "usable_count": int(np.count_nonzero(valid_regularized)),
+        "population_ess": effective_sample_size(
+            base_weight[valid_base]
+            / np.sum(base_weight[valid_base])
+        ),
         "ess": effective_sample_size(combined),
     }
     return combined, diagnostics
@@ -485,25 +694,27 @@ def component_metrics(
     }
 
 
-def precision_cap_sweep(
+def shape_noise_weight_comparison(
     case: dict,
     posterior_diagnostics: dict[str, dict[str, np.ndarray]],
     low_g: float,
 ) -> list[dict]:
-    """Evaluate Mean-estimator low-|g| calibration across precision caps."""
+    """Compare population-only and regularized Mean-estimator summaries."""
 
     rows = []
     truth = np.asarray(case["truth"], dtype=np.float64)
     for population_label, population in case["populations"].items():
         posterior = posterior_diagnostics[population["key"]]
         base_weight = population_weight(population)
-        for percentile in PRECISION_CAP_SWEEP:
-            weight, diagnostics = compose_precision_weights(
-                base_weight,
-                posterior["g1_variance"],
-                posterior["g2_variance"],
-                percentile,
-            )
+        regularized_weight, diagnostics = compose_shape_noise_regularized_weights(
+            base_weight,
+            posterior["g1_variance"],
+            posterior["g2_variance"],
+        )
+        for weighting, weight in (
+            ("Population only", base_weight),
+            ("Shape-noise regularized", regularized_weight),
+        ):
             component_rows = [
                 component_metrics(
                     truth[:, index], population["mean"][:, index], low_g, weight
@@ -514,7 +725,28 @@ def precision_cap_sweep(
                 {
                     "population": population_label,
                     "population_key": population["key"],
+                    "weighting": weighting,
                     **diagnostics,
+                    "reported_shape_noise": (
+                        diagnostics["shape_noise"]
+                        if weighting == "Population only"
+                        else diagnostics["weighted_shape_noise"]
+                    ),
+                    "reported_shape_noise_se": (
+                        diagnostics["shape_noise_se"]
+                        if weighting == "Population only"
+                        else diagnostics["weighted_shape_noise_se"]
+                    ),
+                    "reported_shape_noise_ess": (
+                        diagnostics["shape_noise_ess"]
+                        if weighting == "Population only"
+                        else diagnostics["weighted_shape_noise_ess"]
+                    ),
+                    "reported_ess": (
+                        diagnostics["population_ess"]
+                        if weighting == "Population only"
+                        else diagnostics["ess"]
+                    ),
                     "g1_m": component_rows[0]["low_m"],
                     "g1_m_se": component_rows[0]["low_m_se"],
                     "g1_ess": component_rows[0]["ess_low"],
@@ -531,24 +763,22 @@ def precision_cap_sweep(
 def apply_precision_weighting(
     case: dict,
     posterior_diagnostics: dict[str, dict[str, np.ndarray]],
-    cap_percentile: float = DEFAULT_PRECISION_CAP_PERCENTILE,
 ) -> dict[str, dict]:
-    """Install capped precision-composed weights for all downstream sections."""
+    """Install shape-noise-regularized weights for downstream sections."""
 
     applied = {}
     for population_label, population in case["populations"].items():
         posterior = posterior_diagnostics[population["key"]]
-        weight, diagnostics = compose_precision_weights(
+        weight, diagnostics = compose_shape_noise_regularized_weights(
             population_weight(population),
             posterior["g1_variance"],
             posterior["g2_variance"],
-            cap_percentile,
         )
         population["galaxy_weight"] = weight
         population["precision_weighting"] = diagnostics
         applied[population_label] = diagnostics
     case["precision_weighted"] = True
-    case["precision_cap_percentile"] = cap_percentile
+    case["shape_noise_regularized"] = True
     return applied
 
 
@@ -570,10 +800,10 @@ def compute_metrics(case: dict, low_g: float) -> list[dict]:
     truth = case["truth"]
     for population_label, population in case["populations"].items():
         weight = population["galaxy_weight"]
-        for estimator, estimate in (
-            ("MAP", population["map"]),
-            ("Mean", population["mean"]),
-        ):
+        estimators = [("Mean", population["mean"])]
+        if case.get("report_map", True):
+            estimators.insert(0, ("MAP", population["map"]))
+        for estimator, estimate in estimators:
             frames = {
                 "image": (
                     (truth[:, 0], truth[:, 1]),
@@ -608,10 +838,10 @@ def nuisance_bias_metrics(case: dict) -> list[dict]:
     truth = np.asarray(case["truth"], dtype=np.float64)
     for population_label, population in case["populations"].items():
         weight = np.asarray(population["galaxy_weight"], dtype=np.float64)
-        for estimator, estimate in (
-            ("Mean", population["mean"]),
-            ("MAP", population["map"]),
-        ):
+        estimators = [("Mean", population["mean"])]
+        if case.get("report_map", True):
+            estimators.append(("MAP", population["map"]))
+        for estimator, estimate in estimators:
             estimate = np.asarray(estimate, dtype=np.float64)
             for index, parameter in enumerate(case["feature_names"]):
                 if parameter in {"g1", "g2"}:
@@ -736,22 +966,22 @@ def quantile_binned(
 
 
 def nuisance_bias_curves(case: dict, bins: int) -> dict[str, dict]:
-    """Mean-estimator nuisance residuals in common proposal-truth bins."""
+    """Mean-estimator nuisance residuals in common reference-truth bins."""
 
     if bins <= 0:
         raise ValueError("bins must be positive")
     truth = np.asarray(case["truth"], dtype=np.float64)
-    proposal = next(
+    reference = next(
         (
             population
             for population in case["populations"].values()
             if population["key"] == "proposal"
         ),
-        None,
+        next(iter(case["populations"].values()), None),
     )
-    if proposal is None:
-        raise ValueError("nuisance plots require a proposal population")
-    proposal_weight = population_weight(proposal)
+    if reference is None:
+        raise ValueError("nuisance plots require at least one population")
+    reference_weight = population_weight(reference)
     curves = {}
     for index, parameter in enumerate(case["feature_names"]):
         if parameter in {"g1", "g2"}:
@@ -759,15 +989,15 @@ def nuisance_bias_curves(case: dict, bins: int) -> dict[str, dict]:
         true = truth[:, index]
         finite_truth = (
             np.isfinite(true)
-            & np.isfinite(proposal_weight)
-            & (proposal_weight >= 0.0)
+            & np.isfinite(reference_weight)
+            & (reference_weight >= 0.0)
         )
-        if not np.any(finite_truth) or np.sum(proposal_weight[finite_truth]) <= 0.0:
+        if not np.any(finite_truth) or np.sum(reference_weight[finite_truth]) <= 0.0:
             continue
         edges = weighted_quantile(
             true[finite_truth],
             np.linspace(0.0, 1.0, bins + 1),
-            proposal_weight[finite_truth],
+            reference_weight[finite_truth],
         )
         assignment_edges = edges.copy()
         assignment_edges[0], assignment_edges[-1] = -np.inf, np.inf
@@ -780,7 +1010,7 @@ def nuisance_bias_curves(case: dict, bins: int) -> dict[str, dict]:
         for bin_index in range(bins):
             selected = finite_truth & (assignment == bin_index)
             mask, normalized = normalize_subset_weights(
-                proposal_weight, selected
+                reference_weight, selected
             )
             if len(normalized):
                 centers[bin_index] = float(np.sum(normalized * true[mask]))
@@ -870,10 +1100,16 @@ def conditional_shear_calibration(
     )
     conditions = {
         "true magnitude": case["rmag_true"],
-        spectral_condition_name: spectral_condition,
-        "true hlr": truth[:, names.index("hlr")],
-        "true sini": truth[:, names.index("sini")],
     }
+    if case.get("image_snr") is not None:
+        conditions["image S/N"] = case["image_snr"]
+    conditions.update(
+        {
+            spectral_condition_name: spectral_condition,
+            "true hlr": truth[:, names.index("hlr")],
+            "true sini": truth[:, names.index("sini")],
+        }
+    )
     result = {}
     for condition, axis in conditions.items():
         axis = np.asarray(axis, dtype=np.float64)
@@ -1021,7 +1257,7 @@ def _conditional_candidate_mass(
 def load_shear_posterior_diagnostics(
     case: dict, block_size: int = 64
 ) -> dict[str, dict[str, np.ndarray]]:
-    """Stream proposal and TF shear ranks and variances in one candidate pass."""
+    """Stream active-population shear ranks and variances in one candidate pass."""
 
     if block_size <= 0:
         raise ValueError("block_size must be positive")
@@ -1030,32 +1266,60 @@ def load_shear_posterior_diagnostics(
     cache_partitions = case.get("cache_partitions")
     if cache_partitions is None:
         cache_partitions = load_cache_partitions(root)
-    sample_files = cache_partitions.files["sample"]
+    candidate_array = case.get("candidate_array", "sample")
+    sample_files = cache_partitions.files[candidate_array]
     truth_files = cache_partitions.files["truth"]
-    weight_files = cache_partitions.files["posterior_tf_log_weight"]
+    population_keys = tuple(
+        population["key"] for population in case["populations"].values()
+    )
+    weighted_population_keys = {"tf_target", "test_set"} & set(population_keys)
+    candidate_log_weight_array = case.get(
+        "candidate_log_weight_array", "posterior_tf_log_weight"
+    )
+    weight_files = (
+        cache_partitions.files[candidate_log_weight_array]
+        if weighted_population_keys
+        else None
+    )
     result = {
         key: _empty_shear_posterior_diagnostic(len(truth))
-        for key in ("proposal", "tf_target")
+        for key in population_keys
     }
 
     offset = 0
-    for part_index, (sample_path, truth_path, weight_path) in enumerate(
-        zip(sample_files, truth_files, weight_files)
+    for part_index, (sample_path, truth_path) in enumerate(
+        zip(sample_files, truth_files)
     ):
         if offset >= len(truth):
             break
         samples = np.load(sample_path, mmap_mode="r")
         stored_truth = np.load(truth_path, mmap_mode="r")
-        cached_log_weight = np.load(weight_path, mmap_mode="r")
-        if samples.ndim != 3 or samples.shape[-1] != len(case["feature_names"]):
+        cached_log_weight = (
+            np.load(weight_files[part_index], mmap_mode="r")
+            if weight_files is not None
+            else None
+        )
+        expected_candidate_features = (
+            2 if candidate_array == "shear_sample" else len(case["feature_names"])
+        )
+        if samples.ndim != 3 or samples.shape[-1] != expected_candidate_features:
             raise ValueError(
-                f"Expected flat candidate shape (galaxy, draw, feature), got "
+                f"Expected candidate shape (galaxy, draw, "
+                f"{expected_candidate_features}), got "
                 f"{samples.shape} in {sample_path}"
             )
-        if stored_truth.shape != (samples.shape[0], samples.shape[-1]):
+        if stored_truth.shape != (
+            samples.shape[0], len(case["feature_names"])
+        ):
             raise ValueError(f"Truth/sample shape mismatch in {sample_path}")
-        if cached_log_weight.shape != samples.shape[:2]:
-            raise ValueError(f"Candidate-weight shape mismatch in {weight_path}")
+        if (
+            cached_log_weight is not None
+            and cached_log_weight.shape != samples.shape[:2]
+        ):
+            raise ValueError(
+                "Candidate-weight shape mismatch in "
+                f"{weight_files[part_index]}"
+            )
         take = min(samples.shape[0], len(truth) - offset)
         expected_truth = truth[offset : offset + take]
         if not np.array_equal(
@@ -1070,8 +1334,12 @@ def load_shear_posterior_diagnostics(
             draws = np.asarray(
                 samples[local_start:local_end, :, :2], dtype=np.float64
             )
-            tf_log_weight = np.asarray(
-                cached_log_weight[local_start:local_end], dtype=np.float64
+            candidate_log_weight = (
+                np.asarray(
+                    cached_log_weight[local_start:local_end], dtype=np.float64
+                )
+                if cached_log_weight is not None
+                else None
             )
             targets = expected_truth[local_start:local_end, :2]
             truth_bins = shear_pp_bin_indices(targets)
@@ -1079,8 +1347,13 @@ def load_shear_posterior_diagnostics(
             for row in range(len(targets)):
                 global_row = offset + local_start + row
                 candidate_logs = {
-                    "proposal": None,
-                    "tf_target": tf_log_weight[row],
+                    key: (
+                        candidate_log_weight[row]
+                        if key in weighted_population_keys
+                        and candidate_log_weight is not None
+                        else None
+                    )
+                    for key in population_keys
                 }
                 for component in range(2):
                     finite_in_bin = (
@@ -1118,7 +1391,9 @@ def load_shear_posterior_diagnostics(
                             effective_sample_size(conditional)
                         )
         offset += take
-        del samples, stored_truth, cached_log_weight
+        del samples, stored_truth
+        if cached_log_weight is not None:
+            del cached_log_weight
     if offset != len(truth):
         raise ValueError(
             f"Sample cache has {offset} galaxies, report uses {len(truth)}"
@@ -1152,9 +1427,13 @@ def load_shear_pit_values(
 ) -> dict[str, np.ndarray]:
     """Compatibility wrapper returning one population's streamed diagnostics."""
 
-    if population_key not in {"proposal", "tf_target"}:
-        raise ValueError("population_key must be proposal or tf_target")
-    return load_shear_posterior_diagnostics(case, block_size)[population_key]
+    diagnostics = load_shear_posterior_diagnostics(case, block_size)
+    if population_key not in diagnostics:
+        raise ValueError(
+            f"population_key must be one of {sorted(diagnostics)}, "
+            f"got {population_key!r}"
+        )
+    return diagnostics[population_key]
 
 
 def posterior_pp_curve(
@@ -1202,10 +1481,10 @@ def bias_figure(case: dict, bins: int) -> str:
     for row, (label, population) in enumerate(populations):
         for component, axis in enumerate(axes[row]):
             true = case["truth"][:, component]
-            for estimator, estimate, color in (
-                ("MAP", population["map"], "tab:blue"),
-                ("Mean", population["mean"], "tab:orange"),
-            ):
+            estimators = [("Mean", population["mean"], "tab:orange")]
+            if case.get("report_map", True):
+                estimators.insert(0, ("MAP", population["map"], "tab:blue"))
+            for estimator, estimate, color in estimators:
                 center, residual, error, _, _ = quantile_binned(
                     true,
                     estimate[:, component] - true,
@@ -1227,12 +1506,20 @@ def bias_figure(case: dict, bins: int) -> str:
 
 
 def nuisance_bias_figure(case: dict, bins: int) -> str:
-    """Overlay proposal and TF posterior-mean nuisance residual trends."""
+    """Overlay active-population posterior-mean nuisance residual trends."""
 
     curves = nuisance_bias_curves(case, bins)
     fig, axes = plt.subplots(2, 4, figsize=(18, 8.5), squeeze=False)
-    colors = {"proposal": "tab:blue", "tf_target": "tab:orange"}
-    short_labels = {"proposal": "Original", "tf_target": "TF"}
+    colors = {
+        "proposal": "tab:blue",
+        "tf_target": "tab:orange",
+        "test_set": "tab:purple",
+    }
+    short_labels = {
+        "proposal": "Original",
+        "tf_target": "TF",
+        "test_set": "Test set",
+    }
     for axis, (parameter, parameter_curves) in zip(axes.flat, curves.items()):
         scale, _ = NUISANCE_DISPLAY[parameter]
         unit = NUISANCE_PLOT_UNIT[parameter]
@@ -1268,7 +1555,7 @@ def nuisance_bias_figure(case: dict, bins: int) -> str:
     for axis in axes.flat[len(curves):]:
         axis.set_visible(False)
     weighting = (
-        f"precision weighted (p{case['precision_cap_percentile']:g} cap)"
+        "shape-noise-regularized precision weighted"
         if case.get("precision_weighted")
         else "population weighted"
     )
@@ -1291,7 +1578,13 @@ def conditional_shear_calibration_figure(
     spectral_condition_log_scale = case.get(
         "spectral_condition_log_scale", True
     )
-    fig, axes = plt.subplots(3, 4, figsize=(18, 11), squeeze=False)
+    column_count = len(curves)
+    fig, axes = plt.subplots(
+        3,
+        column_count,
+        figsize=(4.5 * column_count, 11),
+        squeeze=False,
+    )
     colors = {"g1": "tab:blue", "g2": "tab:orange"}
     for column, (condition, components) in enumerate(curves.items()):
         for row, (metric, scale, ylabel) in enumerate(
@@ -1651,11 +1944,396 @@ def posterior_pp_figure(case: dict, pits_by_population: dict[str, dict]) -> str:
             axis.set_title(f"{population_label} — {component}")
             axis.legend(fontsize="xx-small", loc="upper left")
         axes[row, 0].set_ylabel("weighted fraction of truths")
-    fig.suptitle(
-        f"{case['case']} — prior-matched conditional P-P (three true-shear bins)"
+    description = (
+        "empirical test-set conditional P-P"
+        if case.get("analysis_mode") == "test_set"
+        else "prior-matched conditional P-P"
     )
+    fig.suptitle(f"{case['case']} — {description} (three true-shear bins)")
     fig.tight_layout()
     return fig_data_uri(fig)
+
+
+def _flatten_provenance(value: dict, prefix: str = "") -> list[tuple[str, str]]:
+    """Flatten bounded JSON provenance for compact HTML display."""
+
+    rows = []
+    for key in sorted(value):
+        item = value[key]
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(item, dict):
+            rows.extend(_flatten_provenance(item, name))
+        elif isinstance(item, list) and len(item) > 12:
+            rows.append((name, f"<{len(item)} values>"))
+        else:
+            rows.append((name, json.dumps(item, sort_keys=True)))
+    return rows
+
+
+def test_set_provenance_table(case: dict) -> str:
+    """Render the generation and analysis contract for a compact test cache."""
+
+    provenance = case.get("test_set_provenance")
+    if not isinstance(provenance, dict) or not isinstance(
+        provenance.get("generation_manifest"), dict
+    ):
+        raise ValueError(
+            f"{case['case']} lacks required compact test-set generation provenance"
+        )
+    operative_weight = (
+        "1 / (posterior shear variance + fixed ensemble shape-noise variance)"
+        if case.get("precision_weighted")
+        else "equal over generated test galaxies (population only)"
+    )
+    rows = [
+        ("cache dataset rows", f"{case['dataset_size']:,}"),
+        ("report rows", f"{case['analyzed_size']:,}"),
+        ("posterior estimator", "Mean only"),
+        (
+            "posterior candidate mass",
+            f"{case.get('candidate_weight_name', 'TF importance')} weights "
+            "normalized within each galaxy",
+        ),
+        ("pre-precision galaxy mass", "equal over generated test galaxies"),
+        (
+            "operative analysis weight",
+            operative_weight,
+        ),
+        ("cache analysis mode", "test_set"),
+    ]
+    display_provenance = {
+        key: value
+        for key, value in provenance.items()
+        if key != "map_computed"
+    }
+    rows.extend(_flatten_provenance(display_provenance, "test_set"))
+    body = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(name)}</code></td>"
+        f"<td>{html.escape(value)}</td></tr>"
+        for name, value in rows
+    )
+    return (
+        "<table><thead><tr><th>Contract field</th><th>Value</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
+    )
+
+
+def _uniform_ks(values: np.ndarray) -> float:
+    values = np.sort(np.asarray(values, dtype=np.float64))
+    values = values[np.isfinite(values)]
+    if not len(values) or np.any((values < 0.0) | (values > 1.0)):
+        return float("nan")
+    after = np.arange(1, len(values) + 1, dtype=np.float64) / len(values)
+    before = np.arange(len(values), dtype=np.float64) / len(values)
+    return float(max(np.max(after - values), np.max(values - before)))
+
+
+def compute_test_set_tf_conformance_audit(
+    vcirc: np.ndarray,
+    rmag_true: np.ndarray,
+    embedded_tf: dict,
+    *,
+    generation_tf: dict | None = None,
+) -> dict:
+    """Audit cached truth against its embedded truncated TF conditional.
+
+    This calculation deliberately does not call the generation sampler. It
+    independently maps every cached (rmag_true, vcirc) row through the CDF of
+    the configured normal in log10(vcirc), truncated to the configured
+    physical velocity support. Correctly generated rows therefore have a
+    uniform probability-integral transform (PIT).
+    """
+
+    expected_fields = {
+        "slope", "intercept", "scatter_dex", "vcirc_min", "vcirc_max"
+    }
+    if not isinstance(embedded_tf, dict) or set(embedded_tf) != expected_fields:
+        raise ValueError(
+            "test_set.tf must contain exactly slope, intercept, scatter_dex, "
+            "vcirc_min, and vcirc_max"
+        )
+    config = {}
+    for name in expected_fields:
+        value = embedded_tf[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"test_set.tf.{name} must be finite numeric")
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"test_set.tf.{name} must be finite numeric")
+        config[name] = value
+    if config["slope"] == 0.0:
+        raise ValueError("test_set.tf.slope must be non-zero")
+    if config["scatter_dex"] <= 0.0:
+        raise ValueError("test_set.tf.scatter_dex must be positive")
+    if not 0.0 < config["vcirc_min"] < config["vcirc_max"]:
+        raise ValueError(
+            "test_set.tf velocity bounds must satisfy 0 < vcirc_min < vcirc_max"
+        )
+    if generation_tf is not None and generation_tf != embedded_tf:
+        raise ValueError(
+            "test_set.generation_manifest.tf must exactly match test_set.tf"
+        )
+
+    velocity = np.asarray(vcirc, dtype=np.float64)
+    magnitude = np.asarray(rmag_true, dtype=np.float64)
+    if velocity.ndim != 1 or magnitude.ndim != 1 or velocity.shape != magnitude.shape:
+        raise ValueError("cached vcirc and rmag_true must be matching vectors")
+    if not len(velocity):
+        raise ValueError("TF-conformance audit requires at least one cached row")
+    if not np.all(np.isfinite(velocity)) or not np.all(np.isfinite(magnitude)):
+        raise ValueError(
+            "cached vcirc and rmag_true must be finite for TF-conformance audit"
+        )
+    on_support = (velocity >= config["vcirc_min"]) & (
+        velocity <= config["vcirc_max"]
+    )
+    if not np.all(on_support):
+        invalid = np.flatnonzero(~on_support)
+        preview = invalid[:10].tolist()
+        raise ValueError(
+            "cached vcirc lies outside embedded test_set.tf support at rows "
+            f"{preview}" + ("..." if len(invalid) > len(preview) else "")
+        )
+
+    mean_log10 = (magnitude - config["intercept"]) / config["slope"]
+    residual_dex = np.log10(velocity) - mean_log10
+    standardized = residual_dex / config["scatter_dex"]
+    lower = (math.log10(config["vcirc_min"]) - mean_log10) / config[
+        "scatter_dex"
+    ]
+    upper = (math.log10(config["vcirc_max"]) - mean_log10) / config[
+        "scatter_dex"
+    ]
+    intermediates = (mean_log10, residual_dex, standardized, lower, upper)
+    if not all(np.all(np.isfinite(value)) for value in intermediates):
+        raise ValueError("TF-conformance transform produced non-finite values")
+    if np.any(lower >= upper):
+        raise ValueError("embedded TF truncation interval is empty")
+
+    pit = np.asarray(truncnorm.cdf(standardized, lower, upper), dtype=np.float64)
+    if not np.all(np.isfinite(pit)) or np.any((pit < 0.0) | (pit > 1.0)):
+        raise ValueError("truncated TF conditional CDF produced invalid values")
+
+    ks_distance = _uniform_ks(pit)
+    if not math.isfinite(ks_distance):
+        raise ValueError("TF-conformance KS distance is not finite")
+    row_count = len(pit)
+    dkw_threshold = min(
+        1.0, math.sqrt(math.log(2.0 / TF_AUDIT_ALPHA) / (2.0 * row_count))
+    )
+    ks_pvalue = float(kstwobign.sf(math.sqrt(row_count) * ks_distance))
+    if not math.isfinite(ks_pvalue):
+        raise ValueError("TF-conformance KS probability is not finite")
+    pit_quantiles = np.quantile(pit, TF_AUDIT_QUANTILES)
+    residual_quantiles = np.quantile(residual_dex, TF_AUDIT_QUANTILES)
+    standardized_quantiles = np.quantile(standardized, TF_AUDIT_QUANTILES)
+    quantile_max_error = float(
+        np.max(np.abs(pit_quantiles - TF_AUDIT_QUANTILES))
+    )
+    return {
+        "config": config,
+        "row_count": row_count,
+        "pit_min": float(np.min(pit)),
+        "pit_max": float(np.max(pit)),
+        "ks_distance": ks_distance,
+        "ks_pvalue_asymptotic": ks_pvalue,
+        "significance_alpha": TF_AUDIT_ALPHA,
+        "dkw_distance_threshold": dkw_threshold,
+        "uniformity_status": "PASS" if ks_distance <= dkw_threshold else "FAIL",
+        "residual_status": "PASS",
+        "quantile_status": (
+            "PASS" if quantile_max_error <= dkw_threshold else "FAIL"
+        ),
+        "quantile_max_abs_error": quantile_max_error,
+        "quantile_probabilities": TF_AUDIT_QUANTILES.copy(),
+        "pit_quantiles": pit_quantiles,
+        "residual_dex_quantiles": residual_quantiles,
+        "standardized_residual_quantiles": standardized_quantiles,
+    }
+
+
+def test_set_tf_conformance_table(case: dict) -> str:
+    """Render the independent cached-truth TF probability-integral audit."""
+
+    audit = case.get("tf_conformance_audit")
+    if not isinstance(audit, dict):
+        raise ValueError(f"{case['case']} lacks a cached-truth TF audit")
+    config = audit.get("config")
+    probabilities = np.asarray(audit.get("quantile_probabilities"), dtype=float)
+    pit_quantiles = np.asarray(audit.get("pit_quantiles"), dtype=float)
+    residual_quantiles = np.asarray(
+        audit.get("residual_dex_quantiles"), dtype=float
+    )
+    standardized_quantiles = np.asarray(
+        audit.get("standardized_residual_quantiles"), dtype=float
+    )
+    expected_shape = TF_AUDIT_QUANTILES.shape
+    if not isinstance(config, dict) or any(
+        value.shape != expected_shape
+        for value in (
+            probabilities,
+            pit_quantiles,
+            residual_quantiles,
+            standardized_quantiles,
+        )
+    ):
+        raise ValueError(f"{case['case']} has malformed cached-truth TF audit data")
+
+    status_rows = (
+        ("rows audited", f"{audit['row_count']:,}"),
+        (
+            "embedded conditional",
+            "log10(vcirc) | rmag ~ Normal((rmag - intercept) / slope, "
+            "scatter_dex), truncated to [vcirc_min, vcirc_max]",
+        ),
+        (
+            "embedded TF parameters",
+            ", ".join(f"{name}={config[name]:g}" for name in sorted(config)),
+        ),
+        ("velocity support / finite residual status", audit["residual_status"]),
+        (
+            "truncated-CDF PIT range",
+            f"[{audit['pit_min']:.6g}, {audit['pit_max']:.6g}]",
+        ),
+        ("uniform KS distance D", f"{audit['ks_distance']:.6g}"),
+        (
+            "asymptotic uniform-KS p-value",
+            f"{audit['ks_pvalue_asymptotic']:.6g}",
+        ),
+        (
+            f"DKW distance threshold (alpha={audit['significance_alpha']:.0e})",
+            f"{audit['dkw_distance_threshold']:.6g}",
+        ),
+        ("uniformity status", audit["uniformity_status"]),
+        (
+            "PIT quantile status / maximum absolute deviation",
+            f"{audit['quantile_status']} / {audit['quantile_max_abs_error']:.6g}",
+        ),
+    )
+    status_body = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(label)}</code></td>"
+        f"<td>{html.escape(str(value))}</td></tr>"
+        for label, value in status_rows
+    )
+    quantile_body = "".join(
+        "<tr>"
+        f"<td>{probability:.2f}</td>"
+        f"<td>{residual:.6g}</td>"
+        f"<td>{standardized_value:.6g}</td>"
+        f"<td>{pit_value:.6g}</td>"
+        f"<td>{pit_value - probability:+.6g}</td></tr>"
+        for probability, residual, standardized_value, pit_value in zip(
+            probabilities,
+            residual_quantiles,
+            standardized_quantiles,
+            pit_quantiles,
+        )
+    )
+    return (
+        "<table><thead><tr><th>TF audit field</th><th>Value</th></tr></thead>"
+        f"<tbody>{status_body}</tbody></table>"
+        "<table><thead><tr><th>quantile</th><th>TF residual [dex]</th>"
+        "<th>standardized residual</th><th>truncated-CDF PIT</th>"
+        "<th>PIT − nominal</th></tr></thead>"
+        f"<tbody>{quantile_body}</tbody></table>"
+    )
+
+
+def test_set_audit_table(case: dict) -> str:
+    """Summarize cached empirical inputs and core generation invariants."""
+
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    names = case["feature_names"]
+    sini = truth[:, names.index("sini")]
+    cosi = np.sqrt(np.clip(1.0 - np.square(sini), 0.0, 1.0))
+    values = {
+        "rmag_true": case["rmag_true"],
+        "image_snr": case["image_snr"],
+        "central_halpha_snr": case["spectral_condition"],
+        "vcirc [km/s]": truth[:, names.index("vcirc")],
+        "hlr [arcsec]": truth[:, names.index("hlr")],
+        "sini": sini,
+        "reconstructed cosi": cosi,
+    }
+    body = []
+    for label, raw in values.items():
+        raw = np.asarray(raw, dtype=np.float64)
+        finite = raw[np.isfinite(raw)]
+        quantile = (
+            np.quantile(finite, [0.0, 0.16, 0.5, 0.84, 1.0])
+            if len(finite)
+            else np.full(5, np.nan)
+        )
+        body.append(
+            "<tr>"
+            f"<td><code>{html.escape(label)}</code></td>"
+            f"<td>{len(finite):,} / {len(raw):,}</td>"
+            + "".join(f"<td>{value:.5g}</td>" for value in quantile)
+            + "</tr>"
+        )
+    cached_rows_status = (
+        "PASS"
+        if case["dataset_size"] == 100_000
+        else "CHECK: final requested size is 100,000"
+    )
+    truncation = (
+        "none"
+        if case["analyzed_size"] == case["dataset_size"]
+        else f"debug prefix {case['analyzed_size']:,}/{case['dataset_size']:,}"
+    )
+    hlr_max = float(np.max(truth[:, names.index("hlr")]))
+    return (
+        f"<p><b>Row-count check:</b> {cached_rows_status}; report truncation: "
+        f"{html.escape(truncation)}. <b>HLR upper-limit check:</b> "
+        f"{'PASS' if hlr_max <= 5.0 + 1.0e-6 else 'FAIL'} "
+        f"(max {hlr_max:.5g} arcsec). <b>Inclination check:</b> reconstructed "
+        f"cos(i) uniform KS distance = {_uniform_ks(cosi):.5g}.</p>"
+        "<table><thead><tr><th>Cached quantity</th><th>finite / N</th>"
+        "<th>min</th><th>16th</th><th>median</th><th>84th</th><th>max</th>"
+        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+    )
+
+
+def cross_case_summary_table(results: list[dict]) -> str:
+    """Compare operative Mean shear calibration across test-set cuts."""
+
+    body = []
+    for result in results:
+        weighting = result["weighting"]
+        operative = next(
+            row
+            for row in result["weight_rows"]
+            if row["weighting"] == weighting
+        )
+        for component in ("g1", "g2"):
+            metric = next(
+                row
+                for row in result["metric_rows"]
+                if row["estimator"] == "Mean"
+                and row["frame"] == "image"
+                and row["component"] == component
+            )
+            body.append(
+                "<tr>"
+                f"<td>{html.escape(result['case'])}</td><td>{component}</td>"
+                f"<td>{html.escape(weighting)}</td>"
+                f"<td>{_format_scaled(metric['c'], 1e4)} ± "
+                f"{_format_scaled(metric['c_se'], 1e4)}</td>"
+                f"<td>{_format_scaled(metric['low_m'], 1e2)} ± "
+                f"{_format_scaled(metric['low_m_se'], 1e2)}</td>"
+                f"<td>{operative['reported_shape_noise']:.5g}</td>"
+                f"<td>{metric['n']:,} / {metric['ess']:.1f}</td>"
+                "</tr>"
+            )
+    return (
+        "<table><thead><tr><th>Case / catalog cut</th><th>Component</th>"
+        "<th>Operative galaxy weighting</th>"
+        "<th>10<sup>4</sup> c</th><th>10<sup>2</sup> low-|g| m</th>"
+        "<th>reported σ<sub>shape</sub></th><th>N / ESS</th></tr></thead>"
+        "<tbody>" + "".join(body) + "</tbody></table>"
+    )
 
 
 def _format_scaled(value: float, scale: float) -> str:
@@ -1689,33 +2367,23 @@ def metrics_table(rows: list[dict]) -> str:
     )
 
 
-def precision_cap_sweep_table(rows: list[dict]) -> str:
-    """Render precision caps, invalid-variance diagnostics, ESS, and Mean m."""
+def shape_noise_weight_comparison_table(rows: list[dict]) -> str:
+    """Render two-pass shape noise, invalid variances, ESS, and Mean m."""
 
     body = []
     for row in rows:
-        percentile = row["cap_percentile"]
-        cap_label = "uncapped / all" if percentile is None else f"{percentile:g}th"
-        threshold = (
-            "∞"
-            if percentile is None
-            else f"{row['precision_threshold']:.5g}"
-        )
-        floor = (
-            "0"
-            if percentile is None
-            else f"{row['shape_noise_floor']:.5g}"
-        )
         body.append(
             "<tr>"
             f"<td>{html.escape(row['population'])}</td>"
-            f"<td>{cap_label}</td><td>{threshold}</td><td>{floor}</td>"
-            f"<td>{row['capped_count']:,} / {100 * row['capped_fraction']:.2f}% "
-            f"rows / {100 * row['capped_population_mass']:.2f}% mass</td>"
+            f"<td>{row['weighting']}</td>"
+            f"<td>{row['shape_noise']:.5g}</td>"
+            f"<td>{row['reported_shape_noise']:.5g} ± "
+            f"{row['reported_shape_noise_se']:.3g} / "
+            f"{row['reported_shape_noise_ess']:.1f}</td>"
             f"<td>{row['invalid_variance_count']:,} / "
             f"{100 * row['invalid_variance_fraction']:.3f}% rows / "
             f"{100 * row['invalid_variance_population_mass']:.3f}% mass</td>"
-            f"<td>{row['ess']:.1f}</td>"
+            f"<td>{row['reported_ess']:.1f}</td>"
             f"<td>{_format_scaled(row['g1_m'], 1e2)} ± "
             f"{_format_scaled(row['g1_m_se'], 1e2)}</td>"
             f"<td>{row['g1_n']:,} / {row['g1_ess']:.1f}</td>"
@@ -1725,9 +2393,10 @@ def precision_cap_sweep_table(rows: list[dict]) -> str:
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>Population / posterior</th><th>Precision cap</th>"
-        "<th>max p</th><th>equivalent σ<sub>ε</sub> floor</th>"
-        "<th>Capped</th><th>Invalid variance</th><th>Overall ESS</th>"
+        "<table><thead><tr><th>Population / posterior</th><th>Weighting</th>"
+        "<th>fixed first-pass σ<sub>shape</sub></th>"
+        "<th>reported σ<sub>shape</sub> ± SE / ESS</th>"
+        "<th>Invalid variance</th><th>Overall ESS</th>"
         "<th>10<sup>2</sup> g1 m</th><th>g1 N / fit ESS</th>"
         "<th>10<sup>2</sup> g2 m</th><th>g2 N / fit ESS</th>"
         "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
@@ -1807,6 +2476,48 @@ def importance_table(case: dict) -> str:
     )
 
 
+def test_set_candidate_weight_table(case: dict) -> str:
+    """Summarize candidate weights without reweighting truth galaxies."""
+
+    population = next(iter(case["populations"].values()))
+    galaxy_weight = population_weight(population)
+    rows = []
+    for label, values in (
+        ("posterior candidate ESS", case["posterior_candidate_ess"]),
+        (
+            "posterior candidate ESS fraction",
+            case["posterior_candidate_ess_fraction"],
+        ),
+        (
+            "largest posterior candidate weight",
+            case["posterior_candidate_max_weight"],
+        ),
+    ):
+        quantiles = weighted_quantile(
+            values, np.asarray((0.16, 0.5, 0.84)), galaxy_weight
+        )
+        mean, _, _ = weighted_mean_and_se(values, galaxy_weight)
+        invalid = int(np.count_nonzero(~np.isfinite(values)))
+        rows.append(
+            f"<tr><td>{label}</td><td>{mean:.4g}</td>"
+            f"<td>{quantiles[0]:.4g}</td><td>{quantiles[1]:.4g}</td>"
+            f"<td>{quantiles[2]:.4g}</td><td>{invalid:,}</td></tr>"
+        )
+    candidate_weight_name = html.escape(
+        case.get("candidate_weight_name", "TF importance")
+    )
+    return (
+        f"<p>These diagnostics describe {candidate_weight_name} weights over posterior "
+        "candidates within each galaxy. Their summary uses uniform "
+        "pre-precision galaxy mass; no TF population ratio is applied across "
+        "the already-TF-conformed truth rows.</p>"
+        "<table><thead><tr><th>Diagnostic</th><th>mean</th>"
+        "<th>16th</th><th>median</th><th>84th</th>"
+        "<th>non-finite rows</th></tr></thead><tbody>"
+        + "".join(rows) + "</tbody></table>"
+    )
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     logging.basicConfig(
@@ -1818,33 +2529,53 @@ def main(argv=None) -> None:
     if args.low_g <= 0.0:
         raise ValueError("low-g must be positive")
     cases = [
-        load_case(args.cache_root, value, args.max_galaxies)
+        load_case(
+            args.cache_root,
+            value,
+            args.max_galaxies,
+            test_set=args.test_set,
+        )
         for value in args.case
     ]
     sections = []
+    cross_case_results = []
     for case in cases:
         case_name = case["case"]
+        case["report_map"] = not (args.weighted or args.test_set)
         LOGGER.info("%s: starting report", case_name)
-        importance_html = importance_table(case)
-        LOGGER.info("%s: finished section: importance-sampling health", case_name)
+        if args.test_set:
+            importance_html = test_set_candidate_weight_table(case)
+            LOGGER.info(
+                "%s: finished section: %s",
+                case_name,
+                case["candidate_weight_health_heading"],
+            )
+        else:
+            importance_html = importance_table(case)
+            LOGGER.info(
+                "%s: finished section: importance-sampling health", case_name
+            )
 
         LOGGER.info("%s: streaming posterior candidate diagnostics", case_name)
         pits = load_shear_posterior_diagnostics(case)
         LOGGER.info("%s: finished posterior candidate diagnostics", case_name)
-        cap_sweep_rows = precision_cap_sweep(case, pits, args.low_g)
-        cap_sweep_html = precision_cap_sweep_table(cap_sweep_rows)
+        weight_comparison_rows = shape_noise_weight_comparison(
+            case, pits, args.low_g
+        )
+        weight_comparison_html = shape_noise_weight_comparison_table(
+            weight_comparison_rows
+        )
         if args.weighted:
-            applied = apply_precision_weighting(
-                case, pits, DEFAULT_PRECISION_CAP_PERCENTILE
-            )
+            applied = apply_precision_weighting(case, pits)
             for population_label, diagnostic in applied.items():
                 LOGGER.info(
-                    "%s: %s p95 precision weighting: ESS %.1f, capped %d, "
-                    "invalid variance %d",
+                    "%s: %s shape-noise-regularized precision: "
+                    "sigma_shape %.5g -> %.5g, ESS %.1f, invalid variance %d",
                     case_name,
                     population_label,
+                    diagnostic["shape_noise"],
+                    diagnostic["weighted_shape_noise"],
                     diagnostic["ess"],
-                    diagnostic["capped_count"],
                     diagnostic["invalid_variance_count"],
                 )
 
@@ -1876,7 +2607,10 @@ def main(argv=None) -> None:
         LOGGER.info("%s: finished section: posterior coverage", case_name)
 
         conditional_html = {}
-        for estimator in ("Mean", "MAP"):
+        conditional_estimators = (
+            ("Mean", "MAP") if case.get("report_map", True) else ("Mean",)
+        )
+        for estimator in conditional_estimators:
             panels = []
             for population_label, population in case["populations"].items():
                 curves = conditional_shear_calibration(
@@ -1900,32 +2634,174 @@ def main(argv=None) -> None:
                 case_name,
                 estimator,
             )
+        conditional_map_section = ""
+        if case.get("report_map", True):
+            conditional_map_section = (
+                "<h3>Conditional MAP calibration</h3>"
+                "<p>The m and c panels use MAP point estimates. Shape noise is a "
+                "property of the corresponding posterior, so its panels match the "
+                "Mean section.</p>"
+                + conditional_html["MAP"]
+            )
         pp_html = (
             f"<img src=\"{posterior_pp_figure(case, pits)}\" "
             "alt=\"weighted posterior P-P plots\">"
         )
         LOGGER.info("%s: finished section: conditional P-P diagnostic", case_name)
+        if args.test_set:
+            combined_prior = (
+                case["posterior_candidate_weighting"]
+                == COMBINED_TEST_SET_CANDIDATE_WEIGHTING
+            )
+            operative_weighting = (
+                "Shape-noise regularized" if args.weighted else "Population only"
+            )
+            operative_weight_description = (
+                "shape-noise-regularized posterior precision"
+                if args.weighted
+                else "equal truth-galaxy mass without posterior-precision weighting"
+            )
+            if combined_prior:
+                prior_replacement_description = (
+                    "Inference replaces the uniform training priors on circular "
+                    "velocity and inclination with the declared TF and isotropic-"
+                    "inclination priors using combined prior-replacement importance "
+                    "weights over joint posterior candidates within each galaxy. "
+                    "Truth galaxies retain uniform population mass."
+                )
+                posterior_variance_description = (
+                    "Each galaxy's posterior shear variance after combined "
+                    "prior-replacement weighting is"
+                )
+                interval_description = (
+                    "Intervals come from posterior candidates after combined "
+                    "prior-replacement weighting and"
+                )
+                rank_description = (
+                    "posterior ranks use renormalized combined prior-replacement "
+                    "candidate weights."
+                )
+            else:
+                prior_replacement_description = (
+                    "Inference replaces the uniform training prior on circular "
+                    "velocity with the declared TF prior by importance weighting "
+                    "joint posterior candidates within each galaxy. Truth galaxies "
+                    "retain uniform population mass."
+                )
+                posterior_variance_description = (
+                    "Each galaxy's TF-weighted posterior shear variance is"
+                )
+                interval_description = (
+                    "Intervals come from TF-weighted posterior candidates and"
+                )
+                rank_description = (
+                    "posterior ranks use renormalized TF candidate weights."
+                )
+            cross_case_results.append(
+                {
+                    "case": case_name,
+                    "metric_rows": metric_rows,
+                    "weight_rows": weight_comparison_rows,
+                    "weighting": operative_weighting,
+                }
+            )
+            sections.append(
+                f"<section><h2>{html.escape(case_name)}</h2>"
+                "<h3>Test-set provenance and generation contract</h3>"
+                "<p>This section is rendered from the compact cache's embedded "
+                "generation manifest. The catalog-selected truth population is "
+                "already TF-conformed. "
+                + prior_replacement_description
+                + "</p>"
+                + test_set_provenance_table(case)
+                + "<h3>Independent TF-conformance audit</h3>"
+                "<p>Every cached truth row is transformed independently through "
+                "the embedded, correctly truncated conditional TF CDF. A "
+                "TF-conformed cache has a uniform probability-integral transform. "
+                "The KS and quantile statuses therefore expose a generation, "
+                "LMDB, or cache row-alignment mismatch without applying any TF "
+                "truth-population weight to the shear analysis.</p>"
+                + test_set_tf_conformance_table(case)
+                + "<h3>Cached-input audit</h3>"
+                "<p>The table reports the exact values passed through the held-out "
+                "dataset and cache. Image and central H-alpha S/N are record-backed "
+                "and are neither redrawn nor clipped at posterior-cache time.</p>"
+                + test_set_audit_table(case)
+                + f"<h3>{html.escape(case['candidate_weight_health_heading'])}</h3>"
+                + importance_html
+                + "<h3>Galaxy-weighting and shape-noise comparison</h3>"
+                f"<p>{posterior_variance_description} "
+                "σ²<sub>gal,j</sub> = [Var(g1) + Var(g2)] / 2. The fixed "
+                "ensemble floor is the equal-population mean of "
+                "σ<sub>gal,j</sub>, and the regularized alternative is "
+                "w<sub>j</sub> ∝ 1 / "
+                "[σ²<sub>gal,j</sub> + σ²<sub>shape</sub>]. Both population-only "
+                "and regularized results are shown here. The operative row for "
+                f"subsequent ensemble statistics is <b>{operative_weighting}</b>. "
+                "Invalid variances receive zero regularized weight.</p>"
+                + weight_comparison_html
+                + "<h3>Shear calibration — posterior Mean</h3>"
+                "<p>Only the posterior Mean is reported. Low-|g| fits use "
+                f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
+                f"Results use {operative_weight_description}.</p>"
+                + shear_html
+                + "<h3>Nuisance-parameter calibration — posterior Mean</h3>"
+                "<p>Entries are weighted means of estimate minus truth. Error "
+                "bars are weighted standard errors; legend values are full-range "
+                "residual slopes. The <code>theta_int</code> residual is wrapped "
+                "to [-π, π).</p>"
+                + nuisance_html
+                + "<h3>Conditional Mean calibration</h3>"
+                "<p>Weighted-quantile bins show m, c, and posterior shape noise "
+                "against catalog r magnitude, catalog image S/N, catalog central "
+                "H-alpha S/N, true HLR, and true sin(i). The two S/N coordinates "
+                "are the exact cached observation controls.</p>"
+                + conditional_html["Mean"]
+                + "<h3>Empirical test-set posterior coverage</h3>"
+                f"<p>{interval_description} "
+                "are averaged over the selected test population with the operative "
+                f"{operative_weight_description}. This is empirical "
+                "held-out coverage, not simulation-based calibration under the "
+                "training proposal.</p>"
+                + coverage_html
+                + "<h3>Empirical test-set conditional P-P diagnostic</h3>"
+                "<p>Within each true-shear interval, "
+                + rank_description
+                + " Curves use the operative "
+                "galaxy weights; retained "
+                "candidate fraction and conditional candidate ESS are reported "
+                "separately from galaxy ESS.</p>"
+                + pp_html
+                + "</section>"
+            )
+            LOGGER.info("%s: finished test-set report assembly", case_name)
+            continue
+
         sections.append(
             f"<section><h2>{html.escape(case['case'])}</h2>"
             "<h3>Importance-sampling health</h3>"
             + importance_html
-            + "<h3>Posterior-precision cap sweep</h3>"
-            "<p>For each galaxy, p = 2 / [Var(g1) + Var(g2)]. Population "
-            "weights are multiplied by p after clipping p at the named "
-            "population-mass percentile; <i>uncapped / all</i> retains the "
-            "full finite precision. These are caps, not sample cuts. The "
-            "equivalent σ<sub>ε</sub> floor is 1/√p<sub>max</sub>. Invalid "
-            "variances receive zero precision-analysis weight. The m fits use "
-            "the posterior Mean in the image frame and the same low-|g| range "
-            "as the main table.</p>"
-            + cap_sweep_html
+            + "<h3>Shape-noise-regularized precision comparison</h3>"
+            "<p>The first pass defines each galaxy's posterior variance as "
+            "σ²<sub>gal,j</sub> = [Var(g1) + Var(g2)] / 2 and estimates the "
+            "ensemble σ<sub>shape</sub> as the population-weighted mean of "
+            "σ<sub>gal,j</sub>. The fixed floor then gives "
+            "w<sub>j</sub> ∝ w<sub>pop,j</sub> / "
+            "[σ²<sub>gal,j</sub> + σ²<sub>shape</sub>]. There are no caps or "
+            "percentile cuts. The table compares population-only and "
+            "regularized Mean-estimator m, ESS, and ensemble shape noise; the "
+            "regularized shape noise is recomputed without iterating the "
+            "floor. Invalid posterior variances receive zero regularized "
+            "weight.</p>"
+            + weight_comparison_html
             + "<h3>Shear calibration</h3>"
             "<p>Every number is an ensemble statistic with the galaxy weights "
             "appropriate to the named population. Low-|g| fits use "
             f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
             + (
-                "This report applies posterior precision with a "
-                "population-weighted 95th-percentile cap."
+                "This report applies shape-noise-regularized posterior precision. "
+                "MAP diagnostics are omitted because these weights are defined "
+                "from posterior spread around the Mean."
                 if args.weighted
                 else "This report does not apply posterior-precision weights."
             )
@@ -1949,10 +2825,7 @@ def main(argv=None) -> None:
             "σ<sub>ε,j</sub> = √[(σ²<sub>g1,j</sub> + σ²<sub>g2,j</sub>)/2]. "
             "Per-galaxy values are population-weighted inside each bin.</p>"
             + conditional_html["Mean"]
-            + "<h3>Conditional MAP calibration</h3>"
-            "<p>The m and c panels use MAP point estimates. Shape noise is a property "
-            "of the corresponding posterior, so its panels match the Mean section.</p>"
-            + conditional_html["MAP"]
+            + conditional_map_section
             + "<h3>Posterior coverage</h3>"
             "<p>The base posterior uses equal candidate mass and equal galaxy "
             "mass. The TF posterior uses within-galaxy TF candidate weights; its "
@@ -1970,6 +2843,53 @@ def main(argv=None) -> None:
         )
         LOGGER.info("%s: finished report assembly", case_name)
 
+    if args.test_set:
+        operative_weight_description = (
+            "shape-noise-regularized posterior precision"
+            if args.weighted
+            else "equal truth-galaxy mass without posterior-precision weighting"
+        )
+        report_heading = "KL-NN TF-conformed catalog test-set diagnostics"
+        combined_modes = [
+            case["posterior_candidate_weighting"]
+            == COMBINED_TEST_SET_CANDIDATE_WEIGHTING
+            for case in cases
+        ]
+        if all(combined_modes):
+            posterior_population_description = (
+                "TF + isotropic-inclination prior-replaced"
+            )
+        elif any(combined_modes):
+            posterior_population_description = "declared prior-replaced"
+        else:
+            posterior_population_description = "TF-weighted"
+        report_intro = (
+            "<p>Each named case is an independently generated empirical catalog "
+            "selection. The truth population already follows the declared "
+            "Tully–Fisher relation. The report uses one "
+            f"{posterior_population_description} posterior "
+            f"population, the posterior Mean, {operative_weight_description}, "
+            "and no MAP estimator.</p>"
+        )
+        cross_case_html = (
+            "<section><h2>Cross-cut operative shear summary</h2>"
+            f"<p>All rows use the same Mean estimator and "
+            f"{operative_weight_description} defined in the per-case sections.</p>"
+            + cross_case_summary_table(cross_case_results)
+            + "</section>"
+        )
+    else:
+        report_heading = "KL-NN shear bias diagnostics"
+        report_intro = (
+            "<p>This report deliberately keeps two estimands separate: "
+            "<b>Proposal population / base posterior</b> is the uninformative "
+            "simulator population and raw NPE posterior; <b>TF target population / "
+            "TF posterior</b> applies post-training prior replacement within each "
+            "joint posterior and global importance weighting across galaxies. There "
+            "is no model mode, resampling, or hidden TF-conditioned network.</p>"
+        )
+        cross_case_html = ""
+
     document = (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -1981,14 +2901,11 @@ def main(argv=None) -> None:
         "th:first-child,td:first-child{text-align:left}th{background:#f3f3f3}"
         "img{display:block;max-width:100%;height:auto;margin:1rem auto}"
         "code{background:#f4f4f4;padding:.1rem .25rem}</style></head><body>"
-        "<h1>KL-NN shear bias diagnostics</h1>"
-        "<p>This report deliberately keeps two estimands separate: "
-        "<b>Proposal population / base posterior</b> is the uninformative "
-        "simulator population and raw NPE posterior; <b>TF target population / "
-        "TF posterior</b> applies post-training prior replacement within each "
-        "joint posterior and global importance weighting across galaxies. There "
-        "is no model mode, resampling, or hidden TF-conditioned network.</p>"
-        + "".join(sections) + "</body></html>"
+        f"<h1>{report_heading}</h1>"
+        + report_intro
+        + cross_case_html
+        + "".join(sections)
+        + "</body></html>"
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, encoding="utf-8")

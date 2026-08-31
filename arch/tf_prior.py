@@ -28,6 +28,7 @@ import math
 
 import numpy as np
 from scipy.special import log_ndtr, logsumexp
+from scipy.stats import truncnorm
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,7 @@ class TFPrior:
 
 @dataclass(frozen=True)
 class PosteriorImportance:
-    """Candidate-level TF importance products for a batch of galaxies."""
+    """Candidate-level importance products for a batch of galaxies."""
 
     log_ratio: np.ndarray
     log_weight: np.ndarray
@@ -78,6 +79,60 @@ class PosteriorImportance:
     effective_sample_fraction: np.ndarray
     max_weight: np.ndarray
     log_mean_ratio: np.ndarray
+
+
+def sample_truncated_tf_vcirc(
+    rmag_true: np.ndarray,
+    prior: TFPrior,
+    *,
+    rng: np.random.Generator | None = None,
+    quantiles: np.ndarray | None = None,
+) -> np.ndarray:
+    """Draw ``vcirc`` from the configured TF population.
+
+    Sampling is performed in ``log10(vcirc)`` with the same truncated-normal
+    convention used by :func:`truncated_tf_log_prob`.  Supplying ``quantiles``
+    makes the transform deterministic and is useful when a Latin hypercube is
+    used to cover the TF scatter.  Otherwise draws come from ``rng`` (or a new
+    default NumPy generator).
+    """
+
+    magnitude = np.asarray(rmag_true, dtype=np.float64)
+    if not np.all(np.isfinite(magnitude)):
+        raise ValueError("rmag_true must contain only finite values")
+
+    if quantiles is None:
+        generator = np.random.default_rng() if rng is None else rng
+        if not isinstance(generator, np.random.Generator):
+            raise TypeError("rng must be a numpy.random.Generator")
+        probability = generator.random(magnitude.shape)
+        # Avoid exact endpoints if a custom bit generator ever returns one.
+        probability = np.clip(
+            probability,
+            np.nextafter(0.0, 1.0),
+            np.nextafter(1.0, 0.0),
+        )
+    else:
+        if rng is not None:
+            raise ValueError("provide either rng or quantiles, not both")
+        probability = np.asarray(quantiles, dtype=np.float64)
+        if probability.shape != magnitude.shape:
+            raise ValueError("quantiles must have the same shape as rmag_true")
+        if not np.all(np.isfinite(probability)) or np.any(
+            (probability <= 0.0) | (probability >= 1.0)
+        ):
+            raise ValueError("quantiles must be finite and strictly between 0 and 1")
+
+    mean_log10 = (magnitude - prior.intercept) / prior.slope
+    lower = (math.log10(prior.vcirc_min) - mean_log10) / prior.scatter_dex
+    upper = (math.log10(prior.vcirc_max) - mean_log10) / prior.scatter_dex
+    standardized = truncnorm.ppf(probability, lower, upper)
+    velocity = np.power(10.0, mean_log10 + prior.scatter_dex * standardized)
+    if not np.all(np.isfinite(velocity)):
+        raise RuntimeError("TF sampling produced non-finite velocities")
+    if np.any((velocity < prior.vcirc_min) | (velocity > prior.vcirc_max)):
+        raise RuntimeError("TF sampling produced velocities outside configured support")
+    return velocity
 
 
 def _log_standard_normal_interval(
@@ -166,6 +221,54 @@ def tf_log_prior_ratio(
     return truncated_tf_log_prob(vcirc, rmag_true, prior) - prior.base_log_density
 
 
+def posterior_importance_from_log_ratio(
+    log_ratio: np.ndarray,
+) -> PosteriorImportance:
+    """Normalize candidate-level log prior ratios within each galaxy.
+
+    Keeping this normalization independent of any particular prior lets callers
+    compose several prior replacements in log space and normalize exactly once.
+    Rows may contain ``-inf`` for zero target density, but each row must retain
+    at least one finite candidate.
+    """
+
+    ratio = np.asarray(log_ratio, dtype=np.float64)
+    if ratio.ndim != 2:
+        raise ValueError("log_ratio must have shape (galaxy, candidate)")
+    if ratio.shape[1] == 0:
+        raise ValueError("each galaxy must have at least one posterior candidate")
+    if np.any(np.isnan(ratio)) or np.any(np.isposinf(ratio)):
+        raise ValueError("log_ratio may contain finite values or -inf only")
+
+    finite_row = np.any(np.isfinite(ratio), axis=1)
+    if not np.all(finite_row):
+        invalid = np.flatnonzero(~finite_row).tolist()
+        raise RuntimeError(
+            "importance sampling has no finite candidates for galaxy rows "
+            f"{invalid}; increase the candidate bank or inspect posterior support"
+        )
+
+    log_normalizer = logsumexp(ratio, axis=1, keepdims=True)
+    log_weight = ratio - log_normalizer
+    weight = np.exp(log_weight)
+    if not np.all(np.isfinite(weight)):
+        raise RuntimeError("importance sampling produced non-finite weights")
+    weight_sum = np.sum(weight, axis=1)
+    if not np.allclose(weight_sum, 1.0, rtol=2e-12, atol=2e-12):
+        raise RuntimeError("posterior importance weights do not normalize to one")
+
+    ess = 1.0 / np.sum(np.square(weight), axis=1)
+    return PosteriorImportance(
+        log_ratio=ratio,
+        log_weight=log_weight,
+        weight=weight,
+        effective_sample_size=ess,
+        effective_sample_fraction=ess / ratio.shape[1],
+        max_weight=np.max(weight, axis=1),
+        log_mean_ratio=log_normalizer[:, 0] - math.log(ratio.shape[1]),
+    )
+
+
 def posterior_importance_weights(
     vcirc_candidates: np.ndarray,
     rmag_true: np.ndarray,
@@ -190,33 +293,8 @@ def posterior_importance_weights(
     if velocity.shape[1] == 0:
         raise ValueError("each galaxy must have at least one posterior candidate")
 
-    log_ratio = tf_log_prior_ratio(velocity, magnitude[:, None], prior)
-    finite_row = np.any(np.isfinite(log_ratio), axis=1)
-    if not np.all(finite_row):
-        invalid = np.flatnonzero(~finite_row).tolist()
-        raise RuntimeError(
-            "TF importance sampling has no finite candidates for galaxy rows "
-            f"{invalid}; increase the candidate bank or inspect posterior support"
-        )
-
-    log_normalizer = logsumexp(log_ratio, axis=1, keepdims=True)
-    log_weight = log_ratio - log_normalizer
-    weight = np.exp(log_weight)
-    if not np.all(np.isfinite(weight)):
-        raise RuntimeError("TF importance sampling produced non-finite weights")
-    weight_sum = np.sum(weight, axis=1)
-    if not np.allclose(weight_sum, 1.0, rtol=2e-12, atol=2e-12):
-        raise RuntimeError("TF posterior weights do not normalize to one")
-
-    ess = 1.0 / np.sum(np.square(weight), axis=1)
-    return PosteriorImportance(
-        log_ratio=log_ratio,
-        log_weight=log_weight,
-        weight=weight,
-        effective_sample_size=ess,
-        effective_sample_fraction=ess / velocity.shape[1],
-        max_weight=np.max(weight, axis=1),
-        log_mean_ratio=log_normalizer[:, 0] - math.log(velocity.shape[1]),
+    return posterior_importance_from_log_ratio(
+        tf_log_prior_ratio(velocity, magnitude[:, None], prior)
     )
 
 

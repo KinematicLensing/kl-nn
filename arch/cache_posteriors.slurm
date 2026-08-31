@@ -9,14 +9,18 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -euo pipefail
+set -eo pipefail
 ulimit -c 0
+
+source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+setup_shared_job_scratch cache-posteriors
 
 module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
+set -u
 
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
 : "${DATASET:?Set DATASET to an independent held-out dataset not used for training or checkpoint selection}"
@@ -25,7 +29,10 @@ NPARTS="${NPARTS:-10}"
 NGALS="${NGALS:-1000}"
 NSAMPLES="${NSAMPLES:-10000}"
 SEED="${SEED:-42}"
-CACHE_TAG="${CACHE_TAG:-${MODEL_NAME}_posterior_candidates}"
+CACHE_TAG="${CACHE_TAG:-}"
+TEST_SET="${TEST_SET:-0}"
+ISOTROPIC_INCLINATION_PRIOR="${ISOTROPIC_INCLINATION_PRIOR:-0}"
+DATASET_MANIFEST="${DATASET_MANIFEST:-}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
 CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
@@ -43,6 +50,21 @@ fi
 if (( NSAMPLES <= 0 || NSAMPLES % 2 != 0 )); then
     echo "NSAMPLES must be positive and even for the identity/R90 pair" >&2
     exit 2
+fi
+if [[ "${TEST_SET}" != "0" && "${TEST_SET}" != "1" ]]; then
+    echo "TEST_SET must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${ISOTROPIC_INCLINATION_PRIOR}" != "0" && "${ISOTROPIC_INCLINATION_PRIOR}" != "1" ]]; then
+    echo "ISOTROPIC_INCLINATION_PRIOR must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" && "${TEST_SET}" != "1" ]]; then
+    echo "ISOTROPIC_INCLINATION_PRIOR=1 requires TEST_SET=1" >&2
+    exit 2
+fi
+if [[ -z "${CACHE_TAG}" ]]; then
+    CACHE_TAG="${MODEL_NAME}_posterior_candidates"
 fi
 SHARED_ROOT="$(dirname "${MODEL_ROOT%/}")"
 if [[ ! -f "${SHARED_ROOT}/configs/cfg_${MODEL_NAME}.json" ]]; then
@@ -72,10 +94,27 @@ ARGS=(
 if [[ -n "${EPOCH}" ]]; then
     ARGS+=(--epoch "${EPOCH}")
 fi
+if [[ "${TEST_SET}" == "1" ]]; then
+    ARGS+=(--test-set)
+    if [[ -n "${DATASET_MANIFEST}" ]]; then
+        ARGS+=(--dataset-manifest "${DATASET_MANIFEST}")
+    fi
+fi
+if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" ]]; then
+    ARGS+=(--isotropic-inclination-prior)
+fi
 
 echo "model=${MODEL_NAME} epoch=${EPOCH:-best}"
 echo "dataset=${DATASET} partition=${PART_INDEX}/${NPARTS} ngals=${NGALS} nsamples=${NSAMPLES}"
-echo "cache_tag=${CACHE_TAG}; saving base candidates, posterior TF weights, and raw population TF log ratios"
+if [[ "${TEST_SET}" == "1" ]]; then
+    if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" ]]; then
+        echo "cache_tag=${CACHE_TAG}_tf_iso_inclination; mode=test_set; saving TF + isotropic-inclination-weighted Mean summaries, physical shear candidates, combined log weights, and ESS diagnostics"
+    else
+        echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
+    fi
+else
+    echo "cache_tag=${CACHE_TAG}; mode=proposal_and_tf; saving base candidates, posterior TF weights, and raw population TF log ratios"
+fi
 
 cd /jet/home/xwang30/kl-nn/arch
 python cache_posteriors.py "${ARGS[@]}"

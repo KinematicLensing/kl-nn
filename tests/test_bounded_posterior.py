@@ -10,8 +10,8 @@ from networks import (
     BoundedHybridCircularFlow,
     ConditionalUnitBox,
     IdentityBoundedRationalQuadraticAutoregressiveTransform,
+    FEATURE_DIM,
     KLNPE,
-    ORACLE_CONTEXT_FIELDS,
 )
 
 
@@ -29,7 +29,7 @@ FEATURE_NAMES = (
 THETA_INDEX = FEATURE_NAMES.index("theta_int")
 NFEATURES = len(FEATURE_NAMES)
 DIRECT_CONTEXT_DIM = 7
-MODEL_CONTEXT_DIM = 1024 + len(ORACLE_CONTEXT_FIELDS)
+MODEL_CONTEXT_DIM = FEATURE_DIM
 
 
 def _make_flow(
@@ -83,10 +83,19 @@ def _perturb_splines(flow, scale=0.02):
 
 
 class TinyFeatureExtractor(nn.Module):
-    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
-        del spectra, fiber_positions, fiber_mask
+    output_dim = FEATURE_DIM
+
+    def forward(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
+    ):
+        del spectra, fiber_positions, observation_context, fiber_mask
         scalar = image.mean(dim=tuple(range(1, image.ndim)))[:, None]
-        return scalar.expand(-1, 1024)
+        return scalar.expand(-1, FEATURE_DIM)
 
 
 def _observations(batch_size=1, dtype=torch.float64):
@@ -341,7 +350,7 @@ def test_klnpe_samples_and_scores_single_observation_candidate_bank():
     torch.testing.assert_close(candidate_lp, sample_lp[0], atol=2e-8, rtol=2e-8)
 
 
-def test_klnpe_rejects_halpha_truth_as_context_and_supports_batched_banks():
+def test_klnpe_supports_batched_candidate_banks_with_fused_context():
     flow = _make_flow(context_features=MODEL_CONTEXT_DIM)
     model = KLNPE(
         feature_extractor=TinyFeatureExtractor(),
@@ -358,14 +367,3 @@ def test_klnpe_rejects_halpha_truth_as_context_and_supports_batched_banks():
         image, spectra, candidates, positions, context
     )
     assert scores.shape == (2, 5)
-
-    leaked = dict(context)
-    leaked["halpha_flux_true"] = torch.ones(2, dtype=torch.float64)
-    with pytest.raises(ValueError, match="posterior targets.*halpha_flux_true"):
-        model.posterior_log_prob(
-            image,
-            spectra,
-            candidates,
-            positions,
-            leaked,
-        )

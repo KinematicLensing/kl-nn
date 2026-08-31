@@ -2,6 +2,7 @@
 
 import copy
 
+import pytest
 import torch
 from torch import nn
 
@@ -23,10 +24,17 @@ FEATURE_NAMES = (
 
 
 class IdentityBackbone(nn.Module):
+    output_dim = networks.FEATURE_DIM
+
     def forward(
-        self, image, spectra, fiber_positions, fiber_mask=None
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
     ):
-        del spectra, fiber_positions, fiber_mask
+        del spectra, fiber_positions, observation_context, fiber_mask
         return image
 
 
@@ -34,9 +42,17 @@ class EmptyFlow(nn.Module):
     pass
 
 
+class UndeclaredArchivedBackbone(nn.Module):
+    def forward(
+        self, image, spectra, fiber_positions, fiber_mask=None
+    ):
+        del spectra, fiber_positions, fiber_mask
+        return image
+
+
 def _inputs():
     generator = torch.Generator().manual_seed(2026)
-    features = torch.randn((8, 1024), generator=generator)
+    features = torch.randn((8, networks.FEATURE_DIM), generator=generator)
     labels = torch.rand((8, len(FEATURE_NAMES)), generator=generator) * 2.0 - 1.0
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, features.shape[0]),
@@ -51,9 +67,7 @@ def _inputs():
 def _ccl_model():
     return CCLPretrain(
         backbone=IdentityBackbone(),
-        projector=nn.Linear(
-            networks.FEATURE_DIM + len(networks.ORACLE_CONTEXT_FIELDS), 16
-        ),
+        projector=nn.Linear(networks.FEATURE_DIM, 16),
     )
 
 
@@ -68,12 +82,7 @@ def _npe_model():
 def test_ccl_pretrain_matches_direct_oracle_context_loss():
     model = _ccl_model().eval()
     features, labels, context = _inputs()
-    normalized_context = model.context_normalizer(
-        context, features.shape[0], features
-    )
-    projected = model.projector(
-        torch.cat((features, normalized_context), dim=-1)
-    )
+    projected = model.projector(features)
     expected, expected_diagnostics = model.ccl_loss(
         projected,
         labels,
@@ -95,12 +104,7 @@ def test_ccl_pretrain_matches_direct_oracle_context_loss():
 def test_distributed_ccl_uses_only_rank_local_anchor_rows(monkeypatch):
     model = _ccl_model().eval()
     features, labels, context = _inputs()
-    normalized_context = model.context_normalizer(
-        context, features.shape[0], features
-    )
-    local_projected = model.projector(
-        torch.cat((features, normalized_context), dim=-1)
-    )
+    local_projected = model.projector(features)
     remote_projected = local_projected.detach() + 0.25
     remote_labels = torch.roll(labels, shifts=1, dims=0)
     expected = model.ccl_loss(
@@ -127,9 +131,23 @@ def test_ccl_pretrain_backbone_extraction_and_strict_reload():
     model = _ccl_model().eval()
     reloaded = _ccl_model().eval()
     reloaded.load_state_dict(copy.deepcopy(model.state_dict()), strict=True)
-    features, _, _ = _inputs()
-    extracted = reloaded.extract_features(features, None, None)
+    features, _, context = _inputs()
+    extracted = reloaded.extract_features(
+        features, None, None, context
+    )
     torch.testing.assert_close(extracted, features)
+
+
+def test_archived_backbones_are_rejected_before_the_first_forward():
+    archived = UndeclaredArchivedBackbone()
+    with pytest.raises(ValueError, match="Archived feature extractors"):
+        CCLPretrain(backbone=archived)
+    with pytest.raises(ValueError, match="output_dim=None"):
+        KLNPE(
+            feature_extractor=archived,
+            flow=EmptyFlow(),
+            feature_names=FEATURE_NAMES,
+        )
 
 
 def test_retired_global_calibration_buffers_are_not_persisted():

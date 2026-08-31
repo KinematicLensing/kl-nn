@@ -9,10 +9,12 @@ from torch import nn
 import config
 import train
 from networks import (
+    FEATURE_DIM,
+    SPECTRAL_FEATURE_DIM,
     BoundedHybridCircularFlow,
     CCLPretrain,
     KLNPE,
-    Stage3FeatureExtractor,
+    SimpleFusionFeatureExtractor,
 )
 
 
@@ -95,13 +97,22 @@ def test_disabled_compile_does_not_touch_the_module():
 
 
 class _AutocastFeatureExtractor(nn.Module):
+    output_dim = FEATURE_DIM
+
     def __init__(self):
         super().__init__()
-        self.projection = nn.Linear(1, 1024)
+        self.projection = nn.Linear(1, FEATURE_DIM)
         self.last_output_dtype = None
 
-    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
-        del spectra, fiber_positions, fiber_mask
+    def forward(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
+    ):
+        del spectra, fiber_positions, observation_context, fiber_mask
         result = self.projection(image.mean(dim=(-2, -1)))
         self.last_output_dtype = result.dtype
         return result
@@ -160,11 +171,8 @@ class _TinyImageEncoder(nn.Module):
 
 
 def _feature_extractor():
-    return Stage3FeatureExtractor(
+    return SimpleFusionFeatureExtractor(
         nspec=5,
-        spectral_embedding_dim=16,
-        token_dim=16,
-        num_heads=4,
         img_net=_TinyImageEncoder(),
         spec_net=_TinySpectralEncoder(),
     )
@@ -173,11 +181,10 @@ def _feature_extractor():
 class _TinySpectralEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.embedding_dim = 16
-        self.projection = nn.Linear(1, self.embedding_dim)
+        self.projection = nn.Linear(1, SPECTRAL_FEATURE_DIM)
 
     def forward(self, spectra):
-        summary = spectra.mean(dim=-1).squeeze(1).unsqueeze(-1)
+        summary = spectra.mean(dim=(-2, -1))
         return self.projection(summary)
 
 
@@ -261,7 +268,7 @@ def test_cuda_pretraining_compiles_and_runs_one_amp_optimizer_step():
     model = CCLPretrain(
         backbone=_feature_extractor(),
         projector=nn.Sequential(
-            nn.Linear(1024 + len(config.ORACLE_CONTEXT_FIELDS), 64),
+            nn.Linear(FEATURE_DIM, 64),
             nn.GELU(),
             nn.Linear(64, 16),
         ),
@@ -294,7 +301,7 @@ def test_cuda_npe_compiles_without_replacing_frozen_feature_variables_and_uses_a
     flow = BoundedHybridCircularFlow(
         features=len(config.TARGET_NAMES),
         theta_index=config.TARGET_NAMES.index("theta_int"),
-        context_features=1024 + len(config.ORACLE_CONTEXT_FIELDS),
+        context_features=FEATURE_DIM,
         num_bounded_layers=1,
         num_theta_layers=1,
         num_bins=4,

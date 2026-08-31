@@ -10,8 +10,22 @@ TARGET_COUNT = len(config.TARGET_NAMES)
 
 
 class _TinyFeatureExtractor(nn.Module):
-    def forward(self, image, spectra, fiber_positions, fiber_mask=None):
+    output_dim = FEATURE_DIM
+
+    def __init__(self):
+        super().__init__()
+        self.observation_contexts = []
+
+    def forward(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
+    ):
         del spectra, fiber_positions, fiber_mask
+        self.observation_contexts.append(observation_context)
         scalar = image.mean(dim=tuple(range(1, image.ndim)), keepdim=False)
         return scalar[:, None].expand(-1, FEATURE_DIM)
 
@@ -178,12 +192,12 @@ def test_invalid_context_normalization_bounds_are_rejected():
         OracleContextNormalizer(central_halpha_snr_min=0.0)
 
 
-def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
+def test_public_klnpe_routes_catalog_context_through_backbone_only():
     flow = _RecordingFlow()
-    model = KLNPE(feature_extractor=_TinyFeatureExtractor(), flow=flow)
+    extractor = _TinyFeatureExtractor()
+    model = KLNPE(feature_extractor=extractor, flow=flow)
     image, spectra, targets, positions = _dummy_datavector(batch_size=2)
     oracle = _oracle_context(batch_size=2)
-    expected = model.context_normalizer(oracle, 2, image)
 
     loss = model(
         image,
@@ -193,8 +207,8 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert torch.isfinite(loss)
-    assert flow.log_prob_contexts[-1].shape == (2, FEATURE_DIM + 3)
-    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -3:], expected)
+    assert extractor.observation_contexts[-1] is oracle
+    assert flow.log_prob_contexts[-1].shape == (2, FEATURE_DIM)
 
     density = model.posterior_log_prob(
         image,
@@ -204,7 +218,8 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert density.shape == (2,)
-    torch.testing.assert_close(flow.log_prob_contexts[-1][:, -3:], expected)
+    assert extractor.observation_contexts[-1] is oracle
+    assert flow.log_prob_contexts[-1].shape == (2, FEATURE_DIM)
 
     samples = model.sample(
         image,
@@ -214,4 +229,5 @@ def test_public_klnpe_routes_only_normalized_oracle_context_to_flow():
         observation_context=oracle,
     )
     assert samples.shape == (2, 5, TARGET_COUNT)
-    torch.testing.assert_close(flow.sample_contexts[-1][:, -3:], expected)
+    assert extractor.observation_contexts[-1] is oracle
+    assert flow.sample_contexts[-1].shape == (2, FEATURE_DIM)

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Cache one base NPE candidate bank and its post-training TF weights.
+"""Cache posterior products for standard or TF-conformed test analyses.
 
 The sampling adapter in :mod:`train` constructs the canonical original/R90
 ensemble and inverse-aligns every rotated parameter row. This script adds no
-second observation, resampling, or alternate network path.
+second observation, resampling, or alternate network path. ``--test-set``
+keeps a compact candidate bank (physical shear plus normalized TF log weights)
+and TF-weighted Mean summaries. It does not request density scores, compute
+MAP, or apply a second truth-population TF weight.
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import math
@@ -22,12 +26,25 @@ from torch.utils.data import Subset
 
 try:
     from . import config
+    from .cache_contract import (
+        CACHE_SCHEMA,
+        COMBINED_TEST_SET_CACHE_SCHEMA,
+        STANDARD_ANALYSIS_MODE,
+        TEST_SET_ANALYSIS_MODE,
+        TEST_SET_CACHE_SCHEMA,
+    )
+    from .inclination_prior import (
+        InclinationPrior,
+        isotropic_inclination_log_prior_ratio,
+    )
     from .model_registry import load_model_config
     from .networks import KLNPE
     from .tf_prior import (
         TFPrior,
         population_log_importance_ratio,
+        posterior_importance_from_log_ratio,
         posterior_importance_weights,
+        tf_log_prior_ratio,
     )
     from .train import load_model, sample_density, seed_everything
     from .utils import (
@@ -37,12 +54,25 @@ try:
     )
 except ImportError:  # Direct execution from arch/.
     import config
+    from cache_contract import (
+        CACHE_SCHEMA,
+        COMBINED_TEST_SET_CACHE_SCHEMA,
+        STANDARD_ANALYSIS_MODE,
+        TEST_SET_ANALYSIS_MODE,
+        TEST_SET_CACHE_SCHEMA,
+    )
+    from inclination_prior import (
+        InclinationPrior,
+        isotropic_inclination_log_prior_ratio,
+    )
     from model_registry import load_model_config
     from networks import KLNPE
     from tf_prior import (
         TFPrior,
         population_log_importance_ratio,
+        posterior_importance_from_log_ratio,
         posterior_importance_weights,
+        tf_log_prior_ratio,
     )
     from train import load_model, sample_density, seed_everything
     from utils import denormalization_logabsdet, denormalize, resolve_feature_index
@@ -50,7 +80,7 @@ except ImportError:  # Direct execution from arch/.
 
 DEFAULT_SHARED_ROOT = Path("/ocean/projects/phy250048p/shared")
 
-CACHE_ARRAY_TYPES = (
+STANDARD_CACHE_ARRAY_TYPES = (
     "sample",
     "base_log_prob",
     "posterior_tf_log_ratio",
@@ -71,6 +101,37 @@ CACHE_ARRAY_TYPES = (
     "proposal_mean_estimates",
     "tf_target_map_estimates",
     "tf_target_mean_estimates",
+)
+CACHE_ARRAY_TYPES = STANDARD_CACHE_ARRAY_TYPES
+TEST_SET_CACHE_ARRAY_TYPES = (
+    "shear_sample",
+    "posterior_tf_log_weight",
+    "posterior_tf_ess",
+    "posterior_tf_ess_fraction",
+    "posterior_tf_max_weight",
+    "truth",
+    "rmag_true",
+    "image_snr",
+    "central_halpha_snr",
+    "image_noise_sigma",
+    "central_spectral_noise_sigma",
+    "proposal_mean_estimates",
+    "tf_target_mean_estimates",
+)
+COMBINED_TEST_SET_CACHE_ARRAY_TYPES = (
+    "shear_sample",
+    "posterior_target_log_weight",
+    "posterior_target_ess",
+    "posterior_target_ess_fraction",
+    "posterior_target_max_weight",
+    "truth",
+    "rmag_true",
+    "image_snr",
+    "central_halpha_snr",
+    "image_noise_sigma",
+    "central_spectral_noise_sigma",
+    "proposal_mean_estimates",
+    "target_mean_estimates",
 )
 
 
@@ -94,6 +155,33 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--cache-root", type=Path, default=DEFAULT_SHARED_ROOT / "cache"
     )
     parser.add_argument("--cache-tag", default="posterior_candidates")
+    parser.add_argument(
+        "--test-set",
+        action="store_true",
+        help=(
+            "Write a compact TF-conformed test cache with TF-weighted "
+            "posterior Mean summaries, normalized candidate log weights, "
+            "and physical shear candidates."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Generation manifest; test-set mode defaults to "
+            "DATASET/manifest.json and requires it."
+        ),
+    )
+    parser.add_argument(
+        "--isotropic-inclination-prior",
+        action="store_true",
+        help=(
+            "In compact test-set mode, additionally replace the uniform-sini "
+            "training prior with the isotropic uniform-cosi prior. The output "
+            "cache name receives a _tf_iso_inclination suffix."
+        ),
+    )
     parser.add_argument("--matched-group-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -117,6 +205,204 @@ def resolve_device(value: str) -> torch.device:
 def resolve_path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def resolve_dataset_manifest(
+    dataset_path: Path,
+    data_root: Path,
+    explicit_path: Path | None,
+) -> Path:
+    """Resolve the required generation sidecar for a compact test cache."""
+
+    if explicit_path is None:
+        return dataset_path / "manifest.json"
+    return (
+        explicit_path
+        if explicit_path.is_absolute()
+        else data_root / explicit_path
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_test_set_generation_manifest(
+    path: Path,
+    *,
+    dataset_size: int,
+    tf_prior: TFPrior,
+    hlr_bounds: tuple[float, float] | list[float],
+    require_isotropic_inclination: bool = False,
+) -> dict:
+    """Fail closed on the generation provenance asserted by test-set mode."""
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Test-set generation manifest not found: {path}"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot read test-set generation manifest {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("test-set generation manifest must be a JSON object")
+    expected = {
+        "schema": "klnn-generation-manifest-v1",
+        "analysis_mode": TEST_SET_ANALYSIS_MODE,
+        "population": "tf_conformed_catalog",
+    }
+    for name, value in expected.items():
+        if payload.get(name) != value:
+            raise ValueError(
+                f"generation manifest {name} must equal {value!r}"
+            )
+    sample_count = payload.get("sample_count")
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count != dataset_size
+    ):
+        raise ValueError(
+            "generation manifest sample_count must equal the dataset size "
+            f"{dataset_size}"
+        )
+    for name in ("redshift", "simulation_redshift"):
+        redshift = payload.get(name)
+        if (
+            isinstance(redshift, bool)
+            or not isinstance(redshift, (int, float))
+            or not math.isclose(
+                float(redshift), 0.3, rel_tol=0.0, abs_tol=1e-12
+            )
+        ):
+            raise ValueError(f"generation manifest {name} must be 0.3")
+    for name in (
+        "source_catalog",
+        "catalog_sampling",
+        "parameter_sampling",
+        "sample_table",
+    ):
+        if not isinstance(payload.get(name), dict):
+            raise ValueError(f"generation manifest {name} must be an object")
+
+    bounds = np.asarray(hlr_bounds, dtype=np.float64)
+    if (
+        bounds.shape != (2,)
+        or not np.all(np.isfinite(bounds))
+        or bounds[0] >= bounds[1]
+    ):
+        raise ValueError("hlr_bounds must contain two increasing finite values")
+    catalog_sampling = payload["catalog_sampling"]
+    eligibility = catalog_sampling.get("eligibility")
+    if not isinstance(eligibility, dict):
+        raise ValueError(
+            "generation manifest catalog_sampling.eligibility must be an object"
+        )
+    hlr_eligibility = eligibility.get("hlr")
+    expected_hlr_keys = {"finite", "minimum", "maximum", "bounds"}
+    if (
+        not isinstance(hlr_eligibility, dict)
+        or set(hlr_eligibility) != expected_hlr_keys
+    ):
+        raise ValueError(
+            "generation manifest catalog_sampling.eligibility.hlr must "
+            "contain exactly finite, minimum, maximum, and bounds"
+        )
+    if hlr_eligibility.get("finite") is not True:
+        raise ValueError(
+            "generation manifest catalog_sampling.eligibility.hlr.finite "
+            "must be true"
+        )
+    if hlr_eligibility.get("bounds") != "inclusive":
+        raise ValueError(
+            "generation manifest catalog_sampling.eligibility.hlr.bounds "
+            "must be 'inclusive'"
+        )
+    for name, expected_bound in zip(("minimum", "maximum"), bounds):
+        actual = hlr_eligibility.get(name)
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not math.isclose(
+                float(actual),
+                float(expected_bound),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "generation manifest catalog_sampling.eligibility.hlr."
+                f"{name} must equal {float(expected_bound)!r}"
+            )
+    sample_table = payload["sample_table"]
+    for name in ("path", "sha256", "id_policy"):
+        if not isinstance(sample_table.get(name), str) or not sample_table[name]:
+            raise ValueError(
+                f"generation manifest sample_table.{name} must be non-empty"
+            )
+    if len(sample_table["sha256"]) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in sample_table["sha256"]
+    ):
+        raise ValueError(
+            "generation manifest sample_table.sha256 must be lowercase hex"
+        )
+    table_row_count = sample_table.get("row_count")
+    if (
+        isinstance(table_row_count, bool)
+        or not isinstance(table_row_count, int)
+        or table_row_count != dataset_size
+    ):
+        raise ValueError(
+            "generation manifest sample_table.row_count must equal the "
+            f"dataset size {dataset_size}"
+        )
+
+    generated_tf = payload.get("tf")
+    if not isinstance(generated_tf, dict):
+        raise ValueError("generation manifest tf must be an object")
+    expected_tf = tf_prior.to_dict()
+    if set(generated_tf) != set(expected_tf):
+        raise ValueError(
+            "generation manifest tf must contain exactly "
+            f"{sorted(expected_tf)}"
+        )
+    for name, value in expected_tf.items():
+        actual = generated_tf.get(name)
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not math.isclose(
+                float(actual), float(value), rel_tol=1e-12, abs_tol=1e-12
+            )
+        ):
+            raise ValueError(
+                f"generation manifest tf.{name} must equal {value!r}"
+            )
+
+    if require_isotropic_inclination:
+        inclination = payload["parameter_sampling"].get("inclination")
+        expected_inclination = {
+            "distribution": "cosi_uniform_0_1_latin_hypercube",
+            "transform": "sini=sqrt(1-cosi**2)",
+        }
+        if inclination != expected_inclination:
+            raise ValueError(
+                "isotropic inclination prior requires generation manifest "
+                f"parameter_sampling.inclination={expected_inclination!r}"
+            )
+
+    embedded = dict(payload)
+    embedded["path"] = str(path.resolve())
+    embedded["sha256"] = _sha256(path)
+    return embedded
 
 
 def resolve_checkpoint(args: argparse.Namespace, model_path: str | Path) -> Path:
@@ -277,6 +563,64 @@ def summarize_posterior_samples(
     return summary
 
 
+def proposal_mean_summaries(
+    samples: np.ndarray,
+    feature_names: tuple[str, ...] | list[str],
+) -> np.ndarray:
+    """Return equal-candidate 16th, Mean, and 84th summaries per galaxy."""
+
+    values = np.asarray(samples)
+    feature_names = tuple(feature_names)
+    if values.ndim != 3 or values.shape[2] != len(feature_names):
+        raise ValueError(
+            "samples must have shape (galaxy, draw, len(feature_names))"
+        )
+    return np.stack(
+        [
+            summarize_posterior_samples(row, feature_names)
+            for row in values
+        ],
+        axis=0,
+    )
+
+
+def target_mean_summaries(
+    samples: np.ndarray,
+    target_weight: np.ndarray,
+    feature_names: tuple[str, ...] | list[str],
+) -> np.ndarray:
+    """Return target-weighted 16th, Mean, and 84th summaries per galaxy."""
+
+    values = np.asarray(samples)
+    weights = np.asarray(target_weight)
+    feature_names = tuple(feature_names)
+    if values.ndim != 3 or values.shape[2] != len(feature_names):
+        raise ValueError(
+            "samples must have shape (galaxy, draw, len(feature_names))"
+        )
+    if weights.shape != values.shape[:2]:
+        raise ValueError(
+            "target_weight must have shape (galaxy, draw)"
+        )
+    return np.stack(
+        [
+            summarize_posterior_samples(row, feature_names, row_weight)
+            for row, row_weight in zip(values, weights)
+        ],
+        axis=0,
+    )
+
+
+def tf_target_mean_summaries(
+    samples: np.ndarray,
+    tf_weight: np.ndarray,
+    feature_names: tuple[str, ...] | list[str],
+) -> np.ndarray:
+    """Backward-compatible name for TF-only target summaries."""
+
+    return target_mean_summaries(samples, tf_weight, feature_names)
+
+
 def posterior_summaries(
     samples: np.ndarray,
     base_log_prob: np.ndarray,
@@ -385,6 +729,14 @@ def main(argv=None) -> None:
         raise ValueError(
             "matched-group-size must be 1 or a divisor-aligned 5"
         )
+    if args.test_set and args.matched_group_size != 1:
+        raise ValueError("test-set caches require matched-group-size=1")
+    if args.isotropic_inclination_prior and not args.test_set:
+        raise ValueError(
+            "--isotropic-inclination-prior is only valid with --test-set"
+        )
+    if not args.test_set and args.dataset_manifest is not None:
+        raise ValueError("--dataset-manifest is only valid with --test-set")
     if not 0.0 <= args.warn_ess_fraction <= 1.0:
         raise ValueError("warn-ess-fraction must lie in [0, 1]")
 
@@ -401,6 +753,7 @@ def main(argv=None) -> None:
             f"current posterior schema requires 9 targets, got {feature_names}"
         )
     vcirc_index = resolve_feature_index(feature_names, "vcirc")
+    sini_index = resolve_feature_index(feature_names, "sini")
     vcirc_bounds = config.par_ranges["vcirc"]
     tf_prior = TFPrior(
         slope=args.tf_slope,
@@ -408,6 +761,11 @@ def main(argv=None) -> None:
         scatter_dex=args.tf_scatter_dex,
         vcirc_min=float(vcirc_bounds[0]),
         vcirc_max=float(vcirc_bounds[1]),
+    )
+    sini_bounds = config.par_ranges["sini"]
+    inclination_prior = InclinationPrior(
+        sini_min=float(sini_bounds[0]),
+        sini_max=float(sini_bounds[1]),
     )
 
     device = resolve_device(args.device)
@@ -421,6 +779,22 @@ def main(argv=None) -> None:
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
     dataset = pxt.TorchDataset(str(dataset_path))
     validate_partition_coverage(args.nparts, args.ngals, len(dataset))
+    generation_manifest = None
+    if args.test_set:
+        manifest_path = resolve_dataset_manifest(
+            dataset_path,
+            args.data_root,
+            args.dataset_manifest,
+        )
+        generation_manifest = load_test_set_generation_manifest(
+            manifest_path,
+            dataset_size=len(dataset),
+            tf_prior=tf_prior,
+            hlr_bounds=config.par_ranges["hlr"],
+            require_isotropic_inclination=(
+                args.isotropic_inclination_prior
+            ),
+        )
     start, end = resolve_partition_range(
         args.partition_index, args.ngals, len(dataset)
     )
@@ -443,7 +817,7 @@ def main(argv=None) -> None:
         partition_seed,
         deterministic=bool(_config_value(train_config, "deterministic")),
     )
-    samples_normalized, base_log_prob, metadata = sample_density(
+    sampled = sample_density(
         model,
         subset,
         args.nsamples,
@@ -451,13 +825,17 @@ def main(argv=None) -> None:
         matched_group_size=args.matched_group_size,
         noise_seed=partition_seed,
         spectral_noise_seed=partition_seed + 101,
-        return_log_prob=True,
+        return_log_prob=not args.test_set,
         return_observation_metadata=True,
     )
+    if args.test_set:
+        samples_normalized, metadata = sampled
+        base_log_prob = None
+    else:
+        samples_normalized, base_log_prob, metadata = sampled
     samples_normalized = _to_numpy(samples_normalized, name="samples")
-    base_log_prob = _to_numpy(
-        base_log_prob, name="base_log_prob"
-    )
+    if base_log_prob is not None:
+        base_log_prob = _to_numpy(base_log_prob, name="base_log_prob")
     expected_shape = (
         args.ngals,
         args.nsamples,
@@ -468,17 +846,17 @@ def main(argv=None) -> None:
             f"unexpected sample shape {samples_normalized.shape}; "
             f"expected {expected_shape}"
         )
-    if base_log_prob.shape != samples_normalized.shape[:2]:
+    if (
+        base_log_prob is not None
+        and base_log_prob.shape != samples_normalized.shape[:2]
+    ):
         raise RuntimeError(
             f"unexpected base-log-probability shape {base_log_prob.shape}"
         )
-    if (
-        not np.all(np.isfinite(samples_normalized))
-        or not np.all(np.isfinite(base_log_prob))
-    ):
-        raise RuntimeError(
-            "base posterior returned non-finite samples or scores"
-        )
+    if not np.all(np.isfinite(samples_normalized)):
+        raise RuntimeError("base posterior returned non-finite samples")
+    if base_log_prob is not None and not np.all(np.isfinite(base_log_prob)):
+        raise RuntimeError("base posterior returned non-finite scores")
     if not isinstance(metadata, dict):
         raise RuntimeError(
             "sample_density must return observation metadata"
@@ -558,38 +936,74 @@ def main(argv=None) -> None:
         feature_names=feature_names,
         target_transforms=config.TARGET_TRANSFORMS,
     ).astype(np.float32, copy=False)
-    physical_base_log_prob = physical_log_prob_from_normalized(
-        samples_normalized,
-        base_log_prob,
-        par_ranges=config.par_ranges,
-        feature_names=feature_names,
-        target_transforms=config.TARGET_TRANSFORMS,
-    )
-    importance = posterior_importance_weights(
-        samples[..., vcirc_index], rmag_true, tf_prior
-    )
-    population_log_ratio = population_log_importance_ratio(
-        truth[:, vcirc_index].astype(np.float64),
-        rmag_true,
-        tf_prior,
-    )
-    summaries = posterior_summaries(
-        samples,
-        physical_base_log_prob,
-        importance.log_ratio,
-        importance.weight,
-        feature_names,
-    )
+    if args.test_set:
+        if args.isotropic_inclination_prior:
+            tf_log_ratio = tf_log_prior_ratio(
+                np.asarray(samples[..., vcirc_index], dtype=np.float64),
+                rmag_true[:, None],
+                tf_prior,
+            )
+            inclination_log_ratio = isotropic_inclination_log_prior_ratio(
+                np.asarray(samples[..., sini_index], dtype=np.float64),
+                inclination_prior,
+            )
+            importance = posterior_importance_from_log_ratio(
+                tf_log_ratio + inclination_log_ratio
+            )
+            target_summary_name = "target_mean_estimates"
+        else:
+            importance = posterior_importance_weights(
+                samples[..., vcirc_index], rmag_true, tf_prior
+            )
+            target_summary_name = "tf_target_mean_estimates"
+        summaries = {
+            "proposal_mean_estimates": proposal_mean_summaries(
+                samples, feature_names
+            ),
+            target_summary_name: target_mean_summaries(
+                samples, importance.weight, feature_names
+            ),
+        }
+        population_log_ratio = None
+    else:
+        assert base_log_prob is not None
+        physical_base_log_prob = physical_log_prob_from_normalized(
+            samples_normalized,
+            base_log_prob,
+            par_ranges=config.par_ranges,
+            feature_names=feature_names,
+            target_transforms=config.TARGET_TRANSFORMS,
+        )
+        importance = posterior_importance_weights(
+            samples[..., vcirc_index], rmag_true, tf_prior
+        )
+        population_log_ratio = population_log_importance_ratio(
+            truth[:, vcirc_index].astype(np.float64),
+            rmag_true,
+            tf_prior,
+        )
+        summaries = posterior_summaries(
+            samples,
+            physical_base_log_prob,
+            importance.log_ratio,
+            importance.weight,
+            feature_names,
+        )
 
-    low_ess = (
-        importance.effective_sample_fraction < args.warn_ess_fraction
-    )
+    assert importance is not None
+    low_ess = importance.effective_sample_fraction < args.warn_ess_fraction
     if np.any(low_ess):
+        weighting_label = (
+            "combined TF + isotropic-inclination"
+            if args.isotropic_inclination_prior
+            else "TF"
+        )
         logging.warning(
-            "%d/%d galaxies have posterior TF ESS fraction below %.3f; "
+            "%d/%d galaxies have posterior %s ESS fraction below %.3f; "
             "minimum %.5f",
             int(np.count_nonzero(low_ess)),
             len(low_ess),
+            weighting_label,
             args.warn_ess_fraction,
             float(np.min(importance.effective_sample_fraction)),
         )
@@ -597,31 +1011,11 @@ def main(argv=None) -> None:
     dataset_name = dataset_path.name
     if args.cache_tag:
         dataset_name += f"_{args.cache_tag.strip('_')}"
+    if args.isotropic_inclination_prior:
+        dataset_name += "_tf_iso_inclination"
     output_root = args.cache_root / args.model_name / dataset_name
     output_root.mkdir(parents=True, exist_ok=True)
-    arrays = {
-        "sample": samples,
-        "base_log_prob": base_log_prob.astype(np.float32),
-        "posterior_tf_log_ratio": (
-            importance.log_ratio.astype(np.float32)
-        ),
-        "posterior_tf_log_weight": importance.log_weight.astype(np.float32),
-        "posterior_tf_weight": importance.weight.astype(np.float32),
-        "posterior_tf_ess": (
-            importance.effective_sample_size.astype(np.float64)
-        ),
-        "posterior_tf_ess_fraction": (
-            importance.effective_sample_fraction.astype(np.float64)
-        ),
-        "posterior_tf_max_weight": (
-            importance.max_weight.astype(np.float64)
-        ),
-        "posterior_tf_log_mean_ratio": (
-            importance.log_mean_ratio.astype(np.float64)
-        ),
-        "population_tf_log_ratio": (
-            population_log_ratio.astype(np.float64)
-        ),
+    common_arrays = {
         "truth": truth,
         "rmag_true": rmag_true.astype(np.float32),
         "image_snr": image_snr.astype(np.float32),
@@ -630,14 +1024,97 @@ def main(argv=None) -> None:
         "central_spectral_noise_sigma": central_spectral_noise_sigma.astype(
             np.float32
         ),
-        **{
-            name: value.astype(np.float32)
-            for name, value in summaries.items()
-        },
     }
+    if args.test_set:
+        assert importance is not None
+        shear_indices = [
+            resolve_feature_index(feature_names, name)
+            for name in ("g1", "g2")
+        ]
+        test_set_common_arrays = {
+            "shear_sample": samples[..., shear_indices].astype(
+                np.float32, copy=False
+            ),
+            **common_arrays,
+            "proposal_mean_estimates": summaries[
+                "proposal_mean_estimates"
+            ].astype(np.float32),
+        }
+        if args.isotropic_inclination_prior:
+            arrays = {
+                **test_set_common_arrays,
+                "posterior_target_log_weight": importance.log_weight.astype(
+                    np.float32
+                ),
+                "posterior_target_ess": (
+                    importance.effective_sample_size.astype(np.float64)
+                ),
+                "posterior_target_ess_fraction": (
+                    importance.effective_sample_fraction.astype(np.float64)
+                ),
+                "posterior_target_max_weight": importance.max_weight.astype(
+                    np.float64
+                ),
+                "target_mean_estimates": summaries[
+                    "target_mean_estimates"
+                ].astype(np.float32),
+            }
+            array_types = COMBINED_TEST_SET_CACHE_ARRAY_TYPES
+        else:
+            arrays = {
+                **test_set_common_arrays,
+                "posterior_tf_log_weight": importance.log_weight.astype(
+                    np.float32
+                ),
+                "posterior_tf_ess": importance.effective_sample_size.astype(
+                    np.float64
+                ),
+                "posterior_tf_ess_fraction": (
+                    importance.effective_sample_fraction.astype(np.float64)
+                ),
+                "posterior_tf_max_weight": importance.max_weight.astype(
+                    np.float64
+                ),
+                "tf_target_mean_estimates": summaries[
+                    "tf_target_mean_estimates"
+                ].astype(np.float32),
+            }
+            array_types = TEST_SET_CACHE_ARRAY_TYPES
+    else:
+        assert base_log_prob is not None
+        assert importance is not None
+        assert population_log_ratio is not None
+        arrays = {
+            "sample": samples,
+            "base_log_prob": base_log_prob.astype(np.float32),
+            "posterior_tf_log_ratio": importance.log_ratio.astype(np.float32),
+            "posterior_tf_log_weight": importance.log_weight.astype(np.float32),
+            "posterior_tf_weight": importance.weight.astype(np.float32),
+            "posterior_tf_ess": importance.effective_sample_size.astype(
+                np.float64
+            ),
+            "posterior_tf_ess_fraction": (
+                importance.effective_sample_fraction.astype(np.float64)
+            ),
+            "posterior_tf_max_weight": importance.max_weight.astype(
+                np.float64
+            ),
+            "posterior_tf_log_mean_ratio": importance.log_mean_ratio.astype(
+                np.float64
+            ),
+            "population_tf_log_ratio": population_log_ratio.astype(
+                np.float64
+            ),
+            **common_arrays,
+            **{
+                name: value.astype(np.float32)
+                for name, value in summaries.items()
+            },
+        }
+        array_types = STANDARD_CACHE_ARRAY_TYPES
     saved = {
         name: _save_array(output_root, name, label, arrays[name])
-        for name in CACHE_ARRAY_TYPES
+        for name in array_types
     }
 
     provenance = {}
@@ -654,8 +1131,27 @@ def main(argv=None) -> None:
             "spectral_noise_seed": partition_noise_seed + 101,
         }
     )
+    if args.test_set:
+        provenance.update(
+            {
+                "analysis_mode": TEST_SET_ANALYSIS_MODE,
+                "snr_source": "dataset_record",
+                "snr_redraw": False,
+                "snr_clipping": False,
+            }
+        )
+    analysis_mode = (
+        TEST_SET_ANALYSIS_MODE if args.test_set else STANDARD_ANALYSIS_MODE
+    )
+    if args.isotropic_inclination_prior:
+        cache_schema = COMBINED_TEST_SET_CACHE_SCHEMA
+    elif args.test_set:
+        cache_schema = TEST_SET_CACHE_SCHEMA
+    else:
+        cache_schema = CACHE_SCHEMA
     manifest = {
-        "schema": "klnn-posterior-cache-v2",
+        "schema": cache_schema,
+        "analysis_mode": analysis_mode,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "model_name": args.model_name,
         "checkpoint": str(checkpoint),
@@ -676,11 +1172,21 @@ def main(argv=None) -> None:
         "target_transforms": {
             name: config.TARGET_TRANSFORMS[name] for name in feature_names
         },
-        "density_coordinates": {
-            "stored_base_log_prob": "normalized_target_coordinates",
-            "map_selection": "physical_target_coordinates",
-            "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
-        },
+        "density_coordinates": (
+            {
+                "stored_shear_samples": "physical_target_coordinates",
+                "posterior_summary": "physical_target_coordinates",
+                "map_selection": "not_computed",
+            }
+            if args.test_set
+            else {
+                "stored_base_log_prob": "normalized_target_coordinates",
+                "map_selection": "physical_target_coordinates",
+                "map_jacobian": (
+                    "subtract_logabsdet_dphysical_dnormalized"
+                ),
+            }
+        ),
         "observation_model": {
             "schema_version": int(config.observation["schema_version"]),
             "context_fields": list(config.observation["context_fields"]),
@@ -705,54 +1211,156 @@ def main(argv=None) -> None:
             "policy": "original_plus_r90_equal_mixture",
             "rotated_joint_rows_inverse_aligned": True,
         },
-        "tf": {
-            **tf_prior.to_dict(),
-            "magnitude": "rmag_true",
-            "magnitude_measurement_error": 0.0,
-            "posterior_log_ratio": (
-                "raw log[p_TF(vcirc|rmag_true)/p0(vcirc)] per candidate"
-            ),
-            "posterior_log_weight": (
-                "within-galaxy log-softmax of posterior_log_ratio"
-            ),
-            "posterior_weight_normalization": "within_galaxy",
-            "population_log_ratio_normalization": (
-                "global_after_partition_concat"
-            ),
-            "resampling": False,
-        },
-        "posterior_populations": {
-            "proposal": (
-                "base NPE trained under independent uniform vcirc prior"
-            ),
-            "tf_target": (
-                "same joint candidates with "
-                "p_TF(vcirc|rmag_true)/p0(vcirc) weights"
-            ),
-        },
         "observation_provenance": provenance,
         "files": saved,
-        "posterior_tf_ess": {
-            "minimum": float(
-                np.min(importance.effective_sample_size)
-            ),
-            "median": float(
-                np.median(importance.effective_sample_size)
-            ),
-            "mean": float(
-                np.mean(importance.effective_sample_size)
-            ),
-            "maximum": float(
-                np.max(importance.effective_sample_size)
-            ),
-        },
     }
+    if args.test_set:
+        assert generation_manifest is not None
+        assert importance is not None
+        test_set_metadata = {
+            "population": "tf_conformed_catalog",
+            "posterior_candidate_weighting": "tf_importance",
+            "population_weighting": "uniform",
+            "point_estimator": "mean",
+            "map_computed": False,
+            "tf_importance_weighting": True,
+            "shape_noise_regularization": "report_time",
+            "snr_source": "dataset_record",
+            "snr_policy": "used_as_stored_without_redraw_or_clipping",
+            "stored_candidate_parameters": ["g1", "g2"],
+            "tf": tf_prior.to_dict(),
+            "generation_manifest": generation_manifest,
+        }
+        posterior_description = (
+            "TF-conformed catalog truth / TF-weighted posterior"
+        )
+        posterior_log_weight_description = (
+            "stored within-galaxy log-softmax of posterior_log_ratio"
+        )
+        ess_manifest_name = "posterior_tf_ess"
+        if args.isotropic_inclination_prior:
+            inclination_metadata = {
+                "training": "uniform_sini",
+                "target": "uniform_cosi_0_1",
+                "parameter": "sini",
+                "composition": (
+                    "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
+                ),
+                "resampling": False,
+                "bounds": [
+                    float(inclination_prior.sini_min),
+                    float(inclination_prior.sini_max),
+                ],
+            }
+            test_set_metadata.update(
+                posterior_candidate_weighting=(
+                    "tf_x_isotropic_inclination_importance"
+                ),
+                inclination_importance_weighting=True,
+                inclination_prior=inclination_metadata,
+            )
+            posterior_description = (
+                "TF-conformed isotropic-inclination catalog truth / "
+                "TF + isotropic-inclination-weighted posterior"
+            )
+            posterior_log_weight_description = (
+                "TF component is not stored separately; the compact cache "
+                "stores the within-galaxy log-softmax after adding the "
+                "isotropic-inclination log-ratio"
+            )
+            ess_manifest_name = "posterior_target_ess"
+        manifest.update(
+            {
+                "tf": {
+                    **tf_prior.to_dict(),
+                    "magnitude": "rmag_true",
+                    "magnitude_measurement_error": 0.0,
+                    "posterior_log_ratio": (
+                        "computed log[p_TF(vcirc|rmag_true)/p0(vcirc)] "
+                        "per candidate; not stored in the compact cache"
+                    ),
+                    "posterior_log_weight": (
+                        posterior_log_weight_description
+                    ),
+                    "posterior_weight_normalization": "within_galaxy",
+                    "population_log_ratio_normalization": (
+                        "not_applicable_already_tf_conformed"
+                    ),
+                    "resampling": False,
+                },
+                "posterior_populations": {
+                    "test_set": posterior_description
+                },
+                "test_set": test_set_metadata,
+                ess_manifest_name: {
+                    "minimum": float(
+                        np.min(importance.effective_sample_size)
+                    ),
+                    "median": float(
+                        np.median(importance.effective_sample_size)
+                    ),
+                    "mean": float(
+                        np.mean(importance.effective_sample_size)
+                    ),
+                    "maximum": float(
+                        np.max(importance.effective_sample_size)
+                    ),
+                },
+            }
+        )
+    else:
+        assert importance is not None
+        manifest.update(
+            {
+                "tf": {
+                    **tf_prior.to_dict(),
+                    "magnitude": "rmag_true",
+                    "magnitude_measurement_error": 0.0,
+                    "posterior_log_ratio": (
+                        "raw log[p_TF(vcirc|rmag_true)/p0(vcirc)] per candidate"
+                    ),
+                    "posterior_log_weight": (
+                        "within-galaxy log-softmax of posterior_log_ratio"
+                    ),
+                    "posterior_weight_normalization": "within_galaxy",
+                    "population_log_ratio_normalization": (
+                        "global_after_partition_concat"
+                    ),
+                    "resampling": False,
+                },
+                "posterior_populations": {
+                    "proposal": (
+                        "base NPE trained under independent uniform vcirc prior"
+                    ),
+                    "tf_target": (
+                        "same joint candidates with "
+                        "p_TF(vcirc|rmag_true)/p0(vcirc) weights"
+                    ),
+                },
+                "posterior_tf_ess": {
+                    "minimum": float(
+                        np.min(importance.effective_sample_size)
+                    ),
+                    "median": float(
+                        np.median(importance.effective_sample_size)
+                    ),
+                    "mean": float(
+                        np.mean(importance.effective_sample_size)
+                    ),
+                    "maximum": float(
+                        np.max(importance.effective_sample_size)
+                    ),
+                },
+            }
+        )
     meta_dir = output_root / "meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
     with (meta_dir / f"{label}.json").open(
         "w", encoding="utf-8"
     ) as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
+        # Preserve feature order in physical_parameter_ranges; the fail-closed
+        # cache contract requires it to match feature_names exactly.
+        json.dump(manifest, handle, indent=2)
     logging.info("Saved %s posterior cache to %s", label, output_root)
 
 

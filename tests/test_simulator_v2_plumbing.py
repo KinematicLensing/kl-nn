@@ -136,6 +136,7 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     paths = [
         ROOT / "data_generate" / name
         for name in (
+            "checksum.sh",
             "generate_simulator_v3.slurm",
             "make_database_simulator_v3.slurm",
             "merge_database_simulator_v3.slurm",
@@ -170,8 +171,11 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert "Missing current nine-target dataset" in pretrain
     generate = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()
     package = (ROOT / "data_generate/make_database_simulator_v3.slurm").read_text()
-    assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"' in generate
-    assert "TASK_COUNT != ARRAY_TASK_COUNT" in generate
+    assert 'ARRAY_TASK_MIN="${SLURM_ARRAY_TASK_MIN:-1}"' in generate
+    assert 'ARRAY_TASK_MAX="${SLURM_ARRAY_TASK_MAX:-${TASK_COUNT}}"' in generate
+    assert 'ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-1}"' in generate
+    assert "ARRAY_TASK_COUNT != TASK_COUNT" in generate
+    assert "--skip-existing" in generate
     assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"' in package
     assert "PART_COUNT != ARRAY_TASK_COUNT" in package
     assert "simv2" not in generate

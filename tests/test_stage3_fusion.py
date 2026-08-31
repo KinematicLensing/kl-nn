@@ -1,4 +1,4 @@
-"""Contracts for the sole Stage-3 multimodal feature extractor."""
+"""Contracts for the fixed-shape, three-branch feature extractor."""
 
 import copy
 
@@ -6,12 +6,14 @@ import pytest
 import torch
 from torch import nn
 
-import networks
 from networks import (
-    CCLPretrain,
-    DivisibleMeanPool1d,
-    SharedSpecCNN,
-    Stage3FeatureExtractor,
+    FEATURE_DIM,
+    IMAGE_FEATURE_DIM,
+    METADATA_FEATURE_DIM,
+    SPECTRAL_FEATURE_DIM,
+    JointSpecCNN,
+    MetadataMLP,
+    SimpleFusionFeatureExtractor,
     build_feature_extractor,
 )
 
@@ -19,14 +21,40 @@ from networks import (
 class TinyImageEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.projection = nn.Linear(1, 512)
+        self.projection = nn.Linear(1, IMAGE_FEATURE_DIM)
 
     def forward(self, image):
         return self.projection(image.mean(dim=(-2, -1)))
 
 
-def _inputs(batch_size=2, fiber_count=5, *, requires_grad=False):
-    generator = torch.Generator().manual_seed(20260811 + fiber_count)
+class TinySpectralEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection = nn.Linear(5 * 64, SPECTRAL_FEATURE_DIM)
+
+    def forward(self, spectra):
+        return self.projection(spectra.flatten(start_dim=1))
+
+
+class TinyMetadataEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection = nn.Linear(13, METADATA_FEATURE_DIM)
+
+    def forward(self, metadata):
+        return self.projection(metadata)
+
+
+def _context(batch_size=2):
+    return {
+        "rmag_true": torch.linspace(18.0, 21.0, batch_size),
+        "image_snr": torch.linspace(50.0, 500.0, batch_size),
+        "central_halpha_snr": torch.linspace(20.0, 120.0, batch_size),
+    }
+
+
+def _inputs(batch_size=2, *, requires_grad=False):
+    generator = torch.Generator().manual_seed(20260811)
     image = torch.randn(
         batch_size,
         1,
@@ -38,202 +66,260 @@ def _inputs(batch_size=2, fiber_count=5, *, requires_grad=False):
     spectra = torch.randn(
         batch_size,
         1,
-        fiber_count,
+        5,
         64,
         generator=generator,
         requires_grad=requires_grad,
     )
     positions = torch.randn(
         batch_size,
-        fiber_count,
+        5,
         2,
         generator=generator,
         requires_grad=requires_grad,
     )
-    return image, spectra, positions
+    return image, spectra, positions, _context(batch_size)
 
 
-def _extractor():
-    torch.manual_seed(17)
-    return Stage3FeatureExtractor(nspec=5, img_net=TinyImageEncoder())
-
-
-def test_shared_spectral_encoder_preserves_wavelength_location():
-    torch.manual_seed(5)
-    encoder = SharedSpecCNN(embedding_dim=32).eval()
-    spectra = torch.zeros(1, 1, 2, 64)
-    spectra[0, 0, 0, 20] = 1.0
-    spectra[0, 0, 1, 28] = 1.0
-    encoded = encoder(spectra)
-    assert not torch.allclose(encoded[:, 0], encoded[:, 1])
-
-
-def test_divisible_pool_matches_adaptive_pool_and_is_differentiable():
-    inputs = torch.randn(3, 7, 16, requires_grad=True)
-    output = DivisibleMeanPool1d(8)(inputs)
-    torch.testing.assert_close(
-        output, torch.nn.functional.adaptive_avg_pool1d(inputs, 8)
+def _extractor(seed=17):
+    torch.manual_seed(seed)
+    return SimpleFusionFeatureExtractor(
+        nspec=5,
+        img_net=TinyImageEncoder(),
+        spec_net=TinySpectralEncoder(),
+        metadata_net=TinyMetadataEncoder(),
     )
-    output.square().mean().backward()
-    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
-    with pytest.raises(ValueError, match="positive multiple"):
-        DivisibleMeanPool1d(8)(torch.randn(1, 2, 15))
 
 
-def test_shared_spectral_encoder_is_fiber_permutation_equivariant():
-    encoder = SharedSpecCNN(embedding_dim=32).eval()
-    _, spectra, _ = _inputs(requires_grad=True)
-    permutation = torch.tensor([3, 1, 4, 0, 2])
-    encoded = encoder(spectra)
-    permuted = encoder(spectra[:, :, permutation])
-    torch.testing.assert_close(
-        permuted, encoded[:, permutation], atol=1e-6, rtol=1e-5
-    )
-    encoded.square().mean().backward()
-    assert spectra.grad is not None and torch.isfinite(spectra.grad).all()
+def _clone_context(context):
+    return {name: value.clone() for name, value in context.items()}
 
 
-@pytest.mark.parametrize("fiber_count", (3, 5))
-def test_stage3_output_shape_is_finite_for_variable_fiber_count(fiber_count):
-    output = _extractor().eval()(*_inputs(fiber_count=fiber_count))
-    assert output.shape == (2, 1024)
+def test_only_three_catalog_scalars_are_accepted():
+    extractor = _extractor().eval()
+    image, spectra, positions, context = _inputs()
+    leaked = _clone_context(context)
+    leaked["halpha_flux_true"] = torch.ones(image.shape[0])
+    with pytest.raises(ValueError, match="halpha_flux_true"):
+        extractor(image, spectra, positions, leaked)
+
+
+def test_feature_dimensions_and_fixed_shape_output():
+    assert IMAGE_FEATURE_DIM == 512
+    assert SPECTRAL_FEATURE_DIM == 512
+    assert METADATA_FEATURE_DIM == 128
+    assert FEATURE_DIM == 1152
+    assert MetadataMLP(nspec=5).input_dim == 13
+
+    output = _extractor().eval()(*_inputs())
+    assert output.shape == (2, FEATURE_DIM)
     assert torch.isfinite(output).all()
 
 
-def test_production_image_encoder_shape_with_channels_last():
-    extractor = Stage3FeatureExtractor(nspec=5).eval()
-    image = torch.randn(1, 1, 48, 48).contiguous(
-        memory_format=torch.channels_last
-    )
-    spectra = torch.randn(1, 1, 5, 64).contiguous(
-        memory_format=torch.channels_last
-    )
+def test_joint_spectral_cnn_requires_five_by_sixty_four_and_returns_512():
+    encoder = JointSpecCNN(nspec=5).eval()
     with torch.inference_mode():
-        output = extractor(image, spectra, torch.randn(1, 5, 2))
-    assert output.shape == (1, 1024)
+        output = encoder(torch.randn(2, 1, 5, 64))
+    assert output.shape == (2, SPECTRAL_FEATURE_DIM)
     assert torch.isfinite(output).all()
 
+    with pytest.raises(ValueError, match=r"5, 64"):
+        encoder(torch.randn(2, 1, 4, 64))
+    with pytest.raises(ValueError, match=r"5, 64"):
+        encoder(torch.randn(2, 1, 5, 63))
 
-def test_joint_fiber_permutation_is_invariant_but_association_matters():
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (
+            lambda image, spectra, positions: (
+                image[:, :0],
+                spectra,
+                positions,
+            ),
+            "image must have shape",
+        ),
+        (
+            lambda image, spectra, positions: (
+                image,
+                spectra[:, :, :4],
+                positions,
+            ),
+            "spectra must have shape",
+        ),
+        (
+            lambda image, spectra, positions: (
+                image,
+                spectra[..., :-1],
+                positions,
+            ),
+            "spectra must have shape",
+        ),
+        (
+            lambda image, spectra, positions: (
+                image,
+                spectra,
+                positions[:, :4],
+            ),
+            "fiber_positions must have shape",
+        ),
+    ],
+)
+def test_extractor_rejects_noncanonical_observation_shapes(replacement, message):
     extractor = _extractor().eval()
-    image, spectra, positions = _inputs()
-    mask = torch.tensor(
-        [[True, True, True, False, True], [True, False, True, True, True]]
-    )
-    permutation = torch.tensor([4, 2, 0, 3, 1])
-    reference = extractor(image, spectra, positions, mask)
-    permuted = extractor(
-        image,
-        spectra[:, :, permutation],
-        positions[:, permutation],
-        mask[:, permutation],
-    )
-    torch.testing.assert_close(reference, permuted, atol=2e-5, rtol=2e-5)
-
-    association_reference = extractor(image, spectra, positions)
-    broken = extractor(image, spectra[:, :, permutation], positions)
-    assert not torch.allclose(association_reference, broken, atol=1e-5, rtol=1e-5)
+    image, spectra, positions, context = _inputs()
+    invalid = replacement(image, spectra, positions)
+    with pytest.raises(ValueError, match=message):
+        extractor(*invalid, context)
 
 
-def test_relative_spectral_strength_matches_global_normalization():
-    _, spectra, _ = _inputs()
-    strength = Stage3FeatureExtractor._relative_spectral_strength(spectra)
-    reconstructed = torch.nn.functional.normalize(spectra, dim=-1) * strength
-    expected = torch.nn.functional.normalize(spectra, dim=(-2, -1))
-    torch.testing.assert_close(reconstructed, expected)
-
-
-def test_absolute_line_strength_preserves_global_amplitude_and_fiber_order():
-    _, spectra, _ = _inputs()
-    permutation = torch.tensor([3, 1, 4, 0, 2])
-    strength = Stage3FeatureExtractor._absolute_spectral_strength(spectra)
-    scaled = Stage3FeatureExtractor._absolute_spectral_strength(4.0 * spectra)
-    permuted = Stage3FeatureExtractor._absolute_spectral_strength(
-        spectra[:, :, permutation]
-    )
-
-    assert strength.shape == (2, 1, 5, 1)
-    assert torch.all(scaled > strength)
-    torch.testing.assert_close(permuted, strength[:, :, permutation])
-
-
-def test_global_spectral_amplitude_changes_stage3_features():
+def test_fixed_fiber_mask_requires_all_five_fibers():
     extractor = _extractor().eval()
-    image, spectra, positions = _inputs()
+    image, spectra, positions, context = _inputs()
+    full_mask = torch.ones(2, 5, dtype=torch.bool)
     with torch.inference_mode():
-        reference = extractor(image, spectra, positions)
-        scaled = extractor(image, 4.0 * spectra, positions)
-    assert not torch.allclose(reference, scaled, atol=1e-7, rtol=1e-7)
+        reference = extractor(image, spectra, positions, context)
+        masked = extractor(
+            image, spectra, positions, context, fiber_mask=full_mask
+        )
+    torch.testing.assert_close(reference, masked)
 
-
-def test_masked_fiber_values_are_ignored_and_receive_zero_gradient():
-    extractor = _extractor().eval()
-    image, spectra, positions = _inputs(requires_grad=True)
-    mask = torch.tensor(
-        [[True, True, False, True, False], [True, False, True, True, False]]
-    )
-    reference = extractor(image, spectra, positions, mask)
-    altered_spectra = spectra.detach().clone()
-    altered_positions = positions.detach().clone()
-    altered_spectra[~mask[:, None, :, None].expand_as(altered_spectra)] = 1e5
-    altered_positions[~mask.unsqueeze(-1).expand_as(altered_positions)] = -1e5
-    altered = extractor(
-        image.detach(), altered_spectra, altered_positions, mask
-    )
-    torch.testing.assert_close(reference.detach(), altered, atol=1e-6, rtol=1e-6)
-
-    weights = torch.linspace(
-        -1.0, 1.0, reference.shape[-1], device=reference.device
-    )
-    (reference * weights).sum().backward()
-    spectral_mask = mask[:, None, :, None].expand_as(spectra)
-    position_mask = mask.unsqueeze(-1).expand_as(positions)
-    assert torch.count_nonzero(spectra.grad[~spectral_mask]) == 0
-    assert torch.count_nonzero(positions.grad[~position_mask]) == 0
-    assert torch.count_nonzero(spectra.grad[spectral_mask]) > 0
-    assert torch.count_nonzero(positions.grad[position_mask]) > 0
-
-
-def test_stage3_mask_and_shape_errors_are_explicit():
-    extractor = _extractor().eval()
-    image, spectra, positions = _inputs()
     with pytest.raises(TypeError, match="bool"):
-        extractor(image, spectra, positions, torch.ones(2, 5))
+        extractor(
+            image,
+            spectra,
+            positions,
+            context,
+            fiber_mask=torch.ones(2, 5),
+        )
     with pytest.raises(ValueError, match="shape"):
-        extractor(image, spectra, positions, torch.ones(2, 4, dtype=torch.bool))
-    with pytest.raises(ValueError, match="same fiber count"):
-        extractor(image, spectra, positions[:, :4])
-    with pytest.raises(ValueError, match="at least one"):
-        extractor(image, spectra, positions, torch.zeros(2, 5, dtype=torch.bool))
+        extractor(
+            image,
+            spectra,
+            positions,
+            context,
+            fiber_mask=torch.ones(2, 4, dtype=torch.bool),
+        )
+    partial_mask = full_mask.clone()
+    partial_mask[0, -1] = False
+    with pytest.raises(ValueError, match="requires all configured fibers"):
+        extractor(
+            image, spectra, positions, context, fiber_mask=partial_mask
+        )
 
 
-def test_factory_and_ccl_use_stage3_with_nine_targets_and_oracle_context(
-    monkeypatch,
-):
-    monkeypatch.setattr(networks, "ImgCNN", TinyImageEncoder)
+def test_joint_spectral_normalization_is_globally_scale_invariant():
+    extractor = _extractor().eval()
+    image, spectra, positions, context = _inputs()
+    with torch.inference_mode():
+        reference = extractor(image, spectra, positions, context)
+        scaled = extractor(image, 7.0 * spectra, positions, context)
+    torch.testing.assert_close(reference, scaled, atol=2e-6, rtol=2e-6)
+
+
+def test_joint_spectral_branch_preserves_relative_fiber_strength_and_order():
+    extractor = _extractor().eval()
+    image, spectra, positions, context = _inputs()
+    relative_change = spectra.clone()
+    relative_change[:, :, 0] *= 4.0
+    permutation = torch.tensor([3, 1, 4, 0, 2])
+
+    with torch.inference_mode():
+        reference = extractor(image, spectra, positions, context)
+        changed = extractor(image, relative_change, positions, context)
+        permuted = extractor(
+            image, spectra[:, :, permutation], positions, context
+        )
+    assert not torch.allclose(reference, changed, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(reference, permuted, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("rmag_true", torch.tensor([19.0, 19.5])),
+        ("image_snr", torch.tensor([250.0, 750.0])),
+        ("central_halpha_snr", torch.tensor([60.0, 180.0])),
+    ],
+)
+def test_each_catalog_scalar_changes_metadata_features(field, replacement):
+    extractor = _extractor().eval()
+    image, spectra, positions, context = _inputs()
+    changed_context = _clone_context(context)
+    changed_context[field] = replacement
+    with torch.inference_mode():
+        reference = extractor(image, spectra, positions, context)
+        changed = extractor(image, spectra, positions, changed_context)
+    assert not torch.allclose(
+        reference[:, -METADATA_FEATURE_DIM:],
+        changed[:, -METADATA_FEATURE_DIM:],
+        atol=1e-7,
+        rtol=1e-7,
+    )
+
+
+def test_fiber_positions_change_metadata_features():
+    extractor = _extractor().eval()
+    image, spectra, positions, context = _inputs()
+    changed_positions = positions.clone()
+    changed_positions[:, 0, 0] += 0.5
+    with torch.inference_mode():
+        reference = extractor(image, spectra, positions, context)
+        changed = extractor(image, spectra, changed_positions, context)
+    assert not torch.allclose(
+        reference[:, -METADATA_FEATURE_DIM:],
+        changed[:, -METADATA_FEATURE_DIM:],
+        atol=1e-7,
+        rtol=1e-7,
+    )
+
+
+def test_production_image_and_spectral_parameter_counts_are_same_order():
+    extractor = SimpleFusionFeatureExtractor(nspec=5)
+    image_parameters = sum(
+        parameter.numel() for parameter in extractor.img_net.parameters()
+    )
+    spectral_parameters = sum(
+        parameter.numel() for parameter in extractor.spec_net.parameters()
+    )
+    ratio = max(image_parameters, spectral_parameters) / min(
+        image_parameters, spectral_parameters
+    )
+    assert ratio < 10.0
+
+
+def test_all_three_feature_branches_receive_gradients():
+    extractor = _extractor().train()
+    output = extractor(*_inputs())
+    weights = torch.linspace(-1.0, 1.0, FEATURE_DIM)
+    (output * weights).sum().backward()
+
+    for branch in (
+        extractor.img_net,
+        extractor.spec_net,
+        extractor.metadata_net,
+    ):
+        gradients = [
+            parameter.grad
+            for parameter in branch.parameters()
+            if parameter.requires_grad
+        ]
+        assert gradients
+        assert all(gradient is not None for gradient in gradients)
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert any(torch.count_nonzero(gradient) for gradient in gradients)
+
+
+def test_factory_builds_simple_fusion_extractor():
     backbone = build_feature_extractor(nspec=5)
-    assert isinstance(backbone, Stage3FeatureExtractor)
-
-    model = CCLPretrain(projector_dim=16)
-    image, spectra, positions = _inputs(batch_size=4)
-    labels = torch.rand(4, 9) * 2.0 - 1.0
-    context = {
-        "rmag_true": torch.linspace(18.0, 21.0, 4),
-        "image_snr": torch.linspace(5.0, 1000.0, 4),
-        "central_halpha_snr": torch.linspace(1.0, 200.0, 4),
-    }
-    loss = model(image, spectra, positions, labels, context)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert model.backbone.image_fiber_attention.in_proj_weight.grad is not None
+    assert isinstance(backbone, SimpleFusionFeatureExtractor)
+    assert backbone.output_dim == FEATURE_DIM
 
 
-def test_stage3_state_dict_round_trip():
+def test_simple_fusion_state_dict_round_trip():
     original = _extractor().eval()
-    torch.manual_seed(999)
-    restored = Stage3FeatureExtractor(
-        nspec=5, img_net=TinyImageEncoder()
-    ).eval()
+    restored = _extractor(seed=999).eval()
     inputs = _inputs(batch_size=1)
     assert not torch.allclose(original(*inputs), restored(*inputs))
     restored.load_state_dict(copy.deepcopy(original.state_dict()), strict=True)

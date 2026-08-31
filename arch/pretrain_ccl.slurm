@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/pretrain_ccl_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
-#SBATCH --time=9:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
@@ -22,12 +22,12 @@ EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 CCL_SIGMA_LABEL="${CCL_SIGMA_LABEL:-0.15}"
 CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_galaxyaxis_central_halpha/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_galaxyaxis_central_halpha/}"
+TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3/}"
+VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_NAME="${MODEL_NAME:-Pretrain_CCL_1m}"
+MODEL_NAME="${MODEL_NAME:-CNN-CNN-Meta-CCL-simv3-r90_1m_s${SEED}_${JOB_TAG}}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 
 for DATA_DIR in "${TRAIN_DATA}" "${VALID_DATA}"; do

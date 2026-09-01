@@ -77,7 +77,7 @@ def _validate_feature_schema(feature_names) -> tuple[str, ...]:
         "g1",
         "g2",
         "theta_int",
-        "sini",
+        "cosi",
         "v0",
         "vcirc",
         "rscale",

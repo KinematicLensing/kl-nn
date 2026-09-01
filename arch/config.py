@@ -11,7 +11,7 @@ TARGET_NAMES = (
     "g1",
     "g2",
     "theta_int",
-    "sini",
+    "cosi",
     "v0",
     "vcirc",
     "rscale",
@@ -23,7 +23,7 @@ CANONICAL_PARAMETER_RANGES = {
     "g1": [-0.1, 0.1],
     "g2": [-0.1, 0.1],
     "theta_int": [-float(np.pi), float(np.pi)],
-    "sini": [0.0, 1.0],
+    "cosi": [0.0, 1.0],
     "v0": [-30.0, 30.0],
     "vcirc": [60.0, 540.0],
     "rscale": [0.1, 5.0],
@@ -148,11 +148,11 @@ class ObservationConfig:
     target_line: str = "Ha"
     image_reference_psf_fwhm_arcsec: float = 1.0
     image_pixel_scale_arcsec: float = 0.2637
-    image_snr_min: float = 5.0
+    image_snr_min: float = 10.0
     image_snr_max: float = 1000.0
     image_snr_distribution: str = "uniform"
     central_halpha_snr_min: float = 1.0
-    central_halpha_snr_max: float = 200.0
+    central_halpha_snr_max: float = 150.0
     central_halpha_snr_distribution: str = "uniform"
     spectral_units: str = "counts"
     center_fiber_index: int = 2

@@ -28,23 +28,16 @@ try:
     from . import config
     from .cache_contract import (
         CACHE_SCHEMA,
-        COMBINED_TEST_SET_CACHE_SCHEMA,
         STANDARD_ANALYSIS_MODE,
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
-    )
-    from .inclination_prior import (
-        InclinationPrior,
-        isotropic_inclination_log_prior_ratio,
     )
     from .model_registry import load_model_config
     from .networks import KLNPE
     from .tf_prior import (
         TFPrior,
         population_log_importance_ratio,
-        posterior_importance_from_log_ratio,
         posterior_importance_weights,
-        tf_log_prior_ratio,
     )
     from .train import load_model, sample_density, seed_everything
     from .utils import (
@@ -56,23 +49,16 @@ except ImportError:  # Direct execution from arch/.
     import config
     from cache_contract import (
         CACHE_SCHEMA,
-        COMBINED_TEST_SET_CACHE_SCHEMA,
         STANDARD_ANALYSIS_MODE,
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
-    )
-    from inclination_prior import (
-        InclinationPrior,
-        isotropic_inclination_log_prior_ratio,
     )
     from model_registry import load_model_config
     from networks import KLNPE
     from tf_prior import (
         TFPrior,
         population_log_importance_ratio,
-        posterior_importance_from_log_ratio,
         posterior_importance_weights,
-        tf_log_prior_ratio,
     )
     from train import load_model, sample_density, seed_everything
     from utils import denormalization_logabsdet, denormalize, resolve_feature_index
@@ -118,21 +104,6 @@ TEST_SET_CACHE_ARRAY_TYPES = (
     "proposal_mean_estimates",
     "tf_target_mean_estimates",
 )
-COMBINED_TEST_SET_CACHE_ARRAY_TYPES = (
-    "shear_sample",
-    "posterior_target_log_weight",
-    "posterior_target_ess",
-    "posterior_target_ess_fraction",
-    "posterior_target_max_weight",
-    "truth",
-    "rmag_true",
-    "image_snr",
-    "central_halpha_snr",
-    "image_noise_sigma",
-    "central_spectral_noise_sigma",
-    "proposal_mean_estimates",
-    "target_mean_estimates",
-)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -171,15 +142,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         help=(
             "Generation manifest; test-set mode defaults to "
             "DATASET/manifest.json and requires it."
-        ),
-    )
-    parser.add_argument(
-        "--isotropic-inclination-prior",
-        action="store_true",
-        help=(
-            "In compact test-set mode, additionally replace the uniform-sini "
-            "training prior with the isotropic uniform-cosi prior. The output "
-            "cache name receives a _tf_iso_inclination suffix."
         ),
     )
     parser.add_argument("--matched-group-size", type=int, default=1)

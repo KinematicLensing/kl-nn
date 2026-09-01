@@ -47,7 +47,7 @@ LOGGER = logging.getLogger(__name__)
 
 NUISANCE_DISPLAY = {
     "theta_int": (1.0, "rad"),
-    "sini": (1.0, ""),
+    "cosi": (1.0, ""),
     "v0": (1.0, "km s<sup>-1</sup>"),
     "vcirc": (1.0, "km s<sup>-1</sup>"),
     "rscale": (1.0, "arcsec"),
@@ -59,7 +59,7 @@ NUISANCE_DISPLAY = {
 }
 NUISANCE_PLOT_UNIT = {
     "theta_int": "rad",
-    "sini": "",
+    "cosi": "",
     "v0": r"km s$^{-1}$",
     "vcirc": r"km s$^{-1}$",
     "rscale": "arcsec",
@@ -297,9 +297,9 @@ def load_case(
             )
         if not np.all(np.isfinite(truth)):
             raise ValueError(f"Test-set truth contains non-finite values for {case}")
-        sini = truth[:, feature_names.index("sini")]
-        if np.any((sini < 0.0) | (sini > 1.0)):
-            raise ValueError(f"Test-set sini lies outside [0, 1] for {case}")
+        cosi = truth[:, feature_names.index("cosi")]
+        if np.any((cosi < 0.0) | (cosi > 1.0)):
+            raise ValueError(f"Test-set cosi lies outside [0, 1] for {case}")
         hlr = truth[:, feature_names.index("hlr")]
         if np.max(hlr) > 5.0 + 1.0e-6:
             raise ValueError(
@@ -1107,7 +1107,7 @@ def conditional_shear_calibration(
         {
             spectral_condition_name: spectral_condition,
             "true hlr": truth[:, names.index("hlr")],
-            "true sini": truth[:, names.index("sini")],
+            "true cosi": truth[:, names.index("cosi")],
         }
     )
     result = {}
@@ -2246,16 +2246,16 @@ def test_set_audit_table(case: dict) -> str:
 
     truth = np.asarray(case["truth"], dtype=np.float64)
     names = case["feature_names"]
-    sini = truth[:, names.index("sini")]
-    cosi = np.sqrt(np.clip(1.0 - np.square(sini), 0.0, 1.0))
+    cosi = truth[:, names.index("cosi")]
+    sini = np.sqrt(np.clip(1.0 - np.square(cosi), 0.0, 1.0))
     values = {
         "rmag_true": case["rmag_true"],
         "image_snr": case["image_snr"],
         "central_halpha_snr": case["spectral_condition"],
         "vcirc [km/s]": truth[:, names.index("vcirc")],
         "hlr [arcsec]": truth[:, names.index("hlr")],
-        "sini": sini,
-        "reconstructed cosi": cosi,
+        "cosi": cosi,
+        "reconstructed sini": sini,
     }
     body = []
     for label, raw in values.items():

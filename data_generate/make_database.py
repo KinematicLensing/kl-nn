@@ -254,10 +254,20 @@ def normalize_sample_table(
 ):
     """Normalize named inference targets, leaving observation metadata untouched."""
 
-    missing = [name for name in parameter_ranges if name not in samples.columns]
+    normalized = samples.copy()
+    if 'cosi' in parameter_ranges:
+        if 'sini' not in normalized.columns:
+            raise ValueError(
+                "Sample table requires simulator parameter 'sini' to derive "
+                "inference target 'cosi'"
+            )
+        sini = normalized['sini'].to_numpy(dtype=np.float64)
+        if np.any(~np.isfinite(sini)) or np.any((sini < 0.0) | (sini > 1.0)):
+            raise ValueError("Sample table sini values must be finite and in [0, 1]")
+        normalized['cosi'] = np.sqrt(np.maximum(0.0, 1.0 - np.square(sini)))
+    missing = [name for name in parameter_ranges if name not in normalized.columns]
     if missing:
         raise ValueError(f'Sample table is missing inference targets: {missing}')
-    normalized = samples.copy()
     names = tuple(parameter_ranges)
     normalized.loc[:, names] = arch_utils.normalize_targets(
         normalized.loc[:, names].to_numpy(dtype=np.float64),

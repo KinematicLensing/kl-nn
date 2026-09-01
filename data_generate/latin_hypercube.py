@@ -71,9 +71,11 @@ def generate_samples(
 ) -> pd.DataFrame:
     """Draw targets and observation-quality controls independently.
 
-    H-alpha flux is Latin-hypercube-uniform in log10 physical flux. Image and
-    central-line S/N are Latin-hypercube-uniform in linear S/N and are stored
-    once per galaxy for reuse across noise realizations and matched shears.
+    Inclination is Latin-hypercube-uniform in ``cos(i)`` and converted to the
+    simulator's ``sin(i)`` parameterization. H-alpha flux is uniform in log10
+    physical flux. Image and central-line S/N are uniform in linear S/N and
+    are stored once per galaxy for reuse across noise realizations and matched
+    shears.
     """
 
     if nsamples <= 0:
@@ -93,7 +95,11 @@ def generate_samples(
     ).random(nsamples)
     result = pd.DataFrame(unit, columns=names)
     for name, (lower, upper) in PARAMETER_LIMITS.items():
-        result[name] = lower + result[name] * (upper - lower)
+        if name == "sini":
+            cosi = lower + result[name].to_numpy() * (upper - lower)
+            result[name] = np.sqrt(np.maximum(0.0, 1.0 - np.square(cosi)))
+        else:
+            result[name] = lower + result[name] * (upper - lower)
     result[RMAG_TRUE_COLUMN] = _lhs_column(
         nsamples, magnitude_seed, *DEFAULT_RMAG_RANGE
     )

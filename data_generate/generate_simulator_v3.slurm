@@ -12,7 +12,12 @@
 set -eo pipefail
 ulimit -c 0
 
-source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch simulator-v3-fits
 
 module load anaconda3
@@ -23,8 +28,8 @@ set -u
 echo "FITS array=${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID} raw_job=${SLURM_JOB_ID} node=${SLURMD_NODENAME:-unknown}"
 echo "FITS log=/ocean/projects/phy250048p/shared/logs/generate_simulator_v3_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out"
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv3}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_cosi}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3_cosi}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 SAMPLE_FILE="${SAMPLE_NAME}.csv"
@@ -67,7 +72,7 @@ if (( STOP > TOTAL )); then
     STOP="${TOTAL}"
 fi
 
-cd /jet/home/xwang30/kl-nn/data_generate
+cd "${KLNN_REPO_ROOT}/data_generate"
 python generate_fits_wrapper.py \
     -i="${START}" \
     -j="${STOP}" \

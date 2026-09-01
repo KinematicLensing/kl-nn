@@ -5,8 +5,6 @@ import pytest
 
 from cache_contract import (
     CACHE_SCHEMA,
-    COMBINED_TEST_SET_CACHE_SCHEMA,
-    COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS,
     CURRENT_FEATURE_NAMES,
     CURRENT_TARGET_TRANSFORMS,
     EXPECTED_DENSITY_COORDINATES,
@@ -36,7 +34,6 @@ def _array(name, rows, draws, start):
         "posterior_tf_log_ratio",
         "posterior_tf_log_weight",
         "posterior_tf_weight",
-        "posterior_target_log_weight",
     }:
         return np.zeros((rows, draws), dtype=np.float32)
     if name in {
@@ -45,9 +42,6 @@ def _array(name, rows, draws, start):
         "posterior_tf_max_weight",
         "posterior_tf_log_mean_ratio",
         "population_tf_log_ratio",
-        "posterior_target_ess",
-        "posterior_target_ess_fraction",
-        "posterior_target_max_weight",
         "rmag_true",
         "spectral_reference_quality",
         "image_snr",
@@ -96,13 +90,9 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
             "spectral_noise_seed": seed + 101,
         }
         required_arrays = (
-            COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS
-            if schema == COMBINED_TEST_SET_CACHE_SCHEMA
-            else (
-                TEST_SET_REQUIRED_CACHE_ARRAYS
-                if schema == TEST_SET_CACHE_SCHEMA
-                else REQUIRED_CACHE_ARRAYS
-            )
+            TEST_SET_REQUIRED_CACHE_ARRAYS
+            if schema == TEST_SET_CACHE_SCHEMA
+            else REQUIRED_CACHE_ARRAYS
         )
     payload = {
         "schema": schema,
@@ -148,21 +138,14 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
             name: f"{name}/{label}.npy" for name in required_arrays
         },
     }
-    if schema in {
-        CACHE_SCHEMA,
-        TEST_SET_CACHE_SCHEMA,
-        COMBINED_TEST_SET_CACHE_SCHEMA,
-    }:
+    if schema in {CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA}:
         payload.update(
             {
                 "physical_parameter_ranges": {
                     "g1": [-0.1, 0.1],
                     "g2": [-0.1, 0.1],
                     "theta_int": [0.0, np.pi],
-                    "sini": [
-                        0.0 if schema == COMBINED_TEST_SET_CACHE_SCHEMA else 0.1,
-                        1.0,
-                    ],
+                    "cosi": [0.0, 1.0],
                     "v0": [0.0, 20.0],
                     "vcirc": [60.0, 540.0],
                     "rscale": [0.1, 5.0],
@@ -172,17 +155,13 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                 "target_transforms": dict(CURRENT_TARGET_TRANSFORMS),
                 "density_coordinates": dict(
                     EXPECTED_TEST_SET_DENSITY_COORDINATES
-                    if schema in {
-                        TEST_SET_CACHE_SCHEMA,
-                        COMBINED_TEST_SET_CACHE_SCHEMA,
-                    }
+                    if schema == TEST_SET_CACHE_SCHEMA
                     else EXPECTED_DENSITY_COORDINATES
                 ),
                 "observation_model": dict(EXPECTED_OBSERVATION_MODEL),
             }
         )
-    if schema in {TEST_SET_CACHE_SCHEMA, COMBINED_TEST_SET_CACHE_SCHEMA}:
-        combined_weighting = schema == COMBINED_TEST_SET_CACHE_SCHEMA
+    if schema == TEST_SET_CACHE_SCHEMA:
         payload["tf"]["population_log_ratio_normalization"] = (
             "not_applicable_already_tf_conformed"
         )
@@ -194,11 +173,7 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                 },
                 "test_set": {
                     "population": "tf_conformed_catalog",
-                    "posterior_candidate_weighting": (
-                        "tf_x_isotropic_inclination_importance"
-                        if combined_weighting
-                        else "tf_importance"
-                    ),
+                    "posterior_candidate_weighting": "tf_importance",
                     "population_weighting": "uniform",
                     "point_estimator": "mean",
                     "map_computed": False,
@@ -234,17 +209,23 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                                     "minimum": 0.1,
                                     "maximum": 5.0,
                                     "bounds": "inclusive",
+                                },
+                                "image_snr": {
+                                    "finite": True,
+                                    "minimum": 10.0,
+                                    "maximum": 1000.0,
+                                },
+                                "halpha_snr": {
+                                    "finite": True,
+                                    "minimum": 1.0,
+                                    "maximum": 150.0,
                                 }
                             },
                         },
                         "parameter_sampling": {
                             "inclination": {
                                 "distribution": "cosi_uniform_0_1_latin_hypercube",
-                                **(
-                                    {"transform": "sini=sqrt(1-cosi**2)"}
-                                    if combined_weighting
-                                    else {}
-                                ),
+                                "transform": "sini=sqrt(1-cosi**2)",
                             }
                         },
                         "tf": {
@@ -264,22 +245,6 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                 },
             }
         )
-        if combined_weighting:
-            payload["test_set"].update(
-                {
-                    "inclination_importance_weighting": True,
-                    "inclination_prior": {
-                        "training": "uniform_sini",
-                        "target": "uniform_cosi_0_1",
-                        "parameter": "sini",
-                        "composition": (
-                            "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
-                        ),
-                        "resampling": False,
-                        "bounds": [0.0, 1.0],
-                    },
-                }
-            )
     return payload
 
 
@@ -289,13 +254,9 @@ def _write_cache(root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA):
         LEGACY_REQUIRED_CACHE_ARRAYS
         if schema == LEGACY_CACHE_SCHEMA
         else (
-            COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS
-            if schema == COMBINED_TEST_SET_CACHE_SCHEMA
-            else (
-                TEST_SET_REQUIRED_CACHE_ARRAYS
-                if schema == TEST_SET_CACHE_SCHEMA
-                else REQUIRED_CACHE_ARRAYS
-            )
+            TEST_SET_REQUIRED_CACHE_ARRAYS
+            if schema == TEST_SET_CACHE_SCHEMA
+            else REQUIRED_CACHE_ARRAYS
         )
     )
     for index in range(total):
@@ -363,44 +324,6 @@ def test_compact_test_set_contract_exposes_mode_and_embedded_provenance(
     assert shear.shape == (4, 4, 2)
 
 
-def test_combined_test_set_contract_exposes_neutral_target_arrays(tmp_path):
-    root = _write_cache(
-        tmp_path / "combined-test-cache",
-        schema=COMBINED_TEST_SET_CACHE_SCHEMA,
-    )
-    partitions = load_cache_partitions(root)
-    assert partitions.analysis_mode == TEST_SET_ANALYSIS_MODE
-    assert partitions.manifests[0]["schema"] == COMBINED_TEST_SET_CACHE_SCHEMA
-    assert set(partitions.files) == set(
-        COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS
-    )
-    assert "posterior_tf_log_weight" not in partitions.files
-    assert "tf_target_mean_estimates" not in partitions.files
-    assert "posterior_target_log_weight" in partitions.files
-    assert "target_mean_estimates" in partitions.files
-    assert (
-        partitions.mode_metadata["posterior_candidate_weighting"]
-        == "tf_x_isotropic_inclination_importance"
-    )
-    assert partitions.mode_metadata["inclination_importance_weighting"] is True
-    assert partitions.mode_metadata["inclination_prior"] == {
-        "training": "uniform_sini",
-        "target": "uniform_cosi_0_1",
-        "parameter": "sini",
-        "composition": (
-            "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
-        ),
-        "resampling": False,
-        "bounds": [0.0, 1.0],
-    }
-    assert load_partitioned_array(
-        partitions, "posterior_target_log_weight"
-    ).shape == (4, 4)
-    assert load_partitioned_array(
-        partitions, "target_mean_estimates"
-    ).shape == (4, 3, len(CURRENT_FEATURE_NAMES))
-
-
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -440,6 +363,13 @@ def test_combined_test_set_contract_exposes_neutral_target_arrays(tmp_path):
             "cap-after-selection caches are invalid",
         ),
         (
+            lambda payload: payload["test_set"]["generation_manifest"]
+            ["catalog_sampling"]["eligibility"]["image_snr"].__setitem__(
+                "minimum", 5.0
+            ),
+            "eligibility.image_snr",
+        ),
+        (
             lambda payload: payload["test_set"][
                 "generation_manifest"
             ].__setitem__("sample_count", 3),
@@ -456,126 +386,39 @@ def test_compact_test_set_contract_fails_closed(tmp_path, mutation, message):
         load_cache_partitions(root)
 
 
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda payload: payload["test_set"].__setitem__(
-                "posterior_candidate_weighting", "tf_importance"
-            ),
-            "posterior_candidate_weighting",
-        ),
-        (
-            lambda payload: payload["test_set"].__setitem__(
-                "inclination_importance_weighting", False
-            ),
-            "inclination_importance_weighting",
-        ),
-        (
-            lambda payload: payload["test_set"]["inclination_prior"].__setitem__(
-                "training", "uniform_cosi"
-            ),
-            "inclination_prior",
-        ),
-        (
-            lambda payload: payload["test_set"]["inclination_prior"].__setitem__(
-                "resampling", True
-            ),
-            "inclination_prior",
-        ),
-        (
-            lambda payload: payload["test_set"]["inclination_prior"].__setitem__(
-                "bounds", [0.1, 1.0]
-            ),
-            "inclination_prior",
-        ),
-        (
-            lambda payload: payload["physical_parameter_ranges"].__setitem__(
-                "sini", [0.1, 1.0]
-            ),
-            "physical_parameter_ranges.sini",
-        ),
-        (
-            lambda payload: payload["test_set"]["generation_manifest"][
-                "parameter_sampling"
-            ]["inclination"].pop("transform"),
-            "parameter_sampling.inclination",
-        ),
-        (
-            lambda payload: payload["test_set"]["generation_manifest"][
-                "parameter_sampling"
-            ]["inclination"].__setitem__("distribution", "sini_uniform"),
-            "parameter_sampling.inclination",
-        ),
-        (
-            lambda payload: payload["files"].__setitem__(
-                "posterior_tf_log_weight",
-                "posterior_tf_log_weight/part0of2.npy",
-            ),
-            "extra=.*posterior_tf_log_weight",
-        ),
-    ],
-)
-def test_combined_test_set_contract_fails_closed(
-    tmp_path, mutation, message
-):
+def test_compact_test_set_contract_requires_direct_cosi_manifest(tmp_path):
     root = _write_cache(
-        tmp_path / "combined-test-cache",
-        schema=COMBINED_TEST_SET_CACHE_SCHEMA,
+        tmp_path / "test-cache", schema=TEST_SET_CACHE_SCHEMA
     )
-    _mutate_manifest(root, 0, 2, mutation)
-    with pytest.raises(ValueError, match=message):
+
+    def remove_transform(payload):
+        payload["test_set"]["generation_manifest"]["parameter_sampling"][
+            "inclination"
+        ].pop("transform")
+
+    _mutate_manifest(root, 0, 2, remove_transform)
+    with pytest.raises(ValueError, match="parameter_sampling.inclination"):
         load_cache_partitions(root)
 
 
-@pytest.mark.parametrize(
-    ("source_schema", "declared_schema"),
-    [
-        (TEST_SET_CACHE_SCHEMA, COMBINED_TEST_SET_CACHE_SCHEMA),
-        (COMBINED_TEST_SET_CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA),
-    ],
-)
-def test_test_set_schema_and_weighting_metadata_cannot_be_mixed(
-    tmp_path, source_schema, declared_schema
-):
+def test_compact_test_set_contract_rejects_sini_target_range(tmp_path):
     root = _write_cache(
-        tmp_path / "mixed-test-cache",
-        total=1,
-        schema=source_schema,
+        tmp_path / "test-cache", schema=TEST_SET_CACHE_SCHEMA
     )
-    _mutate_manifest(
-        root,
-        0,
-        1,
-        lambda payload: payload.__setitem__("schema", declared_schema),
-    )
-    with pytest.raises(ValueError, match="posterior_candidate_weighting"):
-        load_cache_partitions(root)
 
+    def replace_cosi(payload):
+        ranges = payload["physical_parameter_ranges"]
+        ranges["sini"] = ranges.pop("cosi")
+        payload["feature_names"][3] = "sini"
 
-@pytest.mark.parametrize(
-    ("name", "shape"),
-    [
-        ("posterior_target_log_weight", (2, 4, 1)),
-        ("posterior_target_ess", (2, 1)),
-        ("target_mean_estimates", (2, len(CURRENT_FEATURE_NAMES))),
-    ],
-)
-def test_combined_test_set_contract_rejects_wrong_array_shapes(
-    tmp_path, name, shape
-):
-    root = _write_cache(
-        tmp_path / f"bad-{name}",
-        schema=COMBINED_TEST_SET_CACHE_SCHEMA,
-    )
-    np.save(root / name / "part0of2.npy", np.zeros(shape, dtype=np.float32))
-    with pytest.raises(ValueError, match=rf"{name}.*expected"):
+    _mutate_manifest(root, 0, 2, replace_cosi)
+    with pytest.raises(ValueError, match="feature_names"):
         load_cache_partitions(root)
 
 
 @pytest.mark.parametrize(
     "schema",
-    [CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA, COMBINED_TEST_SET_CACHE_SCHEMA],
+    [CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA],
 )
 def test_current_contract_rejects_reordered_physical_parameter_ranges(
     tmp_path, schema

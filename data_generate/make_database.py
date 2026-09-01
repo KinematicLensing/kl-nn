@@ -17,9 +17,17 @@ from astropy.io import fits
 from argparse import ArgumentParser
 
 try:
-    from .observation_schema import observation_metadata_arrays
+    from .observation_schema import (
+        DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
+        DEFAULT_IMAGE_SNR_RANGE,
+        observation_metadata_arrays,
+    )
 except ImportError:  # Support direct execution from data_generate/.
-    from observation_schema import observation_metadata_arrays
+    from observation_schema import (
+        DEFAULT_CENTRAL_HALPHA_SNR_RANGE,
+        DEFAULT_IMAGE_SNR_RANGE,
+        observation_metadata_arrays,
+    )
 
 
 def parse_args(argv=None):
@@ -118,6 +126,7 @@ def validate_generation_manifest(sample_path, expected_sample_count):
         'redshift',
         'tf',
         'catalog_sampling',
+        'parameter_sampling',
         'sample_table',
     }
     missing = sorted(required - payload.keys())
@@ -198,6 +207,20 @@ def validate_generation_manifest(sample_path, expected_sample_count):
                 'Generation manifest catalog_sampling.eligibility.hlr.'
                 f'{name} must equal {float(expected_bound)!r}'
             )
+    for name, expected_range in (
+        ('image_snr', DEFAULT_IMAGE_SNR_RANGE),
+        ('halpha_snr', DEFAULT_CENTRAL_HALPHA_SNR_RANGE),
+    ):
+        expected_eligibility = {
+            'finite': True,
+            'minimum': expected_range[0],
+            'maximum': expected_range[1],
+        }
+        if eligibility.get(name) != expected_eligibility:
+            raise ValueError(
+                'Generation manifest catalog_sampling.eligibility.'
+                f'{name} must equal {expected_eligibility!r}'
+            )
     legacy_hlr_cap_fields = {
         'eligible_hlr_capped_count',
         'selected_hlr_capped_count',
@@ -206,6 +229,19 @@ def validate_generation_manifest(sample_path, expected_sample_count):
         raise ValueError(
             'Generation manifest uses legacy HLR cap-after-selection '
             'provenance; regenerate with the inclusive HLR eligibility cut'
+        )
+    parameter_sampling = payload['parameter_sampling']
+    expected_inclination = {
+        'distribution': 'cosi_uniform_0_1_latin_hypercube',
+        'transform': 'sini=sqrt(1-cosi**2)',
+    }
+    if (
+        not isinstance(parameter_sampling, dict)
+        or parameter_sampling.get('inclination') != expected_inclination
+    ):
+        raise ValueError(
+            'Generation manifest parameter_sampling.inclination must equal '
+            f'{expected_inclination!r}'
         )
     sample_table = payload['sample_table']
     if not isinstance(sample_table, dict):

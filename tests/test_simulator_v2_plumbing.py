@@ -48,7 +48,11 @@ def test_wrapper_forwards_only_current_simulator_inputs():
         "--central-halpha-snr=37.0",
     ):
         assert item in command
-    assert SIMULATION_PARAMETERS == tuple(config.TARGET_NAMES[:8])
+    assert SIMULATION_PARAMETERS == (
+        *config.TARGET_NAMES[:3],
+        "sini",
+        *config.TARGET_NAMES[4:8],
+    )
     assert not any("version" in item or "fiber-layout" in item or "low_psf" in item for item in command)
     assert not any("dx_" in item or "dy_" in item for item in command)
 
@@ -81,6 +85,7 @@ def test_database_fiducials_are_exactly_nine_targets_in_current_order():
                 for name, (low, high) in config.par_ranges.items()
             }
         )
+        row["sini"] = np.sqrt(1.0 - row.pop("cosi") ** 2)
         rows.append(row)
     normalized = normalize_sample_table(pd.DataFrame(rows), config.par_ranges)
     fids = extract_fiducial_parameters(normalized, [2, 0], config.TARGET_NAMES)
@@ -165,8 +170,8 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert '--model-root "${MODEL_ROOT}"' in npe
     pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
     assert '--model-root "${MODEL_ROOT}"' in pretrain
-    assert "train_1m_simv3_galaxyaxis_central_halpha/" in pretrain
-    assert "valid_100k_simv3_galaxyaxis_central_halpha/" in pretrain
+    assert "train_1m_simv3_cosi/" in pretrain
+    assert "valid_100k_simv3_cosi/" in pretrain
     assert "simv2" not in pretrain
     assert "Missing current nine-target dataset" in pretrain
     generate = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()

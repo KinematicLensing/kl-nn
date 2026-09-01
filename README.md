@@ -21,7 +21,7 @@ The broad simulation proposal does not impose a TF relation. The nine
 posterior targets are:
 
 ```text
-g1, g2, theta_int, sini, v0, vcirc, rscale, hlr, halpha_flux_true
+g1, g2, theta_int, cosi, v0, vcirc, rscale, hlr, halpha_flux_true
 ```
 
 The only scalar observation context is perfect knowledge of:

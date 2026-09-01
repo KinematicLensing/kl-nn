@@ -71,7 +71,11 @@ def test_proposal_has_eight_targets_plus_independent_observation_controls():
 def test_halpha_is_lhs_uniform_in_log_flux_and_snrs_are_linear_uniform():
     count = 257
     samples = generate_samples(count, seed=381)
+    assert DEFAULT_IMAGE_SNR_RANGE == (10.0, 1000.0)
+    assert DEFAULT_CENTRAL_HALPHA_SNR_RANGE == (1.0, 150.0)
+    cosi = np.sqrt(np.maximum(0.0, 1.0 - samples["sini"] ** 2))
     quantities = (
+        (cosi, (0.0, 1.0)),
         (
             np.log10(samples[HALPHA_FLUX_TRUE_COLUMN]),
             DEFAULT_HALPHA_LOG10_FLUX_RANGE,
@@ -102,7 +106,7 @@ def test_generation_is_seed_reproducible_and_cli_has_no_schema_switches():
     assert not hasattr(args, "halpha_flux_min")
     assert args.nsamples == 100_000
     assert args.output.endswith(
-        "samples_train_1m_simv3_galaxyaxis_central_halpha.csv"
+        "train_1m_simv3_cosi.csv"
     )
     for removed in (
         "--rmag-min", "--rmag-max", "--halpha-flux-min", "--halpha-flux-max"

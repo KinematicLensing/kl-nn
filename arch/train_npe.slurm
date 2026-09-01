@@ -11,6 +11,12 @@
 set -euo pipefail
 ulimit -c 0
 
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/arch/train_model.py" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+
 module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
@@ -37,13 +43,13 @@ MIN_LR="${MIN_LR:-0.00001}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-20}"
 EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.001}"
 GRADIENT_CLIP_NORM="${GRADIENT_CLIP_NORM:-1.0}"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3/}"
+TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_cosi/}"
+VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_NAME="${MODEL_NAME:-CNN-CNN-Meta-bounded-hybrid-simv3-r90_1m_s${SEED}_${JOB_TAG}}"
+MODEL_NAME="${MODEL_NAME:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_1m_s${SEED}_${JOB_TAG}}"
 PRETRAIN_CHECKPOINT="${MODEL_ROOT}/${PRETRAINED_NAME}/${PRETRAINED_NAME}${PRETRAIN_FROM}"
 
 if [[ ! -f "${PRETRAIN_CHECKPOINT}" ]]; then
@@ -62,7 +68,7 @@ echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
 
-cd /jet/home/xwang30/kl-nn/arch
+cd "${KLNN_REPO_ROOT}/arch"
 python train_model.py \
     --stage npe \
     --train-data "${TRAIN_DATA}" \

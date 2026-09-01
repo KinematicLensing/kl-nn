@@ -58,6 +58,10 @@ def test_current_target_ranges_and_transforms_are_immutable():
     assert tuple(config.TARGET_TRANSFORMS) == config.TARGET_NAMES
     assert config.TARGET_TRANSFORMS["halpha_flux_true"] == "log10"
     assert set(config.TARGET_TRANSFORMS.values()) == {"identity", "log10"}
+    assert config.MODEL_CONFIG.observation.image_snr_min == 10.0
+    assert config.MODEL_CONFIG.observation.image_snr_max == 1000.0
+    assert config.MODEL_CONFIG.observation.central_halpha_snr_min == 1.0
+    assert config.MODEL_CONFIG.observation.central_halpha_snr_max == 150.0
 
 
 @pytest.mark.parametrize(

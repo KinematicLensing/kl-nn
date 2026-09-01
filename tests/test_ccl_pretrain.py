@@ -14,7 +14,7 @@ FEATURE_NAMES = (
     "g1",
     "g2",
     "theta_int",
-    "sini",
+    "cosi",
     "v0",
     "vcirc",
     "rscale",
@@ -56,9 +56,9 @@ def _inputs():
     labels = torch.rand((8, len(FEATURE_NAMES)), generator=generator) * 2.0 - 1.0
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, features.shape[0]),
-        "image_snr": torch.linspace(5.0, 1000.0, features.shape[0]),
+        "image_snr": torch.linspace(10.0, 1000.0, features.shape[0]),
         "central_halpha_snr": torch.linspace(
-            1.0, 200.0, features.shape[0]
+            1.0, 150.0, features.shape[0]
         ),
     }
     return features, labels, context

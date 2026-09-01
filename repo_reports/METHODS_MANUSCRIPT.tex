@@ -30,7 +30,7 @@
 \begin{document}
 \maketitle
 \begin{center}
-\small\textbf{Monitored-source fingerprint:} \code{41e3bf8f652c99a0f70fc0c6440e0d9b9e7937f4cf9e6ff803119ddf26f8796d}
+\small\textbf{Monitored-source fingerprint:} \code{b7675dc757937b3b0ea8251f7aa0dc56aeb3a39a83cbb3e13c464ac2f90f4241}
 \end{center}
 
 
@@ -102,9 +102,9 @@ five random-number streams are spawned from one \code{SeedSequence}. This is a
 space-filling experimental design over a rectangular domain, not a draw from a
 measured galaxy population. In particular, it imposes no Tully--Fisher
 relation or other astrophysical covariance among size, luminosity, rotation
-speed, inclination, line flux, and shear. A uniform proposal in \code{sini} also
-must not be interpreted as the isotropic-orientation distribution, for which
-cosine inclination is uniform. These facts follow directly from
+speed, inclination, line flux, and shear. The inclination coordinate is uniform
+in \code{cosi}, matching the isotropic-orientation distribution. It is converted to
+\code{sini = sqrt(1 - cosi**2)} only at the forward-renderer boundary. These facts follow directly from
 \href{../data_generate/latin_hypercube.py}{\code{generate_samples}} and the immutable
 schema in \href{../arch/config.py}{\code{config.py}}.
 
@@ -221,7 +221,7 @@ the ordering, bounds, and transforms are fixed by \code{TARGET_NAMES},
 \(g_1\) & \([-0.1,0.1]\) & linear & Cartesian reduced-shear component \\
 \(g_2\) & \([-0.1,0.1]\) & linear & Cartesian reduced-shear component \\
 \(\theta_\mathrm{int}\) & \([-\pi,\pi]\) rad & linear and periodic & intrinsic disk position angle \\
-\(\sin i\) & \([0,1]\) & linear & sine of disk inclination \\
+\(\cos i\) & \([0,1]\) & linear & cosine of disk inclination; converted to \(\sin i\) for rendering \\
 \(v_0\) & \([-30,30]\) km s\(^{-1}\) & linear & systemic line-of-sight velocity \\
 \(v_\mathrm{circ}\) & \([60,540]\) km s\(^{-1}\) & linear & asymptotic speed of the arctangent rotation curve \\
 \(R_\mathrm{vscale}\) (\code{rscale}) & \([0.1,5]\) arcsec & linear & turnover radius of the rotation curve \\
@@ -234,8 +234,8 @@ the ordering, bounds, and transforms are fixed by \code{TARGET_NAMES},
 The proposal table also carries three non-target observation descriptors.
 \code{rmag_true} is stratified over \([15,23.4]\); the upper bound coincides with
 the nominal 5-sigma \code{r}-band depth quoted for the Legacy Surveys by \hyperlink{ref:dey2019}{Dey et al. (2019)}, but the full interval is a repository choice rather than a
-catalog selection function. \code{image_snr} is stratified over \([5,1000]\), and
-\code{central_halpha_snr} over \([1,200]\). The latter two values survive into FITS
+catalog selection function. \code{image_snr} is stratified over \([10,1000]\), and
+\code{central_halpha_snr} over \([1,150]\). The latter two values survive into FITS
 and LMDB metadata but are replaced by new uniform draws during every training
 epoch; \code{rmag_true} is retained. At held-out inference, the stored S/N fields are
 used instead. The generation definitions are in

@@ -40,7 +40,7 @@ except ImportError:
 SAMPLE_ROOT = "/ocean/projects/phy250048p/shared/samples"
 DEFAULT_OUTPUT = join(
     SAMPLE_ROOT,
-    "samples_train_1m_simv3_galaxyaxis_central_halpha.csv",
+    "train_1m_simv3_cosi.csv",
 )
 PARAMETER_LIMITS = {
     "g1": (-0.1, 0.1),

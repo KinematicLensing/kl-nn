@@ -100,8 +100,8 @@ def test_central_halpha_noise_uses_requested_snr_and_count_exposure_scaling():
 
 
 def test_observation_levels_validate_explicit_record_backed_snrs():
-    requested_image = torch.tensor([5.0, 250.0, 1000.0])
-    requested_line = torch.tensor([1.0, 75.0, 200.0])
+    requested_image = torch.tensor([10.0, 250.0, 1000.0])
+    requested_line = torch.tensor([1.0, 75.0, 150.0])
     image_snr, line_snr = build_observation_levels(
         requested_image, requested_line
     )
@@ -111,9 +111,9 @@ def test_observation_levels_validate_explicit_record_backed_snrs():
     with pytest.raises(ValueError, match="matching shapes"):
         build_observation_levels(requested_image, requested_line[:2])
     with pytest.raises(ValueError, match="image_snr"):
-        build_observation_levels(torch.tensor([4.9]), torch.tensor([1.0]))
+        build_observation_levels(torch.tensor([9.9]), torch.tensor([1.0]))
     with pytest.raises(ValueError, match="central_halpha_snr"):
-        build_observation_levels(torch.tensor([5.0]), torch.tensor([200.1]))
+        build_observation_levels(torch.tensor([10.0]), torch.tensor([150.1]))
 
 
 def test_record_validation_requires_current_nine_target_schema():
@@ -147,6 +147,6 @@ def test_record_validation_requires_current_nine_target_schema():
         validate_observation_record(bad, location="training record 2")
 
     bad = dict(record)
-    bad["central_halpha_snr"] = torch.tensor(201.0)
+    bad["central_halpha_snr"] = torch.tensor(151.0)
     with pytest.raises(ValueError, match="central_halpha_snr"):
         validate_observation_record(bad, location="training record 2")

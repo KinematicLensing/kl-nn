@@ -12,7 +12,8 @@
 set -eo pipefail
 ulimit -c 0
 
-source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch cache-posteriors
 
 module load anaconda3
@@ -31,7 +32,6 @@ NSAMPLES="${NSAMPLES:-10000}"
 SEED="${SEED:-42}"
 CACHE_TAG="${CACHE_TAG:-}"
 TEST_SET="${TEST_SET:-0}"
-ISOTROPIC_INCLINATION_PRIOR="${ISOTROPIC_INCLINATION_PRIOR:-0}"
 DATASET_MANIFEST="${DATASET_MANIFEST:-}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
@@ -53,14 +53,6 @@ if (( NSAMPLES <= 0 || NSAMPLES % 2 != 0 )); then
 fi
 if [[ "${TEST_SET}" != "0" && "${TEST_SET}" != "1" ]]; then
     echo "TEST_SET must be 0 or 1" >&2
-    exit 2
-fi
-if [[ "${ISOTROPIC_INCLINATION_PRIOR}" != "0" && "${ISOTROPIC_INCLINATION_PRIOR}" != "1" ]]; then
-    echo "ISOTROPIC_INCLINATION_PRIOR must be 0 or 1" >&2
-    exit 2
-fi
-if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" && "${TEST_SET}" != "1" ]]; then
-    echo "ISOTROPIC_INCLINATION_PRIOR=1 requires TEST_SET=1" >&2
     exit 2
 fi
 if [[ -z "${CACHE_TAG}" ]]; then
@@ -100,21 +92,14 @@ if [[ "${TEST_SET}" == "1" ]]; then
         ARGS+=(--dataset-manifest "${DATASET_MANIFEST}")
     fi
 fi
-if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" ]]; then
-    ARGS+=(--isotropic-inclination-prior)
-fi
 
 echo "model=${MODEL_NAME} epoch=${EPOCH:-best}"
 echo "dataset=${DATASET} partition=${PART_INDEX}/${NPARTS} ngals=${NGALS} nsamples=${NSAMPLES}"
 if [[ "${TEST_SET}" == "1" ]]; then
-    if [[ "${ISOTROPIC_INCLINATION_PRIOR}" == "1" ]]; then
-        echo "cache_tag=${CACHE_TAG}_tf_iso_inclination; mode=test_set; saving TF + isotropic-inclination-weighted Mean summaries, physical shear candidates, combined log weights, and ESS diagnostics"
-    else
-        echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
-    fi
+    echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
 else
     echo "cache_tag=${CACHE_TAG}; mode=proposal_and_tf; saving base candidates, posterior TF weights, and raw population TF log ratios"
 fi
 
-cd /jet/home/xwang30/kl-nn/arch
+cd "${KLNN_REPO_ROOT}/arch"
 python cache_posteriors.py "${ARGS[@]}"

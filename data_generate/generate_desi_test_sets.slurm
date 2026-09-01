@@ -13,7 +13,12 @@
 set -eo pipefail
 ulimit -c 0
 
-source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch desi-test-samples
 
 module load anaconda3
@@ -58,7 +63,7 @@ fi
 
 CUT="${SAMPLE_CUTS[${TASK_INDEX}]}"
 CATALOG="${CATALOG_ROOT}/xu_sample_${CUT}_fullfootprint.fits"
-CANONICAL_SAMPLE_NAME="test_100k_simv3_xu${CUT}_tf"
+CANONICAL_SAMPLE_NAME="test_100k_simv3_cosi_xu${CUT}_tf"
 OUTPUT="${SAMPLE_ROOT}/${CANONICAL_SAMPLE_NAME}.csv"
 MANIFEST="${SAMPLE_ROOT}/${CANONICAL_SAMPLE_NAME}.manifest.json"
 SEED="$((BASE_SEED + CUT))"
@@ -72,7 +77,7 @@ if [[ "${ALLOW_OVERWRITE}" != "1" && ( -e "${OUTPUT}" || -e "${MANIFEST}" ) ]]; 
     exit 2
 fi
 
-cd /jet/home/xwang30/kl-nn/data_generate
+cd "${KLNN_REPO_ROOT}/data_generate"
 python latin_hypercube.py \
     --test-set \
     --nsamples="${TOTAL}" \

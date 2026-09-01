@@ -199,7 +199,6 @@ def load_test_set_generation_manifest(
     dataset_size: int,
     tf_prior: TFPrior,
     hlr_bounds: tuple[float, float] | list[float],
-    require_isotropic_inclination: bool = False,
 ) -> dict:
     """Fail closed on the generation provenance asserted by test-set mode."""
 
@@ -303,6 +302,32 @@ def load_test_set_generation_manifest(
                 "generation manifest catalog_sampling.eligibility.hlr."
                 f"{name} must equal {float(expected_bound)!r}"
             )
+    for name, expected_range in (
+        (
+            "image_snr",
+            (
+                config.observation["image_snr_min"],
+                config.observation["image_snr_max"],
+            ),
+        ),
+        (
+            "halpha_snr",
+            (
+                config.observation["central_halpha_snr_min"],
+                config.observation["central_halpha_snr_max"],
+            ),
+        ),
+    ):
+        expected_eligibility = {
+            "finite": True,
+            "minimum": float(expected_range[0]),
+            "maximum": float(expected_range[1]),
+        }
+        if eligibility.get(name) != expected_eligibility:
+            raise ValueError(
+                "generation manifest catalog_sampling.eligibility."
+                f"{name} must equal {expected_eligibility!r}"
+            )
     sample_table = payload["sample_table"]
     for name in ("path", "sha256", "id_policy"):
         if not isinstance(sample_table.get(name), str) or not sample_table[name]:
@@ -349,17 +374,16 @@ def load_test_set_generation_manifest(
                 f"generation manifest tf.{name} must equal {value!r}"
             )
 
-    if require_isotropic_inclination:
-        inclination = payload["parameter_sampling"].get("inclination")
-        expected_inclination = {
-            "distribution": "cosi_uniform_0_1_latin_hypercube",
-            "transform": "sini=sqrt(1-cosi**2)",
-        }
-        if inclination != expected_inclination:
-            raise ValueError(
-                "isotropic inclination prior requires generation manifest "
-                f"parameter_sampling.inclination={expected_inclination!r}"
-            )
+    inclination = payload["parameter_sampling"].get("inclination")
+    expected_inclination = {
+        "distribution": "cosi_uniform_0_1_latin_hypercube",
+        "transform": "sini=sqrt(1-cosi**2)",
+    }
+    if inclination != expected_inclination:
+        raise ValueError(
+            "generation manifest must declare the uniform-cosi inclination "
+            f"proposal {expected_inclination!r}"
+        )
 
     embedded = dict(payload)
     embedded["path"] = str(path.resolve())
@@ -693,10 +717,6 @@ def main(argv=None) -> None:
         )
     if args.test_set and args.matched_group_size != 1:
         raise ValueError("test-set caches require matched-group-size=1")
-    if args.isotropic_inclination_prior and not args.test_set:
-        raise ValueError(
-            "--isotropic-inclination-prior is only valid with --test-set"
-        )
     if not args.test_set and args.dataset_manifest is not None:
         raise ValueError("--dataset-manifest is only valid with --test-set")
     if not 0.0 <= args.warn_ess_fraction <= 1.0:
@@ -715,7 +735,6 @@ def main(argv=None) -> None:
             f"current posterior schema requires 9 targets, got {feature_names}"
         )
     vcirc_index = resolve_feature_index(feature_names, "vcirc")
-    sini_index = resolve_feature_index(feature_names, "sini")
     vcirc_bounds = config.par_ranges["vcirc"]
     tf_prior = TFPrior(
         slope=args.tf_slope,
@@ -723,11 +742,6 @@ def main(argv=None) -> None:
         scatter_dex=args.tf_scatter_dex,
         vcirc_min=float(vcirc_bounds[0]),
         vcirc_max=float(vcirc_bounds[1]),
-    )
-    sini_bounds = config.par_ranges["sini"]
-    inclination_prior = InclinationPrior(
-        sini_min=float(sini_bounds[0]),
-        sini_max=float(sini_bounds[1]),
     )
 
     device = resolve_device(args.device)
@@ -753,9 +767,6 @@ def main(argv=None) -> None:
             dataset_size=len(dataset),
             tf_prior=tf_prior,
             hlr_bounds=config.par_ranges["hlr"],
-            require_isotropic_inclination=(
-                args.isotropic_inclination_prior
-            ),
         )
     start, end = resolve_partition_range(
         args.partition_index, args.ngals, len(dataset)
@@ -899,30 +910,14 @@ def main(argv=None) -> None:
         target_transforms=config.TARGET_TRANSFORMS,
     ).astype(np.float32, copy=False)
     if args.test_set:
-        if args.isotropic_inclination_prior:
-            tf_log_ratio = tf_log_prior_ratio(
-                np.asarray(samples[..., vcirc_index], dtype=np.float64),
-                rmag_true[:, None],
-                tf_prior,
-            )
-            inclination_log_ratio = isotropic_inclination_log_prior_ratio(
-                np.asarray(samples[..., sini_index], dtype=np.float64),
-                inclination_prior,
-            )
-            importance = posterior_importance_from_log_ratio(
-                tf_log_ratio + inclination_log_ratio
-            )
-            target_summary_name = "target_mean_estimates"
-        else:
-            importance = posterior_importance_weights(
-                samples[..., vcirc_index], rmag_true, tf_prior
-            )
-            target_summary_name = "tf_target_mean_estimates"
+        importance = posterior_importance_weights(
+            samples[..., vcirc_index], rmag_true, tf_prior
+        )
         summaries = {
             "proposal_mean_estimates": proposal_mean_summaries(
                 samples, feature_names
             ),
-            target_summary_name: target_mean_summaries(
+            "tf_target_mean_estimates": target_mean_summaries(
                 samples, importance.weight, feature_names
             ),
         }
@@ -955,11 +950,7 @@ def main(argv=None) -> None:
     assert importance is not None
     low_ess = importance.effective_sample_fraction < args.warn_ess_fraction
     if np.any(low_ess):
-        weighting_label = (
-            "combined TF + isotropic-inclination"
-            if args.isotropic_inclination_prior
-            else "TF"
-        )
+        weighting_label = "TF"
         logging.warning(
             "%d/%d galaxies have posterior %s ESS fraction below %.3f; "
             "minimum %.5f",
@@ -973,8 +964,6 @@ def main(argv=None) -> None:
     dataset_name = dataset_path.name
     if args.cache_tag:
         dataset_name += f"_{args.cache_tag.strip('_')}"
-    if args.isotropic_inclination_prior:
-        dataset_name += "_tf_iso_inclination"
     output_root = args.cache_root / args.model_name / dataset_name
     output_root.mkdir(parents=True, exist_ok=True)
     common_arrays = {
@@ -1002,46 +991,25 @@ def main(argv=None) -> None:
                 "proposal_mean_estimates"
             ].astype(np.float32),
         }
-        if args.isotropic_inclination_prior:
-            arrays = {
-                **test_set_common_arrays,
-                "posterior_target_log_weight": importance.log_weight.astype(
-                    np.float32
-                ),
-                "posterior_target_ess": (
-                    importance.effective_sample_size.astype(np.float64)
-                ),
-                "posterior_target_ess_fraction": (
-                    importance.effective_sample_fraction.astype(np.float64)
-                ),
-                "posterior_target_max_weight": importance.max_weight.astype(
-                    np.float64
-                ),
-                "target_mean_estimates": summaries[
-                    "target_mean_estimates"
-                ].astype(np.float32),
-            }
-            array_types = COMBINED_TEST_SET_CACHE_ARRAY_TYPES
-        else:
-            arrays = {
-                **test_set_common_arrays,
-                "posterior_tf_log_weight": importance.log_weight.astype(
-                    np.float32
-                ),
-                "posterior_tf_ess": importance.effective_sample_size.astype(
-                    np.float64
-                ),
-                "posterior_tf_ess_fraction": (
-                    importance.effective_sample_fraction.astype(np.float64)
-                ),
-                "posterior_tf_max_weight": importance.max_weight.astype(
-                    np.float64
-                ),
-                "tf_target_mean_estimates": summaries[
-                    "tf_target_mean_estimates"
-                ].astype(np.float32),
-            }
-            array_types = TEST_SET_CACHE_ARRAY_TYPES
+        arrays = {
+            **test_set_common_arrays,
+            "posterior_tf_log_weight": importance.log_weight.astype(
+                np.float32
+            ),
+            "posterior_tf_ess": importance.effective_sample_size.astype(
+                np.float64
+            ),
+            "posterior_tf_ess_fraction": (
+                importance.effective_sample_fraction.astype(np.float64)
+            ),
+            "posterior_tf_max_weight": importance.max_weight.astype(
+                np.float64
+            ),
+            "tf_target_mean_estimates": summaries[
+                "tf_target_mean_estimates"
+            ].astype(np.float32),
+        }
+        array_types = TEST_SET_CACHE_ARRAY_TYPES
     else:
         assert base_log_prob is not None
         assert importance is not None
@@ -1105,9 +1073,7 @@ def main(argv=None) -> None:
     analysis_mode = (
         TEST_SET_ANALYSIS_MODE if args.test_set else STANDARD_ANALYSIS_MODE
     )
-    if args.isotropic_inclination_prior:
-        cache_schema = COMBINED_TEST_SET_CACHE_SCHEMA
-    elif args.test_set:
+    if args.test_set:
         cache_schema = TEST_SET_CACHE_SCHEMA
     else:
         cache_schema = CACHE_SCHEMA
@@ -1161,6 +1127,14 @@ def main(argv=None) -> None:
             "central_halpha_snr_distribution": config.observation[
                 "central_halpha_snr_distribution"
             ],
+            "image_snr_min": float(config.observation["image_snr_min"]),
+            "image_snr_max": float(config.observation["image_snr_max"]),
+            "central_halpha_snr_min": float(
+                config.observation["central_halpha_snr_min"]
+            ),
+            "central_halpha_snr_max": float(
+                config.observation["central_halpha_snr_max"]
+            ),
             "center_exposure_s": float(
                 config.observation["center_exposure_s"]
             ),
@@ -1200,37 +1174,6 @@ def main(argv=None) -> None:
             "stored within-galaxy log-softmax of posterior_log_ratio"
         )
         ess_manifest_name = "posterior_tf_ess"
-        if args.isotropic_inclination_prior:
-            inclination_metadata = {
-                "training": "uniform_sini",
-                "target": "uniform_cosi_0_1",
-                "parameter": "sini",
-                "composition": (
-                    "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
-                ),
-                "resampling": False,
-                "bounds": [
-                    float(inclination_prior.sini_min),
-                    float(inclination_prior.sini_max),
-                ],
-            }
-            test_set_metadata.update(
-                posterior_candidate_weighting=(
-                    "tf_x_isotropic_inclination_importance"
-                ),
-                inclination_importance_weighting=True,
-                inclination_prior=inclination_metadata,
-            )
-            posterior_description = (
-                "TF-conformed isotropic-inclination catalog truth / "
-                "TF + isotropic-inclination-weighted posterior"
-            )
-            posterior_log_weight_description = (
-                "TF component is not stored separately; the compact cache "
-                "stores the within-galaxy log-softmax after adding the "
-                "isotropic-inclination log-ratio"
-            )
-            ess_manifest_name = "posterior_target_ess"
         manifest.update(
             {
                 "tf": {

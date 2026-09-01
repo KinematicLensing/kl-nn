@@ -1,6 +1,6 @@
 # KL-NN simulator-v3 methods manuscript
 
-<!-- klnn-methods-source-sha256: 0df40b67c1af44a267307ca29b78257d393c4b5e60a3fd19245deb788dd08584 -->
+<!-- klnn-methods-source-sha256: b7675dc757937b3b0ea8251f7aa0dc56aeb3a39a83cbb3e13c464ac2f90f4241 -->
 
 > **Living-document status.** This manuscript describes the simulator-v3
 > working tree on 2026-08-28. The implementation, rather than this prose, is
@@ -68,9 +68,9 @@ five random-number streams are spawned from one `SeedSequence`. This is a
 space-filling experimental design over a rectangular domain, not a draw from a
 measured galaxy population. In particular, it imposes no Tully--Fisher
 relation or other astrophysical covariance among size, luminosity, rotation
-speed, inclination, line flux, and shear. A uniform proposal in `sini` also
-must not be interpreted as the isotropic-orientation distribution, for which
-cosine inclination is uniform. These facts follow directly from
+speed, inclination, line flux, and shear. The inclination coordinate is uniform
+in `cosi`, matching the isotropic-orientation distribution. It is converted to
+`sini = sqrt(1 - cosi**2)` only at the forward-renderer boundary. These facts follow directly from
 [`generate_samples`](../data_generate/latin_hypercube.py) and the immutable
 schema in [`config.py`](../arch/config.py).
 
@@ -182,7 +182,7 @@ the ordering, bounds, and transforms are fixed by `TARGET_NAMES`,
 | \(g_1\) | \([-0.1,0.1]\) | linear | Cartesian reduced-shear component |
 | \(g_2\) | \([-0.1,0.1]\) | linear | Cartesian reduced-shear component |
 | \(\theta_\mathrm{int}\) | \([-\pi,\pi]\) rad | linear and periodic | intrinsic disk position angle |
-| \(\sin i\) | \([0,1]\) | linear | sine of disk inclination |
+| \(\cos i\) | \([0,1]\) | linear | cosine of disk inclination; converted to \(\sin i\) for rendering |
 | \(v_0\) | \([-30,30]\) km s\(^{-1}\) | linear | systemic line-of-sight velocity |
 | \(v_\mathrm{circ}\) | \([60,540]\) km s\(^{-1}\) | linear | asymptotic speed of the arctangent rotation curve |
 | \(R_\mathrm{vscale}\) (`rscale`) | \([0.1,5]\) arcsec | linear | turnover radius of the rotation curve |
@@ -193,8 +193,8 @@ The proposal table also carries three non-target observation descriptors.
 `rmag_true` is stratified over \([15,23.4]\); the upper bound coincides with
 the nominal 5-sigma `r`-band depth quoted for the Legacy Surveys by [Dey et al.
 (2019)](#dey2019), but the full interval is a repository choice rather than a
-catalog selection function. `image_snr` is stratified over \([5,1000]\), and
-`central_halpha_snr` over \([1,200]\). The latter two values survive into FITS
+catalog selection function. `image_snr` is stratified over \([10,1000]\), and
+`central_halpha_snr` over \([1,150]\). The latter two values survive into FITS
 and LMDB metadata but are replaced by new uniform draws during every training
 epoch; `rmag_true` is retained. At held-out inference, the stored S/N fields are
 used instead. The generation definitions are in

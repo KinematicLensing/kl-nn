@@ -19,7 +19,7 @@ FEATURE_NAMES = (
     "g1",
     "g2",
     "theta_int",
-    "sini",
+    "cosi",
     "v0",
     "vcirc",
     "rscale",
@@ -105,10 +105,10 @@ def _observations(batch_size=1, dtype=torch.float64):
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, batch_size, dtype=dtype),
         "image_snr": torch.linspace(
-            5.0, 1000.0, batch_size, dtype=dtype
+            10.0, 1000.0, batch_size, dtype=dtype
         ),
         "central_halpha_snr": torch.linspace(
-            1.0, 200.0, batch_size, dtype=dtype
+            1.0, 150.0, batch_size, dtype=dtype
         ),
     }
     return image, spectra, positions, context

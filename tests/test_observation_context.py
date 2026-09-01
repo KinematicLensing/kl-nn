@@ -48,8 +48,8 @@ class _RecordingFlow(nn.Module):
 def _oracle_context(batch_size=3):
     return {
         "rmag_true": torch.linspace(15.0, 23.4, batch_size),
-        "image_snr": torch.linspace(5.0, 1000.0, batch_size),
-        "central_halpha_snr": torch.linspace(1.0, 200.0, batch_size),
+        "image_snr": torch.linspace(10.0, 1000.0, batch_size),
+        "central_halpha_snr": torch.linspace(1.0, 150.0, batch_size),
     }
 
 
@@ -85,8 +85,8 @@ def test_mapping_and_tensor_contexts_share_field_order_and_normalization():
     reference = torch.zeros((3, FEATURE_DIM), dtype=torch.float64)
     mapping = {
         "rmag_true": torch.tensor([15.0, 19.2, 23.4]),
-        "image_snr": torch.tensor([5.0, 502.5, 1000.0]),
-        "central_halpha_snr": torch.tensor([1.0, 100.5, 200.0]),
+        "image_snr": torch.tensor([10.0, 505.0, 1000.0]),
+        "central_halpha_snr": torch.tensor([1.0, 75.5, 150.0]),
     }
     tensor = torch.stack([mapping[name] for name in ORACLE_CONTEXT_FIELDS], dim=-1)
 
@@ -109,8 +109,8 @@ def test_scalar_and_singleton_columns_expand_to_batch():
     result = normalizer(
         {
             "rmag_true": 19.2,
-            "image_snr": torch.tensor([[502.5], [502.5]]),
-            "central_halpha_snr": 100.5,
+            "image_snr": torch.tensor([[505.0], [505.0]]),
+            "central_halpha_snr": 75.5,
         },
         2,
         reference,
@@ -152,7 +152,7 @@ def test_scalar_and_singleton_columns_expand_to_batch():
         (
             {
                 "rmag_true": torch.tensor([18.0, 19.0]),
-                "image_snr": torch.tensor([5.0, 0.0]),
+                "image_snr": torch.tensor([10.0, 0.0]),
                 "central_halpha_snr": torch.ones(2),
             },
             "must be positive",

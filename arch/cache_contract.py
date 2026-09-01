@@ -21,14 +21,12 @@ import numpy as np
 CACHE_SCHEMA = "klnn-posterior-cache-v2"
 LEGACY_CACHE_SCHEMA = "klnn-posterior-cache-v1"
 TEST_SET_CACHE_SCHEMA = "klnn-posterior-cache-test-v2"
-COMBINED_TEST_SET_CACHE_SCHEMA = "klnn-posterior-cache-test-v3"
 STANDARD_ANALYSIS_MODE = "proposal_and_tf"
 TEST_SET_ANALYSIS_MODE = "test_set"
 SUPPORTED_CACHE_SCHEMAS = (
     LEGACY_CACHE_SCHEMA,
     CACHE_SCHEMA,
     TEST_SET_CACHE_SCHEMA,
-    COMBINED_TEST_SET_CACHE_SCHEMA,
 )
 CURRENT_FEATURE_NAMES = (
     "g1",
@@ -63,6 +61,10 @@ EXPECTED_OBSERVATION_MODEL = {
     ),
     "image_snr_distribution": "uniform",
     "central_halpha_snr_distribution": "uniform",
+    "image_snr_min": 10.0,
+    "image_snr_max": 1000.0,
+    "central_halpha_snr_min": 1.0,
+    "central_halpha_snr_max": 150.0,
     "center_exposure_s": 180.0,
     "offset_exposure_s": 600.0,
 }
@@ -109,21 +111,6 @@ TEST_SET_REQUIRED_CACHE_ARRAYS = (
     "central_spectral_noise_sigma",
     "proposal_mean_estimates",
     "tf_target_mean_estimates",
-)
-COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS = (
-    "shear_sample",
-    "posterior_target_log_weight",
-    "posterior_target_ess",
-    "posterior_target_ess_fraction",
-    "posterior_target_max_weight",
-    "truth",
-    "rmag_true",
-    "image_snr",
-    "central_halpha_snr",
-    "image_noise_sigma",
-    "central_spectral_noise_sigma",
-    "proposal_mean_estimates",
-    "target_mean_estimates",
 )
 EXPECTED_SYMMETRY = {
     "policy": "original_plus_r90_equal_mixture",
@@ -276,8 +263,7 @@ def _validate_populations(
 def _analysis_mode(payload: dict[str, Any], schema: str, path: Path) -> str:
     expected = (
         TEST_SET_ANALYSIS_MODE
-        if schema in {TEST_SET_CACHE_SCHEMA, COMBINED_TEST_SET_CACHE_SCHEMA}
-        else STANDARD_ANALYSIS_MODE
+        if schema == TEST_SET_CACHE_SCHEMA else STANDARD_ANALYSIS_MODE
     )
     value = payload.get("analysis_mode", expected)
     if value != expected:
@@ -292,16 +278,10 @@ def _validate_test_set(
     test_set: dict[str, Any],
     path: Path,
     physical_parameter_ranges: dict[str, Any],
-    schema: str,
 ) -> None:
-    combined_weighting = schema == COMBINED_TEST_SET_CACHE_SCHEMA
     expected_values = {
         "population": "tf_conformed_catalog",
-        "posterior_candidate_weighting": (
-            "tf_x_isotropic_inclination_importance"
-            if combined_weighting
-            else "tf_importance"
-        ),
+        "posterior_candidate_weighting": "tf_importance",
         "population_weighting": "uniform",
         "point_estimator": "mean",
         "map_computed": False,
@@ -311,35 +291,15 @@ def _validate_test_set(
         "snr_policy": "used_as_stored_without_redraw_or_clipping",
         "stored_candidate_parameters": ["g1", "g2"],
     }
-    if combined_weighting:
-        expected_values["inclination_importance_weighting"] = True
     for name, expected in expected_values.items():
         if test_set.get(name) != expected:
             raise _fail(path, f"test_set.{name} must equal {expected!r}")
 
-    if combined_weighting:
-        expected_inclination_prior = {
-            "training": "uniform_sini",
-            "target": "uniform_cosi_0_1",
-            "parameter": "sini",
-            "composition": (
-                "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
-            ),
-            "resampling": False,
-            "bounds": [0.0, 1.0],
-        }
-        if test_set.get("inclination_prior") != expected_inclination_prior:
-            raise _fail(
-                path,
-                "test_set.inclination_prior must equal "
-                f"{expected_inclination_prior!r}",
-            )
-        if physical_parameter_ranges.get("sini") != [0.0, 1.0]:
-            raise _fail(
-                path,
-                "physical_parameter_ranges.sini must equal [0.0, 1.0] "
-                "for isotropic-inclination importance weighting",
-            )
+    if physical_parameter_ranges.get("cosi") != [0.0, 1.0]:
+        raise _fail(
+            path,
+            "physical_parameter_ranges.cosi must equal [0.0, 1.0]",
+        )
 
     generation = test_set.get("generation_manifest")
     if not isinstance(generation, dict):
@@ -378,20 +338,19 @@ def _validate_test_set(
                 path,
                 f"test_set.generation_manifest.{name} must be an object",
             )
-    if combined_weighting:
-        expected_generation_inclination = {
-            "distribution": "cosi_uniform_0_1_latin_hypercube",
-            "transform": "sini=sqrt(1-cosi**2)",
-        }
-        generation_inclination = generation["parameter_sampling"].get(
-            "inclination"
+    expected_generation_inclination = {
+        "distribution": "cosi_uniform_0_1_latin_hypercube",
+        "transform": "sini=sqrt(1-cosi**2)",
+    }
+    generation_inclination = generation["parameter_sampling"].get(
+        "inclination"
+    )
+    if generation_inclination != expected_generation_inclination:
+        raise _fail(
+            path,
+            "test_set.generation_manifest.parameter_sampling.inclination "
+            f"must equal {expected_generation_inclination!r}",
         )
-        if generation_inclination != expected_generation_inclination:
-            raise _fail(
-                path,
-                "test_set.generation_manifest.parameter_sampling.inclination "
-                f"must equal {expected_generation_inclination!r}",
-            )
     catalog_sampling = generation["catalog_sampling"]
     eligibility = catalog_sampling.get("eligibility")
     if not isinstance(eligibility, dict):
@@ -425,6 +384,30 @@ def _validate_test_set(
             "test_set generation HLR eligibility must equal "
             f"{expected_hlr_policy!r}; cap-after-selection caches are invalid",
         )
+    for name, expected_policy in (
+        (
+            "image_snr",
+            {
+                "finite": True,
+                "minimum": EXPECTED_OBSERVATION_MODEL["image_snr_min"],
+                "maximum": EXPECTED_OBSERVATION_MODEL["image_snr_max"],
+            },
+        ),
+        (
+            "halpha_snr",
+            {
+                "finite": True,
+                "minimum": EXPECTED_OBSERVATION_MODEL["central_halpha_snr_min"],
+                "maximum": EXPECTED_OBSERVATION_MODEL["central_halpha_snr_max"],
+            },
+        ),
+    ):
+        if eligibility.get(name) != expected_policy:
+            raise _fail(
+                path,
+                "test_set generation eligibility."
+                f"{name} must equal {expected_policy!r}",
+            )
     forbidden_hlr_cap_fields = {
         "eligible_hlr_capped_count",
         "selected_hlr_capped_count",
@@ -495,8 +478,6 @@ def _required_cache_arrays(schema: str) -> tuple[str, ...]:
         return LEGACY_REQUIRED_CACHE_ARRAYS
     if schema == TEST_SET_CACHE_SCHEMA:
         return TEST_SET_REQUIRED_CACHE_ARRAYS
-    if schema == COMBINED_TEST_SET_CACHE_SCHEMA:
-        return COMBINED_TEST_SET_REQUIRED_CACHE_ARRAYS
     return REQUIRED_CACHE_ARRAYS
 
 
@@ -692,11 +673,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         feature_names = payload.get("feature_names")
         if not isinstance(feature_names, list) or tuple(feature_names) != CURRENT_FEATURE_NAMES:
             raise _fail(path, f"feature_names must equal {CURRENT_FEATURE_NAMES!r}")
-        if schema in {
-            CACHE_SCHEMA,
-            TEST_SET_CACHE_SCHEMA,
-            COMBINED_TEST_SET_CACHE_SCHEMA,
-        }:
+        if schema in {CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA}:
             parameter_ranges = _require_mapping(
                 payload, "physical_parameter_ranges", path
             )
@@ -729,11 +706,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
                 )
             expected_density = (
                 EXPECTED_TEST_SET_DENSITY_COORDINATES
-                if schema in {
-                    TEST_SET_CACHE_SCHEMA,
-                    COMBINED_TEST_SET_CACHE_SCHEMA,
-                }
-                else EXPECTED_DENSITY_COORDINATES
+                if schema == TEST_SET_CACHE_SCHEMA else EXPECTED_DENSITY_COORDINATES
             )
             if payload.get("density_coordinates") != expected_density:
                 raise _fail(
@@ -778,7 +751,6 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
                 test_set,
                 path,
                 payload["physical_parameter_ranges"],
-                schema,
             )
             relation_fields = {
                 name: tf[name]
@@ -823,11 +795,7 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
             invariant["tf"] = _canonical(tf)
         if test_set is not None:
             invariant["test_set"] = _canonical(test_set)
-        if schema in {
-            CACHE_SCHEMA,
-            TEST_SET_CACHE_SCHEMA,
-            COMBINED_TEST_SET_CACHE_SCHEMA,
-        }:
+        if schema in {CACHE_SCHEMA, TEST_SET_CACHE_SCHEMA}:
             invariant.update(
                 {
                     "physical_parameter_ranges": _canonical(

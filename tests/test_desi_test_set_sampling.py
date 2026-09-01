@@ -41,8 +41,8 @@ def _write_catalog(path: Path) -> dict[str, np.ndarray]:
             (18.0, 19.0, 14.9, 21.0, 21.0, 21.0, 22.0, 23.4, np.nan, 20, 20, 20)
         ),
         "hlr": np.asarray((1.0, 6.0, 2.0, 0.1, 2.0, 0.05, 4.0, 5.0, 2, 2, 2, np.nan)),
-        "img_snr": np.asarray((10, 20, 30, 5.0, 30, 30, 1000, 5, 30, np.inf, 30, 30)),
-        "halpha_snr": np.asarray((2, 3, 4, 4, np.nan, 4, 200, 1, 4, 4, 201, 4)),
+        "img_snr": np.asarray((10, 20, 30, 10, 30, 30, 1000, 10, 30, np.inf, 30, 30)),
+        "halpha_snr": np.asarray((2, 3, 4, 4, np.nan, 4, 150, 1, 4, 4, 151, 4)),
         # Row 0 has zero weight and row 7 has NaN.  Both remain eligible because
         # this field is provenance, not a sampling or downstream analysis weight.
         "xu_effective_weight": np.asarray((0, 1, 1, 1, 1, 1, 0.2, np.nan, 1, 1, 1, 1)),
@@ -137,6 +137,20 @@ def test_catalog_test_set_preserves_joint_rows_filters_hlr_and_conforms_tf(tmp_p
         "maximum": 5.0,
         "bounds": "inclusive",
     }
+    assert manifest["catalog_sampling"]["eligibility"]["image_snr"] == {
+        "finite": True,
+        "minimum": 10.0,
+        "maximum": 1000.0,
+    }
+    assert manifest["catalog_sampling"]["eligibility"]["halpha_snr"] == {
+        "finite": True,
+        "minimum": 1.0,
+        "maximum": 150.0,
+    }
+    assert manifest["parameter_sampling"]["inclination"] == {
+        "distribution": "cosi_uniform_0_1_latin_hypercube",
+        "transform": "sini=sqrt(1-cosi**2)",
+    }
     assert "eligible_hlr_capped_count" not in manifest["catalog_sampling"]
     assert "selected_hlr_capped_count" not in manifest["catalog_sampling"]
     assert (
@@ -211,6 +225,51 @@ def test_database_rejects_legacy_hlr_cap_manifest(tmp_path):
         validate_generation_manifest(sample_path, 4)
 
 
+def test_database_rejects_stale_snr_eligibility(tmp_path):
+    catalog = tmp_path / "catalog.fits"
+    _write_catalog(catalog)
+    samples, manifest = generate_test_set_samples(
+        4,
+        catalog=str(catalog),
+        seed=34,
+        catalog_block_size=4,
+    )
+    sample_path = tmp_path / "test_population.csv"
+    samples.to_csv(sample_path, index_label="ID")
+    manifest_path = write_generation_manifest(manifest, sample_path)
+    payload = json.loads(manifest_path.read_text())
+    payload["catalog_sampling"]["eligibility"]["image_snr"][
+        "minimum"
+    ] = 5.0
+    manifest_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="eligibility.image_snr"):
+        validate_generation_manifest(sample_path, 4)
+
+
+def test_database_rejects_non_cosi_generation_manifest(tmp_path):
+    catalog = tmp_path / "catalog.fits"
+    _write_catalog(catalog)
+    samples, manifest = generate_test_set_samples(
+        4,
+        catalog=str(catalog),
+        seed=33,
+        catalog_block_size=4,
+    )
+    sample_path = tmp_path / "test_population.csv"
+    samples.to_csv(sample_path, index_label="ID")
+    manifest_path = write_generation_manifest(manifest, sample_path)
+    payload = json.loads(manifest_path.read_text())
+    payload["parameter_sampling"]["inclination"] = {
+        "distribution": "sini_uniform_0_1_latin_hypercube",
+        "transform": "identity",
+    }
+    manifest_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="parameter_sampling.inclination"):
+        validate_generation_manifest(sample_path, 4)
+
+
 def test_test_set_cli_requires_catalog_and_explicit_output():
     with pytest.raises(SystemExit):
         parse_args(["--test-set"])
@@ -244,6 +303,6 @@ def test_production_launcher_uses_canonical_cut_names_and_seeds():
     assert 'REQUESTED_TOTAL="${TOTAL:-${PRODUCTION_TOTAL}}"' in launcher
     assert '[[ "${REQUESTED_TOTAL}" != "${PRODUCTION_TOTAL}" ]]' in launcher
     assert '[[ -n "${SAMPLE_NAME:-}" ]]' in launcher
-    assert 'CANONICAL_SAMPLE_NAME="test_100k_simv3_xu${CUT}_tf"' in launcher
+    assert 'CANONICAL_SAMPLE_NAME="test_100k_simv3_cosi_xu${CUT}_tf"' in launcher
     assert 'SAMPLE_NAME="${SAMPLE_NAME:-' not in launcher
     assert 'SEED="$((BASE_SEED + CUT))"' in launcher

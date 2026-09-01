@@ -82,6 +82,7 @@ def test_database_normalization_uses_registry_and_preserves_metadata():
             name: 0.5 * (low + high)
             for name, (low, high) in config.par_ranges.items()
         }
+        row["sini"] = np.sqrt(1.0 - row.pop("cosi") ** 2)
         row["halpha_flux_true"] = flux
         row["image_snr"] = 317.0
         row["expected"] = expected
@@ -93,6 +94,32 @@ def test_database_normalization_uses_registry_and_preserves_metadata():
     )
     np.testing.assert_array_equal(normalized["image_snr"], physical["image_snr"])
     np.testing.assert_array_equal(normalized["expected"], physical["expected"])
+
+
+def test_database_materializes_and_normalizes_cosi_from_simulator_sini():
+    base = {
+        name: 0.5 * (low + high)
+        for name, (low, high) in config.par_ranges.items()
+        if name != "cosi"
+    }
+    physical = pd.DataFrame([base, base, base])
+    physical["sini"] = [1.0, np.sqrt(0.75), 0.0]
+
+    normalized = normalize_sample_table(physical, config.par_ranges)
+
+    np.testing.assert_allclose(normalized["cosi"], [-1.0, 0.0, 1.0], atol=1e-15)
+
+
+@pytest.mark.parametrize("bad_sini", (-0.1, 1.1, np.nan))
+def test_database_rejects_invalid_simulator_sini(bad_sini):
+    row = {
+        name: 0.5 * (low + high)
+        for name, (low, high) in config.par_ranges.items()
+        if name != "cosi"
+    }
+    row["sini"] = bad_sini
+    with pytest.raises(ValueError, match="sini values"):
+        normalize_sample_table(pd.DataFrame([row]), config.par_ranges)
 
 
 @pytest.mark.parametrize("bad", (0.0, -1.0, np.nan))

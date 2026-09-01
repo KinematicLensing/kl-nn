@@ -58,7 +58,7 @@ class PretrainConfig:
     eps: float = 1e-8
     batch_size: int = 100
     model_path: str = "/ocean/projects/phy250048p/shared/models/"
-    model_name: str = "CNN-CNN-Meta-CCL-simv3-r90"
+    model_name: str = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
     use_amp: bool = False
     amp_dtype: str = "float16"
     use_compile: bool = False
@@ -88,8 +88,8 @@ class TrainConfig:
     batch_size: int = 50
     feature_names: list[str] = field(default_factory=lambda: list(TARGET_NAMES))
     model_path: str = "/ocean/projects/phy250048p/shared/models/"
-    model_name: str = "CNN-CNN-Meta-bounded-hybrid-simv3-r90"
-    pretrained_name: str = "CNN-CNN-Meta-CCL-simv3-r90"
+    model_name: str = "CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90"
+    pretrained_name: str = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
     pretrain_from: int | str = "best"
     use_amp: bool = False
     amp_dtype: str = "float16"
@@ -359,7 +359,7 @@ def _default_model_config() -> ModelConfig:
             nspec=5,
             data_dir=(
                 "/ocean/projects/phy250048p/shared/datasets/"
-                "train_1m_simv3_galaxyaxis_central_halpha/"
+                "train_1m_simv3_cosi/"
             ),
         ),
         test=DatasetConfig(
@@ -367,7 +367,7 @@ def _default_model_config() -> ModelConfig:
             nspec=5,
             data_dir=(
                 "/ocean/projects/phy250048p/shared/datasets/"
-                "valid_100k_simv3_galaxyaxis_central_halpha/"
+                "valid_100k_simv3_cosi/"
             ),
         ),
         par_ranges={

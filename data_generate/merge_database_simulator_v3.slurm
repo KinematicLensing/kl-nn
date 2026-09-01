@@ -13,7 +13,12 @@
 set -eo pipefail
 ulimit -c 0
 
-source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch simulator-v3-merge
 
 module load anaconda3
@@ -21,8 +26,8 @@ source ~/.bashrc
 conda activate kl-nn
 set -u
 
-SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3}"
-DATASET_NAME="${DATASET_NAME:-train_1m_simv3}"
+SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_cosi}"
+DATASET_NAME="${DATASET_NAME:-train_1m_simv3_cosi}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 
@@ -32,7 +37,7 @@ if (( TOTAL <= 0 || CHUNK_SIZE <= 0 || TOTAL % CHUNK_SIZE != 0 )); then
 fi
 PART_COUNT="$((TOTAL / CHUNK_SIZE))"
 
-cd /jet/home/xwang30/kl-nn/data_generate
+cd "${KLNN_REPO_ROOT}/data_generate"
 python make_database.py \
     -s="${SAMPLE_NAME}" \
     -d="${DATASET_NAME}" \

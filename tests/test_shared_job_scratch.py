@@ -31,9 +31,14 @@ def test_shared_scratch_helper_is_syntax_valid_and_scoped():
 
 
 def test_every_xu_pipeline_launcher_installs_shared_scratch_cleanup():
-    source = "source /jet/home/xwang30/kl-nn/shared_job_scratch.sh"
+    source = 'source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"'
+    root_default = (
+        'KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-'
+        '${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"'
+    )
     for launcher in LAUNCHERS:
         subprocess.run(["bash", "-n", str(launcher)], check=True)
         text = launcher.read_text(encoding="utf-8")
+        assert text.count(root_default) == 1
         assert text.count(source) == 1
         assert text.count("setup_shared_job_scratch ") == 1

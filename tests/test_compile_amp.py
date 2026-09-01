@@ -140,8 +140,8 @@ def test_npe_amp_keeps_encoder_autocast_but_runs_flow_and_loss_in_float32():
     batch_size = 4
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, batch_size),
-        "image_snr": torch.linspace(5.0, 1000.0, batch_size),
-        "central_halpha_snr": torch.linspace(1.0, 200.0, batch_size),
+        "image_snr": torch.linspace(10.0, 1000.0, batch_size),
+        "central_halpha_snr": torch.linspace(1.0, 150.0, batch_size),
     }
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -213,10 +213,10 @@ def _cuda_observations(batch_size=8):
     context = {
         "rmag_true": torch.linspace(18.0, 21.0, batch_size, device=device),
         "image_snr": torch.linspace(
-            5.0, 1000.0, batch_size, device=device
+            10.0, 1000.0, batch_size, device=device
         ),
         "central_halpha_snr": torch.linspace(
-            1.0, 200.0, batch_size, device=device
+            1.0, 150.0, batch_size, device=device
         ),
     }
     return image, spectra, positions, targets, context

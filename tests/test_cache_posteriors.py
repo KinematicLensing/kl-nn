@@ -60,16 +60,6 @@ def test_cache_cli_rejects_unknown_options_and_has_one_sampling_surface():
     )
     assert test_args.test_set is True
     assert test_args.dataset_manifest == Path("d/manifest.json")
-    assert test_args.isotropic_inclination_prior is False
-    combined_args = module.parse_args(
-        [
-            "-i", "0", "--nparts", "1", "--ngals", "2",
-            "--model-name", "m", "--dataset", "d", "--test-set",
-            "--isotropic-inclination-prior",
-        ]
-    )
-    assert combined_args.test_set is True
-    assert combined_args.isotropic_inclination_prior is True
 
 
 def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
@@ -102,27 +92,6 @@ def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
         }
     )
 
-
-def test_combined_test_set_arrays_use_neutral_target_names():
-    module = _module()
-    assert set(module.COMBINED_TEST_SET_CACHE_ARRAY_TYPES) == {
-        "shear_sample",
-        "posterior_target_log_weight",
-        "posterior_target_ess",
-        "posterior_target_ess_fraction",
-        "posterior_target_max_weight",
-        "truth",
-        "rmag_true",
-        "image_snr",
-        "central_halpha_snr",
-        "image_noise_sigma",
-        "central_spectral_noise_sigma",
-        "proposal_mean_estimates",
-        "target_mean_estimates",
-    }
-    assert not any(
-        "tf" in name for name in module.COMBINED_TEST_SET_CACHE_ARRAY_TYPES
-    )
 
 
 def test_proposal_mean_summaries_use_equal_candidate_mass_and_circular_theta():
@@ -185,6 +154,16 @@ def _generation_manifest(sample_count=4):
                     "minimum": 0.1,
                     "maximum": 5.0,
                     "bounds": "inclusive",
+                },
+                "image_snr": {
+                    "finite": True,
+                    "minimum": 10.0,
+                    "maximum": 1000.0,
+                },
+                "halpha_snr": {
+                    "finite": True,
+                    "minimum": 1.0,
+                    "maximum": 150.0,
                 }
             },
         },
@@ -228,18 +207,6 @@ def test_test_set_generation_manifest_is_required_and_embedded(tmp_path):
     assert len(embedded["sha256"]) == 64
     assert embedded["source_catalog"]["path"] == "/catalog.fits"
 
-    combined = module.load_test_set_generation_manifest(
-        default,
-        dataset_size=4,
-        tf_prior=prior,
-        hlr_bounds=(0.1, 5.0),
-        require_isotropic_inclination=True,
-    )
-    assert (
-        combined["parameter_sampling"]["inclination"]["distribution"]
-        == "cosi_uniform_0_1_latin_hypercube"
-    )
-
     invalid = _generation_manifest(sample_count=3)
     default.write_text(json.dumps(invalid), encoding="utf-8")
     with np.testing.assert_raises_regex(ValueError, "sample_count"):
@@ -251,7 +218,7 @@ def test_test_set_generation_manifest_is_required_and_embedded(tmp_path):
         )
 
 
-def test_isotropic_cache_rejects_non_cosi_generation_manifest(tmp_path):
+def test_cache_rejects_non_cosi_generation_manifest(tmp_path):
     module = _module()
     path = tmp_path / "manifest.json"
     payload = _generation_manifest()
@@ -260,13 +227,12 @@ def test_isotropic_cache_rejects_non_cosi_generation_manifest(tmp_path):
         "transform": "identity",
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with np.testing.assert_raises_regex(ValueError, "isotropic inclination"):
+    with np.testing.assert_raises_regex(ValueError, "uniform-cosi inclination"):
         module.load_test_set_generation_manifest(
             path,
             dataset_size=4,
             tf_prior=module.TFPrior(),
             hlr_bounds=(0.1, 5.0),
-            require_isotropic_inclination=True,
         )
 
 
@@ -329,6 +295,23 @@ def test_generation_manifest_hlr_range_must_match_model_support(tmp_path):
     payload["catalog_sampling"]["eligibility"]["hlr"]["maximum"] = 4.9
     path.write_text(json.dumps(payload), encoding="utf-8")
     with np.testing.assert_raises_regex(ValueError, "hlr.maximum"):
+        module.load_test_set_generation_manifest(
+            path,
+            dataset_size=4,
+            tf_prior=module.TFPrior(),
+            hlr_bounds=(0.1, 5.0),
+        )
+
+
+def test_generation_manifest_snr_range_must_match_model_config(tmp_path):
+    module = _module()
+    path = tmp_path / "manifest.json"
+    payload = _generation_manifest()
+    payload["catalog_sampling"]["eligibility"]["halpha_snr"][
+        "maximum"
+    ] = 200.0
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with np.testing.assert_raises_regex(ValueError, "eligibility.halpha_snr"):
         module.load_test_set_generation_manifest(
             path,
             dataset_size=4,

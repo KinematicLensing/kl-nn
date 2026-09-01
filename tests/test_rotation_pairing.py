@@ -7,7 +7,7 @@ from train import make_ccl_training_batch, make_npe_training_batch
 
 
 FEATURES = (
-    "g1", "g2", "theta_int", "sini", "v0", "vcirc", "rscale", "hlr",
+    "g1", "g2", "theta_int", "cosi", "v0", "vcirc", "rscale", "hlr",
     "halpha_flux_true",
 )
 

@@ -12,6 +12,9 @@ central-fiber H-alpha flux after seeing/aperture losses and before instrument
 throughput, exposure, or noise. It is sampled log-uniformly from
 `1e-17` to `1e-14 erg s^-1 cm^-2` and normalized through `log10(flux)`.
 All other target transforms remain identity.
+Inclination is sampled uniformly in `cosi` on `[0, 1]`, which is also the
+inference target. The sample table converts it to `sini = sqrt(1 - cosi**2)`
+only at the simulator boundary.
 
 `kl-tools` converts the requested central-fiber flux to the total line flux
 once, using the central PSF-convolved aperture fraction, then builds the model
@@ -22,8 +25,8 @@ version (`HAFAPI=1`).
 Training draws the observation controls independently for every galaxy in
 every epoch:
 
-- `image_snr ~ Uniform(5, 1000)`
-- `central_halpha_snr ~ Uniform(1, 200)`
+- `image_snr ~ Uniform(10, 1000)`
+- `central_halpha_snr ~ Uniform(1, 150)`
 
 The same draw controls noise amplitude and the metadata supplied to the model.
 Validation uses deterministic epoch-zero draws so validation losses remain

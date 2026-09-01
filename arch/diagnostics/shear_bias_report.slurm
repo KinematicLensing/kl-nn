@@ -11,7 +11,12 @@
 set -euo pipefail
 ulimit -c 0
 
-source /jet/home/xwang30/kl-nn/shared_job_scratch.sh
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch shear-bias-report
 
 module load anaconda3
@@ -54,5 +59,5 @@ if [[ -n "${MAX_GALAXIES}" ]]; then
     ARGS+=(--max-galaxies "${MAX_GALAXIES}")
 fi
 
-cd /jet/home/xwang30/kl-nn/arch/diagnostics
+cd "${KLNN_REPO_ROOT}/arch/diagnostics"
 python shear_bias_report.py "${ARGS[@]}"

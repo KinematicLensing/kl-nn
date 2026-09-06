@@ -178,8 +178,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help=(
             "In compact test-set mode, additionally replace the uniform-sini "
-            "training prior with the isotropic uniform-cosi prior. The output "
-            "cache name receives a _tf_iso_inclination suffix."
+            "training prior with a stabilized approximation to the isotropic "
+            "uniform-cosi prior using denominator sqrt(1.1-sini**2). The "
+            "output cache name receives a _tf_iso_inclination suffix."
         ),
     )
     parser.add_argument("--matched-group-size", type=int, default=1)
@@ -1241,8 +1242,14 @@ def main(argv=None) -> None:
         if args.isotropic_inclination_prior:
             inclination_metadata = {
                 "training": "uniform_sini",
-                "target": "uniform_cosi_0_1",
+                "target": "stabilized_uniform_cosi_0_1",
                 "parameter": "sini",
+                "denominator_stabilizer": float(
+                    inclination_prior.denominator_stabilizer
+                ),
+                "denominator_constant": float(
+                    inclination_prior.denominator_constant
+                ),
                 "composition": (
                     "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
                 ),

@@ -320,8 +320,10 @@ def _validate_test_set(
     if combined_weighting:
         expected_inclination_prior = {
             "training": "uniform_sini",
-            "target": "uniform_cosi_0_1",
+            "target": "stabilized_uniform_cosi_0_1",
             "parameter": "sini",
+            "denominator_stabilizer": 0.1,
+            "denominator_constant": 1.1,
             "composition": (
                 "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
             ),

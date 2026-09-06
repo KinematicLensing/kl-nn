@@ -1,6 +1,6 @@
 # KL-NN simulator-v3 methods manuscript
 
-<!-- klnn-methods-source-sha256: 0df40b67c1af44a267307ca29b78257d393c4b5e60a3fd19245deb788dd08584 -->
+<!-- klnn-methods-source-sha256: 12f64769ea7b56e180ee33eb2516a0b0aaf4a4d0f977caca84fd60f2386bf8b4 -->
 
 > **Living-document status.** This manuscript describes the simulator-v3
 > working tree on 2026-08-28. The implementation, rather than this prose, is
@@ -148,7 +148,12 @@ TF ratio across the already-conformed rows. Test-set mode omits MAP
 optimization and stores TF-weighted 16th/Mean/84th summaries for all targets,
 physical ((g_1,g_2)) candidates, normalized candidate log weights, and
 candidate-weight diagnostics. The shear-bias report uses those candidate
-weights for posterior intervals, ranks, and shear variance. It starts with
+weights for posterior intervals, ranks, and shear variance. Shear P-P plots are
+ordinary one-dimensional probability-probability diagrams of the weighted
+posterior PIT of each shear component against the corresponding truth, with no
+binning of the true shear. Because the test-set shear proposal is still
+uniform, that diagnostic does not by itself distinguish a prior-dominated shear
+posterior from a well-calibrated informative one. The report starts with
 equal truth-galaxy mass. The unweighted test-set report retains that mass,
 whereas the weighted test-set report composes it with posterior precision
 regularized by a fixed ensemble shape-noise floor. Both report the Mean only.
@@ -327,9 +332,13 @@ image-coordinate convention
 \]
 
 It uses the left singular vectors of \(\mathbf T_\mathrm{fib}\) as the observed principal
-axes, fixes the sign of the first axis against the transformed intrinsic
-major-axis direction, and rotates the five centers into that basis. The
-equation above is a transcription of
+axes. The first-axis sign is chosen so that that vector has a positive projection
+on the image of the intrinsic major axis. The second-axis sign is then chosen so
+that the pair is right-handed, equivalently the minor axis is the 90-degree
+counterclockwise completion of the major axis. Anchoring only the first axis
+does not remove SVD's discrete reflection, which exchanges the two minor-axis
+fibers under an arbitrarily small shear. The five centers are rotated into that
+right-handed basis. The equation above is a transcription of
 [`compute_fiber_offsets`](../data_generate/observation_schema.py). It makes the
 fiber order galaxy-axis-relative rather than a fixed sky-axis order. The
 central-plus-four-offset geometry and asymmetric exposure strategy follow the

@@ -8,13 +8,18 @@ from inclination_prior import (
 )
 
 
-def test_full_support_ratio_matches_isotropic_jacobian():
+def test_full_support_ratio_matches_stabilized_isotropic_jacobian():
     prior = InclinationPrior()
     sini = np.asarray((0.1, 0.5, 0.9), dtype=np.float32)
 
     actual = isotropic_inclination_log_prior_ratio(sini, prior)
-    expected = np.log(sini.astype(np.float64)) - 0.5 * np.log1p(
-        -np.square(sini.astype(np.float64))
+    expected = (
+        np.log(sini.astype(np.float64))
+        - 0.5
+        * np.log(
+            prior.denominator_constant - np.square(sini.astype(np.float64))
+        )
+        + prior.log_ratio_normalization
     )
 
     assert actual.dtype == np.float64
@@ -38,13 +43,13 @@ def test_full_support_target_density_normalizes_and_zero_has_zero_density():
 def test_truncated_support_ratio_has_the_correct_normalization():
     prior = InclinationPrior(sini_min=0.2, sini_max=0.8)
     sini = np.asarray((0.2, 0.4, 0.8))
-    lower_cos = np.sqrt(1.0 - prior.sini_min**2)
-    upper_cos = np.sqrt(1.0 - prior.sini_max**2)
+    lower_term = np.sqrt(prior.denominator_constant - prior.sini_min**2)
+    upper_term = np.sqrt(prior.denominator_constant - prior.sini_max**2)
     expected_ratio = (
         sini
-        / np.sqrt(1.0 - sini**2)
+        / np.sqrt(prior.denominator_constant - sini**2)
         * (prior.sini_max - prior.sini_min)
-        / (lower_cos - upper_cos)
+        / (lower_term - upper_term)
     )
 
     actual = np.exp(isotropic_inclination_log_prior_ratio(sini, prior))
@@ -78,6 +83,12 @@ def test_invalid_support_is_rejected(sini_min, sini_max):
         InclinationPrior(sini_min=sini_min, sini_max=sini_max)
 
 
+@pytest.mark.parametrize("stabilizer", (0.0, -0.1, np.nan, np.inf))
+def test_invalid_denominator_stabilizer_is_rejected(stabilizer):
+    with pytest.raises(ValueError, match="denominator stabilizer"):
+        InclinationPrior(denominator_stabilizer=stabilizer)
+
+
 def test_values_outside_support_are_rejected_without_clipping():
     prior = InclinationPrior(sini_min=0.2, sini_max=0.8)
     with pytest.raises(ValueError, match="configured support"):
@@ -88,11 +99,17 @@ def test_values_outside_support_are_rejected_without_clipping():
         isotropic_inclination_log_prior_ratio(np.asarray((0.4, np.nan)), prior)
 
 
-def test_exact_full_support_singularity_is_rejected_without_capping():
-    with pytest.raises(ValueError, match="singular upper endpoint"):
-        isotropic_inclination_log_prior_ratio(
-            np.asarray((0.5, 1.0)), InclinationPrior()
-        )
+def test_exact_full_support_endpoint_is_finite_with_stabilizer():
+    prior = InclinationPrior()
+    result = isotropic_inclination_log_prior_ratio(
+        np.asarray((0.5, 1.0)), prior
+    )
+
+    assert np.all(np.isfinite(result))
+    assert result[-1] == pytest.approx(
+        -0.5 * np.log(prior.denominator_stabilizer)
+        + prior.log_ratio_normalization
+    )
 
 
 def test_truncated_upper_endpoint_is_finite():
@@ -105,4 +122,5 @@ def test_manifest_dict_records_exact_support():
     assert InclinationPrior(0.1, 0.9).to_dict() == {
         "sini_min": 0.1,
         "sini_max": 0.9,
+        "denominator_stabilizer": 0.1,
     }

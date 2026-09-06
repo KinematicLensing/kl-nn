@@ -270,8 +270,10 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                     "inclination_importance_weighting": True,
                     "inclination_prior": {
                         "training": "uniform_sini",
-                        "target": "uniform_cosi_0_1",
+                        "target": "stabilized_uniform_cosi_0_1",
                         "parameter": "sini",
+                        "denominator_stabilizer": 0.1,
+                        "denominator_constant": 1.1,
                         "composition": (
                             "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
                         ),
@@ -385,8 +387,10 @@ def test_combined_test_set_contract_exposes_neutral_target_arrays(tmp_path):
     assert partitions.mode_metadata["inclination_importance_weighting"] is True
     assert partitions.mode_metadata["inclination_prior"] == {
         "training": "uniform_sini",
-        "target": "uniform_cosi_0_1",
+        "target": "stabilized_uniform_cosi_0_1",
         "parameter": "sini",
+        "denominator_stabilizer": 0.1,
+        "denominator_constant": 1.1,
         "composition": (
             "added_to_tf_log_ratio_before_within_galaxy_log_softmax"
         ),

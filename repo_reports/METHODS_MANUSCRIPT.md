@@ -1,9 +1,9 @@
 # KL-NN simulator-v3 methods manuscript
 
-<!-- klnn-methods-source-sha256: b7675dc757937b3b0ea8251f7aa0dc56aeb3a39a83cbb3e13c464ac2f90f4241 -->
+<!-- klnn-methods-source-sha256: 81eb351455a2eeed57aff4fd6e2a659e789beb11055d7e4e7b57e0fc4033cdc1 -->
 
 > **Living-document status.** This manuscript describes the simulator-v3
-> working tree on 2026-08-28. The implementation, rather than this prose, is
+> working tree on 2026-09-05. The implementation, rather than this prose, is
 > normative. Repository-specific statements below therefore cite the source
 > files that define them; empirical or methodological statements cite the
 > literature. The source fingerprint above is checked by
@@ -148,7 +148,12 @@ TF ratio across the already-conformed rows. Test-set mode omits MAP
 optimization and stores TF-weighted 16th/Mean/84th summaries for all targets,
 physical ((g_1,g_2)) candidates, normalized candidate log weights, and
 candidate-weight diagnostics. The shear-bias report uses those candidate
-weights for posterior intervals, ranks, and shear variance. It starts with
+weights for posterior intervals, ranks, and shear variance. Shear P-P plots are
+ordinary one-dimensional probability-probability diagrams of the weighted
+posterior PIT of each shear component against the corresponding truth, with no
+binning of the true shear. Because the test-set shear proposal is still
+uniform, that diagnostic does not by itself distinguish a prior-dominated shear
+posterior from a well-calibrated informative one. The report starts with
 equal truth-galaxy mass. The unweighted test-set report retains that mass,
 whereas the weighted test-set report composes it with posterior precision
 regularized by a fixed ensemble shape-noise floor. Both report the Mean only.
@@ -160,7 +165,10 @@ statistical nonconformance is displayed as a failed audit without changing any
 analysis weight. The compact schema, cache writer, and report behavior are defined by
 [`cache_contract.py`](../arch/cache_contract.py),
 [`cache_posteriors.py`](../arch/cache_posteriors.py), and
-[`shear_bias_report.py`](../arch/diagnostics/shear_bias_report.py).
+[`shear_bias_report.py`](../arch/diagnostics/shear_bias_report.py). The cache
+Slurm launcher requires one array task per partition by default and accepts
+`ALLOW_PARTIAL_ARRAY=1` for a sparse resume of named task indices
+([`cache_posteriors.slurm`](../arch/cache_posteriors.slurm)).
 
 The `meta_pars["priors"]` block inside the FITS generator is metadata for
 the downstream `kl-tools` likelihood interface; it does not draw the simulated
@@ -327,9 +335,13 @@ image-coordinate convention
 \]
 
 It uses the left singular vectors of \(\mathbf T_\mathrm{fib}\) as the observed principal
-axes, fixes the sign of the first axis against the transformed intrinsic
-major-axis direction, and rotates the five centers into that basis. The
-equation above is a transcription of
+axes. The first-axis sign is chosen so that that vector has a positive projection
+on the image of the intrinsic major axis. The second-axis sign is then chosen so
+that the pair is right-handed, equivalently the minor axis is the 90-degree
+counterclockwise completion of the major axis. Anchoring only the first axis
+does not remove SVD's discrete reflection, which exchanges the two minor-axis
+fibers under an arbitrarily small shear. The five centers are rotated into that
+right-handed basis. The equation above is a transcription of
 [`compute_fiber_offsets`](../data_generate/observation_schema.py). It makes the
 fiber order galaxy-axis-relative rather than a fixed sky-axis order. The
 central-plus-four-offset geometry and asymmetric exposure strategy follow the
@@ -633,17 +645,31 @@ but this target-equivariant action is specific to the repository.
 ### Multimodal encoder
 
 The encoder consists of three independent branches whose outputs are directly
-concatenated into the condition vector
+concatenated into a 1,152-dimensional vector
 
 \[
-\mathbf c=
+\mathbf c_0=
 [\mathbf c_I,\mathbf c_S,\mathbf c_\mathrm{meta}]
 \in\mathbb R^{512+512+128}=\mathbb R^{1152}.
 \]
 
-There is no attention module or learned fusion layer after concatenation. The
-topology below is defined by [`ImgCNN`, `JointSpecCNN`, `MetadataMLP`, and
-`SimpleFusionFeatureExtractor`](../arch/networks.py). Residual blocks follow
+CCL pretraining uses \(\mathbf c_0\) as the backbone output. NPE then applies a
+bidirectional feature-wise linear modulation (FiLM; [Perez et al. 2018](#perez2018))
+of the image and spectral 512-d blocks before LayerNorm. Each branch predicts
+an affine \((\gamma,\beta)\) for the other from the pre-fusion vectors,
+
+\[
+\mathbf c_I'=(1+\gamma_S)\odot\mathbf c_I+\beta_S,\qquad
+\mathbf c_S'=(1+\gamma_I)\odot\mathbf c_S+\beta_I,
+\]
+
+and the metadata block is copied unchanged, so the flow still conditions on
+\(\mathbf c=[\mathbf c_I',\mathbf c_S',\mathbf c_\mathrm{meta}]\in\mathbb R^{1152}\).
+The FiLM maps are zero-initialized, hence the identity at the start of NPE, and
+they remain trainable when the CNN backbone is frozen. They are not part of the
+CCL checkpoint. The topology below is defined by [`ImgCNN`, `JointSpecCNN`,
+`MetadataMLP`, `SimpleFusionFeatureExtractor`, and
+`ImageSpectrumFilmFusion`](../arch/networks.py). Residual blocks follow
 the construction of [He et al. (2016)](#he2016), Batch Normalization follows
 [Ioffe and Szegedy (2015)](#ioffe2015), Layer Normalization follows [Ba, Kiros,
 and Hinton (2016)](#ba2016), and GELU follows [Hendrycks and Gimpel
@@ -652,14 +678,14 @@ and Hinton (2016)](#ba2016), and GELU follows [Hendrycks and Gimpel
 | Branch | Exact current topology | Output |
 |---|---|---:|
 | Image | Two `3x3` convolutions at 64 channels, each with BatchNorm and ReLU; `3x3` stride-2 max pool; four 128-channel residual blocks with downsampling in the fourth; five 256-channel residual blocks with downsampling in the fifth; five 512-channel residual blocks with downsampling in the fifth; final `3x3` average pool | 512 |
-| Spectrum | Conv pairs at 16, 32, 64, and 128 channels, each convolution followed by BatchNorm and ReLU and each pair followed by wavelength-only `1x2` max pooling; two 256-channel convolutions; final `5x4` convolution spanning every fiber and remaining wavelength bin | 512 |
+| Spectrum | Conv pairs at 16, 32, 64, and 128 channels, each convolution followed by BatchNorm and ReLU; wavelength-only `1x2` max pooling after the 16- and 32-channel pairs only; two 256-channel convolutions; final `5x16` convolution spanning every fiber and remaining wavelength bin | 512 |
 | Metadata | Concatenate ten scaled ordered fiber coordinates and three normalized contexts; `13 -> 64 -> 128`, GELU after both linear maps, then LayerNorm | 128 |
 
 The image branch reduces the spatial grid from 48 to 24, 12, 6, and 3 pixels
 before the final average pool. Each residual block contains two `3x3`
 convolutions; a `1x1` projection and BatchNorm are used on the shortcut when
 stride or channel count changes. The spectral branch pools only wavelength,
-reducing 64 bins to 4 before the final `5x4` kernel. It therefore models the
+reducing 64 bins to 16 before the final `5x16` kernel. It therefore models the
 five ordered fibers jointly and is not permutation invariant. These output
 shapes are checked at runtime by [`networks.py`](../arch/networks.py).
 
@@ -667,9 +693,10 @@ shapes are checked at runtime by [`networks.py`](../arch/networks.py).
 > image, a `5x64` ordered spectral plane, and 13 metadata scalars—feeding
 > encoders labeled 512, 512, and 128. Concatenate them into condition vector \(\mathbf c\) and
 > split the figure into two stages: above, the temporary 128-dimensional CCL
-> projection head; below, the trainable LayerNorm and hybrid box/circle
-> posterior flow. Mark the CNN backbone as trainable during CCL and frozen
-> during NPE.
+> projection head; below, the bidirectional FiLM mix of the 512+512 branches,
+> the trainable LayerNorm, and the hybrid box/circle posterior flow. Mark the
+> CNN backbone as trainable during CCL and frozen during NPE by default, and
+> mark the FiLM maps as NPE-only.
 
 ### Continuous-label contrastive pretraining
 
@@ -753,11 +780,20 @@ claim is conditional on this proposal, forward model, runtime noise process,
 and oracle context.
 
 The selected CCL checkpoint contributes only its 1,152-dimensional backbone.
-Every backbone parameter is frozen, and the feature extractor is forced to
-evaluation mode during NPE; the CNN is not jointly fine-tuned with the flow. A
-trainable LayerNorm acts on the frozen representation. Flow density arithmetic
-is evaluated with autocasting disabled, even when the CNN is evaluated under
-mixed precision. These operations are implemented in
+By default every backbone parameter is frozen, and the feature extractor is
+forced to evaluation mode during NPE, so the CNN is not jointly fine-tuned with
+the flow. The NPE launcher passes `--freeze-feature-extractor`. Passing
+`--no-freeze-feature-extractor` leaves those parameters trainable, keeps the
+extractor in training mode so BatchNorm statistics update, places unfrozen
+backbone weights in the NPE `shared` AdamW group, and, on more than one GPU,
+applies the same SyncBatchNorm conversion used in CCL pretraining. A trainable
+bidirectional FiLM mix of the image and spectral 512-d blocks, followed by a
+trainable LayerNorm, acts on the concatenated representation in either freeze
+setting. Those FiLM maps are NPE parameters, not CCL backbone weights.
+`--no-image-spectrum-fusion` replaces the mix with the identity so NPE
+conditions on the concatenated backbone output only. Flow
+density arithmetic is evaluated with autocasting disabled, even when the CNN is
+evaluated under mixed precision. These operations are implemented in
 [`load_train_objs`, `NPETrainer`, and `KLNPE`](../arch/train.py).
 
 The posterior respects the different supports of the targets through
@@ -842,6 +878,8 @@ in [`train.py`](../arch/train.py).
 | Augmentation per row | identity and R90 both used | fair random choice of identity or R90 |
 | Numerical modes | deterministic algorithms, fixed validation streams, FP16 AMP, channels-last tensors, `torch.compile` | same; flow density remains FP32 |
 | Seed | 42 unless overridden | 42 unless overridden |
+| Feature extractor | trainable | frozen by default (`--freeze-feature-extractor`) |
+| Image–spectrum fusion | none; concat only | bidirectional FiLM on 512+512, identity-initialized, trainable by default (`--image-spectrum-fusion`) |
 
 The row counts in this table are launcher requests for deterministic dataset
 prefixes, not evidence that a complete million-object dataset or a finished
@@ -1032,6 +1070,10 @@ estimation. *NeurIPS, 29*.
 <a id="pascanu2013"></a>**Pascanu, R., Mikolov, T., & Bengio, Y. (2013).** On
 the difficulty of training recurrent neural networks. *Proceedings of ICML,
 28*, 1310--1318. [Paper](https://proceedings.mlr.press/v28/pascanu13.html).
+
+<a id="perez2018"></a>**Perez, E., Strub, F., de Vries, H., Dumoulin, V., &
+Courville, A. (2018).** FiLM: Visual reasoning with a general conditioning
+layer. *AAAI*. [arXiv:1709.07871](https://arxiv.org/abs/1709.07871).
 
 <a id="pranjal2023"></a>**Pranjal, R. S., et al. (2023).** Kinematic lensing
 inference I: characterizing shape noise with simulated analyses. *MNRAS, 524*,

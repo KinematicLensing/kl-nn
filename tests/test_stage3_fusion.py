@@ -6,12 +6,16 @@ import pytest
 import torch
 from torch import nn
 
+import config
+import train
 from networks import (
     FEATURE_DIM,
     IMAGE_FEATURE_DIM,
     METADATA_FEATURE_DIM,
     SPECTRAL_FEATURE_DIM,
+    ImageSpectrumFilmFusion,
     JointSpecCNN,
+    KLNPE,
     MetadataMLP,
     SimpleFusionFeatureExtractor,
     build_feature_extractor,
@@ -127,6 +131,15 @@ def test_joint_spectral_cnn_requires_five_by_sixty_four_and_returns_512():
         encoder(torch.randn(2, 1, 4, 64))
     with pytest.raises(ValueError, match=r"5, 64"):
         encoder(torch.randn(2, 1, 5, 63))
+
+
+def test_joint_spectral_cnn_keeps_sixteen_wavelength_bins_before_the_final_kernel():
+    encoder = JointSpecCNN(nspec=5)
+    pools = [module for module in encoder.cnn_spec if isinstance(module, nn.MaxPool2d)]
+    assert len(pools) == 2
+    assert encoder.pooled_wavelength_count == 16
+    last_conv = [module for module in encoder.cnn_spec if isinstance(module, nn.Conv2d)][-1]
+    assert last_conv.kernel_size == (5, 16)
 
 
 @pytest.mark.parametrize(
@@ -324,3 +337,74 @@ def test_simple_fusion_state_dict_round_trip():
     assert not torch.allclose(original(*inputs), restored(*inputs))
     restored.load_state_dict(copy.deepcopy(original.state_dict()), strict=True)
     torch.testing.assert_close(original(*inputs), restored(*inputs))
+
+
+def test_film_fusion_is_identity_at_initialization():
+    fusion = ImageSpectrumFilmFusion()
+    features = torch.randn(4, FEATURE_DIM)
+    torch.testing.assert_close(fusion(features), features)
+
+
+def test_film_fusion_rejects_wrong_feature_width():
+    fusion = ImageSpectrumFilmFusion()
+    with pytest.raises(ValueError, match="1152"):
+        fusion(torch.randn(2, FEATURE_DIM - 1))
+
+
+def test_film_fusion_leaves_metadata_unmodulated_and_mixes_image_from_spectrum():
+    fusion = ImageSpectrumFilmFusion()
+    nn.init.normal_(fusion.spectral_to_image.weight, std=0.05)
+    nn.init.normal_(fusion.image_to_spectral.weight, std=0.05)
+    features = torch.randn(3, FEATURE_DIM)
+    fused = fusion(features)
+    meta = slice(IMAGE_FEATURE_DIM + SPECTRAL_FEATURE_DIM, FEATURE_DIM)
+    torch.testing.assert_close(fused[:, meta], features[:, meta])
+
+    perturbed = features.clone()
+    perturbed[:, IMAGE_FEATURE_DIM:IMAGE_FEATURE_DIM + SPECTRAL_FEATURE_DIM] += 1.5
+    fused_perturbed = fusion(perturbed)
+    assert not torch.allclose(
+        fused[:, :IMAGE_FEATURE_DIM],
+        fused_perturbed[:, :IMAGE_FEATURE_DIM],
+    )
+
+
+class _Tiny1152Extractor(nn.Module):
+    output_dim = FEATURE_DIM
+
+    def forward(
+        self,
+        image,
+        spectra,
+        fiber_positions,
+        observation_context,
+        fiber_mask=None,
+    ):
+        del spectra, fiber_positions, observation_context, fiber_mask
+        return image.new_zeros(image.shape[0], FEATURE_DIM)
+
+
+def test_klnpe_fusion_remains_trainable_when_the_extractor_is_frozen():
+    model = KLNPE(feature_extractor=_Tiny1152Extractor())
+    for parameter in model.feature_extractor.parameters():
+        parameter.requires_grad = False
+    assert all(parameter.requires_grad for parameter in model.fusion.parameters())
+    groups = train._npe_optimizer_parameters(
+        model,
+        {
+            "initial_learning_rate": 3e-4,
+            "non_theta_learning_rate": 2e-4,
+            "theta_learning_rate": 1e-4,
+        },
+    )
+    shared_ids = {id(parameter) for parameter in groups[0]["params"]}
+    fusion_ids = {id(parameter) for parameter in model.fusion.parameters()}
+    assert fusion_ids <= shared_ids
+    extractor_ids = {id(parameter) for parameter in model.feature_extractor.parameters()}
+    assert extractor_ids.isdisjoint(shared_ids)
+
+
+def test_klnpe_can_disable_image_spectrum_fusion(monkeypatch):
+    monkeypatch.setitem(config.train, "use_image_spectrum_fusion", False)
+    model = KLNPE(feature_extractor=_Tiny1152Extractor())
+    assert isinstance(model.fusion, nn.Identity)

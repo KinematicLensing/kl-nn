@@ -239,6 +239,14 @@ def test_multigpu_ccl_converts_batch_norm_and_checkpoint_remains_loadable():
     assert train._synchronize_pretrain_batch_norm(
         npe, train_mode="train", world_size=4
     ) is npe
+    unfrozen = _BatchNormBackbone()
+    synchronized_npe = train._synchronize_pretrain_batch_norm(
+        unfrozen,
+        train_mode="train",
+        world_size=4,
+        freeze_feature_extractor=False,
+    )
+    assert isinstance(synchronized_npe.image, nn.SyncBatchNorm)
 
 
 def _matched_analysis_records(
@@ -577,6 +585,58 @@ def test_optimizer_groups_are_unique_and_use_bounded_branch_rates():
         "non_theta_flow": pytest.approx(2e-4),
         "theta_transform": pytest.approx(1e-4),
     }
+
+
+def test_npe_optimizer_includes_unfrozen_feature_extractor_in_shared_group():
+    class _Extractor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+    class _Flow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.non_theta_flow = nn.Linear(2, 2)
+            self.theta_transform = nn.Linear(2, 1)
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.feature_extractor = _Extractor()
+            self.shared = nn.Linear(1, 2)
+            self.flow = _Flow()
+
+    model = _Model()
+    for parameter in model.feature_extractor.parameters():
+        parameter.requires_grad = False
+    frozen_groups = train._npe_optimizer_parameters(
+        model,
+        {
+            "initial_learning_rate": 3e-4,
+            "non_theta_learning_rate": 2e-4,
+            "theta_learning_rate": 1e-4,
+        },
+    )
+    frozen_ids = {
+        id(parameter)
+        for group in frozen_groups
+        for parameter in group["params"]
+    }
+    assert id(model.feature_extractor.weight) not in frozen_ids
+
+    for parameter in model.feature_extractor.parameters():
+        parameter.requires_grad = True
+    unfrozen_groups = train._npe_optimizer_parameters(
+        model,
+        {
+            "initial_learning_rate": 3e-4,
+            "non_theta_learning_rate": 2e-4,
+            "theta_learning_rate": 1e-4,
+        },
+    )
+    assert unfrozen_groups[0]["group_name"] == "shared"
+    shared_ids = {id(parameter) for parameter in unfrozen_groups[0]["params"]}
+    assert id(model.feature_extractor.weight) in shared_ids
 
 
 @pytest.mark.parametrize(

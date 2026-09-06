@@ -520,6 +520,19 @@ def test_flat_candidate_pp_ranks_use_tf_candidate_weights(tmp_path):
     np.testing.assert_allclose(target["g2_variance"], [1.24e-4])
 
 
+def test_unbinned_pp_ranks_include_samples_outside_former_truth_bins(tmp_path):
+    report = _report()
+    truth = np.zeros((1, len(FEATURES)), dtype=np.float32)
+    samples = np.zeros((1, 4, len(FEATURES)), dtype=np.float32)
+    samples[0, :, 0] = [-0.08, -0.06, -0.01, 0.01]
+    samples[0, :, 1] = samples[0, :, 0]
+    log_weight = np.log(np.full((1, 4), 0.25))
+    case = _manual_case(report, tmp_path, truth, samples, log_weight)
+    diagnostics = report.load_shear_posterior_diagnostics(case)
+    np.testing.assert_allclose(diagnostics["proposal"]["g1"], [0.75])
+    np.testing.assert_allclose(diagnostics["tf_target"]["g1"], [0.75])
+
+
 def test_theta_modality_uses_proposal_or_tf_posterior_mass(tmp_path):
     report = _report()
     truth = np.zeros((1, len(FEATURES)), dtype=np.float32)
@@ -891,6 +904,10 @@ def test_weighted_report_smoke_includes_regularization_and_nuisance_plot(tmp_pat
     assert "MAP diagnostics are omitted" in document
     assert "Conditional MAP calibration" not in document
     assert ">MAP<" not in document
+    assert "Prior-matched P-P diagnostic" in document
+    assert "ordinary one-dimensional P-P" in document
+    assert "no binning of the true shear" in document
+    assert "conditional P-P" not in document
 
 
 def test_test_set_cli_can_select_weighted_or_unweighted_ensemble(tmp_path):
@@ -1131,6 +1148,10 @@ def test_test_set_report_is_mean_only_and_uses_tf_candidate_weights(tmp_path):
     assert "Conditional MAP calibration" not in document
     assert ">MAP<" not in document
     assert "map_computed" not in document
+    assert "Empirical test-set P-P diagnostic" in document
+    assert "ordinary one-dimensional P-P" in document
+    assert "no binning of the true shear" in document
+    assert "conditional P-P" not in document
 
 
 

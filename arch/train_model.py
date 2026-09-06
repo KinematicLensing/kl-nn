@@ -88,6 +88,26 @@ def parse_args(argv=None):
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--freeze-feature-extractor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Freeze the pretrained CNN backbone during NPE (default). "
+            "Pass --no-freeze-feature-extractor to fine-tune it with the flow."
+        ),
+    )
+    parser.add_argument(
+        "--image-spectrum-fusion",
+        dest="use_image_spectrum_fusion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Apply bidirectional FiLM to the concatenated image and spectral "
+            "512-d branches during NPE (default). Pass "
+            "--no-image-spectrum-fusion for concat-only NPE."
+        ),
+    )
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
@@ -163,6 +183,8 @@ def apply_overrides(args):
                 args.warmup_epochs,
                 args.min_learning_rate,
                 args.feature_norm_trainable,
+                args.freeze_feature_extractor,
+                args.use_image_spectrum_fusion,
                 args.early_stopping_patience,
                 args.early_stopping_min_delta,
                 args.gradient_clip_norm,
@@ -192,6 +214,8 @@ def apply_overrides(args):
             "warmup_epochs",
             "min_learning_rate",
             "feature_norm_trainable",
+            "freeze_feature_extractor",
+            "use_image_spectrum_fusion",
             "early_stopping_patience",
             "early_stopping_min_delta",
             "gradient_clip_norm",

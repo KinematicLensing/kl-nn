@@ -30,9 +30,6 @@ from tf_prior import effective_sample_size, normalize_population_log_weights
 from utils import img_to_gal_axis
 
 
-SHEAR_PP_BIN_EDGES = np.asarray(
-    [-0.1, -1.0 / 30.0, 1.0 / 30.0, 0.1], dtype=np.float64
-)
 LOW_G_DEFAULT = 0.02
 ADDITIVE_DISPLAY_SCALE = 1.0e4
 MULTIPLICATIVE_DISPLAY_SCALE = 1.0e2
@@ -1183,45 +1180,6 @@ def conditional_shear_calibration(
     return result
 
 
-def shear_pp_bin_indices(
-    values: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
-) -> np.ndarray:
-    """Assign shear to half-open bins, with a closed final interval."""
-
-    raw = np.asarray(values)
-    values = np.asarray(raw, dtype=np.float64)
-    edges = np.asarray(edges, dtype=np.float64)
-    if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0):
-        raise ValueError("shear P-P bin edges must be strictly increasing")
-    tolerance = 4.0 * (
-        np.finfo(raw.dtype).eps
-        if np.issubdtype(raw.dtype, np.floating)
-        else np.finfo(float).eps
-    )
-    snapped = values.copy()
-    for edge in edges:
-        snapped[np.abs(snapped - edge) <= tolerance] = edge
-    assigned = np.searchsorted(edges, snapped, side="right") - 1
-    assigned[snapped == edges[-1]] = len(edges) - 2
-    valid = (
-        np.isfinite(snapped)
-        & (snapped >= edges[0])
-        & (snapped <= edges[-1])
-        & (assigned >= 0)
-        & (assigned < len(edges) - 1)
-    )
-    result = np.full(values.shape, -1, dtype=np.int8)
-    result[valid] = assigned[valid]
-    return result
-
-
-def shear_pp_bin_masks(
-    values: np.ndarray, edges: np.ndarray = SHEAR_PP_BIN_EDGES
-) -> list[np.ndarray]:
-    indices = shear_pp_bin_indices(values, edges)
-    return [indices == index for index in range(len(edges) - 1)]
-
-
 def _empty_shear_posterior_diagnostic(size: int) -> dict[str, np.ndarray]:
     return {
         "pit": np.full((size, 2), np.nan, dtype=np.float64),
@@ -1342,8 +1300,6 @@ def load_shear_posterior_diagnostics(
                 else None
             )
             targets = expected_truth[local_start:local_end, :2]
-            truth_bins = shear_pp_bin_indices(targets)
-            draw_bins = shear_pp_bin_indices(draws)
             for row in range(len(targets)):
                 global_row = offset + local_start + row
                 candidate_logs = {
@@ -1356,10 +1312,7 @@ def load_shear_posterior_diagnostics(
                     for key in population_keys
                 }
                 for component in range(2):
-                    finite_in_bin = (
-                        np.isfinite(draws[row, :, component])
-                        & (draw_bins[row, :, component] == truth_bins[row, component])
-                    )
+                    finite = np.isfinite(draws[row, :, component])
                     for population_key, log_weight in candidate_logs.items():
                         diagnostic = result[population_key]
                         diagnostic["posterior_variance"][global_row, component] = (
@@ -1367,10 +1320,8 @@ def load_shear_posterior_diagnostics(
                                 draws[row, :, component], log_weight
                             )
                         )
-                        if truth_bins[row, component] < 0:
-                            continue
                         keep, conditional, mass = _conditional_candidate_mass(
-                            draws[row, :, component], finite_in_bin, log_weight
+                            draws[row, :, component], finite, log_weight
                         )
                         diagnostic["retained_count"][global_row, component] = (
                             np.count_nonzero(keep)
@@ -1888,68 +1839,41 @@ def posterior_pp_figure(case: dict, pits_by_population: dict[str, dict]) -> str:
         sharex=True, sharey=True, squeeze=False,
     )
     grid = np.linspace(0.0, 1.0, 501)
-    colors = ("tab:blue", "tab:green", "tab:red")
     for row, (population_label, population) in enumerate(populations):
         pits = pits_by_population[population["key"]]
         galaxy_weight = population["galaxy_weight"]
         for component_index, component in enumerate(("g1", "g2")):
             axis = axes[row, component_index]
-            truth_component = case["truth"][:, component_index]
-            for bin_index, mask in enumerate(shear_pp_bin_masks(truth_component)):
-                selected = mask & np.isfinite(pits[component])
-                x, y, distance, ess = posterior_pp_curve(
-                    pits[component][selected], galaxy_weight[selected]
+            selected = np.isfinite(pits[component])
+            x, y, distance, ess = posterior_pp_curve(
+                pits[component][selected], galaxy_weight[selected]
+            )
+            label = f"N={len(x):,}, ESS={ess:.1f}, KS={distance:.3f}"
+            if len(x):
+                epsilon = math.sqrt(math.log(40.0) / (2.0 * ess))
+                axis.fill_between(
+                    grid,
+                    np.maximum(0.0, grid - epsilon),
+                    np.minimum(1.0, grid + epsilon),
+                    color="tab:blue", alpha=0.12,
                 )
-                lower, upper = (
-                    SHEAR_PP_BIN_EDGES[bin_index],
-                    SHEAR_PP_BIN_EDGES[bin_index + 1],
-                )
-                closing = "]" if bin_index == 2 else ")"
-                label = (
-                    f"[{lower:+.4f}, {upper:+.4f}{closing}; "
-                    f"N={len(x):,}, ESS={ess:.1f}, KS={distance:.3f}"
-                )
-                if len(x):
-                    selected_weight = galaxy_weight[selected]
-                    candidate_ess = weighted_quantile(
-                        pits[f"{component}_conditional_ess"][selected],
-                        np.asarray([0.5]),
-                        selected_weight,
-                    )[0]
-                    retained_mass = weighted_quantile(
-                        pits[f"{component}_retained_mass"][selected],
-                        np.asarray([0.5]),
-                        selected_weight,
-                    )[0]
-                    label += (
-                        f", median draw ESS={candidate_ess:.0f}, "
-                        f"mass={retained_mass:.2f}"
-                    )
-                    epsilon = math.sqrt(math.log(40.0) / (2.0 * ess))
-                    axis.fill_between(
-                        grid,
-                        np.maximum(0.0, grid - epsilon),
-                        np.minimum(1.0, grid + epsilon),
-                        color=colors[bin_index], alpha=0.07,
-                    )
-                axis.step(
-                    x, y, where="post", color=colors[bin_index], lw=1.3,
-                    label=label,
-                )
+            axis.step(
+                x, y, where="post", color="tab:blue", lw=1.4, label=label,
+            )
             axis.plot(grid, grid, color="black", ls="--", lw=0.9, label="Uniform")
             axis.set_xlim(0.0, 1.0)
             axis.set_ylim(0.0, 1.0)
             axis.set_aspect("equal", adjustable="box")
-            axis.set_xlabel("conditional posterior quantile")
+            axis.set_xlabel("posterior quantile")
             axis.set_title(f"{population_label} — {component}")
-            axis.legend(fontsize="xx-small", loc="upper left")
+            axis.legend(fontsize="small", loc="upper left")
         axes[row, 0].set_ylabel("weighted fraction of truths")
     description = (
-        "empirical test-set conditional P-P"
+        "empirical test-set P-P"
         if case.get("analysis_mode") == "test_set"
-        else "prior-matched conditional P-P"
+        else "prior-matched P-P"
     )
-    fig.suptitle(f"{case['case']} — {description} (three true-shear bins)")
+    fig.suptitle(f"{case['case']} — {description}")
     fig.tight_layout()
     return fig_data_uri(fig)
 
@@ -2647,7 +2571,7 @@ def main(argv=None) -> None:
             f"<img src=\"{posterior_pp_figure(case, pits)}\" "
             "alt=\"weighted posterior P-P plots\">"
         )
-        LOGGER.info("%s: finished section: conditional P-P diagnostic", case_name)
+        LOGGER.info("%s: finished section: P-P diagnostic", case_name)
         if args.test_set:
             combined_prior = (
                 case["posterior_candidate_weighting"]
@@ -2764,13 +2688,15 @@ def main(argv=None) -> None:
                 "held-out coverage, not simulation-based calibration under the "
                 "training proposal.</p>"
                 + coverage_html
-                + "<h3>Empirical test-set conditional P-P diagnostic</h3>"
-                "<p>Within each true-shear interval, "
+                + "<h3>Empirical test-set P-P diagnostic</h3>"
+                "<p>Each panel is an ordinary one-dimensional P-P plot of the "
+                "weighted posterior PIT against the corresponding true shear, "
+                "with no binning of the true shear. "
                 + rank_description
-                + " Curves use the operative "
-                "galaxy weights; retained "
-                "candidate fraction and conditional candidate ESS are reported "
-                "separately from galaxy ESS.</p>"
+                + " Curves use the operative galaxy weights. Because the "
+                "test-set shear proposal is still uniform, this diagnostic "
+                "does not by itself distinguish a prior-dominated shear "
+                "posterior from a well-calibrated informative one.</p>"
                 + pp_html
                 + "</section>"
             )
@@ -2832,12 +2758,15 @@ def main(argv=None) -> None:
             "coverage average additionally uses globally normalized TF population "
             "weights.</p>"
             + coverage_html
-            + "<h3>Prior-matched conditional P-P diagnostic</h3>"
-            "<p>For each component, candidates are restricted to the same one of "
-            "three true-shear intervals as the truth. TF-target ranks use the "
-            "within-galaxy TF weights and their curves use global target-population "
-            "galaxy weights. Candidate retention mass and conditional candidate "
-            "ESS are reported separately from galaxy ESS.</p>"
+            + "<h3>Prior-matched P-P diagnostic</h3>"
+            "<p>Each panel is an ordinary one-dimensional P-P plot of the "
+            "weighted posterior PIT against the corresponding true shear, with "
+            "no binning of the true shear. TF-target ranks use the "
+            "within-galaxy TF weights and their curves use global "
+            "target-population galaxy weights. Because the proposal shear is "
+            "still uniform, this diagnostic does not by itself distinguish a "
+            "prior-dominated shear posterior from a well-calibrated "
+            "informative one.</p>"
             + pp_html
             + "</section>"
         )

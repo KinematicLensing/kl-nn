@@ -38,9 +38,14 @@ DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
 CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
 PART_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-10}"
+ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"
 
-if (( NPARTS != ARRAY_TASK_COUNT )); then
-    echo "NPARTS=${NPARTS}, but this job has ${ARRAY_TASK_COUNT} array tasks; submit with --array=1-${NPARTS}" >&2
+if [[ "${ALLOW_PARTIAL_ARRAY}" != "0" && "${ALLOW_PARTIAL_ARRAY}" != "1" ]]; then
+    echo "ALLOW_PARTIAL_ARRAY must be 0 or 1" >&2
+    exit 2
+fi
+if (( NPARTS != ARRAY_TASK_COUNT )) && [[ "${ALLOW_PARTIAL_ARRAY}" != "1" ]]; then
+    echo "NPARTS=${NPARTS}, but this job has ${ARRAY_TASK_COUNT} array tasks; submit with --array=1-${NPARTS}, or set ALLOW_PARTIAL_ARRAY=1 for an intentional sparse resume" >&2
     exit 2
 fi
 if (( PART_INDEX < 0 || PART_INDEX >= NPARTS )); then

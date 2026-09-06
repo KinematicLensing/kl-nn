@@ -43,13 +43,16 @@ MIN_LR="${MIN_LR:-0.00001}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-20}"
 EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.001}"
 GRADIENT_CLIP_NORM="${GRADIENT_CLIP_NORM:-1.0}"
+FREEZE_FEATURE_EXTRACTOR="${FREEZE_FEATURE_EXTRACTOR:-1}"
+IMAGE_SPECTRUM_FUSION="${IMAGE_SPECTRUM_FUSION:-1}"
 TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_cosi/}"
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_NAME="${MODEL_NAME:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_1m_s${SEED}_${JOB_TAG}}"
+MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_1m}"
+MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
 PRETRAIN_CHECKPOINT="${MODEL_ROOT}/${PRETRAINED_NAME}/${PRETRAINED_NAME}${PRETRAIN_FROM}"
 
 if [[ ! -f "${PRETRAIN_CHECKPOINT}" ]]; then
@@ -62,11 +65,25 @@ fi
 export MASTER_PORT PYTHONHASHSEED="${SEED}" CUBLAS_WORKSPACE_CONFIG=:4096:8
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
+if [[ "${FREEZE_FEATURE_EXTRACTOR}" == "0" || "${FREEZE_FEATURE_EXTRACTOR}" == "false" ]]; then
+    FREEZE_FEATURE_EXTRACTOR_FLAG="--no-freeze-feature-extractor"
+else
+    FREEZE_FEATURE_EXTRACTOR_FLAG="--freeze-feature-extractor"
+fi
+
+if [[ "${IMAGE_SPECTRUM_FUSION}" == "0" || "${IMAGE_SPECTRUM_FUSION}" == "false" ]]; then
+    IMAGE_SPECTRUM_FUSION_FLAG="--no-image-spectrum-fusion"
+else
+    IMAGE_SPECTRUM_FUSION_FLAG="--image-spectrum-fusion"
+fi
+
 echo "model=${MODEL_NAME} stage=npe views=random(identity,r90) flow=bounded_hybrid_circular"
 echo "pretrained=${PRETRAINED_NAME} checkpoint=${PRETRAIN_FROM}"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
+echo "freeze_feature_extractor=${FREEZE_FEATURE_EXTRACTOR_FLAG}"
+echo "image_spectrum_fusion=${IMAGE_SPECTRUM_FUSION_FLAG}"
 
 cd "${KLNN_REPO_ROOT}/arch"
 python train_model.py \
@@ -96,6 +113,8 @@ python train_model.py \
     --early-stopping-patience "${EARLY_STOPPING_PATIENCE}" \
     --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA}" \
     --gradient-clip-norm "${GRADIENT_CLIP_NORM}" \
+    ${FREEZE_FEATURE_EXTRACTOR_FLAG} \
+    ${IMAGE_SPECTRUM_FUSION_FLAG} \
     --seed "${SEED}" \
     --deterministic \
     --fixed-validation-streams \

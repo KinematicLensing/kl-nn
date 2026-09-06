@@ -33,7 +33,8 @@ VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-MODEL_NAME="${MODEL_NAME:-CNN-CNN-Meta-CCL-simv3-cosi-r90_1m_s${SEED}_${JOB_TAG}}"
+MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-CCL-simv3-cosi-r90_1m}"
+MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 
 for DATA_DIR in "${TRAIN_DATA}" "${VALID_DATA}"; do

@@ -378,22 +378,33 @@ def _maybe_compile_model(model, stage_config, logger=None):
     return model
 
 
-def _synchronize_pretrain_batch_norm(model, *, train_mode, world_size):
-    """Use global batch statistics for multi-GPU CCL pretraining.
+def _synchronize_pretrain_batch_norm(
+    model,
+    *,
+    train_mode,
+    world_size,
+    freeze_feature_extractor=True,
+):
+    """Use global batch statistics when a CNN with BatchNorm is trained on multiple GPUs.
 
-    The image backbone contains BatchNorm layers and its running buffers are
-    transferred to the frozen NPE feature extractor. Ordinary DDP does not
-    reduce those buffers, so leaving them as BatchNorm would make every rank
-    validate a different model and would save only rank zero's shard-local
-    statistics. SyncBatchNorm keeps the pretraining forward pass and running
-    buffers identical across ranks. Its state-dict keys remain compatible with
-    the ordinary BatchNorm modules used by single-process inference.
+    The image backbone contains BatchNorm layers. Ordinary DDP does not reduce
+    those buffers, so leaving them as BatchNorm would make every rank validate a
+    different model and would save only rank zero's shard-local statistics.
+    SyncBatchNorm keeps the forward pass and running buffers identical across
+    ranks during CCL pretraining and during NPE when the backbone is unfrozen.
+    Frozen-NPE training does not convert, because the extractor stays in
+    evaluation mode and those buffers do not update. State-dict keys remain
+    compatible with the ordinary BatchNorm modules used by single-process
+    inference.
     """
 
     world_size = int(world_size)
     if world_size <= 0:
         raise ValueError("world_size must be positive")
-    if train_mode == "pretrain" and world_size > 1:
+    train_backbone = train_mode == "pretrain" or (
+        train_mode == "train" and not bool(freeze_feature_extractor)
+    )
+    if train_backbone and world_size > 1:
         return nn.SyncBatchNorm.convert_sync_batchnorm(model)
     return model
 
@@ -1061,7 +1072,8 @@ class NPETrainer(Trainer):
     def _train_epoch(self, epoch):
         self.model.train()
         owner = _owner(self.model)
-        owner.feature_extractor.eval()
+        if bool(self.stage_config.get("freeze_feature_extractor", True)):
+            owner.feature_extractor.eval()
         return self._run("train", train=True)
 
     def _valid_epoch(self, epoch):
@@ -1152,6 +1164,9 @@ def load_train_objs(
     valid_ds = limit_dataset(
         valid_ds, config.test["size"], split="validation"
     )
+    freeze_feature_extractor = bool(
+        stage_config.get("freeze_feature_extractor", True)
+    )
     if train_mode == "pretrain":
         model = model_class()
     elif train_mode == "train":
@@ -1176,11 +1191,14 @@ def load_train_objs(
         )
         model = model_class(feature_extractor=pretrained.backbone)
         for parameter in model.feature_extractor.parameters():
-            parameter.requires_grad = False
+            parameter.requires_grad = not freeze_feature_extractor
     else:
         raise ValueError(f"unknown train_mode {train_mode!r}")
     model = _synchronize_pretrain_batch_norm(
-        model, train_mode=train_mode, world_size=world_size
+        model,
+        train_mode=train_mode,
+        world_size=world_size,
+        freeze_feature_extractor=freeze_feature_extractor,
     )
     model = model.to(device)
     parameters = (
@@ -1203,7 +1221,16 @@ def load_train_objs(
         kwargs.pop("fused", None)
         optimizer = optim.AdamW(parameters, **kwargs)
     if logger and rank == 0:
-        logger.info("Loaded current %s model", train_mode)
+        if train_mode == "train":
+            logger.info(
+                "Loaded current %s model (freeze_feature_extractor=%s, "
+                "image_spectrum_film_fusion=%s)",
+                train_mode,
+                freeze_feature_extractor,
+                bool(stage_config.get("use_image_spectrum_fusion", True)),
+            )
+        else:
+            logger.info("Loaded current %s model", train_mode)
     return train_ds, valid_ds, model, optimizer
 
 

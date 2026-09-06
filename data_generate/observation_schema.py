@@ -174,6 +174,106 @@ def validate_fiber_layout(value: str) -> str:
     return value
 
 
+MAJOR_FIBER_INDICES = (0, 1)
+MINOR_FIBER_INDICES = (3, 4)
+DEFAULT_FIBER_OFFSET_ARCSEC = 1.5
+
+
+def observed_galaxy_axes(
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+) -> np.ndarray:
+    """Return a right-handed 2x2 matrix of observed photometric principal axes.
+
+    The rows are unit vectors used as ``offsets @ axes``. Row 0 is the first
+    left-singular-vector gauge after the major-axis vector anchor: if that
+    singular vector is antiparallel to the image of the intrinsic major axis,
+    the whole SVD factor is flipped. Row 1 is the remaining axis, with its
+    sign chosen so that the pair is right-handed. The major-axis vector
+    anchor does not remove that discrete SVD reflection, so leaving the
+    second-row sign free lets the minor-axis fibers swap under an arbitrarily
+    small shear.
+    """
+
+    if not 0.0 <= sini <= 1.0:
+        raise ValueError(f"sini must be in [0, 1], got {sini}")
+    cosi = np.sqrt(max(0.0, 1.0 - sini**2))
+    shear = np.asarray([[1.0 + g1, g2], [g2, 1.0 - g1]], dtype=float)
+    rotation = np.asarray(
+        [
+            [np.cos(theta_int), -np.sin(theta_int)],
+            [np.sin(theta_int), np.cos(theta_int)],
+        ],
+        dtype=float,
+    )
+    projection = np.asarray([[1.0, 0.0], [0.0, cosi]], dtype=float)
+    transform = shear @ (rotation @ projection)
+    observed_axes, _, _ = np.linalg.svd(transform)
+    reference_axis = transform @ np.asarray([1.0, 0.0], dtype=float)
+    # Align the first left singular vector with the transformed intrinsic
+    # major axis. The whole-matrix flip preserves det(U), so it does not
+    # remove SVD's discrete reflection.
+    if np.dot(observed_axes[:, 0], reference_axis) < 0.0:
+        observed_axes *= -1.0
+    # Fiber sky positions are ``offsets @ U``, so the second ROW is the
+    # minor-axis direction. Flip only that row to force a right-handed
+    # frame; the major-axis fibers stay where the vector anchor put them.
+    if np.linalg.det(observed_axes) < 0.0:
+        observed_axes[1, :] *= -1.0
+    return observed_axes
+
+
+def legacy_major_anchored_fiber_offsets(
+    *,
+    fiber_offset: float,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+) -> np.ndarray:
+    """Reproduce the pre-handedness SVD gauge used by existing simulator-v3 data.
+
+    The first left singular vector is aligned with the transformed intrinsic
+    major axis, but both singular vectors are flipped together. That preserves
+    a possible reflection, so the stored minor-axis fibers can be exchanged
+    relative to :func:`compute_fiber_offsets`.
+    """
+
+    if not np.isfinite(fiber_offset) or fiber_offset <= 0.0:
+        raise ValueError("fiber_offset must be finite and positive")
+    if not 0.0 <= sini <= 1.0:
+        raise ValueError(f"sini must be in [0, 1], got {sini}")
+    cosi = np.sqrt(max(0.0, 1.0 - sini**2))
+    shear = np.asarray([[1.0 + g1, g2], [g2, 1.0 - g1]], dtype=float)
+    rotation = np.asarray(
+        [
+            [np.cos(theta_int), -np.sin(theta_int)],
+            [np.sin(theta_int), np.cos(theta_int)],
+        ],
+        dtype=float,
+    )
+    projection = np.asarray([[1.0, 0.0], [0.0, cosi]], dtype=float)
+    transform = shear @ (rotation @ projection)
+    observed_axes, _, _ = np.linalg.svd(transform)
+    reference_axis = transform @ np.asarray([1.0, 0.0], dtype=float)
+    if np.dot(observed_axes[:, 0], reference_axis) < 0.0:
+        observed_axes *= -1.0
+    offsets = np.asarray(
+        [
+            (fiber_offset, 0.0),
+            (-fiber_offset, 0.0),
+            (0.0, 0.0),
+            (0.0, fiber_offset),
+            (0.0, -fiber_offset),
+        ],
+        dtype=float,
+    )
+    return offsets @ observed_axes
+
+
 def compute_fiber_offsets(
     *,
     fiber_offset: float,
@@ -186,8 +286,6 @@ def compute_fiber_offsets(
 
     if not np.isfinite(fiber_offset) or fiber_offset <= 0.0:
         raise ValueError("fiber_offset must be finite and positive")
-    if not 0.0 <= sini <= 1.0:
-        raise ValueError(f"sini must be in [0, 1], got {sini}")
     offsets = np.asarray(
         [
             (fiber_offset, 0.0),
@@ -198,21 +296,71 @@ def compute_fiber_offsets(
         ],
         dtype=float,
     )
-    cosi = np.sqrt(max(0.0, 1.0 - sini**2))
-    shear = np.asarray([[1.0 + g1, g2], [g2, 1.0 - g1]])
-    rotation = np.asarray(
-        [
-            [np.cos(theta_int), -np.sin(theta_int)],
-            [np.sin(theta_int), np.cos(theta_int)],
-        ]
+    return offsets @ observed_galaxy_axes(
+        g1=g1,
+        g2=g2,
+        theta_int=theta_int,
+        sini=sini,
     )
-    projection = np.asarray([[1.0, 0.0], [0.0, cosi]])
-    transform = shear @ (rotation @ projection)
-    observed_axes, _, _ = np.linalg.svd(transform)
-    reference_axis = transform @ np.asarray([1.0, 0.0])
-    if np.dot(observed_axes[:, 0], reference_axis) < 0:
-        observed_axes *= -1.0
-    return offsets @ observed_axes
+
+
+def classify_fiber_offset_sign(
+    stored_offsets: np.ndarray,
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+    fiber_offset: float = DEFAULT_FIBER_OFFSET_ARCSEC,
+    atol: float = 1.0e-6,
+) -> str:
+    """Classify stored fiber centers against the right-handed axis convention.
+
+    Returns ``match`` if the stored centers already follow
+    :func:`compute_fiber_offsets`, ``swap_minor`` if only the two minor-axis
+    fibers are exchanged, and ``mismatch`` otherwise.
+    """
+
+    stored = np.asarray(stored_offsets, dtype=float)
+    expected = compute_fiber_offsets(
+        fiber_offset=fiber_offset,
+        g1=g1,
+        g2=g2,
+        theta_int=theta_int,
+        sini=sini,
+    )
+    if stored.shape != expected.shape:
+        raise ValueError(
+            "stored fiber offsets must have shape "
+            f"{expected.shape}; got {stored.shape}"
+        )
+    if np.allclose(stored, expected, atol=atol, rtol=0.0):
+        return "match"
+    swapped = expected.copy()
+    swapped[MINOR_FIBER_INDICES[0]] = expected[MINOR_FIBER_INDICES[1]]
+    swapped[MINOR_FIBER_INDICES[1]] = expected[MINOR_FIBER_INDICES[0]]
+    if np.allclose(stored, swapped, atol=atol, rtol=0.0):
+        return "swap_minor"
+    return "mismatch"
+
+
+def swap_minor_axis_fibers(spectra: np.ndarray, fiber_positions: np.ndarray):
+    """Exchange the two minor-axis fibers in spectra and sky positions."""
+
+    plus, minus = MINOR_FIBER_INDICES
+    spectra = np.asarray(spectra)
+    fiber_positions = np.asarray(fiber_positions)
+    if spectra.shape[-2] <= minus:
+        raise ValueError("spectra must include both minor-axis fibers")
+    if fiber_positions.shape[-2] <= minus:
+        raise ValueError("fiber positions must include both minor-axis fibers")
+    swapped_spectra = np.array(spectra, copy=True)
+    swapped_positions = np.array(fiber_positions, copy=True)
+    swapped_spectra[..., plus, :] = spectra[..., minus, :]
+    swapped_spectra[..., minus, :] = spectra[..., plus, :]
+    swapped_positions[..., plus, :] = fiber_positions[..., minus, :]
+    swapped_positions[..., minus, :] = fiber_positions[..., plus, :]
+    return swapped_spectra, swapped_positions
 
 
 def _required(header: Mapping[str, Any], key: str) -> Any:

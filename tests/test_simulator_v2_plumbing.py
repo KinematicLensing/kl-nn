@@ -168,12 +168,21 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert "--theta-num-layers" in npe
     assert 'PRETRAIN_FROM="${PRETRAIN_FROM:-best}"' in npe
     assert '--model-root "${MODEL_ROOT}"' in npe
+    assert 'FREEZE_FEATURE_EXTRACTOR="${FREEZE_FEATURE_EXTRACTOR:-1}"' in npe
+    assert "--freeze-feature-extractor" in npe
+    assert "--no-freeze-feature-extractor" in npe
+    assert 'IMAGE_SPECTRUM_FUSION="${IMAGE_SPECTRUM_FUSION:-1}"' in npe
+    assert "--image-spectrum-fusion" in npe
+    assert "--no-image-spectrum-fusion" in npe
     pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
     assert '--model-root "${MODEL_ROOT}"' in pretrain
     assert "train_1m_simv3_cosi/" in pretrain
     assert "valid_100k_simv3_cosi/" in pretrain
     assert "simv2" not in pretrain
     assert "Missing current nine-target dataset" in pretrain
+    cache = (ROOT / "arch/cache_posteriors.slurm").read_text()
+    assert 'ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"' in cache
+    assert "intentional sparse resume" in cache
     generate = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()
     package = (ROOT / "data_generate/make_database_simulator_v3.slurm").read_text()
     assert 'ARRAY_TASK_MIN="${SLURM_ARRAY_TASK_MIN:-1}"' in generate

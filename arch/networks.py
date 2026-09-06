@@ -3,7 +3,10 @@
 There is deliberately one production path:
 
 * independent image-CNN, joint spectral-CNN, and metadata-MLP branches;
-* direct concatenation of the three branches for CCL pretraining; and
+* direct concatenation of the three branches for CCL pretraining;
+* a bidirectional FiLM mix of the image and spectral 512-d branches before
+  the NPE flow, identity-initialized so a frozen concat backbone starts
+  unchanged; and
 * a nine-dimensional bounded hybrid posterior, with eight compact scalar
   coordinates and a directed circular ``theta_int`` coordinate.
 
@@ -970,10 +973,15 @@ class ImgCNN(nn.Module):
 
 
 class JointSpecCNN(nn.Module):
-    """Joint CNN for the fixed ordered five-fiber by 64-bin spectrum."""
+    """Joint CNN for the fixed ordered five-fiber by 64-bin spectrum.
+
+    Two wavelength-only pools reduce 64 bins to 16 before a final convolution
+    that spans every fiber and the remaining wavelength axis.
+    """
 
     output_dim = SPECTRAL_FEATURE_DIM
     wavelength_count = 64
+    pooled_wavelength_count = 16
 
     def __init__(self, nspec=None):
         super().__init__()
@@ -1002,14 +1010,12 @@ class JointSpecCNN(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
             nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
@@ -1019,7 +1025,7 @@ class JointSpecCNN(nn.Module):
             nn.Conv2d(
                 256,
                 self.output_dim,
-                kernel_size=(self.nspecs, 4),
+                kernel_size=(self.nspecs, self.pooled_wavelength_count),
                 bias=False,
             ),
             nn.BatchNorm2d(self.output_dim),
@@ -1196,6 +1202,57 @@ class SimpleFusionFeatureExtractor(nn.Module):
 def build_feature_extractor(nspec=None, **kwargs):
     """Construct the sole supported feature extractor."""
     return SimpleFusionFeatureExtractor(nspec=nspec, **kwargs)
+
+
+class ImageSpectrumFilmFusion(nn.Module):
+    """Bidirectional FiLM mix of the concatenated image and spectral branches.
+
+    The metadata block is copied unchanged. Zero initialization makes the
+    module the identity on the 1,152-d concat vector, so a frozen CCL
+    backbone is unchanged until these maps move. The two 512-d branches
+    modulate each other in parallel from the pre-fusion vectors.
+    """
+
+    image_slice = slice(0, IMAGE_FEATURE_DIM)
+    spectral_slice = slice(
+        IMAGE_FEATURE_DIM, IMAGE_FEATURE_DIM + SPECTRAL_FEATURE_DIM
+    )
+    metadata_slice = slice(IMAGE_FEATURE_DIM + SPECTRAL_FEATURE_DIM, FEATURE_DIM)
+
+    def __init__(self):
+        super().__init__()
+        self.spectral_to_image = nn.Linear(
+            SPECTRAL_FEATURE_DIM, 2 * IMAGE_FEATURE_DIM
+        )
+        self.image_to_spectral = nn.Linear(
+            IMAGE_FEATURE_DIM, 2 * SPECTRAL_FEATURE_DIM
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.spectral_to_image.weight)
+        nn.init.zeros_(self.spectral_to_image.bias)
+        nn.init.zeros_(self.image_to_spectral.weight)
+        nn.init.zeros_(self.image_to_spectral.bias)
+
+    def forward(self, features):
+        if features.ndim != 2 or features.shape[-1] != FEATURE_DIM:
+            raise ValueError(
+                "fusion expects shape (batch, "
+                f"{FEATURE_DIM}); got {tuple(features.shape)}"
+            )
+        image = features[:, self.image_slice]
+        spectral = features[:, self.spectral_slice]
+        metadata = features[:, self.metadata_slice]
+        image_scale, image_shift = self.spectral_to_image(spectral).chunk(
+            2, dim=-1
+        )
+        spectral_scale, spectral_shift = self.image_to_spectral(image).chunk(
+            2, dim=-1
+        )
+        fused_image = image * (image_scale + 1.0) + image_shift
+        fused_spectral = spectral * (spectral_scale + 1.0) + spectral_shift
+        return torch.cat((fused_image, fused_spectral, metadata), dim=-1)
 
 
 class ContinuousContrastiveLoss(nn.Module):
@@ -1573,6 +1630,10 @@ class KLNPE(nn.Module):
                 self.layer_norm.weight.fill_(1.0)
                 self.layer_norm.bias.zero_()
             self.layer_norm.requires_grad_(False)
+        if bool(config.train.get("use_image_spectrum_fusion", True)):
+            self.fusion = ImageSpectrumFilmFusion()
+        else:
+            self.fusion = nn.Identity()
         self.flow_context_features = FEATURE_DIM
         self.flow = (
             BoundedHybridCircularFlow(
@@ -1615,7 +1676,7 @@ class KLNPE(nn.Module):
         return features
 
     def _flow_context(self, raw_features):
-        return self.layer_norm(raw_features)
+        return self.layer_norm(self.fusion(raw_features))
 
     def forward(
         self,
@@ -1655,12 +1716,20 @@ class KLNPE(nn.Module):
             device_type=raw_features.device.type, enabled=False
         ):
             flow_features = raw_features.to(dtype=flow_dtype)
-            context = self._flow_context(flow_features)
+            fused_features = self.fusion(flow_features)
+            context = self.layer_norm(fused_features)
             flow_targets = true.to(dtype=flow_dtype)
             log_prob = self.flow.log_prob(flow_targets, context=context)
         diagnostics = {
             "raw_feature_rms": (
                 raw_features.detach().float().square().mean().sqrt()
+            ),
+            "fusion_delta_rms": (
+                (fused_features.detach() - flow_features.detach())
+                .float()
+                .square()
+                .mean()
+                .sqrt()
             ),
             **getattr(self.flow, "last_component_diagnostics", {}),
             **getattr(

@@ -219,6 +219,8 @@ def test_npe_cli_applies_only_posterior_overrides():
             "--min-learning-rate",
             "0.000001",
             "--no-feature-norm-trainable",
+            "--no-freeze-feature-extractor",
+            "--no-image-spectrum-fusion",
             "--early-stopping-patience",
             "6",
             "--early-stopping-min-delta",
@@ -249,6 +251,8 @@ def test_npe_cli_applies_only_posterior_overrides():
     assert spawned.train.warmup_epochs == 3
     assert spawned.train.min_learning_rate == pytest.approx(1.0e-6)
     assert spawned.train.feature_norm_trainable is False
+    assert spawned.train.freeze_feature_extractor is False
+    assert spawned.train.use_image_spectrum_fusion is False
     assert spawned.train.early_stopping_patience == 6
     assert spawned.train.early_stopping_min_delta == pytest.approx(1.0e-4)
     assert spawned.train.gradient_clip_norm == pytest.approx(2.5)
@@ -258,6 +262,8 @@ def test_npe_cli_applies_only_posterior_overrides():
     ("argv", "message"),
     [
         (["--stage", "pretrain", "--flow-num-layers", "2"], "NPE-only"),
+        (["--stage", "pretrain", "--no-freeze-feature-extractor"], "NPE-only"),
+        (["--stage", "pretrain", "--no-image-spectrum-fusion"], "NPE-only"),
         (["--stage", "npe", "--ccl-sigma-label", "0.2"], "CCL options"),
         (["--stage", "pretrain", "--batch-size", "0"], "batch size"),
         (["--stage", "npe", "--flow-num-bins", "1"], "bins at least two"),
@@ -279,6 +285,14 @@ def test_unknown_cli_flags_are_rejected_without_abbreviation():
 
     with pytest.raises(SystemExit):
         module.parse_args(["--stage", "npe", "--unknown-option", "value"])
+
+
+def test_npe_cli_freezes_feature_extractor_by_default():
+    module = _training_entrypoint()
+    stage = module.apply_overrides(module.parse_args(["--stage", "npe"]))
+    assert config.MODEL_CONFIG.train.freeze_feature_extractor is True
+    assert stage.freeze_feature_extractor is True
+    assert stage.use_image_spectrum_fusion is True
 
 
 def test_best_pretraining_checkpoint_is_the_current_default_and_cli_value():

@@ -109,6 +109,8 @@ class TrainConfig:
     min_learning_rate: float = 1e-6
     fixed_validation_streams: bool = True
     feature_norm_trainable: bool = True
+    freeze_feature_extractor: bool = True
+    use_image_spectrum_fusion: bool = True
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
     gradient_clip_norm: float = 1.0

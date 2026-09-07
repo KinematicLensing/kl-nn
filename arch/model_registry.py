@@ -21,7 +21,16 @@ DEFAULT_CONFIGS_ROOT = join(DEFAULT_SHARED_ROOT, "configs")
 DEFAULT_NETWORKS_ROOT = join(DEFAULT_SHARED_ROOT, "networks")
 
 _CIRCULAR_SPLINE_IMPORT_RE = re.compile(
-    r"(?m)^\s*(?:from\s+circular_spline\s+import\b|import\s+circular_spline\b)"
+    r"(?m)^\s*(?:from\s+circular_spline\s+import\b|import\s+circular_spline\b"
+    r"|from\s+\.\s*circular_spline\s+import\b)"
+)
+_COMPARISON_ARCH_IMPORT_RE = re.compile(
+    r"(?m)^\s*(?:from\s+comparison_arch\s+import\b|import\s+comparison_arch\b"
+    r"|from\s+\.\s*comparison_arch\s+import\b)"
+)
+_GEOM_ARCH_IMPORT_RE = re.compile(
+    r"(?m)^\s*(?:from\s+geom_arch\s+import\b|import\s+geom_arch\b"
+    r"|from\s+\.\s*geom_arch\s+import\b)"
 )
 _MISSING_MODULE = object()
 
@@ -43,6 +52,20 @@ def get_circular_spline_snapshot_path(
     networks_root: str = DEFAULT_NETWORKS_ROOT,
 ) -> str:
     return join(networks_root, f"circular_spline_{model_name}.py")
+
+
+def get_comparison_arch_snapshot_path(
+    model_name: str,
+    networks_root: str = DEFAULT_NETWORKS_ROOT,
+) -> str:
+    return join(networks_root, f"comparison_arch_{model_name}.py")
+
+
+def get_geom_arch_snapshot_path(
+    model_name: str,
+    networks_root: str = DEFAULT_NETWORKS_ROOT,
+) -> str:
+    return join(networks_root, f"geom_arch_{model_name}.py")
 
 
 def _snapshot_module_name(prefix: str, snapshot_path: str) -> str:
@@ -72,7 +95,7 @@ def _load_module_from_path(module_name: str, path: str) -> ModuleType:
 
 
 @contextmanager
-def _snapshot_import_context(helper_module: ModuleType):
+def _snapshot_import_context(helpers: dict[str, ModuleType]):
     """Expose current sibling modules only while executing a saved snapshot."""
 
     source_dir = dirname(__file__)
@@ -85,7 +108,7 @@ def _snapshot_import_context(helper_module: ModuleType):
         package = config.__package__ or ""
         aliases = {
             "config": config,
-            "circular_spline": helper_module,
+            **helpers,
         }
         for name in ("data", "utils"):
             qualified = f"{package}.{name}" if package else name
@@ -152,10 +175,28 @@ def save_model_artifacts(
         network_source = source_file.read()
 
     snapshots_circular_spline = bool(_CIRCULAR_SPLINE_IMPORT_RE.search(network_source))
+    snapshots_comparison_arch = bool(
+        _COMPARISON_ARCH_IMPORT_RE.search(network_source)
+    ) or config.is_comparison_architecture(
+        getattr(model_config.train, "architecture", "concat")
+    )
+    snapshots_geom_arch = bool(
+        _GEOM_ARCH_IMPORT_RE.search(network_source)
+    ) or config.is_kl_geom_architecture(
+        getattr(model_config.train, "architecture", "concat")
+    )
     circular_source_path = circular_spline_source_path or join(
         dirname(source_path), "circular_spline.py"
     )
     circular_snapshot_path = get_circular_spline_snapshot_path(
+        effective_model_name, networks_root=networks_root
+    )
+    comparison_source_path = join(dirname(source_path), "comparison_arch.py")
+    comparison_snapshot_path = get_comparison_arch_snapshot_path(
+        effective_model_name, networks_root=networks_root
+    )
+    geom_source_path = join(dirname(source_path), "geom_arch.py")
+    geom_snapshot_path = get_geom_arch_snapshot_path(
         effective_model_name, networks_root=networks_root
     )
     if snapshots_circular_spline and not isfile(circular_source_path):
@@ -163,11 +204,25 @@ def save_model_artifacts(
             "The networks source imports circular_spline, but its helper source "
             f"was not found at {circular_source_path}."
         )
+    if snapshots_comparison_arch and not isfile(comparison_source_path):
+        raise FileNotFoundError(
+            "The comparison architecture was requested, but "
+            f"{comparison_source_path} was not found."
+        )
+    if snapshots_geom_arch and not isfile(geom_source_path):
+        raise FileNotFoundError(
+            "The geometric architecture was requested, but "
+            f"{geom_source_path} was not found."
+        )
 
     if not overwrite:
         artifact_paths = [config_path, network_path]
         if snapshots_circular_spline:
             artifact_paths.append(circular_snapshot_path)
+        if snapshots_comparison_arch:
+            artifact_paths.append(comparison_snapshot_path)
+        if snapshots_geom_arch:
+            artifact_paths.append(geom_snapshot_path)
         for path in artifact_paths:
             if isfile(path):
                 raise FileExistsError(
@@ -178,6 +233,10 @@ def save_model_artifacts(
     shutil.copy2(source_path, network_path)
     if snapshots_circular_spline:
         shutil.copy2(circular_source_path, circular_snapshot_path)
+    if snapshots_comparison_arch:
+        shutil.copy2(comparison_source_path, comparison_snapshot_path)
+    if snapshots_geom_arch:
+        shutil.copy2(geom_source_path, geom_snapshot_path)
 
     artifacts = {
         "model_name": effective_model_name,
@@ -186,6 +245,10 @@ def save_model_artifacts(
     }
     if snapshots_circular_spline:
         artifacts["circular_spline_path"] = circular_snapshot_path
+    if snapshots_comparison_arch:
+        artifacts["comparison_arch_path"] = comparison_snapshot_path
+    if snapshots_geom_arch:
+        artifacts["geom_arch_path"] = geom_snapshot_path
     return artifacts
 
 
@@ -208,12 +271,53 @@ def load_networks_module_for_model(
         )
     helper_name = _snapshot_module_name("circular_spline", helper_path)
     helper_module = _load_module_from_path(helper_name, helper_path)
+    helpers = {"circular_spline": helper_module}
 
     # Model names routinely contain hyphens and other punctuation, so derive
     # an import-safe module name from the artifact path.
     module_name = _snapshot_module_name("networks", snapshot_path)
-    with _snapshot_import_context(helper_module):
-        return _load_module_from_path(module_name, snapshot_path)
+    with _snapshot_import_context(helpers):
+        networks_module = _load_module_from_path(module_name, snapshot_path)
+
+    comparison_path = get_comparison_arch_snapshot_path(
+        model_name, networks_root=networks_root
+    )
+    geom_path = get_geom_arch_snapshot_path(
+        model_name, networks_root=networks_root
+    )
+    with open(snapshot_path, "r", encoding="utf-8") as stream:
+        network_source = stream.read()
+    needs_comparison = isfile(comparison_path) or bool(
+        _COMPARISON_ARCH_IMPORT_RE.search(network_source)
+    )
+    needs_geom = isfile(geom_path) or bool(
+        _GEOM_ARCH_IMPORT_RE.search(network_source)
+    )
+    if needs_comparison:
+        if not isfile(comparison_path):
+            raise FileNotFoundError(
+                "Current model snapshot is incomplete: missing comparison "
+                f"architecture helper at {comparison_path}"
+            )
+        comparison_name = _snapshot_module_name("comparison_arch", comparison_path)
+        helpers["networks"] = networks_module
+        with _snapshot_import_context(helpers):
+            comparison_module = _load_module_from_path(
+                comparison_name, comparison_path
+            )
+        networks_module._comparison_arch = comparison_module
+    if needs_geom:
+        if not isfile(geom_path):
+            raise FileNotFoundError(
+                "Current model snapshot is incomplete: missing geometric "
+                f"architecture helper at {geom_path}"
+            )
+        geom_name = _snapshot_module_name("geom_arch", geom_path)
+        helpers["networks"] = networks_module
+        with _snapshot_import_context(helpers):
+            geom_module = _load_module_from_path(geom_name, geom_path)
+        networks_module._geom_arch = geom_module
+    return networks_module
 
 
 def infer_model_name_from_checkpoint_path(checkpoint_path: str | None) -> str | None:

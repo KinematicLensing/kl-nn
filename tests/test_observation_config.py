@@ -42,6 +42,7 @@ def test_current_config_json_roundtrip_is_exact(tmp_path):
     assert tuple(restored.train.feature_names) == config.TARGET_NAMES
     assert tuple(restored.par_ranges) == config.TARGET_NAMES
     assert tuple(restored.observation.context_fields) == config.ORACLE_CONTEXT_FIELDS
+    assert restored.train.architecture == "concat"
 
 
 def test_current_target_ranges_and_transforms_are_immutable():
@@ -256,6 +257,7 @@ def test_npe_cli_applies_only_posterior_overrides():
     assert spawned.train.early_stopping_patience == 6
     assert spawned.train.early_stopping_min_delta == pytest.approx(1.0e-4)
     assert spawned.train.gradient_clip_norm == pytest.approx(2.5)
+    assert spawned.train.architecture == "concat"
 
 
 @pytest.mark.parametrize(
@@ -264,6 +266,9 @@ def test_npe_cli_applies_only_posterior_overrides():
         (["--stage", "pretrain", "--flow-num-layers", "2"], "NPE-only"),
         (["--stage", "pretrain", "--no-freeze-feature-extractor"], "NPE-only"),
         (["--stage", "pretrain", "--no-image-spectrum-fusion"], "NPE-only"),
+        (["--stage", "pretrain", "--arch", "comparison"], "NPE-only"),
+        (["--stage", "pretrain", "--arch", "comparison_joint"], "NPE-only"),
+        (["--stage", "pretrain", "--arch", "kl_geom"], "NPE-only"),
         (["--stage", "npe", "--ccl-sigma-label", "0.2"], "CCL options"),
         (["--stage", "pretrain", "--batch-size", "0"], "batch size"),
         (["--stage", "npe", "--flow-num-bins", "1"], "bins at least two"),
@@ -293,6 +298,48 @@ def test_npe_cli_freezes_feature_extractor_by_default():
     assert config.MODEL_CONFIG.train.freeze_feature_extractor is True
     assert stage.freeze_feature_extractor is True
     assert stage.use_image_spectrum_fusion is True
+    assert stage.architecture == "concat"
+
+
+def test_npe_cli_selects_comparison_architecture_without_changing_concat_default():
+    module = _training_entrypoint()
+    args = module.parse_args(["--stage", "npe"])
+    assert args.architecture is None
+    default_stage = module.apply_overrides(args)
+    assert default_stage.architecture == "concat"
+
+    comparison = module.apply_overrides(
+        module.parse_args(["--stage", "npe", "--arch", "comparison"])
+    )
+    assert comparison.architecture == "comparison"
+    assert comparison.freeze_feature_extractor is False
+    assert comparison is config.MODEL_CONFIG.train
+
+
+def test_npe_cli_selects_comparison_joint_without_ccl():
+    module = _training_entrypoint()
+    stage = module.apply_overrides(
+        module.parse_args(["--stage", "npe", "--arch", "comparison_joint"])
+    )
+    assert stage.architecture == "comparison_joint"
+    assert stage.freeze_feature_extractor is False
+
+
+def test_npe_cli_selects_kl_geom_without_ccl():
+    module = _training_entrypoint()
+    stage = module.apply_overrides(
+        module.parse_args(["--stage", "npe", "--arch", "kl_geom", "--compile"])
+    )
+    assert stage.architecture == "kl_geom"
+    assert stage.freeze_feature_extractor is False
+    assert stage.use_compile is False
+
+
+def test_legacy_train_config_without_architecture_defaults_to_concat():
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["train"].pop("architecture")
+    restored = config.ModelConfig.from_dict(payload)
+    assert restored.train.architecture == "concat"
 
 
 def test_best_pretraining_checkpoint_is_the_current_default_and_cli_value():

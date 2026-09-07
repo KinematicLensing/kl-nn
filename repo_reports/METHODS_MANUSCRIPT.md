@@ -1,9 +1,9 @@
 # KL-NN simulator-v3 methods manuscript
 
-<!-- klnn-methods-source-sha256: 81eb351455a2eeed57aff4fd6e2a659e789beb11055d7e4e7b57e0fc4033cdc1 -->
+<!-- klnn-methods-source-sha256: 8b596d7a94aed55e4b0712ac72a8662c4c82eca7f5c5f4f710a493a88251872a -->
 
 > **Living-document status.** This manuscript describes the simulator-v3
-> working tree on 2026-09-05. The implementation, rather than this prose, is
+> working tree on 2026-09-07. The implementation, rather than this prose, is
 > normative. Repository-specific statements below therefore cite the source
 > files that define them; empirical or methodological statements cite the
 > literature. The source fingerprint above is checked by
@@ -698,6 +698,98 @@ shapes are checked at runtime by [`networks.py`](../arch/networks.py).
 > CNN backbone as trainable during CCL and frozen during NPE by default, and
 > mark the FiLM maps as NPE-only.
 
+### Additive comparison architecture
+
+The concat encoder and nine-target hybrid flow remain the production NPE
+path. `--arch concat` is the default of
+[`train_model.py`](../arch/train_model.py) and
+[`train_npe.slurm`](../arch/train_npe.slurm). An additive alternative is
+selected with `--arch comparison` and launched only from
+[`train_comparison_npe.slurm`](../arch/train_comparison_npe.slurm). It does
+not replace concat, is not used for CCL, and is not a fiber-dropout study:
+this comparison still trains on the same five-fiber observations as the
+concat 100k runs. The architecture nevertheless honors a boolean
+`fiber_mask`, so a later data set with \(N\neq 5\) fibers can drop unoccupied
+tokens without occupying a hardcoded major/minor slot.
+
+The comparison encoder is
+[`PhotometricShapeHead`, `SharedFiberSpectrumEncoder`,
+`PositionQueryFiberPool`, and
+`ComparisonFeatureExtractor`](../arch/comparison_arch.py). A small image CNN
+maps the `48x48` cutout to 128 dimensions. Each fiber spectrum is encoded by
+one shared 1-D CNN with the JointSpecCNN channel schedule
+`16 -> 32 -> 64 -> 128 -> 256`, the same two wavelength-only pools (64 bins
+to 16), and a final length-16 convolution that yields a 256-d token per
+fiber. Capacity comes from that width, not from five unshared towers. Fiber
+sky coordinates, scaled by the 1.5-arcsec fiber diameter, are mapped by a
+two-layer MLP to 256-d queries. Masked multi-head attention (8 heads;
+[Vaswani et al. 2017](#vaswani2017)) uses those queries against the spectral
+tokens; a residual adds the original tokens, and a masked mean pools the
+occupied fibers. Missing fibers are excluded from keys, values, and the
+pool. Concat's [`SimpleFusionFeatureExtractor`](../arch/networks.py) still
+rejects any False `fiber_mask` entry. Catalog metadata is the three oracle
+contexts only; the ten flattened fiber coordinates that concat concatenates
+into the 128-d metadata branch are omitted here because positions already
+enter as queries. The concatenated condition is 448-dimensional. NPE
+LayerNorm acts on that vector. Image-spectrum FiLM is absent. Training
+starts from scratch: there is no CCL checkpoint, freeze is forced off, and
+channels-last layout is disabled because the spectral tower is `Conv1d`.
+
+The comparison posterior factorizes shear from the nuisances,
+
+\[
+q_\psi(\widetilde{\bm\theta}\mid\mathbf c)=
+q_{\psi,g}(\widetilde g_1,\widetilde g_2\mid\mathbf c)\,
+q_{\psi,\mathrm{nuis}}(\widetilde{\bm\theta}_{\setminus g}\mid\mathbf c).
+\]
+
+The seven non-shear coordinates keep the bounded-hybrid circular
+factorization, with \(\widetilde\theta_\mathrm{int}\) circular at index 0 of
+that 7-vector. Shear is a diagonal Gaussian on
+\(\operatorname{artanh}(\widetilde g)\) with support \((-1,1)^2\).
+[`ComparisonKLNPE`](../arch/comparison_arch.py) exposes the same `forward`,
+`posterior_log_prob`, and `sample` methods as concat `KLNPE`, so
+[`cache_posteriors.py`](../arch/cache_posteriors.py) selects the class from
+`train.architecture` and does not grow a second sampling adapter. Training
+logs `g_log_prob_mean` alongside the existing nuisance-component
+diagnostics. ``--arch comparison_joint``, launched from
+[`train_comparison_joint_npe.slurm`](../arch/train_comparison_joint_npe.slurm),
+keeps that encoder and replaces the factorized Gaussian with concat's
+nine-target bounded-hybrid circular flow, so \(g_1\) and \(g_2\) sit in the
+eight-dimensional box with the other compact coordinates. That isolation
+does not change concat, CCL, or the factorized comparison checkpoint.
+
+``--arch kl_geom``, launched from
+[`train_kl_geom_npe.slurm`](../arch/train_kl_geom_npe.slurm), is a second
+additive NPE. It does not use the 512-d image or joint spectral CNNs.
+Weighted image quadrupole moments, with a circular 1-arcsec Gaussian PSF
+correction, are converted from polarization
+\(\chi=(Q_{xx}-Q_{yy},2Q_{xy})/(Q_{xx}+Q_{yy})\) to reduced ellipticity
+\(\varepsilon=\chi/(1+\sqrt{1-|\chi|^2})\), matching Xu's
+\(e_{\mathrm{int}}=(1-q)/(1+q)\). That supplies \(e_{\mathrm{obs}}\). The
+stored \(+\)major fiber offset supplies the observed photometric position
+angle. Flux-weighted H-alpha centroids on the five galaxy-axis traces, plus
+a tiny zero-initialized 1-D residual, supply \(v_0\), \(v'_{\mathrm{major}}\),
+and \(v'_{\mathrm{minor}}\). A parameter-free layer then applies the
+first-order [Xu et al. (2024)](#xu2024) map in that fiber frame and rotates
+by twice the observed PA, not \(\theta_{\mathrm{int}}\), into sky
+\((g_1,g_2)\). \(V_{\mathrm{circ}}\) remains a latent of concat's nine-target
+hybrid flow; Tully-Fisher importance weights stay an inference step and are
+not baked into the geometric layer at train time. Face-on and
+\(|v'_{\mathrm{major}}|<1\,\mathrm{km\,s}^{-1}\) rows return a zero geometric
+estimate rather than an unstable ratio. The flow models a residual
+\(\delta\bm g\) around that estimate, so
+\(\bm g=\hat{\bm g}_{\mathrm{KL}}+\delta\bm g\), and
+[`cache_posteriors.py`](../arch/cache_posteriors.py) still consumes composed
+nine-target samples. Geometric training is eager: `torch.compile` of this
+residual hybrid around the Xu map left rank 0 tracing while the other ranks
+waited on the first DDP allreduce. Concat and comparison keep compile.
+Photometric quadrupole and H-alpha centroids accumulate in FP32; AMP float16
+overflows \(\sum w\,x^2\) on noisy cutouts and NaNs nflows' spline bin index.
+The Xu map remains marked `torch.compiler.disable`, and \(V_{\mathrm{circ}}\)
+is denormalized with an identity affine rather than the nine-target Python
+bound loop. Concat, CCL, and both comparison checkpoints are unchanged.
+
 ### Continuous-label contrastive pretraining
 
 Pretraining appends a projection MLP
@@ -795,8 +887,11 @@ conditions on the concatenated backbone output only. Flow
 density arithmetic is evaluated with autocasting disabled, even when the CNN is
 evaluated under mixed precision. These operations are implemented in
 [`load_train_objs`, `NPETrainer`, and `KLNPE`](../arch/train.py).
+Comparison NPE uses the same trainer and sampling adapter with
+[`ComparisonKLNPE`](../arch/comparison_arch.py); it does not load a CCL
+backbone.
 
-The posterior respects the different supports of the targets through
+The concat posterior respects the different supports of the targets through
 
 \[
 q_\psi(\widetilde{\bm\theta}\mid\mathbf c)=
@@ -859,7 +954,9 @@ Hutter (2019)](#adamw), with linear warm-up followed by cosine annealing
 operational settings below are the defaults of the checked-in Slurm launchers,
 which materially override several Python dataclass defaults. They are sourced
 from [`pretrain_ccl.slurm`](../arch/pretrain_ccl.slurm),
-[`train_npe.slurm`](../arch/train_npe.slurm), and the scheduler/optimizer code
+[`train_npe.slurm`](../arch/train_npe.slurm),
+[`train_comparison_npe.slurm`](../arch/train_comparison_npe.slurm), and the
+scheduler/optimizer code
 in [`train.py`](../arch/train.py).
 
 | Setting | CCL pretraining | NPE training |
@@ -880,6 +977,19 @@ in [`train.py`](../arch/train.py).
 | Seed | 42 unless overridden | 42 unless overridden |
 | Feature extractor | trainable | frozen by default (`--freeze-feature-extractor`) |
 | Image–spectrum fusion | none; concat only | bidirectional FiLM on 512+512, identity-initialized, trainable by default (`--image-spectrum-fusion`) |
+
+The comparison NPE launcher
+[`train_comparison_npe.slurm`](../arch/train_comparison_npe.slurm) keeps the
+concat NPE epoch, batch, flow-depth, learning-rate, warmup-cosine,
+early-stopping, AMP, compile, and seed-42 settings, but trains the 448-d
+encoder from scratch on 100,000 / 10,000 rows, never requests a CCL
+checkpoint, forces `--no-freeze-feature-extractor`, omits FiLM flags, and
+disables channels-last layout.
+[`train_comparison_joint_npe.slurm`](../arch/train_comparison_joint_npe.slurm)
+is the same launcher with `--arch comparison_joint`.
+[`train_kl_geom_npe.slurm`](../arch/train_kl_geom_npe.slurm) is the same
+100,000 / 10,000 from-scratch NPE launcher with `--arch kl_geom` and
+`--no-compile`.
 
 The row counts in this table are launcher requests for deterministic dataset
 prefixes, not evidence that a complete million-object dataset or a finished
@@ -922,7 +1032,10 @@ JSON model configuration plus `networks.py` and `circular_spline.py`; those
 artifacts do not constitute a full environment lock or record the external
 `kl-tools` working tree. These behaviors follow from
 [`train.py`](../arch/train.py), [`train_model.py`](../arch/train_model.py), and
-[`model_registry.py`](../arch/model_registry.py).
+[`model_registry.py`](../arch/model_registry.py). Comparison runs additionally
+snapshot [`comparison_arch.py`](../arch/comparison_arch.py). Geometric
+`--arch kl_geom` runs snapshot [`geom_arch.py`](../arch/geom_arch.py). Concat
+snapshots remain `networks.py` plus `circular_spline.py` only.
 
 No performance, coverage, or real-survey validity claim follows from the
 architecture or validation loss alone. A final assessment requires an
@@ -1100,6 +1213,11 @@ gradient descent with warm restarts. *ICLR*.
 Gelman, A. (2018).** Validating Bayesian inference algorithms with
 simulation-based calibration.
 [arXiv:1804.06788](https://arxiv.org/abs/1804.06788).
+
+<a id="vaswani2017"></a>**Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J.,
+Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I. (2017).** Attention is
+all you need. *NeurIPS, 30*.
+[Paper](https://papers.nips.cc/paper_files/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html).
 
 <a id="xu2024"></a>**Xu, X., et al. (2024).** Kinematic lensing with DESI:
 probing structure formation at very low redshift.

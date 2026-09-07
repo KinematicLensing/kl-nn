@@ -32,6 +32,8 @@ try:
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
     )
+    from .comparison_arch import ComparisonKLNPE
+    from .geom_arch import GeometricKLNPE
     from .model_registry import load_model_config
     from .networks import KLNPE
     from .tf_prior import (
@@ -53,6 +55,8 @@ except ImportError:  # Direct execution from arch/.
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
     )
+    from comparison_arch import ComparisonKLNPE
+    from geom_arch import GeometricKLNPE
     from model_registry import load_model_config
     from networks import KLNPE
     from tf_prior import (
@@ -775,8 +779,18 @@ def main(argv=None) -> None:
     label = partition_label(args.partition_index, args.nparts)
 
     checkpoint = resolve_checkpoint(args, args.model_root)
+    try:
+        architecture = str(_config_value(train_config, "architecture"))
+    except (AttributeError, KeyError):
+        architecture = "concat"
+    if config.is_kl_geom_architecture(architecture):
+        model_class = GeometricKLNPE
+    elif config.is_comparison_architecture(architecture):
+        model_class = ComparisonKLNPE
+    else:
+        model_class = KLNPE
     model = load_model(
-        KLNPE,
+        model_class,
         path=str(checkpoint),
         model_name=args.model_name,
         strict=True,

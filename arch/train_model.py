@@ -11,11 +11,15 @@ import torch.multiprocessing as mp
 
 try:
     from . import config
+    from .comparison_arch import ComparisonKLNPE
+    from .geom_arch import GeometricKLNPE
     from .model_registry import save_model_artifacts
     from .networks import CCLPretrain, KLNPE
     from .train import FETrainer, NPETrainer, train_nn
 except ImportError:  # Direct execution from arch/.
     import config
+    from comparison_arch import ComparisonKLNPE
+    from geom_arch import GeometricKLNPE
     from model_registry import save_model_artifacts
     from networks import CCLPretrain, KLNPE
     from train import FETrainer, NPETrainer, train_nn
@@ -111,6 +115,21 @@ def parse_args(argv=None):
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
+    parser.add_argument(
+        "--arch",
+        dest="architecture",
+        choices=config.ARCHITECTURES,
+        default=None,
+        help=(
+            "NPE encoder/posterior family. concat is the production "
+            "CNN-CNN-Meta hybrid (default). comparison is the additive "
+            "position-query encoder with a factorized shear Gaussian. "
+            "comparison_joint keeps that encoder and restores concat's "
+            "nine-target hybrid flow. kl_geom measures quadrupole, "
+            "position angle, and H-alpha centroids, applies the Xu "
+            "shear map, and models a residual with concat's hybrid flow."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -167,6 +186,8 @@ def apply_overrides(args):
     _set_if_not_none(stage, "weight_decay", args.weight_decay)
 
     if args.stage == "pretrain":
+        if config.is_from_scratch_npe_architecture(args.architecture):
+            raise ValueError("comparison architecture is NPE-only")
         invalid_npe = any(
             value is not None
             for value in (
@@ -219,8 +240,17 @@ def apply_overrides(args):
             "early_stopping_patience",
             "early_stopping_min_delta",
             "gradient_clip_norm",
+            "architecture",
         ):
             _set_if_not_none(stage, name, getattr(args, name))
+        if config.is_from_scratch_npe_architecture(
+            getattr(stage, "architecture", "concat")
+        ):
+            stage.freeze_feature_extractor = False
+        if config.is_kl_geom_architecture(
+            getattr(stage, "architecture", "concat")
+        ):
+            stage.use_compile = False
 
     _validate_current_config(args.stage)
     config.set_model_config(config.MODEL_CONFIG)
@@ -275,15 +305,23 @@ def _validate_current_config(stage_name):
         _positive_finite(stage.ccl_d_cutoff, "CCL cutoff")
         return
 
-    if not (
-        stage.pretrain_from == "best"
-        or (
-            isinstance(stage.pretrain_from, int)
-            and not isinstance(stage.pretrain_from, bool)
-            and stage.pretrain_from >= 0
+    if getattr(stage, "architecture", "concat") not in config.ARCHITECTURES:
+        raise ValueError(
+            "architecture must be 'concat', 'comparison', "
+            "'comparison_joint', or 'kl_geom'"
         )
+    if not config.is_from_scratch_npe_architecture(
+        getattr(stage, "architecture", "concat")
     ):
-        raise ValueError("pretrain_from must be 'best' or a non-negative integer")
+        if not (
+            stage.pretrain_from == "best"
+            or (
+                isinstance(stage.pretrain_from, int)
+                and not isinstance(stage.pretrain_from, bool)
+                and stage.pretrain_from >= 0
+            )
+        ):
+            raise ValueError("pretrain_from must be 'best' or a non-negative integer")
 
     flow = model.flow
     if flow.num_layers < 1 or flow.num_bins < 2 or flow.theta_num_layers < 1:
@@ -334,8 +372,22 @@ def main(argv=None):
     world_size = torch.cuda.device_count()
     if world_size < 1:
         raise RuntimeError("Training requires at least one visible CUDA device")
-    model_class = CCLPretrain if args.stage == "pretrain" else KLNPE
-    trainer_class = FETrainer if args.stage == "pretrain" else NPETrainer
+    architecture = (
+        config.MODEL_CONFIG.train.architecture if args.stage == "npe" else "concat"
+    )
+    print(f"architecture={architecture}")
+    if args.stage == "pretrain":
+        model_class = CCLPretrain
+        trainer_class = FETrainer
+    elif config.is_kl_geom_architecture(architecture):
+        model_class = GeometricKLNPE
+        trainer_class = NPETrainer
+    elif config.is_comparison_architecture(architecture):
+        model_class = ComparisonKLNPE
+        trainer_class = NPETrainer
+    else:
+        model_class = KLNPE
+        trainer_class = NPETrainer
     mp.spawn(
         train_nn,
         args=(

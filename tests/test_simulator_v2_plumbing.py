@@ -154,6 +154,9 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
         for name in (
             "pretrain_ccl.slurm",
             "train_npe.slurm",
+            "train_comparison_npe.slurm",
+            "train_comparison_joint_npe.slurm",
+            "train_kl_geom_npe.slurm",
             "cache_posteriors.slurm",
             "shear_response_inference.slurm",
         )
@@ -174,6 +177,27 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert 'IMAGE_SPECTRUM_FUSION="${IMAGE_SPECTRUM_FUSION:-1}"' in npe
     assert "--image-spectrum-fusion" in npe
     assert "--no-image-spectrum-fusion" in npe
+    assert "--arch comparison" not in npe
+    train_model = (ROOT / "arch/train_model.py").read_text()
+    assert '"--arch"' in train_model
+    comparison = (ROOT / "arch/train_comparison_npe.slurm").read_text()
+    assert "--arch comparison" in comparison
+    assert "--no-freeze-feature-extractor" in comparison
+    assert "PRETRAINED_NAME" not in comparison
+    assert "small_10k_simv3_cosi/" in comparison
+    assert "valid_100k_simv3_cosi/" in comparison
+    joint = (ROOT / "arch/train_comparison_joint_npe.slurm").read_text()
+    assert "--arch comparison_joint" in joint
+    assert "--no-freeze-feature-extractor" in joint
+    assert "PRETRAINED_NAME" not in joint
+    assert "small_10k_simv3_cosi/" in joint
+    geom = (ROOT / "arch/train_kl_geom_npe.slurm").read_text()
+    assert "--arch kl_geom" in geom
+    assert "--no-freeze-feature-extractor" in geom
+    assert "--no-compile" in geom
+    assert "PRETRAINED_NAME" not in geom
+    assert "small_10k_simv3_cosi/" in geom
+    assert "valid_100k_simv3_cosi/" in geom
     pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
     assert '--model-root "${MODEL_ROOT}"' in pretrain
     assert "train_1m_simv3_cosi/" in pretrain

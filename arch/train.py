@@ -351,6 +351,15 @@ def _owner(model):
 def _maybe_compile_model(model, stage_config, logger=None):
     if not stage_config.get("use_compile", False):
         return model
+    if config.is_kl_geom_architecture(
+        str(stage_config.get("architecture", "concat"))
+    ):
+        if logger:
+            logger.info(
+                "Skipping torch.compile for kl_geom; compiling the residual "
+                "hybrid around the Xu map desynchronizes DDP"
+            )
+        return model
     if not hasattr(torch, "compile"):
         raise RuntimeError(
             "compilation was requested, but torch.compile is unavailable"
@@ -440,7 +449,7 @@ class Trainer:
         self.nfeatures = len(config.TARGET_NAMES)
         self.use_amp = bool(self.stage_config["use_amp"])
         self.amp_dtype = _resolve_amp_dtype(self.stage_config["amp_dtype"])
-        self.channels_last = bool(self.stage_config["channels_last"])
+        self.channels_last = _use_channels_last(self.stage_config)
         self.fixed_validation_streams = bool(
             self.stage_config["fixed_validation_streams"]
         )
@@ -1081,6 +1090,19 @@ class NPETrainer(Trainer):
         return self._run("valid", train=False)
 
 
+def _architecture_name(stage_config):
+    return str(stage_config.get("architecture", "concat"))
+
+
+def _use_channels_last(stage_config):
+    return (
+        bool(stage_config.get("channels_last", False))
+        and not config.is_from_scratch_npe_architecture(
+            _architecture_name(stage_config)
+        )
+    )
+
+
 def _npe_optimizer_parameters(model, train_config):
     owner = _owner(model)
     flow = owner.flow
@@ -1105,7 +1127,7 @@ def _npe_optimizer_parameters(model, train_config):
     ):
         raise RuntimeError("optimizer groups overlap")
     base_lr = float(train_config["initial_learning_rate"])
-    return [
+    groups = [
         {"params": remaining, "lr": base_lr, "group_name": "shared"},
         {
             "params": non_theta,
@@ -1118,6 +1140,10 @@ def _npe_optimizer_parameters(model, train_config):
             "group_name": "theta_transform",
         },
     ]
+    nonempty = [group for group in groups if len(group["params"]) > 0]
+    if not nonempty:
+        raise RuntimeError("NPE optimizer has no trainable parameters")
+    return nonempty
 
 
 def load_model(
@@ -1138,7 +1164,17 @@ def load_model(
     snapshot = load_networks_module_for_model(
         resolved_name, networks_root=networks_root
     ) if networks_root is not None else load_networks_module_for_model(resolved_name)
-    snapshot_class = getattr(snapshot, model_class.__name__)
+    snapshot_class = getattr(snapshot, model_class.__name__, None)
+    if snapshot_class is None:
+        for helper_name in ("_comparison_arch", "_geom_arch"):
+            helper = getattr(snapshot, helper_name, None)
+            snapshot_class = getattr(helper, model_class.__name__, None)
+            if snapshot_class is not None:
+                break
+    if snapshot_class is None:
+        raise AttributeError(
+            f"snapshot for {resolved_name!r} has no class {model_class.__name__}"
+        )
     model = snapshot_class(**kwargs).to(device)
     state = torch.load(path, weights_only=False, map_location=device)
     model.load_state_dict(state, strict=strict)
@@ -1167,31 +1203,37 @@ def load_train_objs(
     freeze_feature_extractor = bool(
         stage_config.get("freeze_feature_extractor", True)
     )
+    architecture = str(stage_config.get("architecture", "concat"))
     if train_mode == "pretrain":
         model = model_class()
     elif train_mode == "train":
-        if epoch is None:
-            raise ValueError("NPE training requires a pretraining checkpoint")
-        checkpoint = join(
-            stage_config["model_path"],
-            stage_config["pretrained_name"],
-            stage_config["pretrained_name"] + str(epoch),
-        )
-        pretrained = load_model(
-            CCLPretrain,
-            path=checkpoint,
-            model_name=stage_config["pretrained_name"],
-            device=device,
-            networks_root=join(
-                os.path.dirname(
-                    os.path.abspath(stage_config["model_path"]).rstrip(os.sep)
+        if config.is_from_scratch_npe_architecture(architecture):
+            model = model_class()
+            freeze_feature_extractor = False
+            stage_config["freeze_feature_extractor"] = False
+        else:
+            if epoch is None:
+                raise ValueError("NPE training requires a pretraining checkpoint")
+            checkpoint = join(
+                stage_config["model_path"],
+                stage_config["pretrained_name"],
+                stage_config["pretrained_name"] + str(epoch),
+            )
+            pretrained = load_model(
+                CCLPretrain,
+                path=checkpoint,
+                model_name=stage_config["pretrained_name"],
+                device=device,
+                networks_root=join(
+                    os.path.dirname(
+                        os.path.abspath(stage_config["model_path"]).rstrip(os.sep)
+                    ),
+                    "networks",
                 ),
-                "networks",
-            ),
-        )
-        model = model_class(feature_extractor=pretrained.backbone)
-        for parameter in model.feature_extractor.parameters():
-            parameter.requires_grad = not freeze_feature_extractor
+            )
+            model = model_class(feature_extractor=pretrained.backbone)
+            for parameter in model.feature_extractor.parameters():
+                parameter.requires_grad = not freeze_feature_extractor
     else:
         raise ValueError(f"unknown train_mode {train_mode!r}")
     model = _synchronize_pretrain_batch_norm(
@@ -1223,9 +1265,10 @@ def load_train_objs(
     if logger and rank == 0:
         if train_mode == "train":
             logger.info(
-                "Loaded current %s model (freeze_feature_extractor=%s, "
-                "image_spectrum_film_fusion=%s)",
+                "Loaded current %s model (architecture=%s, "
+                "freeze_feature_extractor=%s, image_spectrum_film_fusion=%s)",
                 train_mode,
+                architecture,
                 freeze_feature_extractor,
                 bool(stage_config.get("use_image_spectrum_fusion", True)),
             )
@@ -1285,7 +1328,7 @@ def train_nn(
             logger=logger,
             device=device,
         )
-        if stage["channels_last"]:
+        if _use_channels_last(stage):
             model = model.to(memory_format=torch.channels_last)
         model = _maybe_compile_model(model, stage, logger)
         ddp_kwargs = {
@@ -1487,7 +1530,7 @@ def sample_density(
                 "image_snr": image_snr[index:index + 1],
                 "central_halpha_snr": central_halpha_snr[index:index + 1],
             }
-            if config.train["channels_last"]:
+            if _use_channels_last(config.train):
                 image = image.contiguous(memory_format=torch.channels_last)
                 spectra = spectra.contiguous(memory_format=torch.channels_last)
             half = nsamples // 2

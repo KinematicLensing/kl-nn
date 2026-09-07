@@ -42,6 +42,22 @@ ORACLE_CONTEXT_FIELDS = (
     "central_halpha_snr",
 )
 
+ARCHITECTURES = ("concat", "comparison", "comparison_joint", "kl_geom")
+COMPARISON_ARCHITECTURES = ("comparison", "comparison_joint")
+FROM_SCRATCH_NPE_ARCHITECTURES = ("comparison", "comparison_joint", "kl_geom")
+
+
+def is_comparison_architecture(name) -> bool:
+    return str(name or "concat") in COMPARISON_ARCHITECTURES
+
+
+def is_kl_geom_architecture(name) -> bool:
+    return str(name or "concat") == "kl_geom"
+
+
+def is_from_scratch_npe_architecture(name) -> bool:
+    return str(name or "concat") in FROM_SCRATCH_NPE_ARCHITECTURES
+
 
 @dataclass
 class DatasetConfig:
@@ -111,6 +127,7 @@ class TrainConfig:
     feature_norm_trainable: bool = True
     freeze_feature_extractor: bool = True
     use_image_spectrum_fusion: bool = True
+    architecture: str = "concat"
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
     gradient_clip_norm: float = 1.0
@@ -285,6 +302,11 @@ class ModelConfig:
             raise ValueError(
                 "train.pretrain_from must be 'best' or a non-negative integer"
             )
+        if self.train.architecture not in ARCHITECTURES:
+            raise ValueError(
+                "train.architecture must be 'concat', 'comparison', "
+                "'comparison_joint', or 'kl_geom'"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -316,6 +338,10 @@ class ModelConfig:
             "flow": FlowConfig,
             "observation": ObservationConfig,
         }
+        train_payload = dict(payload["train"])
+        if "architecture" not in train_payload:
+            train_payload["architecture"] = "concat"
+        payload = {**payload, "train": train_payload}
         for name, nested_type in nested_types.items():
             value = payload[name]
             if not isinstance(value, dict):

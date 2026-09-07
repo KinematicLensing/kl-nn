@@ -11,9 +11,11 @@ There is deliberately one production path:
   coordinates and a directed circular ``theta_int`` coordinate.
 
 The spectral branch intentionally assumes the fixed five-fiber, 64-bin
-observation used by the current simulator. Alternate backbones, point-estimate
-heads, training-time population weighting, and alternate flow families are
-intentionally absent.
+observation used by the current simulator. An additive comparison
+architecture lives in ``comparison_arch.py`` and is selected with
+``--arch comparison``; it does not replace this concat path. Point-estimate
+heads, training-time population weighting, and alternate flow families for
+the concat pipeline remain absent.
 """
 
 from __future__ import annotations
@@ -602,14 +604,17 @@ class IdentityBoundedRationalQuadraticAutoregressiveTransform(
 
 
 class BoundedHybridCircularFlow(nn.Module):
-    """Nine-target compact posterior with one correlated circular coordinate.
+    """Compact posterior with one correlated circular coordinate.
 
+    ``features`` defaults to the nine-target concat schema. The additive
+    comparison path uses seven nuisance coordinates with ``theta_index=0``.
     The joint factorization is
 
     ``q(x, theta | context) = q_box(x | context) q_circle(theta | x, context)``,
 
-    where all eight entries of ``x`` live on the closed normalized interval
-    ``[-1, 1]`` and ``theta_int`` lives on the half-open circle ``[-1, 1)``.
+    where the non-angular entries of ``x`` live on the closed normalized
+    interval ``[-1, 1]`` and ``theta_int`` lives on the half-open circle
+    ``[-1, 1)``.
     """
 
     def __init__(
@@ -630,10 +635,8 @@ class BoundedHybridCircularFlow(nn.Module):
         theta_transform=None,
     ):
         super().__init__()
-        if features != TARGET_COUNT:
-            raise ValueError(
-                f"BoundedHybridCircularFlow requires {TARGET_COUNT} targets"
-            )
+        if type(features) is not int or features < 2:
+            raise ValueError("features must be an integer of at least two")
         if type(theta_index) is not int or not 0 <= theta_index < features:
             raise ValueError("theta_index is out of bounds")
         if type(context_features) is not int or context_features <= 0:

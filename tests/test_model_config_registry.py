@@ -196,3 +196,51 @@ def test_missing_current_config_and_network_snapshots_fail_closed(tmp_path):
         model_registry.load_networks_module_for_model(
             "missing", networks_root=str(tmp_path / "snapshots")
         )
+
+
+@pytest.mark.parametrize("architecture", ["comparison", "comparison_joint"])
+def test_comparison_architecture_snapshots_helper_and_exposes_class(
+    tmp_path, architecture
+):
+    configured = copy.deepcopy(config.MODEL_CONFIG)
+    configured.train.model_name = f"{architecture}-snap"
+    configured.train.architecture = architecture
+    artifacts = model_registry.save_model_artifacts(
+        configured,
+        configs_root=str(tmp_path / "configs"),
+        networks_root=str(tmp_path / "networks"),
+    )
+
+    assert "comparison_arch_path" in artifacts
+    assert Path(artifacts["comparison_arch_path"]).read_text(
+        encoding="utf-8"
+    ) == (ROOT / "arch" / "comparison_arch.py").read_text(encoding="utf-8")
+    loaded = model_registry.load_networks_module_for_model(
+        f"{architecture}-snap", networks_root=str(tmp_path / "networks")
+    )
+    assert loaded.KLNPE.__name__ == "KLNPE"
+    assert loaded._comparison_arch.ComparisonKLNPE.__name__ == "ComparisonKLNPE"
+    assert not hasattr(loaded, "ComparisonKLNPE")
+
+
+def test_kl_geom_architecture_snapshots_helper_and_exposes_class(tmp_path):
+    configured = copy.deepcopy(config.MODEL_CONFIG)
+    configured.train.model_name = "kl-geom-snap"
+    configured.train.architecture = "kl_geom"
+    artifacts = model_registry.save_model_artifacts(
+        configured,
+        configs_root=str(tmp_path / "configs"),
+        networks_root=str(tmp_path / "networks"),
+    )
+
+    assert "geom_arch_path" in artifacts
+    assert Path(artifacts["geom_arch_path"]).read_text(
+        encoding="utf-8"
+    ) == (ROOT / "arch" / "geom_arch.py").read_text(encoding="utf-8")
+    loaded = model_registry.load_networks_module_for_model(
+        "kl-geom-snap", networks_root=str(tmp_path / "networks")
+    )
+    assert loaded.KLNPE.__name__ == "KLNPE"
+    assert loaded._geom_arch.GeometricKLNPE.__name__ == "GeometricKLNPE"
+    assert not hasattr(loaded, "GeometricKLNPE")
+

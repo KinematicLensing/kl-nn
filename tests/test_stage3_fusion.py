@@ -142,6 +142,98 @@ def test_joint_spectral_cnn_keeps_sixteen_wavelength_bins_before_the_final_kerne
     assert last_conv.kernel_size == (5, 16)
 
 
+def _halpha_line_cube(shift_pix=0.0, batch_size=2):
+    wave = torch.arange(64, dtype=torch.float32)
+    profile = torch.exp(-0.5 * ((wave - (31.5 + float(shift_pix))) / 1.25) ** 2)
+    amplitudes = torch.tensor([0.55, 0.80, 1.00, 0.80, 0.55])
+    cube = amplitudes.view(1, 1, 5, 1) * profile.view(1, 1, 1, 64)
+    return cube.expand(batch_size, 1, 5, 64).contiguous()
+
+
+class _WavelengthPooledJointSpecCNN(nn.Module):
+    """Frozen copy of the pre-better-spec JointSpecCNN (two 1x2 wavelength pools)."""
+
+    output_dim = SPECTRAL_FEATURE_DIM
+
+    def __init__(self, nspec=5):
+        super().__init__()
+        self.nspecs = int(nspec)
+        self.cnn_spec = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, self.output_dim, kernel_size=(self.nspecs, 16), bias=False),
+            nn.BatchNorm2d(self.output_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, spectra):
+        return self.cnn_spec(spectra).flatten(start_dim=1)
+
+
+def _mean_line_shift_distance(encoder):
+    encoder = encoder.eval()
+    with torch.inference_mode():
+        unshifted = encoder(_halpha_line_cube(0.0))
+        shifted = encoder(_halpha_line_cube(1.0))
+    assert unshifted.shape == (2, SPECTRAL_FEATURE_DIM)
+    assert torch.isfinite(unshifted).all() and torch.isfinite(shifted).all()
+    return float(torch.linalg.vector_norm(shifted - unshifted, dim=-1).mean())
+
+
+def test_joint_spectral_cnn_has_no_hand_crafted_kl_observables():
+    encoder = JointSpecCNN(nspec=5).eval()
+    assert encoder.wavelength_count == 64
+    for name in ("line_centroid", "line_width", "line_flux", "v_obs"):
+        assert not hasattr(encoder, name)
+    with torch.inference_mode():
+        features = encoder(torch.randn(3, 1, 5, 64))
+    assert features.shape == (3, SPECTRAL_FEATURE_DIM)
+
+
+def test_joint_spectral_cnn_line_shift_is_at_least_as_sensitive_as_wavelength_pooling():
+    torch.manual_seed(123)
+    pooled_distance = _mean_line_shift_distance(_WavelengthPooledJointSpecCNN())
+    torch.manual_seed(123)
+    production_distance = _mean_line_shift_distance(JointSpecCNN(nspec=5))
+    assert pooled_distance > 0.0
+    assert production_distance > 0.0
+    n_pool = sum(isinstance(module, nn.MaxPool2d) for module in JointSpecCNN(nspec=5).cnn_spec)
+    if n_pool == 0:
+        assert production_distance > pooled_distance
+    else:
+        assert production_distance == pytest.approx(pooled_distance, rel=1e-5, abs=1e-5)
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [

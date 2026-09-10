@@ -11,6 +11,12 @@
 set -euo pipefail
 ulimit -c 0
 
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/arch/cache_posteriors.py" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+
 module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
@@ -19,7 +25,7 @@ conda activate kl-nn
 
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
 EPOCH="${EPOCH:-}"
-DATASET="${DATASET:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
+DATASET="${DATASET:-shear_response_simv3_cosi_5k}"
 NBASE="${NBASE:-1000}"
 NPARTS="${NPARTS:-10}"
 NSAMPLES="${NSAMPLES:-5000}"
@@ -31,9 +37,14 @@ CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
 TOTAL="$((5 * NBASE))"
 PART_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-10}"
+ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"
 
-if (( NPARTS != ARRAY_TASK_COUNT )); then
-    echo "NPARTS=${NPARTS}, but this job has ${ARRAY_TASK_COUNT} array tasks; submit with --array=1-${NPARTS}" >&2
+if [[ "${ALLOW_PARTIAL_ARRAY}" != "0" && "${ALLOW_PARTIAL_ARRAY}" != "1" ]]; then
+    echo "ALLOW_PARTIAL_ARRAY must be 0 or 1" >&2
+    exit 2
+fi
+if (( NPARTS != ARRAY_TASK_COUNT )) && [[ "${ALLOW_PARTIAL_ARRAY}" != "1" ]]; then
+    echo "NPARTS=${NPARTS}, but this job has ${ARRAY_TASK_COUNT} array tasks; submit with --array=1-${NPARTS}, or set ALLOW_PARTIAL_ARRAY=1 for an intentional sparse resume" >&2
     exit 2
 fi
 if (( TOTAL % NPARTS != 0 )); then
@@ -77,5 +88,5 @@ echo "model=${MODEL_NAME} epoch=${EPOCH:-best}"
 echo "response_dataset=${DATASET} partition=${PART_INDEX}/${NPARTS} matched_group_size=5"
 echo "ngals=${NGALS} nsamples=${NSAMPLES} cache_tag=${CACHE_TAG}"
 
-cd /jet/home/xwang30/kl-nn/arch
+cd "${KLNN_REPO_ROOT}/arch"
 python cache_posteriors.py "${ARGS[@]}"

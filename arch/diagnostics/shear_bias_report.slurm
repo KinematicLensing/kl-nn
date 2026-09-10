@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=15G
 
-set -euo pipefail
+set -eo pipefail
 ulimit -c 0
 
 KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
@@ -22,7 +22,9 @@ setup_shared_job_scratch shear-bias-report
 module load anaconda3
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
+set +u
 conda activate kl-nn
+set -u
 
 : "${CASE_1:?Set CASE_1 to MODEL:CACHE_DATASET}"
 : "${OUTPUT:?Set OUTPUT to the destination HTML report}"
@@ -57,6 +59,22 @@ if [[ -n "${CASE_3}" ]]; then
 fi
 if [[ -n "${MAX_GALAXIES}" ]]; then
     ARGS+=(--max-galaxies "${MAX_GALAXIES}")
+fi
+CASE_2_RESPONSE_CALIBRATION="${CASE_2_RESPONSE_CALIBRATION:-}"
+if [[ -n "${CASE_2_RESPONSE_CALIBRATION}" ]]; then
+    if [[ -z "${CASE_2}" ]]; then
+        echo "CASE_2_RESPONSE_CALIBRATION requires CASE_2" >&2
+        exit 2
+    fi
+    if [[ -n "${CASE_3}" ]]; then
+        echo "CASE_2_RESPONSE_CALIBRATION cannot be combined with CASE_3" >&2
+        exit 2
+    fi
+    ARGS+=(--response-calibrate "${CASE_2_RESPONSE_CALIBRATION}")
+fi
+MAX_SHEAR_SIGMA="${MAX_SHEAR_SIGMA:-}"
+if [[ -n "${MAX_SHEAR_SIGMA}" ]]; then
+    ARGS+=(--max-shear-sigma "${MAX_SHEAR_SIGMA}")
 fi
 
 cd "${KLNN_REPO_ROOT}/arch/diagnostics"

@@ -82,15 +82,53 @@ def test_weighted_response_recovers_known_matrix_and_additive():
         manifest, truth, estimate, rmag, ratio
     )
     weight = report.normalize_log_weights(base_ratio)
-    result = report.analyze_response(
+    raw = report.analyze_response(
         cube, true_cube, weight, calibration_fraction=0.5, seed=7
     )
     np.testing.assert_allclose(
-        result["calibration_response"], [[1.03, 0.02], [-0.01, 0.98]], atol=1e-13
+        raw["calibration_response"], [[1.03, 0.02], [-0.01, 0.98]], atol=1e-13
     )
-    np.testing.assert_allclose(result["calibration_additive"], [2e-4, -1e-4])
-    np.testing.assert_allclose(result["corrected_holdout_response"], np.eye(2), atol=1e-13)
-    np.testing.assert_allclose(result["corrected_holdout_additive"], [0.0, 0.0], atol=1e-13)
+    np.testing.assert_allclose(raw["calibration_additive"], [2e-4, -1e-4])
+    assert "corrected_holdout_response" not in raw
+    corrected = report.analyze_response(
+        cube,
+        true_cube,
+        weight,
+        calibration_fraction=0.5,
+        seed=7,
+        apply_response_correction=True,
+    )
+    np.testing.assert_allclose(
+        corrected["corrected_holdout_response"], np.eye(2), atol=1e-13
+    )
+    np.testing.assert_allclose(
+        corrected["corrected_holdout_additive"], [0.0, 0.0], atol=1e-13
+    )
+
+
+def test_stratified_raw_response_separates_faint_bin():
+    report = _report()
+    nbase = 12
+    manifest, truth, estimate, rmag, ratio = _matched(nbase=nbase)
+    cube, true_cube, base_ratio, _ = report.build_matched_cubes(
+        manifest, truth, estimate, rmag, ratio
+    )
+    image_snr = np.repeat(np.array([20.0, 80.0, 400.0, 800.0]), 3)
+    halpha_snr = np.repeat(np.array([3.0, 8.0, 40.0, 120.0]), 3)
+    true_cube[:, :, 3] = np.repeat(np.array([0.2, 0.5, 0.85, 0.95]), 3)[:, None]
+    result = report.analyze_response(
+        cube,
+        true_cube,
+        np.full(nbase, 1.0 / nbase),
+        calibration_fraction=0.5,
+        seed=3,
+        image_snr=image_snr,
+        central_halpha_snr=halpha_snr,
+    )
+    faint = result["stratified_raw_response"]["faint_low_halpha"]
+    assert faint["n"] >= 2
+    assert "response_diag_mean" in faint
+    assert result["stratified_raw_response"]["cosi"]["bins"]["edge_on"]["n"] >= 1
 
 
 @pytest.mark.parametrize(

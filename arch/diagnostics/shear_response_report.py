@@ -43,6 +43,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--estimator", choices=("map", "mean"), default="mean")
     parser.add_argument("--calibration-fraction", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=31415)
+    parser.add_argument(
+        "--apply-response-correction",
+        action="store_true",
+        help=(
+            "Also invert the calibration-split response matrix. Off by default; "
+            "raw R is the diagnostic estimator."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -339,6 +347,122 @@ def build_matched_cubes(
     return estimate_cube, truth_cube, base_log_ratio, base_ids
 
 
+def _shared_base_values(row_values, nbase, *, name):
+    values = np.asarray(row_values, dtype=np.float64)
+    if values.shape != (nbase * len(STATE_ORDER),):
+        raise ValueError(f"{name} must contain one value per cache row")
+    cube = values.reshape(nbase, len(STATE_ORDER))
+    if not np.allclose(cube, cube[:, :1], rtol=0.0, atol=1e-5):
+        raise ValueError(f"matched groups must share {name}")
+    if not np.all(np.isfinite(cube)):
+        raise ValueError(f"{name} must be finite")
+    return cube[:, 0]
+
+
+def _tertile_edges(values):
+    low, high = np.quantile(np.asarray(values, dtype=np.float64), (1.0 / 3.0, 2.0 / 3.0))
+    return float(low), float(high)
+
+
+def _assign_tertiles(values, low_edge, high_edge):
+    values = np.asarray(values, dtype=np.float64)
+    labels = np.full(len(values), "mid", dtype=object)
+    labels[values <= low_edge] = "low"
+    labels[values > high_edge] = "high"
+    return labels
+
+
+def _assign_cosi_bins(cosi):
+    cosi = np.asarray(cosi, dtype=np.float64)
+    labels = np.full(len(cosi), "intermediate", dtype=object)
+    labels[cosi >= (2.0 / 3.0)] = "face_on"
+    labels[cosi <= (1.0 / 3.0)] = "edge_on"
+    return labels
+
+
+def _bin_response_summary(response, additive, weight, mask):
+    selected = np.asarray(mask, dtype=bool)
+    n = int(np.count_nonzero(selected))
+    if n < 2:
+        return {"n": n, "skipped": True}
+    selected_weight = np.asarray(weight, dtype=np.float64)[selected]
+    if not np.all(np.isfinite(selected_weight)) or np.sum(selected_weight) <= 0.0:
+        return {"n": n, "skipped": True}
+    selected_weight = selected_weight / np.sum(selected_weight)
+    mean_response = weighted_mean(response[selected], selected_weight)
+    mean_additive = weighted_mean(additive[selected], selected_weight)
+    return {
+        "n": n,
+        "weight_ess": float(1.0 / np.sum(selected_weight**2)),
+        "response": mean_response.tolist(),
+        "additive": mean_additive.tolist(),
+        "response_diag_mean": float(np.mean(np.diag(mean_response))),
+    }
+
+
+def stratified_response(
+    response: np.ndarray,
+    additive: np.ndarray,
+    base_weight: np.ndarray,
+    *,
+    image_snr: np.ndarray,
+    central_halpha_snr: np.ndarray,
+    cosi: np.ndarray,
+) -> dict:
+    """Bin raw R so a prior-averaged matrix cannot hide a faint-galaxy hole."""
+
+    nbase = len(response)
+    image_snr = np.asarray(image_snr, dtype=np.float64)
+    central_halpha_snr = np.asarray(central_halpha_snr, dtype=np.float64)
+    cosi = np.asarray(cosi, dtype=np.float64)
+    if (
+        image_snr.shape != (nbase,)
+        or central_halpha_snr.shape != (nbase,)
+        or cosi.shape != (nbase,)
+    ):
+        raise ValueError("stratification covariates must contain one value per base")
+    image_edges = _tertile_edges(image_snr)
+    halpha_edges = _tertile_edges(central_halpha_snr)
+    image_bins = _assign_tertiles(image_snr, *image_edges)
+    halpha_bins = _assign_tertiles(central_halpha_snr, *halpha_edges)
+    cosi_bins = _assign_cosi_bins(cosi)
+    bins = {
+        "image_snr_tertiles": {
+            "edges": {"low_max": image_edges[0], "high_min": image_edges[1]},
+            "bins": {
+                label: _bin_response_summary(
+                    response, additive, base_weight, image_bins == label
+                )
+                for label in ("low", "mid", "high")
+            },
+        },
+        "central_halpha_snr_tertiles": {
+            "edges": {"low_max": halpha_edges[0], "high_min": halpha_edges[1]},
+            "bins": {
+                label: _bin_response_summary(
+                    response, additive, base_weight, halpha_bins == label
+                )
+                for label in ("low", "mid", "high")
+            },
+        },
+        "cosi": {
+            "bins": {
+                label: _bin_response_summary(
+                    response, additive, base_weight, cosi_bins == label
+                )
+                for label in ("edge_on", "intermediate", "face_on")
+            },
+        },
+        "faint_low_halpha": _bin_response_summary(
+            response,
+            additive,
+            base_weight,
+            (image_bins == "low") & (halpha_bins == "low"),
+        ),
+    }
+    return bins
+
+
 def analyze_response(
     estimate_cube: np.ndarray,
     truth_cube: np.ndarray,
@@ -346,6 +470,9 @@ def analyze_response(
     *,
     calibration_fraction: float,
     seed: int,
+    apply_response_correction: bool = False,
+    image_snr: np.ndarray | None = None,
+    central_halpha_snr: np.ndarray | None = None,
 ) -> dict:
     if not 0.0 < calibration_fraction < 1.0:
         raise ValueError("calibration-fraction must lie strictly between 0 and 1")
@@ -379,6 +506,23 @@ def analyze_response(
         estimate_cube[:, code["g2_plus"]]
         - estimate_cube[:, code["g2_minus"]]
     ) / (2.0 * delta)
+    additive = estimate_cube[:, code["zero"]]
+    cosi_index = CURRENT_FEATURE_NAMES.index("cosi")
+    cosi = truth_cube[:, code["zero"], cosi_index]
+    if image_snr is None:
+        image_snr = np.full(nbase, np.nan)
+    if central_halpha_snr is None:
+        central_halpha_snr = np.full(nbase, np.nan)
+    bins = None
+    if np.all(np.isfinite(image_snr)) and np.all(np.isfinite(central_halpha_snr)):
+        bins = stratified_response(
+            response,
+            additive,
+            base_weight,
+            image_snr=image_snr,
+            central_halpha_snr=central_halpha_snr,
+            cosi=cosi,
+        )
 
     rng = np.random.default_rng(seed)
     order = rng.permutation(nbase)
@@ -391,22 +535,11 @@ def analyze_response(
     holdout_weight = holdout_weight / np.sum(holdout_weight)
 
     calibration_response = weighted_mean(response[calibration], calibration_weight)
-    calibration_additive = weighted_mean(
-        estimate_cube[calibration, code["zero"]], calibration_weight
-    )
-    inverse_response = np.linalg.inv(calibration_response)
-    corrected = np.einsum(
-        "ij,bsj->bsi", inverse_response, estimate_cube - calibration_additive
-    )
+    calibration_additive = weighted_mean(additive[calibration], calibration_weight)
     raw_holdout_response = weighted_mean(response[holdout], holdout_weight)
-    corrected_response = inverse_response @ raw_holdout_response
-    holdout_additive = weighted_mean(
-        corrected[holdout, code["zero"]], holdout_weight
-    )
-    additive_se = weighted_mean_se(
-        corrected[holdout, code["zero"]], holdout_weight
-    )
-    return {
+    raw_holdout_additive = weighted_mean(additive[holdout], holdout_weight)
+    raw_holdout_additive_se = weighted_mean_se(additive[holdout], holdout_weight)
+    result = {
         "nbase": nbase,
         "n_calibration": len(calibration),
         "n_holdout": len(holdout),
@@ -416,10 +549,28 @@ def analyze_response(
         "calibration_additive": calibration_additive.tolist(),
         "calibration_response": calibration_response.tolist(),
         "raw_holdout_response": raw_holdout_response.tolist(),
-        "corrected_holdout_response": corrected_response.tolist(),
-        "corrected_holdout_additive": holdout_additive.tolist(),
-        "corrected_holdout_additive_se": additive_se.tolist(),
+        "raw_holdout_additive": raw_holdout_additive.tolist(),
+        "raw_holdout_additive_se": raw_holdout_additive_se.tolist(),
+        "apply_response_correction": bool(apply_response_correction),
     }
+    if bins is not None:
+        result["stratified_raw_response"] = bins
+    if apply_response_correction:
+        inverse_response = np.linalg.inv(calibration_response)
+        corrected = np.einsum(
+            "ij,bsj->bsi", inverse_response, estimate_cube - calibration_additive
+        )
+        corrected_response = inverse_response @ raw_holdout_response
+        holdout_additive = weighted_mean(
+            corrected[holdout, code["zero"]], holdout_weight
+        )
+        additive_se = weighted_mean_se(
+            corrected[holdout, code["zero"]], holdout_weight
+        )
+        result["corrected_holdout_response"] = corrected_response.tolist()
+        result["corrected_holdout_additive"] = holdout_additive.tolist()
+        result["corrected_holdout_additive_se"] = additive_se.tolist()
+    return result
 
 
 def main(argv=None) -> None:
@@ -435,6 +586,13 @@ def main(argv=None) -> None:
     truth = np.asarray(load_partitioned_array(cache_partitions, "truth"))
     rmag_true = np.asarray(
         load_partitioned_array(cache_partitions, "rmag_true"), dtype=np.float64
+    )
+    image_snr = np.asarray(
+        load_partitioned_array(cache_partitions, "image_snr"), dtype=np.float64
+    )
+    central_halpha_snr = np.asarray(
+        load_partitioned_array(cache_partitions, "central_halpha_snr"),
+        dtype=np.float64,
     )
     prefix = "proposal" if args.posterior_source == "proposal" else "tf_target"
     if args.estimator == "map":
@@ -472,6 +630,11 @@ def main(argv=None) -> None:
     cube, true_cube, base_log_ratio, base_ids = build_matched_cubes(
         manifest, truth, estimate, rmag_true, population_log_ratio
     )
+    nbase = len(base_ids)
+    image_snr = _shared_base_values(image_snr, nbase, name="image_snr")
+    central_halpha_snr = _shared_base_values(
+        central_halpha_snr, nbase, name="central_halpha_snr"
+    )
     base_weight = (
         np.full(len(base_ids), 1.0 / len(base_ids), dtype=np.float64)
         if base_log_ratio is None
@@ -483,6 +646,9 @@ def main(argv=None) -> None:
         base_weight,
         calibration_fraction=args.calibration_fraction,
         seed=args.seed,
+        apply_response_correction=args.apply_response_correction,
+        image_snr=image_snr,
+        central_halpha_snr=central_halpha_snr,
     )
     result.update(
         {
@@ -494,7 +660,11 @@ def main(argv=None) -> None:
                 else "globally normalized TF log ratios across matched base galaxies"
             ),
             "targets": {"abs_c": 1e-4, "abs_m": 1e-2},
-            "note": "Calibration and validation base galaxies are disjoint.",
+            "note": (
+                "Calibration and validation base galaxies are disjoint. "
+                "Raw R and additive are the diagnostic; inverse-R correction is "
+                "not the production shear estimator."
+            ),
         }
     )
     result["population_effective_sample_size"] = float(
@@ -513,10 +683,11 @@ def main(argv=None) -> None:
             "<!doctype html><meta charset=\"utf-8\"><title>Shear response pilot</title>"
             "<style>body{font-family:system-ui;max-width:900px;margin:2rem auto}"
             "pre{background:#f5f5f5;padding:1rem;overflow:auto}</style>"
-            "<h1>Matched finite-shear response pilot</h1>"
+            "<h1>Matched finite-shear response diagnostic</h1>"
             "<p>The selected posterior and galaxy population are stated explicitly. "
-            "Calibration and holdout base-galaxy sets are disjoint; response uses "
-            "central finite differences from matched simulations.</p>"
+            "Calibration and holdout base-galaxy sets are disjoint. Quoted response "
+            "is the raw finite-difference matrix; inverse-R catalog correction is "
+            "off unless explicitly requested and is not the production estimator.</p>"
             f"<pre>{payload}</pre>",
             encoding="utf-8",
         )

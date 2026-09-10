@@ -119,7 +119,11 @@ def _write_complete_cache(root, *, n, draws=4, overrides=None):
     return arrays
 
 
-def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
+def _write_compact_test_cache(
+    root, *, n=36, draws=6, combined_prior=False, oracle_vcirc=False
+):
+    if combined_prior and oracle_vcirc:
+        raise ValueError("combined_prior and oracle_vcirc are mutually exclusive")
     rmag = np.linspace(18.0, 22.0, n, dtype=np.float32)
     truth = np.zeros((n, len(FEATURES)), dtype=np.float32)
     truth[:, 0] = np.linspace(-0.019, 0.019, n)
@@ -256,7 +260,7 @@ def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
             "scatter_dex": 0.1,
             "vcirc_min": 60.0,
             "vcirc_max": 540.0,
-            "magnitude": "rmag_true",
+            "magnitude": "vcirc_true" if oracle_vcirc else "rmag_true",
             "magnitude_measurement_error": 0.0,
             "posterior_log_ratio": "raw log prior ratio",
             "posterior_log_weight": "within-galaxy normalized log weight",
@@ -271,12 +275,14 @@ def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
             "posterior_candidate_weighting": (
                 "tf_x_isotropic_inclination_importance"
                 if combined_prior
-                else "tf_importance"
+                else (
+                    "oracle_vcirc_importance" if oracle_vcirc else "tf_importance"
+                )
             ),
             "population_weighting": "uniform",
             "point_estimator": "mean",
             "map_computed": False,
-            "tf_importance_weighting": True,
+            "tf_importance_weighting": not oracle_vcirc,
             "shape_noise_regularization": "report_time",
             "snr_source": "dataset_record",
             "snr_policy": "used_as_stored_without_redraw_or_clipping",
@@ -346,7 +352,11 @@ def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
             "test_set": (
                 "TF-conformed catalog truth / TF + isotropic-inclination posterior"
                 if combined_prior
-                else "TF-conformed catalog truth / TF posterior"
+                else (
+                    "TF-conformed catalog truth / oracle-vcirc posterior"
+                    if oracle_vcirc
+                    else "TF-conformed catalog truth / TF posterior"
+                )
             )
         },
         "observation_provenance": {
@@ -374,6 +384,8 @@ def _write_compact_test_cache(root, *, n=36, draws=6, combined_prior=False):
         manifest["test_set"]["generation_manifest"]["parameter_sampling"][
             "inclination"
         ]["transform"] = "sini=sqrt(1-cosi**2)"
+    if oracle_vcirc:
+        manifest["test_set"]["vcirc_prior_mean"] = "vcirc_true"
     (root / "meta" / f"{label}.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
@@ -1154,6 +1166,82 @@ def test_test_set_report_is_mean_only_and_uses_tf_candidate_weights(tmp_path):
     assert "conditional P-P" not in document
 
 
+def test_oracle_vcirc_report_is_mean_only_and_not_tf_weighted(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1-oracle"
+    _write_compact_test_cache(root, oracle_vcirc=True)
+    output = tmp_path / "oracle-test-set.html"
+
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1-oracle",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+
+    document = output.read_text(encoding="utf-8")
+    assert "TF-conformed catalog test-set diagnostics" in document
+    assert "oracle-vcirc prior-replaced posterior" in document
+    assert "TF-conformed test set / oracle-vcirc posterior" in document
+    assert "Oracle-vcirc candidate-weight health" in document
+    assert "oracle vcirc importance weights normalized within each galaxy" in document
+    assert "not a real-data estimator" in document
+    assert "true vcirc" in document
+    assert "Independent TF-conformance audit" in document
+    assert "TF posterior candidate-weight health" not in document
+    assert "Each galaxy's TF-weighted posterior shear variance is" not in document
+    assert "Conditional MAP calibration" not in document
+
+
+def test_oracle_vcirc_load_case_keeps_tf_named_arrays(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "oracle"
+    arrays = _write_compact_test_cache(root, oracle_vcirc=True)
+    case = report.load_case(
+        tmp_path / "cache", "model:oracle", test_set=True
+    )
+    assert case["posterior_candidate_weighting"] == "oracle_vcirc_importance"
+    assert case["candidate_log_weight_array"] == "posterior_tf_log_weight"
+    assert case["target_summary_array"] == "tf_target_mean_estimates"
+    assert tuple(case["populations"]) == (
+        "TF-conformed test set / oracle-vcirc posterior",
+    )
+    population = next(iter(case["populations"].values()))
+    np.testing.assert_allclose(
+        population["mean"], arrays["tf_target_mean_estimates"][:, 1]
+    )
+    assert case["tf_conformance_audit"]["uniformity_status"] == "PASS"
+
+
+def test_mixed_tf_and_oracle_report_heading(tmp_path):
+    report = _report()
+    tf_root = tmp_path / "cache" / "model" / "xu-tf"
+    oracle_root = tmp_path / "cache" / "model" / "xu-oracle"
+    _write_compact_test_cache(tf_root)
+    _write_compact_test_cache(oracle_root, oracle_vcirc=True)
+    output = tmp_path / "tf-vs-oracle.html"
+
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu-tf",
+            "--case", "model:xu-oracle",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+
+    document = output.read_text(encoding="utf-8")
+    assert "TF-weighted or oracle-vcirc posterior" in document
+    assert "TF-conformed test set / TF posterior" in document
+    assert "TF-conformed test set / oracle-vcirc posterior" in document
+    assert "not a real-data estimator" in document
+    assert "declared TF prior by importance weighting" in document
+
 
 def test_weighted_test_set_report_uses_regularized_galaxy_weights(tmp_path):
     report = _report()
@@ -1181,3 +1269,208 @@ def test_weighted_test_set_report_uses_regularized_galaxy_weights(tmp_path):
     )
     assert "Operative galaxy weighting" in document
     assert "Conditional MAP calibration" not in document
+
+
+def test_response_from_sigma_clips():
+    report = _report()
+    sigma = np.asarray([0.0, 0.02, 0.1], dtype=np.float64)
+    np.testing.assert_allclose(
+        report.response_from_sigma(sigma, a=0.0, b=0.0, r_min=0.25),
+        [0.25, 0.25, 0.25],
+    )
+    np.testing.assert_allclose(
+        report.response_from_sigma(sigma, a=2.0, b=0.0, r_min=0.25),
+        [1.0, 1.0, 1.0],
+    )
+    np.testing.assert_allclose(
+        report.response_from_sigma(sigma, a=1.0, b=-100.0, r_min=0.25),
+        [1.0, 0.96, 0.25],
+    )
+
+
+def test_stretch_shear_summaries_scales_mean_and_width_from_zero():
+    report = _report()
+    mean = np.array(
+        [[0.02, -0.01, 0.3], [0.04, 0.0, 0.4]],
+        dtype=np.float64,
+    )
+    width = np.array(
+        [[0.01, 0.02, 0.05], [0.03, 0.01, 0.05]],
+        dtype=np.float64,
+    )
+    summary = np.stack((mean - width, mean, mean + width), axis=1)
+    response = np.asarray([0.5, 0.25], dtype=np.float64)
+    stretched = report.stretch_shear_summaries(summary, response)
+    np.testing.assert_allclose(stretched[:, 1, :2], mean[:, :2] / response[:, None])
+    raw_h = 0.5 * (summary[:, 2, :2] - summary[:, 0, :2])
+    new_h = 0.5 * (stretched[:, 2, :2] - stretched[:, 0, :2])
+    np.testing.assert_allclose(new_h, raw_h / response[:, None])
+    np.testing.assert_allclose(stretched[:, :, 2], summary[:, :, 2])
+    np.testing.assert_array_equal(summary[:, 1, :2], mean[:, :2])
+
+
+def test_unflagged_test_set_report_omits_response_calibration(tmp_path):
+    report = _report()
+    _write_compact_test_cache(tmp_path / "cache" / "model" / "xu1")
+    output = tmp_path / "plain.html"
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+    document = output.read_text(encoding="utf-8")
+    assert "R(σ) calibrated" not in document
+    assert "report-time shear stretch" not in document
+
+
+def test_response_calibrate_applies_to_last_case_only(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    _write_compact_test_cache(root)
+    calibration_path = tmp_path / "r_sigma.json"
+    calibration_path.write_text(
+        json.dumps({"a": 0.5, "b": 0.0, "R_min": 0.25}),
+        encoding="utf-8",
+    )
+    raw_case = report.load_case(tmp_path / "cache", "model:xu1", test_set=True)
+    calibrated_case = report.load_case(
+        tmp_path / "cache", "model:xu1", test_set=True
+    )
+    label = next(iter(raw_case["populations"]))
+    raw_mean = np.array(
+        raw_case["populations"][label]["mean"][:, :2], dtype=np.float64
+    )
+    raw_summary = np.array(
+        raw_case["populations"][label]["summary"], dtype=np.float64
+    )
+    raw_nuisance = raw_summary[:, :, 2:].copy()
+    report.apply_response_calibration_to_case(
+        calibrated_case,
+        report.load_response_calibration(calibration_path),
+    )
+    response = calibrated_case["response_calibration"]["R"]
+    np.testing.assert_allclose(response, 0.5)
+    calibrated_pop = calibrated_case["populations"][label]
+    np.testing.assert_allclose(
+        calibrated_pop["mean"][:, :2], raw_mean / response[:, None]
+    )
+    raw_h = 0.5 * (raw_summary[:, 2, :2] - raw_summary[:, 0, :2])
+    new_h = 0.5 * (
+        calibrated_pop["summary"][:, 2, :2] - calibrated_pop["summary"][:, 0, :2]
+    )
+    np.testing.assert_allclose(new_h, raw_h / response[:, None])
+    np.testing.assert_allclose(calibrated_pop["summary"][:, :, 2:], raw_nuisance)
+
+    raw_pits = report.load_shear_posterior_diagnostics(raw_case)
+    cal_pits = report.load_shear_posterior_diagnostics(calibrated_case)
+    np.testing.assert_allclose(
+        cal_pits["test_set"]["g1_variance"],
+        raw_pits["test_set"]["g1_variance"] / np.square(response),
+    )
+    np.testing.assert_allclose(
+        cal_pits["test_set"]["g2_variance"],
+        raw_pits["test_set"]["g2_variance"] / np.square(response),
+    )
+    np.testing.assert_allclose(
+        raw_case["populations"][label]["mean"][:, :2], raw_mean
+    )
+    assert calibrated_case["case"].endswith(report.RESPONSE_CALIBRATED_SUFFIX)
+    assert not raw_case["case"].endswith(report.RESPONSE_CALIBRATED_SUFFIX)
+
+    output = tmp_path / "calibrated.html"
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--case", "model:xu1",
+            "--response-calibrate", str(calibration_path),
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+        ]
+    )
+    document = output.read_text(encoding="utf-8")
+    assert document.count("<h2>model:xu1</h2>") == 1
+    assert document.count("<h2>model:xu1 · R(σ) calibrated</h2>") == 1
+    assert "posterior errors inflate on purpose" in document
+    assert "R<sub>min</sub>=0.25" in document
+    assert str(calibration_path) in document
+    assert "This is not the default Mean estimator." in document
+
+
+def test_max_sigma_at_response_floor_matches_clip_boundary():
+    report = _report()
+    a, b, r_min = 1.0623053190434613, -231.20777980415772, 0.25
+    sigma = report.max_sigma_at_response_floor(a, b, r_min)
+    np.testing.assert_allclose(a + b * sigma**2, r_min)
+    np.testing.assert_allclose(
+        report.response_from_sigma(np.array([sigma]), a, b, r_min),
+        r_min,
+    )
+
+
+def test_max_shear_sigma_cut_zeros_wide_galaxy_weights():
+    report = _report()
+    n = 4
+    summary = np.zeros((n, 3, len(FEATURES)), dtype=np.float64)
+    summary[:2, 0, :2] = -0.02
+    summary[:2, 2, :2] = 0.02
+    summary[2:, 0, :2] = -0.08
+    summary[2:, 2, :2] = 0.08
+    case = {
+        "case": "model:xu1",
+        "populations": {
+            "TF-conformed test set / TF posterior": {
+                "key": "test_set",
+                "summary": summary,
+                "mean": summary[:, 1],
+                "galaxy_weight": np.full(n, 0.25),
+                "population_weight": np.full(n, 0.25),
+            }
+        },
+    }
+    report.apply_max_shear_sigma_cut(case, 0.05)
+    keep = case["shear_sigma_cut"]["keep"]
+    np.testing.assert_array_equal(keep, [True, True, False, False])
+    weight = case["populations"]["TF-conformed test set / TF posterior"][
+        "galaxy_weight"
+    ]
+    np.testing.assert_allclose(weight, [0.25, 0.25, 0.0, 0.0])
+    assert case["case"].endswith(" · σ ≤ 0.05")
+    with pytest.raises(ValueError, match="before --response-calibrate"):
+        case["response_calibration"] = {"R": np.ones(n)}
+        report.apply_max_shear_sigma_cut(case, 0.05)
+
+
+def test_max_shear_sigma_report_keeps_narrow_galaxies(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    _write_compact_test_cache(root)
+    summary_path = root / "tf_target_mean_estimates" / "part0of1.npy"
+    summary = np.load(summary_path)
+    wide = slice(24, 36)
+    summary[wide, 0, :2] -= 0.07
+    summary[wide, 2, :2] += 0.07
+    np.save(summary_path, summary)
+    output = tmp_path / "narrow.html"
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+            "--max-shear-sigma", "0.05",
+        ]
+    )
+    document = output.read_text(encoding="utf-8")
+    assert "<h2>model:xu1 · σ ≤ 0.05</h2>" in document
+    assert "Kept 24 / 36" in document
+    assert "uncalibrated TF 16–84 shear width exceeds" in document
+    assert "R(σ) calibrated" not in document
+
+

@@ -40,6 +40,7 @@ TF_AUDIT_QUANTILES = np.asarray(
 COMBINED_TEST_SET_CANDIDATE_WEIGHTING = (
     "tf_x_isotropic_inclination_importance"
 )
+ORACLE_VCIRC_CANDIDATE_WEIGHTING = "oracle_vcirc_importance"
 LOGGER = logging.getLogger(__name__)
 
 NUISANCE_DISPLAY = {
@@ -97,7 +98,241 @@ def parse_args(argv=None) -> argparse.Namespace:
             "posterior precision across galaxies."
         ),
     )
+    parser.add_argument(
+        "--response-calibrate",
+        type=Path,
+        default=None,
+        help=(
+            "Optional R(σ) JSON applied to the last --case. Stretches that "
+            "case's cached shear Means, 16th/84th summaries, and streamed "
+            "shear candidates from zero. Not the default Mean."
+        ),
+    )
+    parser.add_argument(
+        "--max-shear-sigma",
+        type=float,
+        default=None,
+        help=(
+            "Zero analysis weight for galaxies whose uncalibrated TF 16–84 "
+            "shear width exceeds this cut. Applied to every --case from "
+            "uncalibrated summaries, before any R(σ) stretch."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+RESPONSE_CALIBRATED_SUFFIX = " · R(σ) calibrated"
+DEFAULT_RESPONSE_R_MAX = 1.0
+
+
+def shear_interval_sigma(summary: np.ndarray) -> np.ndarray:
+    """Combined TF 16–84 half-width of (g1, g2)."""
+
+    summary = np.asarray(summary, dtype=np.float64)
+    if summary.ndim != 3 or summary.shape[1] != 3 or summary.shape[2] < 2:
+        raise ValueError("posterior summary must have shape (galaxy, 3, feature)")
+    half = 0.5 * (summary[:, 2, :2] - summary[:, 0, :2])
+    if not np.all(np.isfinite(half)):
+        raise ValueError("uncalibrated 16–84 shear width must be finite")
+    if np.any(half < 0.0):
+        raise ValueError("84th percentile must be at least the 16th for g1 and g2")
+    return np.sqrt(0.5 * np.sum(np.square(half), axis=1))
+
+
+def response_from_sigma(
+    sigma: np.ndarray,
+    a: float,
+    b: float,
+    r_min: float,
+    r_max: float = DEFAULT_RESPONSE_R_MAX,
+) -> np.ndarray:
+    """Clip R = a + b σ² into [R_min, R_max]."""
+
+    if not np.isfinite(a) or not np.isfinite(b):
+        raise ValueError("R(σ) coefficients must be finite")
+    if not (0.0 < r_min <= r_max) or not np.isfinite(r_min) or not np.isfinite(r_max):
+        raise ValueError("R clip bounds must satisfy 0 < R_min <= R_max")
+    sigma = np.asarray(sigma, dtype=np.float64)
+    if sigma.ndim != 1 or not np.all(np.isfinite(sigma)) or np.any(sigma < 0.0):
+        raise ValueError("σ must be a finite non-negative vector")
+    return np.clip(a + b * np.square(sigma), r_min, r_max)
+
+
+def load_response_calibration(path: Path) -> dict:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"response calibration {path} must be a JSON object")
+    missing = [key for key in ("a", "b", "R_min") if key not in payload]
+    if missing:
+        raise ValueError(
+            f"response calibration {path} is missing {missing}"
+        )
+    r_max = float(payload.get("R_max", DEFAULT_RESPONSE_R_MAX))
+    calibration = {
+        "a": float(payload["a"]),
+        "b": float(payload["b"]),
+        "R_min": float(payload["R_min"]),
+        "R_max": r_max,
+        "path": Path(path),
+        "payload": payload,
+    }
+    if not np.isfinite(calibration["a"]) or not np.isfinite(calibration["b"]):
+        raise ValueError(f"response calibration {path} has non-finite a or b")
+    if not (0.0 < calibration["R_min"] <= calibration["R_max"]):
+        raise ValueError(
+            f"response calibration {path} has invalid R_min/R_max"
+        )
+    return calibration
+
+
+def tf_or_test_population(case: dict) -> dict:
+    for population in case["populations"].values():
+        if population["key"] in {"tf_target", "test_set"}:
+            return population
+    raise ValueError(
+        "TF or test-set 16–84 summaries are required for response calibration "
+        "and shear-width cuts"
+    )
+
+
+def max_sigma_at_response_floor(a: float, b: float, r_min: float) -> float:
+    """Unclipped R = a + b σ² equals R_min. Requires b < 0 and a > R_min."""
+
+    if not np.isfinite(a) or not np.isfinite(b) or not np.isfinite(r_min):
+        raise ValueError("R(σ) floor sigma requires finite a, b, and R_min")
+    if b >= 0.0 or a <= r_min:
+        raise ValueError("R(σ) floor sigma requires a > R_min and b < 0")
+    return float(np.sqrt((r_min - a) / b))
+
+
+def apply_max_shear_sigma_cut(case: dict, max_sigma: float) -> dict:
+    """Zero analysis weight for galaxies wider than `max_sigma`. Mutates `case`."""
+
+    if not np.isfinite(max_sigma) or max_sigma <= 0.0:
+        raise ValueError("max-shear-sigma must be a positive finite value")
+    source = tf_or_test_population(case)
+    if case.get("response_calibration") is not None:
+        raise ValueError(
+            "shear-width cuts must use uncalibrated 16–84 widths; "
+            "apply --max-shear-sigma before --response-calibrate"
+        )
+    sigma = shear_interval_sigma(source["summary"])
+    keep = sigma <= max_sigma
+    n_kept = int(np.count_nonzero(keep))
+    if n_kept == 0:
+        raise ValueError(
+            f"max-shear-sigma {max_sigma:g} dropped every galaxy"
+        )
+    for population in case["populations"].values():
+        galaxy_weight = np.array(
+            population["galaxy_weight"], dtype=np.float64, copy=True
+        )
+        population_mass = np.array(
+            population["population_weight"], dtype=np.float64, copy=True
+        )
+        galaxy_weight[~keep] = 0.0
+        population_mass[~keep] = 0.0
+        population["galaxy_weight"] = galaxy_weight
+        population["population_weight"] = population_mass
+    case["shear_sigma_cut"] = {
+        "max_shear_sigma": float(max_sigma),
+        "n": int(len(keep)),
+        "n_kept": n_kept,
+        "keep": keep,
+        "sigma": sigma,
+    }
+    suffix = f" · σ ≤ {max_sigma:g}"
+    name = str(case["case"])
+    if suffix not in name:
+        case["case"] = name + suffix
+    return case
+
+
+def shear_sigma_cut_note(case: dict) -> str:
+    info = case.get("shear_sigma_cut")
+    if not info:
+        return ""
+    n_kept = info["n_kept"]
+    n = info["n"]
+    max_sigma = info["max_shear_sigma"]
+    kept_pct = 100.0 * n_kept / n
+    return (
+        "<p>This case zeros analysis weight for galaxies whose uncalibrated "
+        "TF 16–84 shear width exceeds "
+        f"<code>σ ≤ {max_sigma:g}</code>. Kept {n_kept:,} / {n:,} "
+        f"({kept_pct:.1f}%). The cut is the R(σ) floor: wider galaxies would "
+        "clip at R<sub>min</sub>. Cache rows are unchanged; posterior-candidate "
+        "diagnostics still stream every galaxy.</p>"
+    )
+
+
+def stretch_shear_summaries(summary: np.ndarray, response: np.ndarray) -> np.ndarray:
+    """Scale g1 and g2 16/Mean/84 from zero; leave nuisances unchanged."""
+
+    out = np.array(summary, dtype=np.float64, copy=True)
+    scale = np.asarray(response, dtype=np.float64)
+    if scale.shape != (len(out),):
+        raise ValueError("one response value is required per galaxy")
+    if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
+        raise ValueError("response values must be finite and positive")
+    out[:, :, :2] /= scale[:, None, None]
+    return out
+
+
+def apply_response_calibration_to_case(case: dict, calibration: dict) -> dict:
+    """Stretch the last case's shear summaries. Mutates `case` in place."""
+
+    source = tf_or_test_population(case)
+    sigma = shear_interval_sigma(source["summary"])
+    response = response_from_sigma(
+        sigma,
+        calibration["a"],
+        calibration["b"],
+        calibration["R_min"],
+        calibration.get("R_max", DEFAULT_RESPONSE_R_MAX),
+    )
+    for population in case["populations"].values():
+        population["summary"] = stretch_shear_summaries(
+            population["summary"], response
+        )
+        population["mean"] = population["summary"][:, 1]
+    if "base_summary" in case:
+        case["base_summary"] = stretch_shear_summaries(
+            case["base_summary"], response
+        )
+    case["response_calibration"] = {
+        "a": calibration["a"],
+        "b": calibration["b"],
+        "R_min": calibration["R_min"],
+        "R_max": calibration.get("R_max", DEFAULT_RESPONSE_R_MAX),
+        "path": calibration["path"],
+        "sigma": sigma,
+        "R": response,
+    }
+    name = str(case["case"])
+    if not name.endswith(RESPONSE_CALIBRATED_SUFFIX):
+        case["case"] = name + RESPONSE_CALIBRATED_SUFFIX
+    return case
+
+
+def response_calibration_note(case: dict) -> str:
+    info = case.get("response_calibration")
+    if not info:
+        return ""
+    path = html.escape(str(info["path"]))
+    r_min = info["R_min"]
+    r_max = info.get("R_max", DEFAULT_RESPONSE_R_MAX)
+    return (
+        "<p>This case applies an optional report-time shear stretch "
+        f"<code>R(σ)=clip(a + b σ², {r_min:g}, {r_max:g})</code> from "
+        f"<code>{path}</code> "
+        f"(a={info['a']:.6g}, b={info['b']:.6g}, "
+        f"R<sub>min</sub>={r_min:g}). "
+        "Only g<sub>1</sub> and g<sub>2</sub> Means, 16th/84th summaries, "
+        "and streamed shear candidates are divided by R, so posterior errors "
+        "inflate on purpose. Nuisances and truth are unchanged. "
+        "This is not the default Mean estimator.</p>"
+    )
 
 
 def load_case(
@@ -254,6 +489,17 @@ def load_case(
             posterior_ess_array = "posterior_tf_ess"
             posterior_ess_fraction_array = "posterior_tf_ess_fraction"
             posterior_max_weight_array = "posterior_tf_max_weight"
+            if (
+                posterior_candidate_weighting
+                == ORACLE_VCIRC_CANDIDATE_WEIGHTING
+            ):
+                test_set_population_label = (
+                    "TF-conformed test set / oracle-vcirc posterior"
+                )
+                candidate_weight_name = "oracle vcirc importance"
+                candidate_weight_health_heading = (
+                    "Oracle-vcirc candidate-weight health"
+                )
         target_summary = np.asarray(
             load_partitioned_array(cache_partitions, target_summary_array)
         )
@@ -1292,6 +1538,13 @@ def load_shear_posterior_diagnostics(
             draws = np.asarray(
                 samples[local_start:local_end, :, :2], dtype=np.float64
             )
+            response = case.get("response_calibration", {}).get("R")
+            if response is not None:
+                scale = np.asarray(
+                    response[offset + local_start : offset + local_end],
+                    dtype=np.float64,
+                )
+                draws /= scale[:, None, None]
             candidate_log_weight = (
                 np.asarray(
                     cached_log_weight[local_start:local_end], dtype=np.float64
@@ -1925,6 +2178,15 @@ def test_set_provenance_table(case: dict) -> str:
         ),
         ("cache analysis mode", "test_set"),
     ]
+    cut = case.get("shear_sigma_cut")
+    if cut is not None:
+        rows.append(
+            (
+                "uncalibrated TF shear-width cut",
+                f"σ ≤ {cut['max_shear_sigma']:g}; kept "
+                f"{cut['n_kept']:,} / {cut['n']:,} analysis weight",
+            )
+        )
     display_provenance = {
         key: value
         for key, value in provenance.items()
@@ -2452,6 +2714,11 @@ def main(argv=None) -> None:
         raise ValueError("bins must be at least 2")
     if args.low_g <= 0.0:
         raise ValueError("low-g must be positive")
+    calibration = (
+        load_response_calibration(args.response_calibrate)
+        if args.response_calibrate is not None
+        else None
+    )
     cases = [
         load_case(
             args.cache_root,
@@ -2461,6 +2728,20 @@ def main(argv=None) -> None:
         )
         for value in args.case
     ]
+    if args.max_shear_sigma is not None:
+        if args.max_shear_sigma <= 0.0:
+            raise ValueError("max-shear-sigma must be positive")
+        for case in cases:
+            apply_max_shear_sigma_cut(case, args.max_shear_sigma)
+            LOGGER.info(
+                "%s: kept %d / %d galaxies with uncalibrated σ ≤ %g",
+                case["case"],
+                case["shear_sigma_cut"]["n_kept"],
+                case["shear_sigma_cut"]["n"],
+                args.max_shear_sigma,
+            )
+    if calibration is not None:
+        apply_response_calibration_to_case(cases[-1], calibration)
     sections = []
     cross_case_results = []
     for case in cases:
@@ -2585,6 +2866,10 @@ def main(argv=None) -> None:
                 if args.weighted
                 else "equal truth-galaxy mass without posterior-precision weighting"
             )
+            oracle_prior = (
+                case["posterior_candidate_weighting"]
+                == ORACLE_VCIRC_CANDIDATE_WEIGHTING
+            )
             if combined_prior:
                 prior_replacement_description = (
                     "Inference replaces the uniform training priors on circular "
@@ -2604,6 +2889,23 @@ def main(argv=None) -> None:
                 rank_description = (
                     "posterior ranks use renormalized combined prior-replacement "
                     "candidate weights."
+                )
+            elif oracle_prior:
+                prior_replacement_description = (
+                    "Inference replaces the uniform training prior on circular "
+                    "velocity with an oracle log-normal centered on each galaxy's "
+                    "true vcirc (same 0.1 dex TF scatter). This is not a real-data "
+                    "estimator; the prior mean is unavailable on the sky. "
+                    "Truth galaxies retain uniform population mass."
+                )
+                posterior_variance_description = (
+                    "Each galaxy's oracle-vcirc-weighted posterior shear variance is"
+                )
+                interval_description = (
+                    "Intervals come from oracle-vcirc-weighted posterior candidates and"
+                )
+                rank_description = (
+                    "posterior ranks use renormalized oracle-vcirc candidate weights."
                 )
             else:
                 prior_replacement_description = (
@@ -2631,7 +2933,9 @@ def main(argv=None) -> None:
             )
             sections.append(
                 f"<section><h2>{html.escape(case_name)}</h2>"
-                "<h3>Test-set provenance and generation contract</h3>"
+                + shear_sigma_cut_note(case)
+                + response_calibration_note(case)
+                + "<h3>Test-set provenance and generation contract</h3>"
                 "<p>This section is rendered from the compact cache's embedded "
                 "generation manifest. The catalog-selected truth population is "
                 "already TF-conformed. "
@@ -2705,7 +3009,9 @@ def main(argv=None) -> None:
 
         sections.append(
             f"<section><h2>{html.escape(case['case'])}</h2>"
-            "<h3>Importance-sampling health</h3>"
+            + shear_sigma_cut_note(case)
+            + response_calibration_note(case)
+            + "<h3>Importance-sampling health</h3>"
             + importance_html
             + "<h3>Shape-noise-regularized precision comparison</h3>"
             "<p>The first pass defines each galaxy's posterior variance as "
@@ -2784,12 +3090,21 @@ def main(argv=None) -> None:
             == COMBINED_TEST_SET_CANDIDATE_WEIGHTING
             for case in cases
         ]
+        oracle_modes = [
+            case["posterior_candidate_weighting"]
+            == ORACLE_VCIRC_CANDIDATE_WEIGHTING
+            for case in cases
+        ]
         if all(combined_modes):
             posterior_population_description = (
                 "TF + isotropic-inclination prior-replaced"
             )
+        elif all(oracle_modes):
+            posterior_population_description = "oracle-vcirc prior-replaced"
         elif any(combined_modes):
             posterior_population_description = "declared prior-replaced"
+        elif any(oracle_modes):
+            posterior_population_description = "TF-weighted or oracle-vcirc"
         else:
             posterior_population_description = "TF-weighted"
         report_intro = (

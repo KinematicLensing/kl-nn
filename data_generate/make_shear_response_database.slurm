@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
+#SBATCH --mem=2000M
 #SBATCH --array=1-10
 
 set -euo pipefail
@@ -15,8 +15,8 @@ KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate kl-nn
 
-SAMPLE="${SAMPLE:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
-DATASET="${DATASET:-shear_response_simv3_galaxyaxis_central_halpha_5k}"
+SAMPLE="${SAMPLE:-samples_shear_response_simv3_cosi_5k}"
+DATASET="${DATASET:-shear_response_simv3_cosi_5k}"
 NBASE="${NBASE:-1000}"
 NFOLDERS=100
 NSHARDS=10

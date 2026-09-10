@@ -1,6 +1,6 @@
 # KL-NN simulator-v3 methods manuscript
 
-<!-- klnn-methods-source-sha256: 81eb351455a2eeed57aff4fd6e2a659e789beb11055d7e4e7b57e0fc4033cdc1 -->
+<!-- klnn-methods-source-sha256: de824a4303ad3ac3a4debe477e7c9804db65b5cb335a7de4b8fd845e30b53a49 -->
 
 > **Living-document status.** This manuscript describes the simulator-v3
 > working tree on 2026-09-05. The implementation, rather than this prose, is
@@ -678,14 +678,14 @@ and Hinton (2016)](#ba2016), and GELU follows [Hendrycks and Gimpel
 | Branch | Exact current topology | Output |
 |---|---|---:|
 | Image | Two `3x3` convolutions at 64 channels, each with BatchNorm and ReLU; `3x3` stride-2 max pool; four 128-channel residual blocks with downsampling in the fourth; five 256-channel residual blocks with downsampling in the fifth; five 512-channel residual blocks with downsampling in the fifth; final `3x3` average pool | 512 |
-| Spectrum | Conv pairs at 16, 32, 64, and 128 channels, each convolution followed by BatchNorm and ReLU; wavelength-only `1x2` max pooling after the 16- and 32-channel pairs only; two 256-channel convolutions; final `5x16` convolution spanning every fiber and remaining wavelength bin | 512 |
+| Spectrum | Conv pairs at 16, 32, 64, and 128 channels, each convolution followed by BatchNorm and ReLU; no wavelength pooling; two 256-channel convolutions; final `5x64` convolution spanning every fiber and all 64 wavelength bins | 512 |
 | Metadata | Concatenate ten scaled ordered fiber coordinates and three normalized contexts; `13 -> 64 -> 128`, GELU after both linear maps, then LayerNorm | 128 |
 
 The image branch reduces the spatial grid from 48 to 24, 12, 6, and 3 pixels
 before the final average pool. Each residual block contains two `3x3`
 convolutions; a `1x1` projection and BatchNorm are used on the shortcut when
-stride or channel count changes. The spectral branch pools only wavelength,
-reducing 64 bins to 16 before the final `5x16` kernel. It therefore models the
+stride or channel count changes. The spectral branch keeps all 64 wavelength
+bins through the stack and collapses them with a final `5x64` kernel. It therefore models the
 five ordered fibers jointly and is not permutation invariant. These output
 shapes are checked at runtime by [`networks.py`](../arch/networks.py).
 

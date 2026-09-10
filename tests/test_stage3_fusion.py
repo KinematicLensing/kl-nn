@@ -133,13 +133,13 @@ def test_joint_spectral_cnn_requires_five_by_sixty_four_and_returns_512():
         encoder(torch.randn(2, 1, 5, 63))
 
 
-def test_joint_spectral_cnn_keeps_sixteen_wavelength_bins_before_the_final_kernel():
+def test_joint_spectral_cnn_keeps_all_wavelength_bins_before_the_final_kernel():
     encoder = JointSpecCNN(nspec=5)
     pools = [module for module in encoder.cnn_spec if isinstance(module, nn.MaxPool2d)]
-    assert len(pools) == 2
-    assert encoder.pooled_wavelength_count == 16
+    assert pools == []
+    assert encoder.pooled_wavelength_count == 64
     last_conv = [module for module in encoder.cnn_spec if isinstance(module, nn.Conv2d)][-1]
-    assert last_conv.kernel_size == (5, 16)
+    assert last_conv.kernel_size == (5, 64)
 
 
 def _halpha_line_cube(shift_pix=0.0, batch_size=2):
@@ -220,6 +220,27 @@ def test_joint_spectral_cnn_has_no_hand_crafted_kl_observables():
     assert features.shape == (3, SPECTRAL_FEATURE_DIM)
 
 
+def test_wavelength_max_pool_reduces_one_pixel_line_shift():
+    cube = _halpha_line_cube(0.0)
+    shifted = _halpha_line_cube(1.0)
+    pool = nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2))
+    raw = float(torch.linalg.vector_norm((shifted - cube).reshape(2, -1), dim=-1).mean())
+    pooled = float(
+        torch.linalg.vector_norm(
+            (pool(shifted) - pool(cube)).reshape(2, -1), dim=-1
+        ).mean()
+    )
+    twice = nn.Sequential(pool, pool)
+    twice_pooled = float(
+        torch.linalg.vector_norm(
+            (twice(shifted) - twice(cube)).reshape(2, -1), dim=-1
+        ).mean()
+    )
+    assert raw > 0.0
+    assert pooled < raw
+    assert twice_pooled < pooled
+
+
 def test_joint_spectral_cnn_line_shift_is_at_least_as_sensitive_as_wavelength_pooling():
     torch.manual_seed(123)
     pooled_distance = _mean_line_shift_distance(_WavelengthPooledJointSpecCNN())
@@ -228,9 +249,7 @@ def test_joint_spectral_cnn_line_shift_is_at_least_as_sensitive_as_wavelength_po
     assert pooled_distance > 0.0
     assert production_distance > 0.0
     n_pool = sum(isinstance(module, nn.MaxPool2d) for module in JointSpecCNN(nspec=5).cnn_spec)
-    if n_pool == 0:
-        assert production_distance > pooled_distance
-    else:
+    if n_pool != 0:
         assert production_distance == pytest.approx(pooled_distance, rel=1e-5, abs=1e-5)
 
 

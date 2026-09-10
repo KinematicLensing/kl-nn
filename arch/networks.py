@@ -975,13 +975,13 @@ class ImgCNN(nn.Module):
 class JointSpecCNN(nn.Module):
     """Joint CNN for the fixed ordered five-fiber by 64-bin spectrum.
 
-    Two wavelength-only pools reduce 64 bins to 16 before a final convolution
-    that spans every fiber and the remaining wavelength axis.
+    Convolutions keep all 64 wavelength bins. The final convolution spans
+    every fiber and the full wavelength axis. There is no wavelength pooling.
     """
 
     output_dim = SPECTRAL_FEATURE_DIM
     wavelength_count = 64
-    pooled_wavelength_count = 16
+    pooled_wavelength_count = 64
 
     def __init__(self, nspec=None):
         super().__init__()
@@ -996,14 +996,12 @@ class JointSpecCNN(nn.Module):
             nn.Conv2d(16, 16, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
             nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)),
             nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),

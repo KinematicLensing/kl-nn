@@ -146,6 +146,7 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
             "make_database_simulator_v3.slurm",
             "merge_database_simulator_v3.slurm",
             "generate_shear_response.slurm",
+            "generate_fisher_stencil.slurm",
             "make_shear_response_database.slurm",
             "merge_shear_response_database.slurm",
         )
@@ -181,6 +182,10 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert "simv2" not in pretrain
     assert "Missing current nine-target dataset" in pretrain
     cache = (ROOT / "arch/cache_posteriors.slurm").read_text()
+    fisher = (ROOT / "data_generate/generate_fisher_stencil.slurm").read_text()
+    assert "--skip-existing" in fisher
+    assert 'NROWS="${NROWS:?set NROWS to the sample table length}"' in fisher
+    assert 'ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-1}"' in fisher
     assert 'ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"' in cache
     assert "intentional sparse resume" in cache
     generate = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()
@@ -194,3 +199,12 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert "PART_COUNT != ARRAY_TASK_COUNT" in package
     assert "simv2" not in generate
     assert "simv2" not in package
+    response_generate = (ROOT / "data_generate/generate_shear_response.slurm").read_text()
+    response_db = (ROOT / "data_generate/make_shear_response_database.slurm").read_text()
+    response_merge = (ROOT / "data_generate/merge_shear_response_database.slurm").read_text()
+    response_cache = (ROOT / "arch/shear_response_inference.slurm").read_text()
+    assert "samples_shear_response_simv3_cosi_5k.csv" in response_generate
+    assert "samples_shear_response_simv3_cosi_5k" in response_db
+    assert "samples_shear_response_simv3_cosi_5k" in response_merge
+    assert "shear_response_simv3_cosi_5k" in response_cache
+    assert 'ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"' in response_cache

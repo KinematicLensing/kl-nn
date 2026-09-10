@@ -432,6 +432,143 @@ def scatter_vs(x, y, *, xlabel, ylabel, title, hline=None, hlabel=None):
     return figure_to_data_uri(fig)
 
 
+def theory_preamble_html() -> str:
+    """Static theory block: Fisher, σ_CR, shape noise, and Mean-estimator m."""
+
+    return r"""
+<section class="preamble" id="theory">
+<h2>What these numbers mean</h2>
+<p>
+Every quantity on this page is computed from the <em>simulator</em>, not from the neural network.
+The data vector is a noiseless image plus five fibers. We wiggle each galaxy parameter, watch how
+those pixels move, and ask how well Gaussian white noise (the same noise model used in training)
+could constrain shear. That is Fisher information. We then translate that information into a
+prediction for multiplicative bias <em>of one specific estimator</em>: the posterior Mean under
+the training prior \(g\sim\mathcal{U}[-0.1,0.1]\).
+</p>
+
+<h3>1. Fisher information</h3>
+<p>
+For a Gaussian likelihood with known pixel variances \(\sigma_p^2\) and noiseless mean
+\(\mu(\boldsymbol{\theta})\),
+</p>
+\[
+I_{ij}=\sum_p\frac{1}{\sigma_p^2}\frac{\partial\mu_p}{\partial\theta_i}\frac{\partial\mu_p}{\partial\theta_j}.
+\]
+<p>
+A large \(I_{ij}\) means the data vector changes a lot, relative to the noise, when that parameter
+moves. Image S/N \(\rho_I\) and central H\(\alpha\) S/N \(\rho_S\) enter only as overall scales:
+\(I=\rho_I^2\,\tilde I_{\mathrm{img}}+\rho_S^2\,\tilde I_{\mathrm{spec}}\). No new FITS are needed
+to scan S/N.
+</p>
+
+<h3>2. Profiling and \(\sigma_{\mathrm{CR}}\)</h3>
+<p>
+\(\boldsymbol{\theta}\) is nine-dimensional: \((g_1,g_2)\) plus seven nuisances
+(\(\theta_{\mathrm{int}}\), \(\sin i\), \(v_0\), \(v_{\mathrm{circ}}\), \(R_{\mathrm{vscale}}\),
+\(R_h\), \(F_{\mathrm{H}\alpha}\)). Shear is degenerate with those nuisances, so the useful
+information is the <em>profiled</em> \(2\times 2\) block
+</p>
+\[
+I_{g\mid\nu}=I_{gg}-I_{g\nu}\,I_{\nu\nu}^{-1}\,I_{\nu g}.
+\]
+<p>
+The Cramér–Rao covariance is \(C=I_{g\mid\nu}^{-1}\). We report a single width
+</p>
+\[
+\sigma_{\mathrm{CR}}=\sqrt{\tfrac{1}{2}(C_{11}+C_{22})}.
+\]
+<p>
+This is a lower bound on the RMS error of an <strong>unbiased</strong> estimator of
+\((g_1,g_2)\). It is a <em>likelihood</em> width \(\sigma_L\), not a posterior width.
+<strong>Unprofiled</strong> \(\sigma_{\mathrm{CR}}\) inverts only \(I_{gg}\) and pretends the
+nuisances are known; it is optimistic. Image-only / spectra-only \(\sigma_{\mathrm{CR}}\) use just
+one modality’s Fisher (still profiled over that modality’s nuisance derivatives).
+</p>
+
+<h3>3. How \(\sigma_{\mathrm{CR}}\) relates to shape noise</h3>
+<p>
+Two different widths appear in this project:
+</p>
+<ul>
+<li><strong>\(\sigma_{\mathrm{CR}}\)</strong> — how tightly the <em>likelihood</em> constrains
+shear if the model is right and the estimator is unbiased. Frequentist shape noise of an efficient
+unbiased estimator sits at or above this floor.</li>
+<li><strong>xu3 \(\sigma_{\mathrm{shape}}\approx 0.039\)</strong> — 16–84 half-width of the
+<em>posterior</em>. A proper prior always narrows the posterior relative to the likelihood:
+</li>
+</ul>
+\[
+\sigma_{\mathrm{post}}^{2}
+=\Bigl(\sigma_L^{-2}+\sigma_\pi^{-2}\Bigr)^{-1}
+=\frac{\sigma_L^{2}\,\sigma_\pi^{2}}{\sigma_L^{2}+\sigma_\pi^{2}}
+\qquad\Rightarrow\qquad
+\sigma_{\mathrm{post}}=\sigma_{\mathrm{CR}}\sqrt{R}
+\quad\text{if }\sigma_L=\sigma_{\mathrm{CR}}.
+\]
+<p>
+The training prior \(g\sim\mathcal{U}[-0.1,0.1]\) has
+\(\sigma_\pi=0.1/\sqrt{3}\approx 0.0577\). So a galaxy with
+\(\sigma_{\mathrm{CR}}=0.053\) has \(\sigma_{\mathrm{post}}\approx 0.039\). Comparing
+\(\sigma_{\mathrm{CR}}\) on this page directly to xu3 \(\sigma_{\mathrm{shape}}\) is
+<strong>not</strong> apples-to-apples: the NN number is already prior-shrunk.
+</p>
+
+<h3>4. How this becomes \(m\) (the Mean-shrinkage formula)</h3>
+<p>
+Fisher information does <em>not</em> bound multiplicative bias for every possible shear estimator.
+An unbiased estimator can have \(m=0\); what it cannot have is RMS below \(\sigma_{\mathrm{CR}}\).
+</p>
+<p>
+The number labelled \(m\) on this page is the bias of the <strong>posterior Mean</strong> under
+that prior. If the likelihood in \(g\) is approximately Gaussian and the prior is
+\(\mathcal{N}(0,\sigma_\pi^2)\), the Mean is a linear shrinkage of the truth:
+</p>
+\[
+\hat g = R\,g_{\mathrm{true}},\qquad
+R=\frac{\sigma_\pi^{2}}{\sigma_\pi^{2}+\sigma_L^{2}},\qquad
+m=R-1=-\frac{\sigma_L^{2}}{\sigma_L^{2}+\sigma_\pi^{2}}.
+\]
+<p>
+A perfect network that samples the true posterior still reports this Mean, so it cannot beat
+</p>
+\[
+\lvert m\rvert \;\ge\;
+\frac{\sigma_{\mathrm{CR}}^{2}}{\sigma_{\mathrm{CR}}^{2}+\sigma_\pi^{2}}
+\qquad\bigl(R_{\mathrm{Fisher}}=1+m\bigr)
+\]
+<p>
+as a Mean. Smaller \(\sigma_{\mathrm{CR}}\) (higher S/N, easier \(\sin i\)) gives
+<em>smaller</em> \(\lvert m\rvert\). Wider prior (Pranjal I used \(\mathcal{U}[-0.2,0.2]\)) also
+gives smaller \(\lvert m\rvert\). Dividing by \(R\) (the \(R(\sigma)\) calibration)
+<strong>escapes</strong> this bound: that estimator is no longer the Mean, errors inflate toward
+\(\sigma_L\), and linear \(m\) can go to zero.
+</p>
+<p>
+Worked example: \(\sigma_{\mathrm{CR}}=0.039\) would give
+\(m=-(0.039/0.0577)^{2}\approx-0.46\), \(R\approx 0.54\). That is why xu3
+\(\sigma_{\mathrm{shape}}=0.039\) and stencil \(R_{\mathrm{diag}}\approx 0.56\) already matched
+each other — those were posterior widths. This report asks whether the <em>likelihood</em> is
+informative enough that a Mean under \(\lvert g\rvert\le 0.1\) must shrink by that much.
+</p>
+
+<h3>Glossary</h3>
+<table class="glossary">
+<tr><th>Symbol on this page</th><th>Meaning</th></tr>
+<tr><td>Fisher \(I\)</td><td>Pixel-level information matrix from \(\partial\mu/\partial\theta\) and the training noise model.</td></tr>
+<tr><td>\(\sigma_{\mathrm{CR}}\)</td><td>Profiled Cramér–Rao shear width. Floor on RMS of an unbiased estimator. Plug-in for \(\sigma_L\) in the \(m\) formula.</td></tr>
+<tr><td>\(\sigma_{\mathrm{CR}}\) unprofiled</td><td>Same, but nuisances treated as known. Always \(\le\) profiled \(\sigma_{\mathrm{CR}}\).</td></tr>
+<tr><td>\(\sigma_{\mathrm{CR}}\) image / spec</td><td>Width using only that modality. The “spectral information fraction” is \(I_{\mathrm{spec}}/(I_{\mathrm{img}}+I_{\mathrm{spec}})\) with \(I=1/\sigma_{\mathrm{CR}}^{2}\).</td></tr>
+<tr><td>\(m\) or \(m_{\mathrm{shrink}}\)</td><td>\(-\sigma_{\mathrm{CR}}^{2}/(\sigma_{\mathrm{CR}}^{2}+\sigma_\pi^{2})\). Predicted multiplicative bias of the <em>posterior Mean</em>, not of an \(R\)-corrected estimator.</td></tr>
+<tr><td>\(R_{\mathrm{Fisher}}\)</td><td>\(1+m\). Linear shear response of that Mean. Overlay target: NN stencil \(R_{\mathrm{diag}}\approx 0.56\).</td></tr>
+<tr><td>Transfer ratio</td><td>Median \(\sigma_{\mathrm{CR,profiled}}/\sigma_{\mathrm{CR,unprofiled}}\) in a \(\sin i\) bin, applied to the 500 shear-only galaxies that have no nuisance steps.</td></tr>
+<tr><td>\(\sigma_\pi\)</td><td>\(0.1/\sqrt{3}\approx 0.0577\). RMS of \(\mathcal{U}[-0.1,0.1]\), used as a Gaussian stand-in for the training prior.</td></tr>
+<tr><td>xu3 \(\sigma_{\mathrm{shape}}\)</td><td>NN posterior 16–84 width, \(\approx 0.039\). Should be compared to \(\sigma_{\mathrm{CR}}\sqrt{R}\), not to \(\sigma_{\mathrm{CR}}\) itself.</td></tr>
+</table>
+</section>
+"""
+
+
 def line_vs_snr(grid, curves, *, xlabel, ylabel, title):
     fig, ax = plt.subplots(figsize=(5.6, 4.0))
     for label, values in curves:
@@ -458,18 +595,32 @@ def render_html(payload: dict, figures: dict[str, str]) -> str:
 <head>
 <meta charset="utf-8">
 <title>Simulator Fisher shear bound</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {{delimiters: [
+    {{left: '$$', right: '$$', display: true}},
+    {{left: '\\\\[', right: '\\\\]', display: true}},
+    {{left: '\\\\(', right: '\\\\)', display: false}}
+  ]}});"></script>
 <style>
 body {{ font: 16px/1.55 "Iowan Old Style", Palatino, serif; color: #1b1f24; background: #fbfbf9; margin: 0; }}
 header {{ background: #1f4e79; color: #f4f7fa; padding: 2rem 1.5rem; }}
 main {{ max-width: 920px; margin: 0 auto; padding: 1.4rem 1.2rem 3.5rem; }}
+h2 {{ color: #1f4e79; margin-top: 2rem; }}
+h3 {{ color: #2a6f6f; margin-top: 1.3rem; }}
+.preamble p, .preamble li {{ max-width: 46rem; }}
 .stat {{ display: inline-block; border: 1px solid #d9dee3; padding: .7rem .9rem; margin: .3rem .4rem .3rem 0; }}
 .stat b {{ display: block; font-size: 1.35rem; color: #1f4e79; }}
 table {{ border-collapse: collapse; width: 100%; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }}
 th, td {{ border-bottom: 1px solid #d9dee3; padding: .35rem .45rem; text-align: right; }}
 th:first-child, td:first-child {{ text-align: left; }}
+table.glossary td {{ text-align: left; vertical-align: top; }}
+table.glossary td:first-child {{ white-space: nowrap; font-weight: 600; width: 12rem; }}
 figure img {{ width: 100%; height: auto; }}
 .callout {{ border-left: 4px solid #1f4e79; padding-left: 1rem; color: #5c6770; }}
 .warn {{ border-left-color: #b85c38; }}
+.katex-display {{ margin: 0.8rem 0; }}
 </style>
 </head>
 <body>
@@ -478,6 +629,7 @@ figure img {{ width: 100%; height: auto; }}
 <p>Noiseless KL forward model, training white-noise covariance, posterior-Mean shrinkage under g ~ U[-0.1, 0.1].</p>
 </header>
 <main>
+{theory_preamble_html()}
 <p class="callout">This is an information bound <em>inside the simulator</em> for the <strong>posterior Mean</strong>, not a claim about an R-corrected estimator. A perfect network cannot beat this m as a Mean under this prior.</p>
 <div class="stat"><span>Xu-like S/N (ρ_I={XU_IMAGE_SNR:g}, ρ_S={XU_SPEC_SNR:g})</span><b>m = {head["m"]:.3f}</b>median profiled, 250 full bases</div>
 <div class="stat"><span>σ_CR</span><b>{head["sigma_cr"]:.4f}</b>16–84: {head["sigma_cr_p16"]:.4f} – {head["sigma_cr_p84"]:.4f}</div>

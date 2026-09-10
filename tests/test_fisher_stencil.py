@@ -212,3 +212,28 @@ def test_onesided_derivative_matches_twosided_on_linear_signal():
     one = fisher.finite_difference(center, plus=plus, minus=None, delta=1.0, side="plus_only")
     np.testing.assert_allclose(two, one)
     np.testing.assert_allclose(two, np.array([1.0, 2.0]))
+
+
+def test_html_preamble_explains_m_as_mean_shrinkage():
+    fisher = _fisher_module()
+    html = fisher.render_html(
+        {
+            "headline": {
+                "m": -0.4,
+                "R": 0.6,
+                "sigma_cr": 0.05,
+                "sigma_cr_p16": 0.03,
+                "sigma_cr_p84": 0.08,
+            },
+            "n_full": 250,
+            "n_g5": 500,
+            "snr_table_html": "<table></table>",
+            "transfer_table_html": "<table></table>",
+        },
+        {},
+    )
+    assert 'id="theory"' in html
+    assert "posterior Mean" in html
+    assert r"\sigma_{\mathrm{CR}}" in html
+    assert "escapes" in html
+    assert "katex" in html

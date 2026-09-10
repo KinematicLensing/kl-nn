@@ -187,6 +187,36 @@ def test_loading_snapshot_without_circular_helper_fails_closed(tmp_path):
         )
 
 
+def test_load_model_config_ignores_historical_pair_train_keys(tmp_path):
+    configured = copy.deepcopy(config.MODEL_CONFIG)
+    configured.train.model_name = "legacy-pair-snapshot"
+    config_root = tmp_path / "configs"
+    config_root.mkdir()
+    path = Path(
+        model_registry.get_model_config_path(
+            "legacy-pair-snapshot", configs_root=str(config_root)
+        )
+    )
+    payload = configured.to_dict()
+    payload["train"].update(
+        {
+            "pair_data_dir": "/unused",
+            "pair_size": 2,
+            "pair_group_size": 4,
+            "pair_groups_per_batch": 8,
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = model_registry.load_model_config(
+        "legacy-pair-snapshot", configs_root=str(config_root)
+    )
+
+    assert loaded.to_dict() == configured.to_dict()
+    with pytest.raises(ValueError, match="extra="):
+        config.ModelConfig.from_dict(payload)
+
+
 def test_missing_current_config_and_network_snapshots_fail_closed(tmp_path):
     with pytest.raises(FileNotFoundError, match="Current-schema model config"):
         model_registry.load_model_config(

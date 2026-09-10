@@ -53,6 +53,13 @@ EXPECTED_TEST_SET_DENSITY_COORDINATES = {
     "posterior_summary": "physical_target_coordinates",
     "map_selection": "not_computed",
 }
+EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES = {
+    "stored_shear_samples": "physical_target_coordinates",
+    "stored_base_log_prob": "normalized_target_coordinates",
+    "posterior_summary": "physical_target_coordinates",
+    "map_selection": "physical_target_coordinates",
+    "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
+}
 EXPECTED_OBSERVATION_MODEL = {
     "schema_version": 3,
     "context_fields": ["rmag_true", "image_snr", "central_halpha_snr"],
@@ -111,6 +118,14 @@ TEST_SET_REQUIRED_CACHE_ARRAYS = (
     "central_spectral_noise_sigma",
     "proposal_mean_estimates",
     "tf_target_mean_estimates",
+)
+TEST_SET_MAP_REQUIRED_CACHE_ARRAYS = TEST_SET_REQUIRED_CACHE_ARRAYS + (
+    "base_log_prob",
+    "posterior_tf_log_ratio",
+    "proposal_map_estimates",
+    "tf_target_map_estimates",
+    "tf_map_laplace_cov",
+    "tf_map_laplace_ok",
 )
 EXPECTED_SYMMETRY = {
     "policy": "original_plus_r90_equal_mixture",
@@ -283,8 +298,6 @@ def _validate_test_set(
         "population": "tf_conformed_catalog",
         "posterior_candidate_weighting": "tf_importance",
         "population_weighting": "uniform",
-        "point_estimator": "mean",
-        "map_computed": False,
         "tf_importance_weighting": True,
         "shape_noise_regularization": "report_time",
         "snr_source": "dataset_record",
@@ -294,6 +307,17 @@ def _validate_test_set(
     for name, expected in expected_values.items():
         if test_set.get(name) != expected:
             raise _fail(path, f"test_set.{name} must equal {expected!r}")
+    map_computed = test_set.get("map_computed")
+    if map_computed is True:
+        if test_set.get("point_estimator") != "mean_and_map":
+            raise _fail(
+                path, "test_set.point_estimator must equal 'mean_and_map'"
+            )
+    elif map_computed is False:
+        if test_set.get("point_estimator") != "mean":
+            raise _fail(path, "test_set.point_estimator must equal 'mean'")
+    else:
+        raise _fail(path, "test_set.map_computed must be a boolean")
 
     if physical_parameter_ranges.get("cosi") != [0.0, 1.0]:
         raise _fail(
@@ -473,10 +497,19 @@ def _validate_test_set(
         )
 
 
-def _required_cache_arrays(schema: str) -> tuple[str, ...]:
+def _test_set_map_computed(payload: dict[str, Any]) -> bool:
+    test_set = payload.get("test_set")
+    return isinstance(test_set, dict) and test_set.get("map_computed") is True
+
+
+def _required_cache_arrays(
+    schema: str, *, map_computed: bool = False
+) -> tuple[str, ...]:
     if schema == LEGACY_CACHE_SCHEMA:
         return LEGACY_REQUIRED_CACHE_ARRAYS
     if schema == TEST_SET_CACHE_SCHEMA:
+        if map_computed:
+            return TEST_SET_MAP_REQUIRED_CACHE_ARRAYS
         return TEST_SET_REQUIRED_CACHE_ARRAYS
     return REQUIRED_CACHE_ARRAYS
 
@@ -566,6 +599,10 @@ def _expected_array_shape(
         "target_mean_estimates",
     }:
         return rows, 3, features
+    if name == "tf_map_laplace_cov":
+        return rows, 2, 2
+    if name == "tf_map_laplace_ok":
+        return (rows,)
     raise AssertionError(f"No shape contract for cache array {name!r}")
 
 
@@ -705,8 +742,12 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
                     f"target_transforms must equal {CURRENT_TARGET_TRANSFORMS!r}",
                 )
             expected_density = (
-                EXPECTED_TEST_SET_DENSITY_COORDINATES
-                if schema == TEST_SET_CACHE_SCHEMA else EXPECTED_DENSITY_COORDINATES
+                EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES
+                if schema == TEST_SET_CACHE_SCHEMA
+                and _test_set_map_computed(payload)
+                else EXPECTED_TEST_SET_DENSITY_COORDINATES
+                if schema == TEST_SET_CACHE_SCHEMA
+                else EXPECTED_DENSITY_COORDINATES
             )
             if payload.get("density_coordinates") != expected_density:
                 raise _fail(
@@ -847,7 +888,9 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
 
         files = _require_mapping(payload, "files", path)
         supplied_arrays = set(files)
-        required_arrays = _required_cache_arrays(schema)
+        required_arrays = _required_cache_arrays(
+            schema, map_computed=_test_set_map_computed(payload)
+        )
         expected_arrays = set(required_arrays)
         if supplied_arrays != expected_arrays:
             raise _fail(
@@ -877,7 +920,10 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
 
     ordered_files: dict[str, tuple[Path, ...]] = {}
     assert reference_schema is not None
-    required_arrays = _required_cache_arrays(reference_schema)
+    required_arrays = _required_cache_arrays(
+        reference_schema,
+        map_computed=_test_set_map_computed(payloads[0]),
+    )
     for name in required_arrays:
         paths = tuple(root / name / f"{label}.npy" for label in labels)
         found = []

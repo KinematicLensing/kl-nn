@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -18,6 +19,17 @@ except ImportError:  # Direct execution with arch/ on sys.path.
 
 DEFAULT_SHARED_ROOT = "/ocean/projects/phy250048p/shared"
 DEFAULT_CONFIGS_ROOT = join(DEFAULT_SHARED_ROOT, "configs")
+# Leftover pair-NPE train keys still present on some shared snapshots. They are
+# unused by the current frozen-concat TrainConfig; drop them on load so
+# inference can read production configs without relaxing from_dict.
+IGNORED_TRAIN_SNAPSHOT_KEYS = frozenset(
+    {
+        "pair_data_dir",
+        "pair_group_size",
+        "pair_groups_per_batch",
+        "pair_size",
+    }
+)
 DEFAULT_NETWORKS_ROOT = join(DEFAULT_SHARED_ROOT, "networks")
 
 _CIRCULAR_SPLINE_IMPORT_RE = re.compile(
@@ -109,6 +121,14 @@ def _snapshot_import_context(helper_module: ModuleType):
                 pass
 
 
+def _payload_for_current_schema(payload: dict) -> dict:
+    train = payload.get("train")
+    if isinstance(train, dict):
+        for key in IGNORED_TRAIN_SNAPSHOT_KEYS:
+            train.pop(key, None)
+    return payload
+
+
 def load_model_config(
     model_name: str,
     *,
@@ -116,7 +136,9 @@ def load_model_config(
 ) -> config.ModelConfig:
     path = get_model_config_path(model_name, configs_root=configs_root)
     if isfile(path):
-        return config.ModelConfig.from_json(path)
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return config.ModelConfig.from_dict(_payload_for_current_schema(payload))
     raise FileNotFoundError(
         f"Current-schema model config not found for {model_name!r} at {path}"
     )

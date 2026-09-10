@@ -10,6 +10,7 @@ from cache_contract import (
     EXPECTED_DENSITY_COORDINATES,
     EXPECTED_OBSERVATION_MODEL,
     EXPECTED_TEST_SET_DENSITY_COORDINATES,
+    EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES,
     LEGACY_CACHE_SCHEMA,
     LEGACY_REQUIRED_CACHE_ARRAYS,
     PARTITION_SEED_STRIDE,
@@ -17,6 +18,7 @@ from cache_contract import (
     STANDARD_ANALYSIS_MODE,
     TEST_SET_ANALYSIS_MODE,
     TEST_SET_CACHE_SCHEMA,
+    TEST_SET_MAP_REQUIRED_CACHE_ARRAYS,
     TEST_SET_REQUIRED_CACHE_ARRAYS,
     load_cache_partitions,
     load_partitioned_array,
@@ -65,10 +67,17 @@ def _array(name, rows, draws, start):
         "target_mean_estimates",
     }:
         return np.zeros((rows, 3, features), dtype=np.float32)
+    if name == "tf_map_laplace_cov":
+        cov = np.zeros((rows, 2, 2), dtype=np.float64)
+        cov[:, 0, 0] = 1.0
+        cov[:, 1, 1] = 1.0
+        return cov
+    if name == "tf_map_laplace_ok":
+        return np.ones(rows, dtype=bool)
     raise AssertionError(name)
 
 
-def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
+def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_computed=False):
     label = f"part{index}of{total}"
     seed = 42 + PARTITION_SEED_STRIDE * index
     if schema == LEGACY_CACHE_SCHEMA:
@@ -90,7 +99,9 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
             "spectral_noise_seed": seed + 101,
         }
         required_arrays = (
-            TEST_SET_REQUIRED_CACHE_ARRAYS
+            TEST_SET_MAP_REQUIRED_CACHE_ARRAYS
+            if schema == TEST_SET_CACHE_SCHEMA and map_computed
+            else TEST_SET_REQUIRED_CACHE_ARRAYS
             if schema == TEST_SET_CACHE_SCHEMA
             else REQUIRED_CACHE_ARRAYS
         )
@@ -154,7 +165,9 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                 },
                 "target_transforms": dict(CURRENT_TARGET_TRANSFORMS),
                 "density_coordinates": dict(
-                    EXPECTED_TEST_SET_DENSITY_COORDINATES
+                    EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES
+                    if schema == TEST_SET_CACHE_SCHEMA and map_computed
+                    else EXPECTED_TEST_SET_DENSITY_COORDINATES
                     if schema == TEST_SET_CACHE_SCHEMA
                     else EXPECTED_DENSITY_COORDINATES
                 ),
@@ -175,8 +188,10 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
                     "population": "tf_conformed_catalog",
                     "posterior_candidate_weighting": "tf_importance",
                     "population_weighting": "uniform",
-                    "point_estimator": "mean",
-                    "map_computed": False,
+                    "point_estimator": (
+                        "mean_and_map" if map_computed else "mean"
+                    ),
+                    "map_computed": map_computed,
                     "tf_importance_weighting": True,
                     "shape_noise_regularization": "report_time",
                     "snr_source": "dataset_record",
@@ -248,13 +263,17 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA):
     return payload
 
 
-def _write_cache(root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA):
+def _write_cache(
+    root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA, map_computed=False
+):
     (root / "meta").mkdir(parents=True)
     required_arrays = (
         LEGACY_REQUIRED_CACHE_ARRAYS
         if schema == LEGACY_CACHE_SCHEMA
         else (
-            TEST_SET_REQUIRED_CACHE_ARRAYS
+            TEST_SET_MAP_REQUIRED_CACHE_ARRAYS
+            if schema == TEST_SET_CACHE_SCHEMA and map_computed
+            else TEST_SET_REQUIRED_CACHE_ARRAYS
             if schema == TEST_SET_CACHE_SCHEMA
             else REQUIRED_CACHE_ARRAYS
         )
@@ -270,7 +289,15 @@ def _write_cache(root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA):
                 directory / f"{label}.npy",
                 _array(name, rows, draws, start),
             )
-        payload = _manifest(index, total, start, end, draws, schema=schema)
+        payload = _manifest(
+            index,
+            total,
+            start,
+            end,
+            draws,
+            schema=schema,
+            map_computed=map_computed,
+        )
         (root / "meta" / f"{label}.json").write_text(
             json.dumps(payload), encoding="utf-8"
         )
@@ -322,6 +349,43 @@ def test_compact_test_set_contract_exposes_mode_and_embedded_provenance(
     assert generation["source_catalog"]["path"] == "/catalog.fits"
     shear = load_partitioned_array(partitions, "shear_sample")
     assert shear.shape == (4, 4, 2)
+
+
+def test_map_density_test_set_contract_accepts_laplace_arrays(tmp_path):
+    root = _write_cache(
+        tmp_path / "map-cache",
+        schema=TEST_SET_CACHE_SCHEMA,
+        map_computed=True,
+    )
+    partitions = load_cache_partitions(root)
+    assert partitions.mode_metadata["map_computed"] is True
+    assert partitions.mode_metadata["point_estimator"] == "mean_and_map"
+    assert set(partitions.files) == set(TEST_SET_MAP_REQUIRED_CACHE_ARRAYS)
+    cov = load_partitioned_array(partitions, "tf_map_laplace_cov")
+    assert cov.shape == (4, 2, 2)
+    ok = load_partitioned_array(partitions, "tf_map_laplace_ok")
+    assert ok.shape == (4,)
+    assert partitions.manifests[0]["density_coordinates"] == (
+        EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES
+    )
+
+
+def test_map_computed_without_laplace_arrays_fails_closed(tmp_path):
+    root = _write_cache(
+        tmp_path / "test-cache", schema=TEST_SET_CACHE_SCHEMA
+    )
+
+    def claim_map(payload):
+        payload["test_set"]["map_computed"] = True
+        payload["test_set"]["point_estimator"] = "mean_and_map"
+        payload["density_coordinates"] = dict(
+            EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES
+        )
+
+    _mutate_manifest(root, 0, 2, claim_map)
+    _mutate_manifest(root, 1, 2, claim_map)
+    with pytest.raises(ValueError, match="missing="):
+        load_cache_partitions(root)
 
 
 @pytest.mark.parametrize(

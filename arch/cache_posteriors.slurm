@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/cache_posteriors_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=1:00:00
+#SBATCH --time=3:00:00
 #SBATCH --nodes=1
 #SBATCH --array=1-10
 #SBATCH --mail-type=ALL
@@ -32,6 +32,7 @@ NSAMPLES="${NSAMPLES:-10000}"
 SEED="${SEED:-42}"
 CACHE_TAG="${CACHE_TAG:-}"
 TEST_SET="${TEST_SET:-0}"
+MAP_DENSITY="${MAP_DENSITY:-0}"
 DATASET_MANIFEST="${DATASET_MANIFEST:-}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
@@ -58,6 +59,14 @@ if (( NSAMPLES <= 0 || NSAMPLES % 2 != 0 )); then
 fi
 if [[ "${TEST_SET}" != "0" && "${TEST_SET}" != "1" ]]; then
     echo "TEST_SET must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${MAP_DENSITY}" != "0" && "${MAP_DENSITY}" != "1" ]]; then
+    echo "MAP_DENSITY must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${MAP_DENSITY}" == "1" && "${TEST_SET}" != "1" ]]; then
+    echo "MAP_DENSITY=1 requires TEST_SET=1" >&2
     exit 2
 fi
 if [[ -z "${CACHE_TAG}" ]]; then
@@ -96,12 +105,19 @@ if [[ "${TEST_SET}" == "1" ]]; then
     if [[ -n "${DATASET_MANIFEST}" ]]; then
         ARGS+=(--dataset-manifest "${DATASET_MANIFEST}")
     fi
+    if [[ "${MAP_DENSITY}" == "1" ]]; then
+        ARGS+=(--map-density)
+    fi
 fi
 
 echo "model=${MODEL_NAME} epoch=${EPOCH:-best}"
 echo "dataset=${DATASET} partition=${PART_INDEX}/${NPARTS} ngals=${NGALS} nsamples=${NSAMPLES}"
 if [[ "${TEST_SET}" == "1" ]]; then
-    echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
+    if [[ "${MAP_DENSITY}" == "1" ]]; then
+        echo "cache_tag=${CACHE_TAG}; mode=test_set+map_density; saving TF-weighted Mean, sample MAP, normalized mixture log-probabilities, TF log ratios, and Laplace shear covariances"
+    else
+        echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
+    fi
 else
     echo "cache_tag=${CACHE_TAG}; mode=proposal_and_tf; saving base candidates, posterior TF weights, and raw population TF log ratios"
 fi

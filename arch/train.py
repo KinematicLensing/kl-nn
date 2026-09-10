@@ -1347,6 +1347,7 @@ def sample_density(
     spectral_noise_seed=None,
     return_log_prob=True,
     return_observation_metadata=True,
+    return_flow_context=False,
     progress=None,
 ):
     """Draw the sole current identity/R90 posterior ensemble."""
@@ -1451,6 +1452,7 @@ def sample_density(
     )
 
     samples, scores = [], []
+    contexts_original, contexts_rotated = [], []
     iterator = range(len(dataset))
     if progress is not None:
         iterator = progress(iterator, total=len(dataset), desc="Sampling")
@@ -1517,6 +1519,34 @@ def sample_density(
             rotated = rotate_90_parameters(rotated, inverse=True)
             bank = torch.cat((original, rotated), dim=0)
             samples.append(bank.cpu().numpy())
+            if return_flow_context:
+                with torch.no_grad():
+                    raw_original = model._raw_features(
+                        image,
+                        spectra,
+                        positions,
+                        context,
+                    )
+                    raw_rotated = model._raw_features(
+                        image_r,
+                        spectra_r,
+                        positions_r,
+                        context,
+                    )
+                    contexts_original.append(
+                        model._flow_context(raw_original)
+                        .detach()
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
+                    contexts_rotated.append(
+                        model._flow_context(raw_rotated)
+                        .detach()
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
             if return_log_prob:
                 log_original = model.posterior_log_prob(
                     image,
@@ -1550,6 +1580,9 @@ def sample_density(
             group_center_spectral_sigma, matched_group_size
         ).cpu().numpy(),
     }
+    if return_flow_context:
+        metadata["flow_context_original"] = np.stack(contexts_original)
+        metadata["flow_context_rotated"] = np.stack(contexts_rotated)
     if return_log_prob:
         score_array = np.stack(scores)
         if return_observation_metadata:

@@ -411,6 +411,8 @@ def load_case(
     posterior_ess = posterior_ess_fraction = posterior_max_weight = None
     test_set_provenance = tf_conformance_audit = None
     posterior_candidate_weighting = None
+    map_laplace_cov = map_laplace_ok = None
+    map_computed = False
     candidate_log_weight_array = "posterior_tf_log_weight"
     target_summary_array = "tf_target_mean_estimates"
     test_set_population_label = "TF-conformed test set / TF posterior"
@@ -468,6 +470,33 @@ def load_case(
         posterior_candidate_weighting = test_set_provenance.get(
             "posterior_candidate_weighting"
         )
+        map_computed = test_set_provenance.get("map_computed") is True
+        if map_computed:
+            proposal_map = np.asarray(
+                load_partitioned_array(
+                    cache_partitions, "proposal_map_estimates"
+                )
+            )
+            target_map = np.asarray(
+                load_partitioned_array(
+                    cache_partitions, "tf_target_map_estimates"
+                )
+            )
+            map_laplace_cov = np.asarray(
+                load_partitioned_array(cache_partitions, "tf_map_laplace_cov"),
+                dtype=np.float64,
+            )
+            map_laplace_ok = np.asarray(
+                load_partitioned_array(cache_partitions, "tf_map_laplace_ok")
+            ).astype(bool)
+            if proposal_map.shape != truth.shape or target_map.shape != truth.shape:
+                raise ValueError(
+                    f"MAP estimate shape mismatch for {case}; "
+                    f"proposal {proposal_map.shape}, target {target_map.shape}, "
+                    f"truth {truth.shape}"
+                )
+            if map_laplace_cov.shape != (n, 2, 2) or map_laplace_ok.shape != (n,):
+                raise ValueError(f"Laplace array shape mismatch for {case}")
         combined_prior = (
             posterior_candidate_weighting
             == COMBINED_TEST_SET_CANDIDATE_WEIGHTING
@@ -591,6 +620,11 @@ def load_case(
             posterior_ess = posterior_ess[:take]
             posterior_ess_fraction = posterior_ess_fraction[:take]
             posterior_max_weight = posterior_max_weight[:take]
+            if map_computed:
+                proposal_map = proposal_map[:take]
+                target_map = target_map[:take]
+                map_laplace_cov = map_laplace_cov[:take]
+                map_laplace_ok = map_laplace_ok[:take]
         n = take
 
     proposal_weight = np.full(n, 1.0 / n, dtype=np.float64)
@@ -612,8 +646,21 @@ def load_case(
         "analyzed_size": n,
     }
     if test_set:
+        test_set_population = {
+            "key": "test_set",
+            "summary": target_summary,
+            "mean": target_summary[:, 1],
+            "galaxy_weight": proposal_weight,
+            "population_weight": proposal_weight.copy(),
+        }
+        if map_computed:
+            test_set_population["map"] = target_map
+            test_set_population["map_galaxy_weight"] = proposal_weight.copy()
         common.update(
-            report_map=False,
+            report_map=map_computed,
+            map_computed=map_computed,
+            map_laplace_cov=map_laplace_cov,
+            map_laplace_ok=map_laplace_ok,
             candidate_array="shear_sample",
             candidate_log_weight_array=candidate_log_weight_array,
             posterior_candidate_weighting=posterior_candidate_weighting,
@@ -628,13 +675,7 @@ def load_case(
             posterior_candidate_max_weight=posterior_max_weight,
             base_summary=proposal_summary,
             populations={
-                test_set_population_label: {
-                    "key": "test_set",
-                    "summary": target_summary,
-                    "mean": target_summary[:, 1],
-                    "galaxy_weight": proposal_weight,
-                    "population_weight": proposal_weight.copy(),
-                }
+                test_set_population_label: test_set_population
             },
         )
         if posterior_candidate_weighting != COMBINED_TEST_SET_CANDIDATE_WEIGHTING:
@@ -1003,6 +1044,122 @@ def shape_noise_weight_comparison(
     return rows
 
 
+def mean_vs_map_weight_comparison(
+    case: dict,
+    posterior_diagnostics: dict[str, dict[str, np.ndarray]],
+    low_g: float,
+) -> list[dict]:
+    """Compare Mean vs MAP under population and estimator-specific weights."""
+
+    truth = np.asarray(case["truth"], dtype=np.float64)
+    rows = []
+    for population_label, population in case["populations"].items():
+        if "map" not in population:
+            continue
+        posterior = posterior_diagnostics[population["key"]]
+        base_weight = population_weight(population)
+        mean_reg, mean_diag = compose_shape_noise_regularized_weights(
+            base_weight,
+            posterior["g1_variance"],
+            posterior["g2_variance"],
+        )
+        cov = np.asarray(case["map_laplace_cov"], dtype=np.float64)
+        ok = np.asarray(case["map_laplace_ok"], dtype=bool)
+        g1_var = np.where(ok, cov[:, 0, 0], np.nan)
+        g2_var = np.where(ok, cov[:, 1, 1], np.nan)
+        try:
+            map_reg, map_diag = compose_shape_noise_regularized_weights(
+                base_weight, g1_var, g2_var
+            )
+        except ValueError:
+            map_reg = np.zeros_like(base_weight)
+            map_diag = {
+                "shape_noise": float("nan"),
+                "shape_noise_se": float("nan"),
+                "shape_noise_ess": 0.0,
+                "weighted_shape_noise": float("nan"),
+                "weighted_shape_noise_se": float("nan"),
+                "weighted_shape_noise_ess": 0.0,
+                "invalid_variance_count": int(np.size(ok)),
+                "invalid_variance_fraction": 1.0,
+                "invalid_variance_population_mass": 1.0,
+                "population_ess": float("nan"),
+                "ess": 0.0,
+            }
+        map_abs = np.abs(np.asarray(population["map"][:, :2], dtype=np.float64))
+        wall_fraction = float(np.mean(np.any(map_abs >= 0.095, axis=1)))
+        estimators = (
+            ("Mean", population["mean"], "Population only", base_weight, mean_diag),
+            (
+                "Mean",
+                population["mean"],
+                "Shape-noise regularized",
+                mean_reg,
+                mean_diag,
+            ),
+            ("MAP", population["map"], "Population only", base_weight, map_diag),
+            (
+                "MAP",
+                population["map"],
+                "Laplace shape-noise regularized",
+                map_reg,
+                map_diag,
+            ),
+        )
+        for estimator, estimate, weighting, weight, diagnostics in estimators:
+            component_rows = [
+                component_metrics(
+                    truth[:, index], estimate[:, index], low_g, weight
+                )
+                for index in range(2)
+            ]
+            first_pass = weighting == "Population only"
+            rows.append(
+                {
+                    "population": population_label,
+                    "population_key": population["key"],
+                    "estimator": estimator,
+                    "weighting": weighting,
+                    **diagnostics,
+                    "reported_shape_noise": (
+                        diagnostics["shape_noise"]
+                        if first_pass
+                        else diagnostics["weighted_shape_noise"]
+                    ),
+                    "reported_shape_noise_se": (
+                        diagnostics["shape_noise_se"]
+                        if first_pass
+                        else diagnostics["weighted_shape_noise_se"]
+                    ),
+                    "reported_shape_noise_ess": (
+                        diagnostics["shape_noise_ess"]
+                        if first_pass
+                        else diagnostics["weighted_shape_noise_ess"]
+                    ),
+                    "reported_ess": (
+                        diagnostics["population_ess"]
+                        if first_pass
+                        else diagnostics["ess"]
+                    ),
+                    "g1_m": component_rows[0]["low_m"],
+                    "g1_m_se": component_rows[0]["low_m_se"],
+                    "g1_c": component_rows[0]["c"],
+                    "g1_c_se": component_rows[0]["c_se"],
+                    "g1_ess": component_rows[0]["ess_low"],
+                    "g1_n": component_rows[0]["n_low"],
+                    "g2_m": component_rows[1]["low_m"],
+                    "g2_m_se": component_rows[1]["low_m_se"],
+                    "g2_c": component_rows[1]["c"],
+                    "g2_c_se": component_rows[1]["c_se"],
+                    "g2_ess": component_rows[1]["ess_low"],
+                    "g2_n": component_rows[1]["n_low"],
+                    "laplace_invalid_fraction": float(np.mean(~ok)),
+                    "map_wall_fraction": wall_fraction,
+                }
+            )
+    return rows
+
+
 def apply_precision_weighting(
     case: dict,
     posterior_diagnostics: dict[str, dict[str, np.ndarray]],
@@ -1047,6 +1204,9 @@ def compute_metrics(case: dict, low_g: float) -> list[dict]:
         if case.get("report_map", True):
             estimators.insert(0, ("MAP", population["map"]))
         for estimator, estimate in estimators:
+            weight = population["galaxy_weight"]
+            if estimator == "MAP" and "map_galaxy_weight" in population:
+                weight = population["map_galaxy_weight"]
             frames = {
                 "image": (
                     (truth[:, 0], truth[:, 1]),
@@ -1085,6 +1245,12 @@ def nuisance_bias_metrics(case: dict) -> list[dict]:
         if case.get("report_map", True):
             estimators.append(("MAP", population["map"]))
         for estimator, estimate in estimators:
+            if estimator == "MAP" and "map_galaxy_weight" in population:
+                weight = np.asarray(
+                    population["map_galaxy_weight"], dtype=np.float64
+                )
+            else:
+                weight = np.asarray(population["galaxy_weight"], dtype=np.float64)
             estimate = np.asarray(estimate, dtype=np.float64)
             for index, parameter in enumerate(case["feature_names"]):
                 if parameter in {"g1", "g2"}:
@@ -2589,6 +2755,42 @@ def shape_noise_weight_comparison_table(rows: list[dict]) -> str:
     )
 
 
+def mean_vs_map_weight_comparison_table(rows: list[dict]) -> str:
+    """Render Mean vs MAP m, c, and estimator-specific shape-noise weights."""
+
+    body = []
+    for row in rows:
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(row['estimator'])}</td>"
+            f"<td>{html.escape(row['weighting'])}</td>"
+            f"<td>{_format_scaled(row['g1_c'], 1e4)} ± "
+            f"{_format_scaled(row['g1_c_se'], 1e4)}</td>"
+            f"<td>{_format_scaled(row['g1_m'], 1e2)} ± "
+            f"{_format_scaled(row['g1_m_se'], 1e2)}</td>"
+            f"<td>{_format_scaled(row['g2_c'], 1e4)} ± "
+            f"{_format_scaled(row['g2_c_se'], 1e4)}</td>"
+            f"<td>{_format_scaled(row['g2_m'], 1e2)} ± "
+            f"{_format_scaled(row['g2_m_se'], 1e2)}</td>"
+            f"<td>{row['reported_shape_noise']:.5g}</td>"
+            f"<td>{row['reported_ess']:.1f}</td>"
+            f"<td>{100 * row['laplace_invalid_fraction']:.2f}%</td>"
+            f"<td>{100 * row['map_wall_fraction']:.2f}%</td>"
+            f"<td>{row['g1_n']:,} / {row['g1_ess']:.1f}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Estimator</th><th>Weighting</th>"
+        "<th>10<sup>4</sup> g1 c</th><th>10<sup>2</sup> g1 m</th>"
+        "<th>10<sup>4</sup> g2 c</th><th>10<sup>2</sup> g2 m</th>"
+        "<th>reported σ<sub>shape</sub></th><th>ESS</th>"
+        "<th>Laplace invalid</th><th>|g<sub>MAP</sub>|≥0.095</th>"
+        "<th>g1 N / fit ESS</th></tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table>"
+    )
+
+
 def nuisance_bias_table(rows: list[dict]) -> str:
     body = []
     for row in rows:
@@ -2746,7 +2948,9 @@ def main(argv=None) -> None:
     cross_case_results = []
     for case in cases:
         case_name = case["case"]
-        case["report_map"] = not (args.weighted or args.test_set)
+        case["report_map"] = not args.weighted
+        if args.test_set:
+            case["report_map"] = bool(case.get("map_computed"))
         LOGGER.info("%s: starting report", case_name)
         if args.test_set:
             importance_html = test_set_candidate_weight_table(case)
@@ -2770,6 +2974,23 @@ def main(argv=None) -> None:
         weight_comparison_html = shape_noise_weight_comparison_table(
             weight_comparison_rows
         )
+        map_weight_rows = []
+        map_weight_html = ""
+        if case.get("map_computed"):
+            map_weight_rows = mean_vs_map_weight_comparison(
+                case, pits, args.low_g
+            )
+            map_weight_html = (
+                "<h3>Mean vs MAP with estimator-specific weights</h3>"
+                "<p>MAP is the highest-scoring identity/R90 mixture sample after "
+                "the physical Jacobian and TF ratio, not a histogram mode. "
+                "Laplace weights use the shear block of the inverse Hessian at "
+                "that sample and set invalid or wall Hessians to zero weight. "
+                "Mean shape-noise weights still use posterior sample variance; "
+                "they are not applied to MAP. This MAP is a finite-bank argmax, "
+                "not a continuous mode.</p>"
+                + mean_vs_map_weight_comparison_table(map_weight_rows)
+            )
         if args.weighted:
             applied = apply_precision_weighting(case, pits)
             for population_label, diagnostic in applied.items():
@@ -2968,10 +3189,22 @@ def main(argv=None) -> None:
                 f"subsequent ensemble statistics is <b>{operative_weighting}</b>. "
                 "Invalid variances receive zero regularized weight.</p>"
                 + weight_comparison_html
-                + "<h3>Shear calibration — posterior Mean</h3>"
-                "<p>Only the posterior Mean is reported. Low-|g| fits use "
-                f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
-                f"Results use {operative_weight_description}.</p>"
+                + map_weight_html
+                + (
+                    "<h3>Shear calibration — Mean and MAP</h3>"
+                    "<p>Low-|g| fits use "
+                    f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
+                    f"Mean results use {operative_weight_description}. "
+                    "MAP ensemble metrics use equal galaxy mass (Laplace "
+                    "reweighting is only in the Mean vs MAP table).</p>"
+                    if case.get("map_computed")
+                    else (
+                        "<h3>Shear calibration — posterior Mean</h3>"
+                        "<p>Only the posterior Mean is reported. Low-|g| fits use "
+                        f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
+                        f"Results use {operative_weight_description}.</p>"
+                    )
+                )
                 + shear_html
                 + "<h3>Nuisance-parameter calibration — posterior Mean</h3>"
                 "<p>Entries are weighted means of estimate minus truth. Error "
@@ -3107,13 +3340,25 @@ def main(argv=None) -> None:
             posterior_population_description = "TF-weighted or oracle-vcirc"
         else:
             posterior_population_description = "TF-weighted"
+        map_modes = [bool(case.get("map_computed")) for case in cases]
+        if all(map_modes):
+            map_description = (
+                "and the TF-target sample MAP with Laplace shear covariances. "
+                "MAP is a finite-bank argmax, not a continuous mode."
+            )
+        elif any(map_modes):
+            map_description = (
+                "and sample MAP plus Laplace covariances when the cache stored them."
+            )
+        else:
+            map_description = "and no MAP estimator."
         report_intro = (
             "<p>Each named case is an independently generated empirical catalog "
             "selection. The truth population already follows the declared "
             "Tully–Fisher relation. The report uses one "
             f"{posterior_population_description} posterior "
             f"population, the posterior Mean, {operative_weight_description}, "
-            "and no MAP estimator.</p>"
+            f"{map_description}</p>"
         )
         cross_case_html = (
             "<section><h2>Cross-cut operative shear summary</h2>"

@@ -30,6 +30,30 @@ def test_weighted_summary_and_target_map_use_same_joint_candidate_rows():
     assert abs(abs(summary["tf_target_mean_estimates"][0, 1, 2]) - np.pi) < 0.05
 
 
+def test_tf_target_map_follows_physical_density_plus_ratio_not_tf_weight():
+    """MAP is argmax(physical_base + TF log ratio), not argmax(TF weight).
+
+    Stored ``base_log_prob`` is the normalized-coordinate mixture score. MAP
+    selection uses the Jacobian-converted physical score plus the TF ratio.
+    """
+
+    module = _module()
+    names = ("g1", "g2", "theta_int")
+    samples = np.asarray(
+        [[[0.0, 10.0, 0.0], [1.0, 20.0, 0.0], [2.0, 30.0, 0.0]]]
+    )
+    physical_base = np.asarray([[10.0, 3.0, 0.0]])
+    ratio = np.asarray([[0.0, 3.0, 8.0]])
+    weight = np.exp(ratio - np.max(ratio))
+    weight = weight / weight.sum()
+    summary = module.posterior_summaries(
+        samples, physical_base, ratio, weight, names
+    )
+    np.testing.assert_array_equal(summary["proposal_map_estimates"][0], samples[0, 0])
+    np.testing.assert_array_equal(summary["tf_target_map_estimates"][0], samples[0, 0])
+    assert int(np.argmax(weight[0])) == 2
+
+
 def test_cache_cli_rejects_unknown_options_and_has_one_sampling_surface():
     module = _module()
     parser_error = None
@@ -60,6 +84,25 @@ def test_cache_cli_rejects_unknown_options_and_has_one_sampling_surface():
     )
     assert test_args.test_set is True
     assert test_args.dataset_manifest == Path("d/manifest.json")
+    assert test_args.map_density is False
+    map_args = module.parse_args(
+        [
+            "-i", "0", "--nparts", "1", "--ngals", "2",
+            "--model-name", "m", "--dataset", "d", "--test-set",
+            "--map-density",
+        ]
+    )
+    assert map_args.map_density is True
+    assert map_args.test_set is True
+    rejected = module.parse_args(
+        [
+            "-i", "0", "--nparts", "1", "--ngals", "2",
+            "--model-name", "m", "--dataset", "d", "--map-density",
+            "--nsamples", "20",
+        ]
+    )
+    with np.testing.assert_raises_regex(ValueError, "map-density"):
+        module.validate_writer_args(rejected)
 
 
 def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
@@ -91,6 +134,17 @@ def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
             "population_tf_log_ratio",
         }
     )
+    assert set(module.TEST_SET_MAP_CACHE_ARRAY_TYPES) == set(
+        module.TEST_SET_CACHE_ARRAY_TYPES
+    ) | {
+        "base_log_prob",
+        "posterior_tf_log_ratio",
+        "proposal_map_estimates",
+        "tf_target_map_estimates",
+        "tf_map_laplace_cov",
+        "tf_map_laplace_ok",
+    }
+    assert "sample" not in module.TEST_SET_MAP_CACHE_ARRAY_TYPES
 
 
 
@@ -371,3 +425,16 @@ def test_physical_map_scores_include_log_flux_jacobian():
     )
     assert scores[0, 0] > scores[0, 1]
     np.testing.assert_allclose(scores[0, 0] - scores[0, 1], np.log(1000.0))
+
+    # Stored base_log_prob is the normalized mixture score. A modest preference
+    # for the high-flux sample in that array is reversed by the Jacobian.
+    stored_normalized_scores = np.asarray([[0.0, 5.0]], dtype=np.float64)
+    physical_scores = module.physical_log_prob_from_normalized(
+        normalized,
+        stored_normalized_scores,
+        par_ranges={"halpha_flux_true": [1.0e-17, 1.0e-14]},
+        feature_names=names,
+        target_transforms={"halpha_flux_true": "log10"},
+    )
+    assert int(np.argmax(stored_normalized_scores[0])) == 1
+    assert int(np.argmax(physical_scores[0])) == 0

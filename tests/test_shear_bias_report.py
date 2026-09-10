@@ -771,6 +771,48 @@ def test_shape_noise_weight_comparison_reports_m_shape_noise_and_ess():
     assert "g1 N / fit ESS" in rendered
 
 
+def test_mean_vs_map_weight_comparison_keeps_estimator_specific_weights():
+    report = _report()
+    n = 80
+    truth = np.zeros((n, len(FEATURES)), dtype=np.float64)
+    truth[:, 0] = np.linspace(-0.019, 0.019, n)
+    truth[:, 1] = np.linspace(0.019, -0.019, n)
+    mean = truth.copy()
+    mean[:, :2] -= 0.5 * truth[:, :2]
+    mapped = truth.copy()
+    mapped[:, :2] -= 0.3 * truth[:, :2]
+    uniform = np.full(n, 1.0 / n)
+    case = {
+        "truth": truth,
+        "map_laplace_ok": np.ones(n, dtype=bool),
+        "map_laplace_cov": np.repeat(
+            np.eye(2, dtype=np.float64)[None, :, :] * 1.0e-3, n, axis=0
+        ),
+        "populations": {
+            "Test": {
+                "key": "test_set",
+                "mean": mean,
+                "map": mapped,
+                "galaxy_weight": uniform,
+                "population_weight": uniform.copy(),
+            }
+        },
+    }
+    variance = np.full(n, 1.0e-3)
+    posterior = {
+        "test_set": {"g1_variance": variance, "g2_variance": variance},
+    }
+    rows = report.mean_vs_map_weight_comparison(case, posterior, 0.02)
+    assert [row["estimator"] for row in rows] == ["Mean", "Mean", "MAP", "MAP"]
+    assert rows[0]["weighting"] == "Population only"
+    assert rows[1]["weighting"] == "Shape-noise regularized"
+    assert rows[3]["weighting"] == "Laplace shape-noise regularized"
+    assert rows[2]["g1_m"] > rows[0]["g1_m"]
+    table = report.mean_vs_map_weight_comparison_table(rows)
+    assert "Laplace" in table
+    assert "MAP" in table
+
+
 def test_nuisance_curves_share_proposal_bins_and_use_only_means():
     report = _report()
     n = 50

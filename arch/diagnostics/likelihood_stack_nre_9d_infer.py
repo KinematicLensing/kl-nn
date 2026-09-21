@@ -140,6 +140,7 @@ def run_emcee(
     burnin: int,
     production: int,
     seed: int,
+    vectorized: bool = False,
 ) -> dict[str, np.ndarray | dict]:
     """Run a bounded emcee chain and retain sampler diagnostics."""
 
@@ -171,7 +172,12 @@ def run_emcee(
         )
 
     np.random.seed(seed)
-    sampler = emcee.EnsembleSampler(nwalkers, parameter_dim, log_density)
+    sampler = emcee.EnsembleSampler(
+        nwalkers,
+        parameter_dim,
+        log_density,
+        vectorize=bool(vectorized),
+    )
     if burnin:
         sampler.run_mcmc(initial, burnin, progress=False)
         sampler.reset()
@@ -402,6 +408,7 @@ def write_report(args) -> None:
                 burnin=args.burnin,
                 production=args.production,
                 seed=args.seed + int(index),
+                vectorized=True,
             )
             summary = summarize_shear_samples(
                 chain["chain"],

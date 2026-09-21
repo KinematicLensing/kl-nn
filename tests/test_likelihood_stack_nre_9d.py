@@ -94,6 +94,8 @@ def test_emcee_smoke_and_shear_summary():
 
     def log_density(theta):
         theta = np.asarray(theta)
+        if theta.ndim == 2:
+            return np.asarray([log_density(row) for row in theta])
         if np.any(np.abs(theta) > 1.0):
             return -np.inf
         return float(-0.5 * np.sum(theta**2))
@@ -104,6 +106,7 @@ def test_emcee_smoke_and_shear_summary():
         burnin=2,
         production=6,
         seed=12,
+        vectorized=True,
     )
     assert result["chain"].shape == (20 * 6, 9)
     assert result["log_prob"].shape == (20 * 6,)

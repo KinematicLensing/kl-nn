@@ -177,6 +177,121 @@ def validate_fiber_layout(value: str) -> str:
 MAJOR_FIBER_INDICES = (0, 1)
 MINOR_FIBER_INDICES = (3, 4)
 DEFAULT_FIBER_OFFSET_ARCSEC = 1.5
+HOP_ANGLE_THRESHOLD_DEG = 45.0
+HOP_KNIFE_EDGE_DEG = 4.0
+
+
+def observed_linear_map(
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+) -> np.ndarray:
+    """Return the 2x2 map from intrinsic disk coordinates to the sheared image."""
+
+    if not 0.0 <= sini <= 1.0:
+        raise ValueError(f"sini must be in [0, 1], got {sini}")
+    cosi = np.sqrt(max(0.0, 1.0 - sini**2))
+    shear = np.asarray([[1.0 + g1, g2], [g2, 1.0 - g1]], dtype=float)
+    rotation = np.asarray(
+        [
+            [np.cos(theta_int), -np.sin(theta_int)],
+            [np.sin(theta_int), np.cos(theta_int)],
+        ],
+        dtype=float,
+    )
+    projection = np.asarray([[1.0, 0.0], [0.0, cosi]], dtype=float)
+    return shear @ (rotation @ projection)
+
+
+def observed_ellipticity(
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+) -> float:
+    """Return (s1-s2)/(s1+s2) from the observed image of the disk."""
+
+    _, singular, _ = np.linalg.svd(
+        observed_linear_map(g1=g1, g2=g2, theta_int=theta_int, sini=sini),
+        full_matrices=False,
+    )
+    total = float(singular[0] + singular[1])
+    if total <= 0.0:
+        return float("nan")
+    return float((singular[0] - singular[1]) / total)
+
+
+def unsigned_direction_angle_deg(left, right) -> float:
+    """Return the unsigned angle in degrees between two 2-D axes."""
+
+    first = np.asarray(left, dtype=float).reshape(-1)
+    second = np.asarray(right, dtype=float).reshape(-1)
+    if first.shape != (2,) or second.shape != (2,):
+        raise ValueError("axis vectors must have two components")
+    norm_left = float(np.linalg.norm(first))
+    norm_right = float(np.linalg.norm(second))
+    if norm_left <= 0.0 or norm_right <= 0.0:
+        return float("nan")
+    cosine = float(np.abs(np.dot(first, second)) / (norm_left * norm_right))
+    return float(np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0))))
+
+
+def major_axis_hop_angle_deg(
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+    fiber_offset: float = DEFAULT_FIBER_OFFSET_ARCSEC,
+) -> float:
+    """Angle between the major-axis fiber at shear (g1, g2) and at g=0."""
+
+    zero = compute_fiber_offsets(
+        fiber_offset=fiber_offset,
+        g1=0.0,
+        g2=0.0,
+        theta_int=theta_int,
+        sini=sini,
+    )[MAJOR_FIBER_INDICES[0]]
+    sheared = compute_fiber_offsets(
+        fiber_offset=fiber_offset,
+        g1=g1,
+        g2=g2,
+        theta_int=theta_int,
+        sini=sini,
+    )[MAJOR_FIBER_INDICES[0]]
+    return unsigned_direction_angle_deg(zero, sheared)
+
+
+def classify_fiber_hop(
+    *,
+    g1: float,
+    g2: float,
+    theta_int: float,
+    sini: float,
+    fiber_offset: float = DEFAULT_FIBER_OFFSET_ARCSEC,
+    threshold_deg: float = HOP_ANGLE_THRESHOLD_DEG,
+    knife_edge_deg: float = HOP_KNIFE_EDGE_DEG,
+) -> str:
+    """Return ``hopped``, ``unhopped``, or ``knife_edge`` from the 45° split."""
+
+    if threshold_deg <= 0.0 or knife_edge_deg < 0.0:
+        raise ValueError("hop threshold must be positive and knife-edge non-negative")
+    angle = major_axis_hop_angle_deg(
+        g1=g1,
+        g2=g2,
+        theta_int=theta_int,
+        sini=sini,
+        fiber_offset=fiber_offset,
+    )
+    if not np.isfinite(angle):
+        return "invalid"
+    if abs(angle - threshold_deg) < knife_edge_deg:
+        return "knife_edge"
+    return "hopped" if angle > threshold_deg else "unhopped"
 
 
 def observed_galaxy_axes(
@@ -198,19 +313,9 @@ def observed_galaxy_axes(
     small shear.
     """
 
-    if not 0.0 <= sini <= 1.0:
-        raise ValueError(f"sini must be in [0, 1], got {sini}")
-    cosi = np.sqrt(max(0.0, 1.0 - sini**2))
-    shear = np.asarray([[1.0 + g1, g2], [g2, 1.0 - g1]], dtype=float)
-    rotation = np.asarray(
-        [
-            [np.cos(theta_int), -np.sin(theta_int)],
-            [np.sin(theta_int), np.cos(theta_int)],
-        ],
-        dtype=float,
+    transform = observed_linear_map(
+        g1=g1, g2=g2, theta_int=theta_int, sini=sini
     )
-    projection = np.asarray([[1.0, 0.0], [0.0, cosi]], dtype=float)
-    transform = shear @ (rotation @ projection)
     observed_axes, _, _ = np.linalg.svd(transform)
     reference_axis = transform @ np.asarray([1.0, 0.0], dtype=float)
     # Align the first left singular vector with the transformed intrinsic

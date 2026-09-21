@@ -8,7 +8,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -euo pipefail
+set -eo pipefail
 ulimit -c 0
 
 KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
@@ -21,7 +21,9 @@ module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
+set +u
 conda activate kl-nn
+set -u
 
 SEED="${SEED:-42}"
 EPOCHS="${EPOCHS:-100}"
@@ -32,6 +34,7 @@ TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_si
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
+SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-CCL-simv3-cosi-r90_1m}"
 MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
@@ -55,6 +58,7 @@ echo "model=${MODEL_NAME} stage=pretrain views=identity+r90"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
+echo "shear_bound=${SHEAR_BOUND}"
 
 cd "${KLNN_REPO_ROOT}/arch"
 python train_model.py \
@@ -69,6 +73,7 @@ python train_model.py \
     --batch-size "${BATCH_SIZE}" \
     --ccl-sigma-label "${CCL_SIGMA_LABEL}" \
     --ccl-d-cutoff "${CCL_D_CUTOFF}" \
+    --shear-bound "${SHEAR_BOUND}" \
     --seed "${SEED}" \
     --deterministic \
     --fixed-validation-streams \

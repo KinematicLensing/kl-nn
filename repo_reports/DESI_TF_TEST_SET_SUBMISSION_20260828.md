@@ -161,7 +161,7 @@ datasets were introduced.
 
 Combined report job: **44810473**, with `afterok` dependencies on all three
 compact cache arrays. Its output is
-`/ocean/projects/phy250048p/shared/reports/desi_tf_test_set_tfweighted_v2_s42.html`.
+`/ocean/projects/phy250048p/shared/reports/desi-tf-testset/desi_tf_test_set_tfweighted_v2_s42.html`.
 The corrected caches use tag `testset_tfweighted_v2_10k_s42` so they cannot mix
 with the incompatible v1 equal-candidate Xu3 cache; this does not change the
 canonical sample or LMDB dataset names.

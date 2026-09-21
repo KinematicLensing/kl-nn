@@ -55,10 +55,10 @@ EXPECTED_TEST_SET_DENSITY_COORDINATES = {
 }
 EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES = {
     "stored_shear_samples": "physical_target_coordinates",
-    "stored_base_log_prob": "normalized_target_coordinates",
     "posterior_summary": "physical_target_coordinates",
-    "map_selection": "physical_target_coordinates",
-    "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
+    "map_selection": "tf_weighted_1d_kde_mode",
+    "map_nuisance": "tf_weighted_mean",
+    "laplace": "1d_kde_curvature",
 }
 EXPECTED_OBSERVATION_MODEL = {
     "schema_version": 3,
@@ -120,8 +120,6 @@ TEST_SET_REQUIRED_CACHE_ARRAYS = (
     "tf_target_mean_estimates",
 )
 TEST_SET_MAP_REQUIRED_CACHE_ARRAYS = TEST_SET_REQUIRED_CACHE_ARRAYS + (
-    "base_log_prob",
-    "posterior_tf_log_ratio",
     "proposal_map_estimates",
     "tf_target_map_estimates",
     "tf_map_laplace_cov",
@@ -130,6 +128,10 @@ TEST_SET_MAP_REQUIRED_CACHE_ARRAYS = TEST_SET_REQUIRED_CACHE_ARRAYS + (
 EXPECTED_SYMMETRY = {
     "policy": "original_plus_r90_equal_mixture",
     "rotated_joint_rows_inverse_aligned": True,
+}
+EXPECTED_IDENTITY_SYMMETRY = {
+    "policy": "identity",
+    "rotated_joint_rows_inverse_aligned": False,
 }
 REQUIRED_TF_FIELDS = {
     "slope",
@@ -312,6 +314,14 @@ def _validate_test_set(
         if test_set.get("point_estimator") != "mean_and_map":
             raise _fail(
                 path, "test_set.point_estimator must equal 'mean_and_map'"
+            )
+        if test_set.get("map_kind") != "tf_weighted_1d_kde_mode":
+            raise _fail(
+                path, "test_set.map_kind must equal 'tf_weighted_1d_kde_mode'"
+            )
+        if test_set.get("map_nuisance") != "tf_weighted_mean":
+            raise _fail(
+                path, "test_set.map_nuisance must equal 'tf_weighted_mean'"
             )
     elif map_computed is False:
         if test_set.get("point_estimator") != "mean":
@@ -767,17 +777,32 @@ def load_cache_partitions(root: str | Path) -> CachePartitions:
         ):
             raise _fail(path, "sample_shape must contain three integers")
         rows, draws, features = sample_shape
-        if rows != end - start or draws <= 0 or draws % 2 or features != len(feature_names):
-            raise _fail(path, "sample_shape disagrees with rows, R90 pairing, or features")
+        symmetry = _require_mapping(payload, "symmetry", path)
+        if symmetry == EXPECTED_IDENTITY_SYMMETRY:
+            even_draws_required = False
+        elif symmetry == EXPECTED_SYMMETRY:
+            even_draws_required = True
+        else:
+            raise _fail(
+                path,
+                "symmetry must equal "
+                f"{EXPECTED_SYMMETRY!r} or {EXPECTED_IDENTITY_SYMMETRY!r}",
+            )
+        if (
+            rows != end - start
+            or draws <= 0
+            or (even_draws_required and draws % 2)
+            or features != len(feature_names)
+        ):
+            raise _fail(
+                path,
+                "sample_shape disagrees with rows, ensemble pairing, or features",
+            )
         sample_tail = (draws, features)
         if reference_sample_tail is None:
             reference_sample_tail = sample_tail
         elif sample_tail != reference_sample_tail:
             raise _fail(path, "sample shape differs across cache partitions")
-
-        symmetry = _require_mapping(payload, "symmetry", path)
-        if symmetry != EXPECTED_SYMMETRY:
-            raise _fail(path, f"symmetry must equal {EXPECTED_SYMMETRY!r}")
         if analysis_mode == TEST_SET_ANALYSIS_MODE:
             tf = _require_mapping(payload, "tf", path)
             _validate_tf(

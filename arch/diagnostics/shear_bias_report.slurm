@@ -71,10 +71,8 @@ if [[ -n "${CASE_2_RESPONSE_CALIBRATION}" ]]; then
         exit 2
     fi
     ARGS+=(--response-calibrate "${CASE_2_RESPONSE_CALIBRATION}")
-fi
-MAX_SHEAR_SIGMA="${MAX_SHEAR_SIGMA:-}"
-if [[ -n "${MAX_SHEAR_SIGMA}" ]]; then
-    ARGS+=(--max-shear-sigma "${MAX_SHEAR_SIGMA}")
+    MAX_FINAL_VARIANCE="${MAX_FINAL_VARIANCE:-0.2}"
+    ARGS+=(--max-final-variance "${MAX_FINAL_VARIANCE}")
 fi
 
 cd "${KLNN_REPO_ROOT}/arch/diagnostics"

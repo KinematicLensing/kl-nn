@@ -26,6 +26,8 @@ set -u
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
 : "${DATASET:?Set DATASET to an independent held-out dataset not used for training or checkpoint selection}"
 EPOCH="${EPOCH:-}"
+NETWORKS_NAME="${NETWORKS_NAME:-}"
+CHECKPOINT="${CHECKPOINT:-}"
 NPARTS="${NPARTS:-10}"
 NGALS="${NGALS:-1000}"
 NSAMPLES="${NSAMPLES:-10000}"
@@ -33,6 +35,7 @@ SEED="${SEED:-42}"
 CACHE_TAG="${CACHE_TAG:-}"
 TEST_SET="${TEST_SET:-0}"
 MAP_DENSITY="${MAP_DENSITY:-0}"
+IDENTITY_ONLY="${IDENTITY_ONLY:-0}"
 DATASET_MANIFEST="${DATASET_MANIFEST:-}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
@@ -53,8 +56,16 @@ if (( PART_INDEX < 0 || PART_INDEX >= NPARTS )); then
     echo "Array index ${PART_INDEX} is outside NPARTS=${NPARTS}" >&2
     exit 2
 fi
-if (( NSAMPLES <= 0 || NSAMPLES % 2 != 0 )); then
-    echo "NSAMPLES must be positive and even for the identity/R90 pair" >&2
+if (( NSAMPLES <= 0 )); then
+    echo "NSAMPLES must be positive" >&2
+    exit 2
+fi
+if [[ "${IDENTITY_ONLY}" != "0" && "${IDENTITY_ONLY}" != "1" ]]; then
+    echo "IDENTITY_ONLY must be 0 or 1" >&2
+    exit 2
+fi
+if (( NSAMPLES % 2 != 0 )) && [[ "${IDENTITY_ONLY}" != "1" ]]; then
+    echo "NSAMPLES must be even for the identity/R90 pair, or set IDENTITY_ONLY=1" >&2
     exit 2
 fi
 if [[ "${TEST_SET}" != "0" && "${TEST_SET}" != "1" ]]; then
@@ -75,6 +86,14 @@ fi
 SHARED_ROOT="$(dirname "${MODEL_ROOT%/}")"
 if [[ ! -f "${SHARED_ROOT}/configs/cfg_${MODEL_NAME}.json" ]]; then
     echo "Missing current-schema model config for ${MODEL_NAME}" >&2
+    exit 2
+fi
+if [[ -n "${NETWORKS_NAME}" && ! -f "${SHARED_ROOT}/networks/networks_${NETWORKS_NAME}.py" ]]; then
+    echo "Missing networks snapshot for ${NETWORKS_NAME}" >&2
+    exit 2
+fi
+if [[ -n "${CHECKPOINT}" && ! -f "${CHECKPOINT}" ]]; then
+    echo "Checkpoint not found: ${CHECKPOINT}" >&2
     exit 2
 fi
 if [[ ! -d "${DATA_ROOT}/${DATASET}" ]]; then
@@ -100,6 +119,15 @@ ARGS=(
 if [[ -n "${EPOCH}" ]]; then
     ARGS+=(--epoch "${EPOCH}")
 fi
+if [[ -n "${NETWORKS_NAME}" ]]; then
+    ARGS+=(--networks-name "${NETWORKS_NAME}")
+fi
+if [[ -n "${CHECKPOINT}" ]]; then
+    ARGS+=(--checkpoint "${CHECKPOINT}")
+fi
+if [[ "${IDENTITY_ONLY}" == "1" ]]; then
+    ARGS+=(--identity-only)
+fi
 if [[ "${TEST_SET}" == "1" ]]; then
     ARGS+=(--test-set)
     if [[ -n "${DATASET_MANIFEST}" ]]; then
@@ -110,16 +138,20 @@ if [[ "${TEST_SET}" == "1" ]]; then
     fi
 fi
 
-echo "model=${MODEL_NAME} epoch=${EPOCH:-best}"
+ENSEMBLE="identity"
+if [[ "${IDENTITY_ONLY}" != "1" ]]; then
+    ENSEMBLE="identity+R90"
+fi
+echo "model=${MODEL_NAME} epoch=${EPOCH:-best} networks=${NETWORKS_NAME:-${MODEL_NAME}} ensemble=${ENSEMBLE}"
 echo "dataset=${DATASET} partition=${PART_INDEX}/${NPARTS} ngals=${NGALS} nsamples=${NSAMPLES}"
 if [[ "${TEST_SET}" == "1" ]]; then
     if [[ "${MAP_DENSITY}" == "1" ]]; then
-        echo "cache_tag=${CACHE_TAG}; mode=test_set+map_density; saving TF-weighted Mean, sample MAP, normalized mixture log-probabilities, TF log ratios, and Laplace shear covariances"
+        echo "cache_tag=${CACHE_TAG}; mode=test_set+map_density; saving TF-weighted Mean, 1D KDE MAP, and 1D Laplace shear variances; ensemble=${ENSEMBLE}"
     else
-        echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics"
+        echo "cache_tag=${CACHE_TAG}; mode=test_set; saving TF-weighted Mean summaries, physical shear candidates, normalized TF log weights, and ESS diagnostics; ensemble=${ENSEMBLE}"
     fi
 else
-    echo "cache_tag=${CACHE_TAG}; mode=proposal_and_tf; saving base candidates, posterior TF weights, and raw population TF log ratios"
+    echo "cache_tag=${CACHE_TAG}; mode=proposal_and_tf; saving base candidates, posterior TF weights, and raw population TF log ratios; ensemble=${ENSEMBLE}"
 fi
 
 cd "${KLNN_REPO_ROOT}/arch"

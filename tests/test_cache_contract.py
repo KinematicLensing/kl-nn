@@ -8,6 +8,7 @@ from cache_contract import (
     CURRENT_FEATURE_NAMES,
     CURRENT_TARGET_TRANSFORMS,
     EXPECTED_DENSITY_COORDINATES,
+    EXPECTED_IDENTITY_SYMMETRY,
     EXPECTED_OBSERVATION_MODEL,
     EXPECTED_TEST_SET_DENSITY_COORDINATES,
     EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES,
@@ -77,7 +78,7 @@ def _array(name, rows, draws, start):
     raise AssertionError(name)
 
 
-def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_computed=False):
+def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_computed=False, identity_only=False):
     label = f"part{index}of{total}"
     seed = 42 + PARTITION_SEED_STRIDE * index
     if schema == LEGACY_CACHE_SCHEMA:
@@ -120,10 +121,12 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_compu
         },
         "feature_names": list(CURRENT_FEATURE_NAMES),
         "sample_shape": [end - start, draws, len(CURRENT_FEATURE_NAMES)],
-        "symmetry": {
-            "policy": "original_plus_r90_equal_mixture",
-            "rotated_joint_rows_inverse_aligned": True,
-        },
+        "symmetry": dict(
+            EXPECTED_IDENTITY_SYMMETRY if identity_only else {
+                "policy": "original_plus_r90_equal_mixture",
+                "rotated_joint_rows_inverse_aligned": True,
+            }
+        ),
         "tf": {
             "slope": -7.22,
             "intercept": 36.0,
@@ -192,6 +195,14 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_compu
                         "mean_and_map" if map_computed else "mean"
                     ),
                     "map_computed": map_computed,
+                    "map_kind": (
+                        "tf_weighted_1d_kde_mode"
+                        if map_computed
+                        else "not_computed"
+                    ),
+                    "map_nuisance": (
+                        "tf_weighted_mean" if map_computed else "not_computed"
+                    ),
                     "tf_importance_weighting": True,
                     "shape_noise_regularization": "report_time",
                     "snr_source": "dataset_record",
@@ -264,7 +275,14 @@ def _manifest(index, total, start, end, draws, *, schema=CACHE_SCHEMA, map_compu
 
 
 def _write_cache(
-    root, *, total=2, rows=2, draws=4, schema=CACHE_SCHEMA, map_computed=False
+    root,
+    *,
+    total=2,
+    rows=2,
+    draws=4,
+    schema=CACHE_SCHEMA,
+    map_computed=False,
+    identity_only=False,
 ):
     (root / "meta").mkdir(parents=True)
     required_arrays = (
@@ -297,6 +315,7 @@ def _write_cache(
             draws,
             schema=schema,
             map_computed=map_computed,
+            identity_only=identity_only,
         )
         (root / "meta" / f"{label}.json").write_text(
             json.dumps(payload), encoding="utf-8"
@@ -370,6 +389,18 @@ def test_map_density_test_set_contract_accepts_laplace_arrays(tmp_path):
     )
 
 
+def test_identity_ensemble_accepts_odd_draw_count(tmp_path):
+    root = _write_cache(
+        tmp_path / "identity-cache",
+        schema=TEST_SET_CACHE_SCHEMA,
+        draws=5,
+        identity_only=True,
+    )
+    partitions = load_cache_partitions(root)
+    assert partitions.manifests[0]["symmetry"] == EXPECTED_IDENTITY_SYMMETRY
+    assert partitions.manifests[0]["sample_shape"][1] == 5
+
+
 def test_map_computed_without_laplace_arrays_fails_closed(tmp_path):
     root = _write_cache(
         tmp_path / "test-cache", schema=TEST_SET_CACHE_SCHEMA
@@ -378,6 +409,8 @@ def test_map_computed_without_laplace_arrays_fails_closed(tmp_path):
     def claim_map(payload):
         payload["test_set"]["map_computed"] = True
         payload["test_set"]["point_estimator"] = "mean_and_map"
+        payload["test_set"]["map_kind"] = "tf_weighted_1d_kde_mode"
+        payload["test_set"]["map_nuisance"] = "tf_weighted_mean"
         payload["density_coordinates"] = dict(
             EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES
         )

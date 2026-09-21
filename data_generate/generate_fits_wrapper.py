@@ -137,6 +137,18 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
             f"--central-halpha-snr={central_halpha_snr}",
         )
     )
+    if "fiber_g1" in row.index and "fiber_g2" in row.index:
+        fiber_g1 = row["fiber_g1"]
+        fiber_g2 = row["fiber_g2"]
+        if pd.notna(fiber_g1) or pd.notna(fiber_g2):
+            if pd.isna(fiber_g1) or pd.isna(fiber_g2):
+                raise ValueError("fiber_g1 and fiber_g2 must be provided together")
+            command.extend(
+                (
+                    f"--fiber-g1={float(fiber_g1)}",
+                    f"--fiber-g2={float(fiber_g2)}",
+                )
+            )
     return command
 
 

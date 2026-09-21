@@ -1,70 +1,60 @@
+import math
+
 import numpy as np
-import torch
 
 from map_laplace import (
-    laplace_covariance_from_log_prob,
-    tf_log_prior_ratio_torch,
-    truncated_tf_log_prob_torch,
+    WALL_ABS,
+    one_dimensional_kde_map_laplace,
+    tf_weighted_1d_shear_map_laplace,
 )
-from tf_prior import TFPrior, tf_log_prior_ratio, truncated_tf_log_prob
 
 
-def test_torch_tf_log_prob_matches_numpy():
-    prior = TFPrior()
+def test_kde_map_and_laplace_recover_gaussian():
     rng = np.random.default_rng(0)
-    rmag = rng.uniform(16.0, 22.0, size=32)
-    mean_log10 = (rmag - prior.intercept) / prior.slope
-    vcirc = np.clip(10.0 ** (mean_log10 + 0.05 * rng.normal(size=32)), 70.0, 500.0)
-    numpy_lp = truncated_tf_log_prob(vcirc, rmag, prior)
-    torch_lp = truncated_tf_log_prob_torch(
-        torch.as_tensor(vcirc), torch.as_tensor(rmag), prior
-    )
-    np.testing.assert_allclose(torch_lp.numpy(), numpy_lp, rtol=1e-10, atol=1e-10)
-    numpy_ratio = tf_log_prior_ratio(vcirc, rmag, prior)
-    torch_ratio = tf_log_prior_ratio_torch(
-        torch.as_tensor(vcirc), torch.as_tensor(rmag), prior
-    )
-    np.testing.assert_allclose(
-        torch_ratio.numpy(), numpy_ratio, rtol=1e-10, atol=1e-10
-    )
-
-
-def test_torch_tf_log_prob_is_neg_inf_off_support():
-    prior = TFPrior()
-    vcirc = torch.tensor([10.0, 200.0, 800.0])
-    rmag = torch.tensor([20.0, 20.0, 20.0])
-    log_prob = truncated_tf_log_prob_torch(vcirc, rmag, prior)
-    assert torch.isneginf(log_prob[0])
-    assert torch.isfinite(log_prob[1])
-    assert torch.isneginf(log_prob[2])
-
-
-def test_laplace_recovers_known_shear_block_of_quadratic():
-    precision = torch.diag(
-        torch.tensor(
-            [25.0, 16.0, 4.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            dtype=torch.float64,
-        )
-    )
-    precision[0, 5] = precision[5, 0] = 2.0
-    expected = torch.linalg.inv(precision)[:2, :2]
-
-    def log_prob(theta):
-        return -0.5 * theta @ precision.to(dtype=theta.dtype) @ theta
-
-    covariance, ok = laplace_covariance_from_log_prob(
-        log_prob, torch.zeros(9, dtype=torch.float64)
-    )
+    values = rng.normal(0.02, 0.015, size=8000)
+    weights = np.ones_like(values)
+    mode, variance, ok = one_dimensional_kde_map_laplace(values, weights)
     assert ok
-    np.testing.assert_allclose(covariance, expected.numpy(), rtol=1e-6, atol=1e-8)
+    assert abs(mode - 0.02) < 0.003
+    assert math.isfinite(variance) and 5e-5 < variance < 8e-4
 
 
-def test_laplace_marks_non_positive_hessian_invalid():
-    def log_prob(theta):
-        return 0.5 * torch.square(theta).sum()
-
-    covariance, ok = laplace_covariance_from_log_prob(
-        log_prob, torch.zeros(9, dtype=torch.float64)
-    )
+def test_kde_marks_wall_pileup_invalid():
+    values = np.full(2000, 0.099)
+    weights = np.ones_like(values)
+    mode, variance, ok = one_dimensional_kde_map_laplace(values, weights)
     assert not ok
-    assert not np.isfinite(covariance).any()
+    assert abs(mode) >= WALL_ABS or not np.isfinite(variance)
+
+
+def test_tf_weighted_1d_maps_overwrite_only_shear():
+    rng = np.random.default_rng(1)
+    n_galaxies, n_draws = 3, 4000
+    names = (
+        "g1",
+        "g2",
+        "theta_int",
+        "cosi",
+        "v0",
+        "vcirc",
+        "rscale",
+        "hlr",
+        "halpha_flux_true",
+    )
+    samples = np.zeros((n_galaxies, n_draws, 9), dtype=np.float64)
+    samples[..., 0] = rng.normal(0.01, 0.02, size=(n_galaxies, n_draws))
+    samples[..., 1] = rng.normal(-0.015, 0.018, size=(n_galaxies, n_draws))
+    samples[..., 5] = 200.0
+    weights = np.ones((n_galaxies, n_draws), dtype=np.float64)
+    maps, cov, ok = tf_weighted_1d_shear_map_laplace(
+        samples, weights, feature_names=names
+    )
+    assert maps.shape == (n_galaxies, 2)
+    assert cov.shape == (n_galaxies, 2, 2)
+    assert ok.all()
+    np.testing.assert_allclose(maps[:, 0], 0.01, atol=0.004)
+    np.testing.assert_allclose(maps[:, 1], -0.015, atol=0.004)
+    assert np.all(cov[:, 0, 1] == 0.0)
+    assert np.all(cov[:, 1, 0] == 0.0)
+    assert np.all(cov[:, 0, 0] > 0.0)
+    assert np.all(cov[:, 1, 1] > 0.0)

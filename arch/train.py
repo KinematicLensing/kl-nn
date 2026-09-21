@@ -1125,6 +1125,7 @@ def load_model(
     *,
     path,
     model_name=None,
+    networks_name=None,
     device="cpu",
     networks_root=None,
     strict=True,
@@ -1134,10 +1135,11 @@ def load_model(
     resolved_name = model_name or infer_model_name_from_checkpoint_path(path)
     if not resolved_name:
         raise ValueError("model_name is required for strict artifact loading")
+    snapshot_name = networks_name or resolved_name
     kwargs = {} if model_kwargs is None else dict(model_kwargs)
     snapshot = load_networks_module_for_model(
-        resolved_name, networks_root=networks_root
-    ) if networks_root is not None else load_networks_module_for_model(resolved_name)
+        snapshot_name, networks_root=networks_root
+    ) if networks_root is not None else load_networks_module_for_model(snapshot_name)
     snapshot_class = getattr(snapshot, model_class.__name__)
     model = snapshot_class(**kwargs).to(device)
     state = torch.load(path, weights_only=False, map_location=device)
@@ -1158,6 +1160,12 @@ def load_train_objs(
 ):
     train_ds = pxt.TorchDataset(config.data["data_dir"])
     valid_ds = pxt.TorchDataset(config.test["data_dir"])
+    config.require_matching_dataset_par_ranges(
+        config.data["data_dir"], config.par_ranges
+    )
+    config.require_matching_dataset_par_ranges(
+        config.test["data_dir"], config.par_ranges
+    )
     train_ds = limit_dataset(
         train_ds, config.data["size"], split="training"
     )
@@ -1348,11 +1356,14 @@ def sample_density(
     return_log_prob=True,
     return_observation_metadata=True,
     return_flow_context=False,
+    identity_only=False,
     progress=None,
 ):
-    """Draw the sole current identity/R90 posterior ensemble."""
-    if nsamples <= 0 or nsamples % 2:
-        raise ValueError("nsamples must be positive and even")
+    """Draw the identity/R90 posterior ensemble, or identity samples only."""
+    if nsamples <= 0:
+        raise ValueError("nsamples must be positive")
+    if not identity_only and nsamples % 2:
+        raise ValueError("nsamples must be even for the identity/R90 pair")
     if matched_group_size not in (1, 5) or len(dataset) % matched_group_size:
         raise ValueError("matched_group_size must be 1 or a divisor-aligned 5")
     if spectral_noise_seed is None:
@@ -1492,53 +1503,59 @@ def sample_density(
             if config.train["channels_last"]:
                 image = image.contiguous(memory_format=torch.channels_last)
                 spectra = spectra.contiguous(memory_format=torch.channels_last)
-            half = nsamples // 2
+            n_identity = nsamples if identity_only else nsamples // 2
             original = _sample_bank(
                 model.sample(
                     image,
                     spectra,
-                    half,
+                    n_identity,
                     fiber_positions=positions,
                     observation_context=context,
                 ),
                 nfeatures,
             )
-            image_r, spectra_r, _, positions_r = rotate_90_datavector(
-                image, spectra, fiber_positions=positions
-            )
-            rotated = _sample_bank(
-                model.sample(
-                    image_r,
-                    spectra_r,
-                    half,
-                    fiber_positions=positions_r,
-                    observation_context=context,
-                ),
-                nfeatures,
-            )
-            rotated = rotate_90_parameters(rotated, inverse=True)
-            bank = torch.cat((original, rotated), dim=0)
+            if identity_only:
+                bank = original
+                image_r = spectra_r = positions_r = None
+            else:
+                image_r, spectra_r, _, positions_r = rotate_90_datavector(
+                    image, spectra, fiber_positions=positions
+                )
+                rotated = _sample_bank(
+                    model.sample(
+                        image_r,
+                        spectra_r,
+                        n_identity,
+                        fiber_positions=positions_r,
+                        observation_context=context,
+                    ),
+                    nfeatures,
+                )
+                rotated = rotate_90_parameters(rotated, inverse=True)
+                bank = torch.cat((original, rotated), dim=0)
             samples.append(bank.cpu().numpy())
             if return_flow_context:
-                with torch.no_grad():
-                    raw_original = model._raw_features(
-                        image,
-                        spectra,
-                        positions,
-                        context,
-                    )
+                raw_original = model._raw_features(
+                    image,
+                    spectra,
+                    positions,
+                    context,
+                )
+                contexts_original.append(
+                    model._flow_context(raw_original)
+                    .detach()
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                )
+                if identity_only:
+                    contexts_rotated.append(contexts_original[-1].copy())
+                else:
                     raw_rotated = model._raw_features(
                         image_r,
                         spectra_r,
                         positions_r,
                         context,
-                    )
-                    contexts_original.append(
-                        model._flow_context(raw_original)
-                        .detach()
-                        .squeeze(0)
-                        .cpu()
-                        .numpy()
                     )
                     contexts_rotated.append(
                         model._flow_context(raw_rotated)
@@ -1555,17 +1572,20 @@ def sample_density(
                     fiber_positions=positions,
                     observation_context=context,
                 )
-                log_rotated = model.posterior_log_prob(
-                    image_r,
-                    spectra_r,
-                    rotate_90_parameters(bank),
-                    fiber_positions=positions_r,
-                    observation_context=context,
-                )
-                mixture = torch.logsumexp(
-                    torch.stack((log_original, log_rotated)), dim=0
-                ) - np.log(2.0)
-                scores.append(mixture.detach().cpu().numpy())
+                if identity_only:
+                    scores.append(log_original.detach().cpu().numpy())
+                else:
+                    log_rotated = model.posterior_log_prob(
+                        image_r,
+                        spectra_r,
+                        rotate_90_parameters(bank),
+                        fiber_positions=positions_r,
+                        observation_context=context,
+                    )
+                    mixture = torch.logsumexp(
+                        torch.stack((log_original, log_rotated)), dim=0
+                    ) - np.log(2.0)
+                    scores.append(mixture.detach().cpu().numpy())
     sample_array = np.stack(samples)
     metadata = {
         "truth": truths.cpu().numpy(),

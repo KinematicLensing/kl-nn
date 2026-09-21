@@ -126,6 +126,9 @@ def _payload_for_current_schema(payload: dict) -> dict:
     if isinstance(train, dict):
         for key in IGNORED_TRAIN_SNAPSHOT_KEYS:
             train.pop(key, None)
+        # Archived concat configs predate this flag. Missing means identity
+        # fusion, matching the frozen-concat production path.
+        train.setdefault("use_image_spectrum_fusion", False)
     return payload
 
 

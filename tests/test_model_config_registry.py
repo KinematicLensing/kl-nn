@@ -217,6 +217,30 @@ def test_load_model_config_ignores_historical_pair_train_keys(tmp_path):
         config.ModelConfig.from_dict(payload)
 
 
+def test_load_model_config_defaults_missing_fusion_flag_to_identity(tmp_path):
+    configured = copy.deepcopy(config.MODEL_CONFIG)
+    configured.train.model_name = "legacy-concat-snapshot"
+    configured.train.use_image_spectrum_fusion = False
+    config_root = tmp_path / "configs"
+    config_root.mkdir()
+    path = Path(
+        model_registry.get_model_config_path(
+            "legacy-concat-snapshot", configs_root=str(config_root)
+        )
+    )
+    payload = configured.to_dict()
+    payload["train"].pop("use_image_spectrum_fusion")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = model_registry.load_model_config(
+        "legacy-concat-snapshot", configs_root=str(config_root)
+    )
+
+    assert loaded.train.use_image_spectrum_fusion is False
+    with pytest.raises(ValueError, match="missing="):
+        config.ModelConfig.from_dict(payload)
+
+
 def test_missing_current_config_and_network_snapshots_fail_closed(tmp_path):
     with pytest.raises(FileNotFoundError, match="Current-schema model config"):
         model_registry.load_model_config(

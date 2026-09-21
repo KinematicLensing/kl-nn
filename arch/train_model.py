@@ -111,6 +111,14 @@ def parse_args(argv=None):
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
+    parser.add_argument(
+        "--shear-bound",
+        type=float,
+        help=(
+            "Half-width of the uniform g1/g2 prior. Allowed values: "
+            "0.02, 0.1 (default), 0.2."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -136,6 +144,12 @@ def _parse_checkpoint_suffix(value):
 def apply_overrides(args):
     if args.config:
         config.load_model_config_from_json(args.config)
+    if args.shear_bound is not None:
+        payload = config.MODEL_CONFIG.to_dict()
+        payload["par_ranges"] = config.parameter_ranges_for_shear_bound(
+            args.shear_bound
+        )
+        config.set_model_config(config.ModelConfig.from_dict(payload))
 
     stage = (
         config.MODEL_CONFIG.pretrain
@@ -326,6 +340,7 @@ def main(argv=None):
         "Current pipeline: "
         f"stage={args.stage}, targets={len(config.TARGET_NAMES)}, "
         f"views={view_mode}, contexts={list(config.ORACLE_CONTEXT_FIELDS)}, "
+        f"shear_bound={config.MODEL_CONFIG.par_ranges['g1'][1]}, "
         f"train={config.MODEL_CONFIG.data.data_dir}, "
         f"valid={config.MODEL_CONFIG.test.data_dir}"
     )

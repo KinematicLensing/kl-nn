@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,6 +32,98 @@ CANONICAL_PARAMETER_RANGES = {
     "hlr": [0.1, 5.0],
     "halpha_flux_true": [1.0e-17, 1.0e-14],
 }
+
+ALLOWED_SHEAR_BOUNDS = (0.02, 0.1, 0.2)
+DATASET_PAR_RANGES_FILENAME = "par_ranges.json"
+
+
+def _bound_pair(bounds) -> list[float]:
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        raise ValueError("parameter bounds must contain exactly two values")
+    return [float(bounds[0]), float(bounds[1])]
+
+
+def canonical_parameter_ranges() -> dict[str, list[float]]:
+    return {
+        name: _bound_pair(bounds)
+        for name, bounds in CANONICAL_PARAMETER_RANGES.items()
+    }
+
+
+def matching_allowed_shear_bound(value: float) -> float | None:
+    bound = float(value)
+    for allowed in ALLOWED_SHEAR_BOUNDS:
+        if math.isclose(bound, allowed, rel_tol=0.0, abs_tol=1e-12):
+            return allowed
+    return None
+
+
+def parameter_ranges_for_shear_bound(shear_bound: float) -> dict[str, list[float]]:
+    allowed = matching_allowed_shear_bound(shear_bound)
+    if allowed is None:
+        raise ValueError(
+            f"shear_bound must be one of {ALLOWED_SHEAR_BOUNDS!r}; got {shear_bound!r}"
+        )
+    ranges = canonical_parameter_ranges()
+    ranges["g1"] = [-allowed, allowed]
+    ranges["g2"] = [-allowed, allowed]
+    return ranges
+
+
+def normalize_parameter_ranges(par_ranges: dict[str, list[float]]) -> dict[str, list[float]]:
+    if tuple(par_ranges) != TARGET_NAMES:
+        raise ValueError(
+            "par_ranges must use the current target order: "
+            f"{TARGET_NAMES!r}"
+        )
+    return {name: _bound_pair(par_ranges[name]) for name in TARGET_NAMES}
+
+
+def validate_parameter_ranges(par_ranges: dict[str, list[float]]) -> dict[str, list[float]]:
+    canonical = canonical_parameter_ranges()
+    normalized = normalize_parameter_ranges(par_ranges)
+    for name, bounds in canonical.items():
+        if name in ("g1", "g2"):
+            continue
+        if normalized[name] != bounds:
+            raise ValueError(
+                "par_ranges are immutable for the current normalized LMDB schema; "
+                f"expected {canonical!r}"
+            )
+    g1 = normalized["g1"]
+    g2 = normalized["g2"]
+    if g1 != g2:
+        raise ValueError("par_ranges g1 and g2 bounds must match")
+    if g1[0] != -g1[1] or g1[1] <= 0.0:
+        raise ValueError("shear bounds must be symmetric about zero")
+    if matching_allowed_shear_bound(g1[1]) is None:
+        raise ValueError(
+            f"shear bound {g1[1]} is not in the allowlist {ALLOWED_SHEAR_BOUNDS!r}"
+        )
+    return normalized
+
+
+def load_dataset_par_ranges(dataset_dir) -> dict[str, list[float]] | None:
+    path = Path(dataset_dir) / DATASET_PAR_RANGES_FILENAME
+    if not path.is_file():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return normalize_parameter_ranges(payload)
+
+
+def require_matching_dataset_par_ranges(dataset_dir, par_ranges) -> None:
+    stored = load_dataset_par_ranges(dataset_dir)
+    if stored is None:
+        return
+    expected = normalize_parameter_ranges(par_ranges)
+    if stored != expected:
+        raise ValueError(
+            f"dataset {dataset_dir} {DATASET_PAR_RANGES_FILENAME} {stored!r} "
+            f"does not match training cfg {expected!r}"
+        )
 
 TARGET_TRANSFORMS = {
     name: "log10" if name == "halpha_flux_true" else "identity"
@@ -184,15 +278,8 @@ class ModelConfig:
                 "par_ranges must use the current target order: "
                 f"{TARGET_NAMES!r}"
             )
-        canonical_ranges = {
-            name: [float(value) for value in bounds]
-            for name, bounds in CANONICAL_PARAMETER_RANGES.items()
-        }
-        if self.par_ranges != canonical_ranges:
-            raise ValueError(
-                "par_ranges are immutable for the current normalized LMDB schema; "
-                f"expected {canonical_ranges!r}"
-            )
+        self.par_ranges = validate_parameter_ranges(self.par_ranges)
+        canonical_ranges = canonical_parameter_ranges()
         if tuple(self.observation.context_fields) != ORACLE_CONTEXT_FIELDS:
             raise ValueError(
                 "context_fields must contain only the independent oracle fields: "

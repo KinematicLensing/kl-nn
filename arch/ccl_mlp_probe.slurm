@@ -13,16 +13,26 @@
 set -eo pipefail
 ulimit -c 0
 
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/arch/diagnostics/ccl_mlp_probe.py" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
+    exit 2
+fi
+
 module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
+set +u
 conda activate kl-nn
 set -u
 
 : "${MODEL_NAME:?Set MODEL_NAME to the completed CCL pretraining run}"
 CHECKPOINT_SUFFIX="${CHECKPOINT_SUFFIX:-best}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
+TRAIN_DATA="${TRAIN_DATA:-}"
+VALID_DATA="${VALID_DATA:-}"
+OUTPUT="${OUTPUT:-}"
 TRAIN_SAMPLES="${TRAIN_SAMPLES:-20000}"
 VALID_SAMPLES="${VALID_SAMPLES:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
@@ -38,6 +48,8 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 echo "model=${MODEL_NAME} checkpoint_suffix=${CHECKPOINT_SUFFIX}"
+echo "train_data=${TRAIN_DATA:-<config default>} valid_data=${VALID_DATA:-<config default>}"
+echo "output=${OUTPUT:-<default figures path>}"
 echo "train_samples=${TRAIN_SAMPLES} valid_samples=${VALID_SAMPLES}"
 echo "batch_size=${BATCH_SIZE} probe_epochs=${PROBE_EPOCHS} seed=${SEED}"
 echo "hidden_dims=${HIDDEN_DIMS} lr=${LEARNING_RATE} weight_decay=${WEIGHT_DECAY}"
@@ -55,6 +67,15 @@ ARGS=(
     --seed "${SEED}"
     --device cuda
 )
+if [[ -n "${TRAIN_DATA}" ]]; then
+    ARGS+=(--train-data "${TRAIN_DATA}")
+fi
+if [[ -n "${VALID_DATA}" ]]; then
+    ARGS+=(--valid-data "${VALID_DATA}")
+fi
+if [[ -n "${OUTPUT}" ]]; then
+    ARGS+=(--output "${OUTPUT}")
+fi
 if [[ "${OVERWRITE}" == "1" ]]; then
     ARGS+=(--overwrite)
 fi
@@ -62,5 +83,5 @@ fi
 read -r -a HIDDEN_DIM_ARGS <<< "${HIDDEN_DIMS}"
 ARGS+=(--hidden-dims "${HIDDEN_DIM_ARGS[@]}")
 
-cd /jet/home/xwang30/kl-nn/arch
+cd "${KLNN_REPO_ROOT}/arch"
 python diagnostics/ccl_mlp_probe.py "${ARGS[@]}"

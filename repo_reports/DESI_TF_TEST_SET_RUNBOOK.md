@@ -77,7 +77,7 @@ CACHE_TAG=testset_tfweighted_v2_10k_s42
 NAME_XU1=test_100k_simv3_xu1_tf
 NAME_XU3=test_100k_simv3_xu3_tf
 NAME_XU5=test_100k_simv3_xu5_tf
-REPORT_OUTPUT=/ocean/projects/phy250048p/shared/reports/desi_tf_test_set_tfweighted_v2_s42.html
+REPORT_OUTPUT=/ocean/projects/phy250048p/shared/reports/desi-tf-testset/desi_tf_test_set_tfweighted_v2_s42.html
 
 # Generate all three CSV sample tables and generation manifests.
 SAMPLES_JOB=$(sbatch --parsable --array=1-3 \

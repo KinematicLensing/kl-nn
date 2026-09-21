@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,48 @@ def test_current_target_ranges_and_transforms_are_immutable():
     assert config.MODEL_CONFIG.observation.image_snr_max == 1000.0
     assert config.MODEL_CONFIG.observation.central_halpha_snr_min == 1.0
     assert config.MODEL_CONFIG.observation.central_halpha_snr_max == 150.0
+    assert config.MODEL_CONFIG.par_ranges["g1"] == [-0.1, 0.1]
+
+
+@pytest.mark.parametrize("shear_bound", [0.02, 0.1, 0.2])
+def test_allowlisted_shear_bounds_are_accepted(shear_bound):
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"] = config.parameter_ranges_for_shear_bound(shear_bound)
+    restored = config.ModelConfig.from_dict(payload)
+    assert restored.par_ranges["g1"] == [-shear_bound, shear_bound]
+    assert restored.par_ranges["g2"] == [-shear_bound, shear_bound]
+    assert restored.par_ranges["vcirc"] == config.CANONICAL_PARAMETER_RANGES["vcirc"]
+
+
+def test_mixed_or_unknown_shear_bounds_are_rejected():
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"]["g1"] = [-0.02, 0.02]
+    with pytest.raises(ValueError, match="g1 and g2 bounds must match"):
+        config.ModelConfig.from_dict(payload)
+
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"]["g1"] = [-0.15, 0.15]
+    payload["par_ranges"]["g2"] = [-0.15, 0.15]
+    with pytest.raises(ValueError, match="allowlist"):
+        config.ModelConfig.from_dict(payload)
+
+
+def test_dataset_par_ranges_must_match_training_cfg(tmp_path):
+    dataset = tmp_path / "lmdb"
+    dataset.mkdir()
+    (dataset / "par_ranges.json").write_text(
+        json.dumps(config.parameter_ranges_for_shear_bound(0.02), indent=2)
+    )
+    config.require_matching_dataset_par_ranges(
+        dataset, config.parameter_ranges_for_shear_bound(0.02)
+    )
+    with pytest.raises(ValueError, match="does not match training cfg"):
+        config.require_matching_dataset_par_ranges(
+            dataset, config.parameter_ranges_for_shear_bound(0.2)
+        )
+    config.require_matching_dataset_par_ranges(
+        tmp_path / "missing", config.MODEL_CONFIG.par_ranges
+    )
 
 
 @pytest.mark.parametrize(
@@ -285,6 +328,27 @@ def test_unknown_cli_flags_are_rejected_without_abbreviation():
 
     with pytest.raises(SystemExit):
         module.parse_args(["--stage", "npe", "--unknown-option", "value"])
+
+
+def test_cli_applies_allowlisted_shear_bound():
+    module = _training_entrypoint()
+    module.apply_overrides(
+        module.parse_args(["--stage", "pretrain", "--shear-bound", "0.02"])
+    )
+    assert config.MODEL_CONFIG.par_ranges["g1"] == [-0.02, 0.02]
+    assert config.MODEL_CONFIG.par_ranges["g2"] == [-0.02, 0.02]
+
+    module.apply_overrides(
+        module.parse_args(["--stage", "npe", "--shear-bound", "0.2"])
+    )
+    assert config.MODEL_CONFIG.par_ranges["g1"] == [-0.2, 0.2]
+
+
+def test_cli_rejects_unknown_shear_bound():
+    module = _training_entrypoint()
+    args = module.parse_args(["--stage", "pretrain", "--shear-bound", "0.15"])
+    with pytest.raises(ValueError, match="shear_bound must be one of"):
+        module.apply_overrides(args)
 
 
 def test_npe_cli_freezes_feature_extractor_by_default():

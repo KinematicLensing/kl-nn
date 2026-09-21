@@ -103,26 +103,32 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional R(σ) JSON applied to the last --case. Stretches that "
-            "case's cached shear Means, 16th/84th summaries, and streamed "
-            "shear candidates from zero. Not the default Mean."
+            "Optional R(C)=aI+bC JSON applied to the last --case. Maps that "
+            "case's cached shear Means and streamed shear candidates by "
+            "unclipped R^{-1} and recomputes 16th/84th shear summaries on the "
+            "transformed draws. Drops galaxies whose R is not invertible or "
+            "whose calibrated RMS is at least --max-final-variance. "
+            "Not the default Mean."
         ),
     )
     parser.add_argument(
-        "--max-shear-sigma",
+        "--max-final-variance",
         type=float,
         default=None,
         help=(
-            "Zero analysis weight for galaxies whose uncalibrated TF 16–84 "
-            "shear width exceeds this cut. Applied to every --case from "
-            "uncalibrated summaries, before any R(σ) stretch."
+            "Zero analysis weight when the calibrated RMS "
+            "sqrt(tr(C_cal)/2) is at least this value. Default 0.2 when "
+            "--response-calibrate is set; ignored otherwise. The threshold "
+            "is the prior-box width, not a second moment."
         ),
     )
     return parser.parse_args(argv)
 
 
-RESPONSE_CALIBRATED_SUFFIX = " · R(σ) calibrated"
+RESPONSE_CALIBRATED_SUFFIX = " · R(C) calibrated"
 DEFAULT_RESPONSE_R_MAX = 1.0
+DEFAULT_MAX_FINAL_VARIANCE = 0.2
+MATRIX_MODEL = "aI_plus_bC"
 
 
 def shear_interval_sigma(summary: np.ndarray) -> np.ndarray:
@@ -162,6 +168,12 @@ def load_response_calibration(path: Path) -> dict:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"response calibration {path} must be a JSON object")
+    model = payload.get("model")
+    if model != MATRIX_MODEL:
+        raise ValueError(
+            f"response calibration {path} has model {model!r}; "
+            f"required {MATRIX_MODEL!r}"
+        )
     missing = [key for key in ("a", "b", "R_min") if key not in payload]
     if missing:
         raise ValueError(
@@ -173,6 +185,7 @@ def load_response_calibration(path: Path) -> dict:
         "b": float(payload["b"]),
         "R_min": float(payload["R_min"]),
         "R_max": r_max,
+        "model": MATRIX_MODEL,
         "path": Path(path),
         "payload": payload,
     }
@@ -183,6 +196,185 @@ def load_response_calibration(path: Path) -> dict:
             f"response calibration {path} has invalid R_min/R_max"
         )
     return calibration
+
+
+def symmetrize_matrices(matrices: np.ndarray) -> np.ndarray:
+    """Return the symmetric part of one or more 2×2 matrices."""
+
+    values = np.asarray(matrices, dtype=np.float64)
+    if values.ndim == 2:
+        if values.shape != (2, 2):
+            raise ValueError("single matrix must have shape (2, 2)")
+        return 0.5 * (values + values.T)
+    if values.ndim != 3 or values.shape[1:] != (2, 2):
+        raise ValueError("matrices must have shape (n, 2, 2) or (2, 2)")
+    return 0.5 * (values + np.swapaxes(values, -1, -2))
+
+
+def batch_weighted_shear_covariance(
+    draws: np.ndarray,
+    log_weight: np.ndarray | None = None,
+) -> np.ndarray:
+    """TF- or equal-weight 2×2 covariance of (g1, g2) per galaxy."""
+
+    draws = np.asarray(draws, dtype=np.float64)
+    if draws.ndim != 3 or draws.shape[-1] != 2:
+        raise ValueError("draws must have shape (galaxy, draw, 2)")
+    n_galaxies, n_draw, _ = draws.shape
+    finite_draw = np.all(np.isfinite(draws), axis=-1)
+    if log_weight is None:
+        weight = finite_draw.astype(np.float64)
+    else:
+        log_weight = np.asarray(log_weight, dtype=np.float64)
+        if log_weight.shape != (n_galaxies, n_draw):
+            raise ValueError("log_weight must have shape (galaxy, draw)")
+        usable = finite_draw & np.isfinite(log_weight)
+        filled = np.where(usable, log_weight, -np.inf)
+        maximum = np.max(filled, axis=1, keepdims=True)
+        weight = np.exp(filled - maximum)
+        weight[~usable] = 0.0
+        weight[np.squeeze(maximum, axis=1) == -np.inf] = 0.0
+    total = np.sum(weight, axis=1, keepdims=True)
+    normalized = np.divide(
+        weight, total, out=np.zeros_like(weight), where=total > 0.0
+    )
+    filled_draws = np.where(np.isfinite(draws), draws, 0.0)
+    mean = np.sum(normalized[..., None] * filled_draws, axis=1)
+    centered = filled_draws - mean[:, None, :]
+    centered[~finite_draw] = 0.0
+    covariance = np.einsum("nk,nki,nkj->nij", normalized, centered, centered)
+    covariance[np.squeeze(total, axis=1) <= 0.0] = np.nan
+    return symmetrize_matrices(covariance)
+
+
+def inverse_matrices(matrices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Invert stacked 2×2 matrices; invalid rows are NaN with ok=False."""
+
+    values = symmetrize_matrices(matrices)
+    inverse = np.full_like(values, np.nan)
+    finite = np.all(np.isfinite(values), axis=(1, 2))
+    ok = np.zeros(len(values), dtype=bool)
+    if not np.any(finite):
+        return inverse, ok
+    subset = values[finite]
+    determinant = (
+        subset[:, 0, 0] * subset[:, 1, 1] - subset[:, 0, 1] * subset[:, 1, 0]
+    )
+    invertible = np.abs(determinant) > 1.0e-18
+    selected = np.zeros(len(values), dtype=bool)
+    selected[np.flatnonzero(finite)[invertible]] = True
+    if np.any(selected):
+        inverse[selected] = np.linalg.inv(values[selected])
+        ok[selected] = True
+    return inverse, ok
+
+
+def calibrated_rms(response: np.ndarray, covariance: np.ndarray) -> np.ndarray:
+    """σ_final = sqrt(tr(R^{-1} C R^{-T}) / 2). NaN where R is singular."""
+
+    inverse, ok = inverse_matrices(response)
+    covariance = symmetrize_matrices(covariance)
+    calibrated = np.einsum("nij,njk,nlk->nil", inverse, covariance, inverse)
+    variance = 0.5 * (calibrated[:, 0, 0] + calibrated[:, 1, 1])
+    sigma = np.sqrt(np.clip(variance, 0.0, None))
+    return np.where(ok & np.isfinite(sigma), sigma, np.nan)
+
+
+def measured_quality_mask(response: np.ndarray) -> np.ndarray:
+    """Keep finite SPD measured R for OLS. No σ_final cut."""
+
+    values = symmetrize_matrices(response)
+    keep = np.zeros(len(values), dtype=bool)
+    finite = np.all(np.isfinite(values), axis=(1, 2))
+    if not np.any(finite):
+        return keep
+    evals = np.linalg.eigvalsh(values[finite])
+    ok = np.all(evals > 0.0, axis=1)
+    keep[np.flatnonzero(finite)[ok]] = True
+    return keep
+
+
+def measured_keep_mask(
+    response: np.ndarray,
+    covariance: np.ndarray,
+    max_final_variance: float = DEFAULT_MAX_FINAL_VARIANCE,
+) -> np.ndarray:
+    """Keep galaxies whose measured-R inflated RMS is below the prior-box width."""
+
+    if not np.isfinite(max_final_variance) or max_final_variance <= 0.0:
+        raise ValueError("max-final-variance must be a positive finite value")
+    sigma = calibrated_rms(response, covariance)
+    return np.isfinite(sigma) & (sigma < max_final_variance)
+
+
+def response_from_covariance(
+    covariance: np.ndarray,
+    a: float,
+    b: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unclipped R = aI + bC. Valid where R is SPD (all eigenvalues > 0)."""
+
+    if not np.isfinite(a) or not np.isfinite(b):
+        raise ValueError("R(C) coefficients must be finite")
+    covariance = symmetrize_matrices(covariance)
+    identity = np.eye(2, dtype=np.float64)
+    response = a * identity + b * covariance
+    valid = np.zeros(len(covariance), dtype=bool)
+    finite = np.all(np.isfinite(response), axis=(1, 2))
+    response[~finite] = np.nan
+    if not np.any(finite):
+        return response, valid
+    evals = np.linalg.eigvalsh(response[finite])
+    ok = np.all(evals > 0.0, axis=1)
+    dest = np.flatnonzero(finite)
+    response[dest[~ok]] = np.nan
+    valid[dest[ok]] = True
+    return response, valid
+
+
+def fit_ai_plus_bc(response: np.ndarray, covariance: np.ndarray) -> tuple[float, float]:
+    """Frobenius OLS of R ≈ a I + b C on stacked 2×2 entries."""
+
+    response = symmetrize_matrices(response)
+    covariance = symmetrize_matrices(covariance)
+    if response.shape != covariance.shape:
+        raise ValueError("response and covariance must have the same shape")
+    target = response.reshape(len(response), 4)
+    identity = np.broadcast_to(
+        np.eye(2, dtype=np.float64).reshape(4), target.shape
+    )
+    predictor = covariance.reshape(len(covariance), 4)
+    finite = np.all(np.isfinite(target), axis=1) & np.all(
+        np.isfinite(predictor), axis=1
+    )
+    if np.count_nonzero(finite) < 2:
+        raise ValueError("R = aI + bC requires at least two finite leftover galaxies")
+    design = np.column_stack(
+        (identity[finite].reshape(-1), predictor[finite].reshape(-1))
+    )
+    outcome = target[finite].reshape(-1)
+    coef, _, rank, _ = np.linalg.lstsq(design, outcome, rcond=None)
+    if rank < 2:
+        raise ValueError("R = aI + bC design is rank-deficient")
+    return float(coef[0]), float(coef[1])
+
+
+def apply_inverse_to_vectors(
+    vectors: np.ndarray, inverse: np.ndarray
+) -> np.ndarray:
+    """Map shear 2-vectors by per-galaxy R^{-1}."""
+
+    values = np.asarray(vectors, dtype=np.float64)
+    inverse = np.asarray(inverse, dtype=np.float64)
+    if inverse.ndim != 3 or inverse.shape[1:] != (2, 2):
+        raise ValueError("inverse must have shape (galaxy, 2, 2)")
+    if values.ndim == 2:
+        if values.shape != (len(inverse), 2):
+            raise ValueError("vectors must have shape (galaxy, 2)")
+        return np.einsum("nij,nj->ni", inverse, values)
+    if values.ndim != 3 or values.shape[0] != len(inverse) or values.shape[-1] != 2:
+        raise ValueError("vectors must have shape (galaxy, draw, 2)")
+    return np.einsum("nij,nkj->nki", inverse, values)
 
 
 def tf_or_test_population(case: dict) -> dict:
@@ -249,65 +441,163 @@ def apply_max_shear_sigma_cut(case: dict, max_sigma: float) -> dict:
 
 
 def shear_sigma_cut_note(case: dict) -> str:
-    info = case.get("shear_sigma_cut")
+    info = case.get("final_variance_cut") or case.get("shear_sigma_cut")
     if not info:
         return ""
     n_kept = info["n_kept"]
     n = info["n"]
-    max_sigma = info["max_shear_sigma"]
+    threshold = info.get("max_final_variance", info.get("max_shear_sigma"))
     kept_pct = 100.0 * n_kept / n
     return (
-        "<p>This case zeros analysis weight for galaxies whose uncalibrated "
-        "TF 16–84 shear width exceeds "
-        f"<code>σ ≤ {max_sigma:g}</code>. Kept {n_kept:,} / {n:,} "
-        f"({kept_pct:.1f}%). The cut is the R(σ) floor: wider galaxies would "
-        "clip at R<sub>min</sub>. Cache rows are unchanged; posterior-candidate "
+        "<p>This case zeros analysis weight for galaxies whose calibrated "
+        "shear RMS "
+        f"<code>σ<sub>final</sub>=√(tr(C<sub>cal</sub>)/2)</code> is at least "
+        f"<code>{threshold:g}</code> (prior-box width). Kept {n_kept:,} / {n:,} "
+        f"({kept_pct:.1f}%). Cache rows are unchanged; posterior-candidate "
         "diagnostics still stream every galaxy.</p>"
     )
 
 
-def stretch_shear_summaries(summary: np.ndarray, response: np.ndarray) -> np.ndarray:
-    """Scale g1 and g2 16/Mean/84 from zero; leave nuisances unchanged."""
+def load_shear_covariances(case: dict, block_size: int = 64) -> np.ndarray:
+    """Stream TF/test-set weighted 2×2 shear covariances from the candidate bank."""
 
-    out = np.array(summary, dtype=np.float64, copy=True)
-    scale = np.asarray(response, dtype=np.float64)
-    if scale.shape != (len(out),):
-        raise ValueError("one response value is required per galaxy")
-    if not np.all(np.isfinite(scale)) or np.any(scale <= 0.0):
-        raise ValueError("response values must be finite and positive")
-    out[:, :, :2] /= scale[:, None, None]
-    return out
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    truth = np.asarray(case["truth"])
+    root = Path(case["root"])
+    cache_partitions = case.get("cache_partitions")
+    if cache_partitions is None:
+        cache_partitions = load_cache_partitions(root)
+    candidate_array = case.get("candidate_array", "sample")
+    sample_files = cache_partitions.files[candidate_array]
+    weight_array = case.get(
+        "candidate_log_weight_array", "posterior_tf_log_weight"
+    )
+    population_keys = {
+        population["key"] for population in case["populations"].values()
+    }
+    weighted = bool({"tf_target", "test_set"} & population_keys)
+    weight_files = (
+        cache_partitions.files[weight_array] if weighted else None
+    )
+    covariance = np.full((len(truth), 2, 2), np.nan, dtype=np.float64)
+    offset = 0
+    for part_index, sample_path in enumerate(sample_files):
+        if offset >= len(truth):
+            break
+        samples = np.load(sample_path, mmap_mode="r")
+        cached_log_weight = (
+            np.load(weight_files[part_index], mmap_mode="r")
+            if weight_files is not None
+            else None
+        )
+        take = min(samples.shape[0], len(truth) - offset)
+        for local_start in range(0, take, block_size):
+            local_end = min(take, local_start + block_size)
+            draws = np.asarray(
+                samples[local_start:local_end, :, :2], dtype=np.float64
+            )
+            log_weight = (
+                np.asarray(
+                    cached_log_weight[local_start:local_end], dtype=np.float64
+                )
+                if cached_log_weight is not None
+                else None
+            )
+            covariance[offset + local_start : offset + local_end] = (
+                batch_weighted_shear_covariance(draws, log_weight)
+            )
+        offset += take
+        del samples
+        if cached_log_weight is not None:
+            del cached_log_weight
+    if offset != len(truth):
+        raise ValueError(
+            f"Sample cache has {offset} galaxies, report uses {len(truth)}"
+        )
+    return covariance
 
 
-def apply_response_calibration_to_case(case: dict, calibration: dict) -> dict:
-    """Stretch the last case's shear summaries. Mutates `case` in place."""
+def apply_response_calibration_to_case(
+    case: dict,
+    calibration: dict,
+    *,
+    max_final_variance: float = DEFAULT_MAX_FINAL_VARIANCE,
+) -> dict:
+    """Apply R(C)=aI+bC inverse to Means and zero weight on σ_final. Mutates `case`."""
 
-    source = tf_or_test_population(case)
-    sigma = shear_interval_sigma(source["summary"])
-    response = response_from_sigma(
-        sigma,
+    if not np.isfinite(max_final_variance) or max_final_variance <= 0.0:
+        raise ValueError("max-final-variance must be a positive finite value")
+    covariance = load_shear_covariances(case)
+    response, valid = response_from_covariance(
+        covariance,
         calibration["a"],
         calibration["b"],
-        calibration["R_min"],
-        calibration.get("R_max", DEFAULT_RESPONSE_R_MAX),
     )
+    inverse, invertible = inverse_matrices(response)
+    sigma_final = calibrated_rms(response, covariance)
+    keep = (
+        valid
+        & invertible
+        & np.isfinite(sigma_final)
+        & (sigma_final < max_final_variance)
+    )
+    n_kept = int(np.count_nonzero(keep))
+    if n_kept == 0:
+        raise ValueError(
+            f"max-final-variance {max_final_variance:g} dropped every galaxy"
+        )
     for population in case["populations"].values():
-        population["summary"] = stretch_shear_summaries(
-            population["summary"], response
+        summary = np.array(population["summary"], dtype=np.float64, copy=True)
+        mean_shear = apply_inverse_to_vectors(summary[:, 1, :2], inverse)
+        summary[:, 1, :2] = mean_shear
+        population["summary"] = summary
+        population["mean"] = summary[:, 1]
+        galaxy_weight = np.array(
+            population["galaxy_weight"], dtype=np.float64, copy=True
         )
-        population["mean"] = population["summary"][:, 1]
+        population_mass = np.array(
+            population["population_weight"], dtype=np.float64, copy=True
+        )
+        galaxy_weight[~keep] = 0.0
+        population_mass[~keep] = 0.0
+        population["galaxy_weight"] = galaxy_weight
+        population["population_weight"] = population_mass
+        if "map" in population:
+            mapped = np.array(population["map"], dtype=np.float64, copy=True)
+            mapped[:, :2] = apply_inverse_to_vectors(mapped[:, :2], inverse)
+            population["map"] = mapped
+        if "map_galaxy_weight" in population:
+            map_weight = np.array(
+                population["map_galaxy_weight"], dtype=np.float64, copy=True
+            )
+            map_weight[~keep] = 0.0
+            population["map_galaxy_weight"] = map_weight
     if "base_summary" in case:
-        case["base_summary"] = stretch_shear_summaries(
-            case["base_summary"], response
+        base_summary = np.array(case["base_summary"], dtype=np.float64, copy=True)
+        base_summary[:, 1, :2] = apply_inverse_to_vectors(
+            base_summary[:, 1, :2], inverse
         )
+        case["base_summary"] = base_summary
     case["response_calibration"] = {
         "a": calibration["a"],
         "b": calibration["b"],
         "R_min": calibration["R_min"],
         "R_max": calibration.get("R_max", DEFAULT_RESPONSE_R_MAX),
+        "model": MATRIX_MODEL,
         "path": calibration["path"],
-        "sigma": sigma,
+        "covariance": covariance,
         "R": response,
+        "R_inv": inverse,
+        "sigma_final": sigma_final,
+        "keep": keep,
+    }
+    case["final_variance_cut"] = {
+        "max_final_variance": float(max_final_variance),
+        "n": int(len(keep)),
+        "n_kept": n_kept,
+        "keep": keep,
+        "sigma_final": sigma_final,
     }
     name = str(case["case"])
     if not name.endswith(RESPONSE_CALIBRATED_SUFFIX):
@@ -320,18 +610,32 @@ def response_calibration_note(case: dict) -> str:
     if not info:
         return ""
     path = html.escape(str(info["path"]))
-    r_min = info["R_min"]
-    r_max = info.get("R_max", DEFAULT_RESPONSE_R_MAX)
+    cut = case.get("final_variance_cut") or {}
+    n_kept = cut.get("n_kept")
+    n = cut.get("n")
+    threshold = cut.get("max_final_variance", DEFAULT_MAX_FINAL_VARIANCE)
+    kept_text = ""
+    if n_kept is not None and n:
+        kept_text = (
+            f" Kept {n_kept:,} / {n:,} galaxies with invertible "
+            f"<code>R=aI+bC</code> and "
+            f"σ<sub>final</sub> &lt; {threshold:g}."
+        )
     return (
-        "<p>This case applies an optional report-time shear stretch "
-        f"<code>R(σ)=clip(a + b σ², {r_min:g}, {r_max:g})</code> from "
+        "<p>This case applies an optional report-time matrix calibration "
+        f"<code>R(C)=aI+bC</code> from "
         f"<code>{path}</code> "
-        f"(a={info['a']:.6g}, b={info['b']:.6g}, "
-        f"R<sub>min</sub>={r_min:g}). "
-        "Only g<sub>1</sub> and g<sub>2</sub> Means, 16th/84th summaries, "
-        "and streamed shear candidates are divided by R, so posterior errors "
-        "inflate on purpose. Nuisances and truth are unchanged. "
-        "This is not the default Mean estimator.</p>"
+        f"(a={info['a']:.6g}, b={info['b']:.6g}), unclipped. "
+        "Galaxies whose <code>R</code> is not positive-definite, not "
+        "invertible, or whose calibrated RMS "
+        f"<code>σ<sub>final</sub>=√(tr(C<sub>cal</sub>)/2)</code> is at least "
+        f"<code>{threshold:g}</code> receive zero analysis weight. "
+        "Shear Means and streamed candidates are mapped by "
+        "<code>R<sup>-1</sup></code>; 16th/84th shear summaries are recomputed "
+        "on the transformed draws. Posterior errors inflate through "
+        "<code>C<sub>cal</sub>=R<sup>-1</sup> C (R<sup>-1</sup>)<sup>T</sup></code>. "
+        "Nuisances and truth are unchanged. "
+        f"This is not the default Mean estimator.{kept_text}</p>"
     )
 
 
@@ -1655,6 +1959,12 @@ def load_shear_posterior_diagnostics(
         key: _empty_shear_posterior_diagnostic(len(truth))
         for key in population_keys
     }
+    inverse_all = case.get("response_calibration", {}).get("R_inv")
+    if inverse_all is not None:
+        for population in case["populations"].values():
+            population["summary"] = np.array(
+                population["summary"], dtype=np.float64, copy=True
+            )
 
     offset = 0
     for part_index, (sample_path, truth_path) in enumerate(
@@ -1704,13 +2014,12 @@ def load_shear_posterior_diagnostics(
             draws = np.asarray(
                 samples[local_start:local_end, :, :2], dtype=np.float64
             )
-            response = case.get("response_calibration", {}).get("R")
-            if response is not None:
-                scale = np.asarray(
-                    response[offset + local_start : offset + local_end],
-                    dtype=np.float64,
+            inverse = case.get("response_calibration", {}).get("R_inv")
+            if inverse is not None:
+                draws = apply_inverse_to_vectors(
+                    draws,
+                    inverse[offset + local_start : offset + local_end],
                 )
-                draws /= scale[:, None, None]
             candidate_log_weight = (
                 np.asarray(
                     cached_log_weight[local_start:local_end], dtype=np.float64
@@ -1760,6 +2069,20 @@ def load_shear_posterior_diagnostics(
                         diagnostic["conditional_ess"][global_row, component] = (
                             effective_sample_size(conditional)
                         )
+                        if inverse is None:
+                            continue
+                        lower, upper = weighted_quantile(
+                            values,
+                            np.asarray((0.16, 0.84), dtype=np.float64),
+                            conditional,
+                        )
+                        for population in case["populations"].values():
+                            if population["key"] != population_key:
+                                continue
+                            summary = population["summary"]
+                            summary[global_row, 0, component] = lower
+                            summary[global_row, 2, component] = upper
+                            population["mean"] = summary[:, 1]
         offset += take
         del samples, stored_truth
         if cached_log_weight is not None:
@@ -2331,7 +2654,7 @@ def test_set_provenance_table(case: dict) -> str:
     rows = [
         ("cache dataset rows", f"{case['dataset_size']:,}"),
         ("report rows", f"{case['analyzed_size']:,}"),
-        ("posterior estimator", "Mean only"),
+        ("posterior estimator", "Mean and 1D MAP" if case.get("map_computed") else "Mean only"),
         (
             "posterior candidate mass",
             f"{case.get('candidate_weight_name', 'TF importance')} weights "
@@ -2344,12 +2667,13 @@ def test_set_provenance_table(case: dict) -> str:
         ),
         ("cache analysis mode", "test_set"),
     ]
-    cut = case.get("shear_sigma_cut")
+    cut = case.get("final_variance_cut") or case.get("shear_sigma_cut")
     if cut is not None:
+        threshold = cut.get("max_final_variance", cut.get("max_shear_sigma"))
         rows.append(
             (
-                "uncalibrated TF shear-width cut",
-                f"σ ≤ {cut['max_shear_sigma']:g}; kept "
+                "calibrated shear RMS cut",
+                f"σ_final < {threshold:g}; kept "
                 f"{cut['n_kept']:,} / {cut['n']:,} analysis weight",
             )
         )
@@ -2930,20 +3254,28 @@ def main(argv=None) -> None:
         )
         for value in args.case
     ]
-    if args.max_shear_sigma is not None:
-        if args.max_shear_sigma <= 0.0:
-            raise ValueError("max-shear-sigma must be positive")
-        for case in cases:
-            apply_max_shear_sigma_cut(case, args.max_shear_sigma)
-            LOGGER.info(
-                "%s: kept %d / %d galaxies with uncalibrated σ ≤ %g",
-                case["case"],
-                case["shear_sigma_cut"]["n_kept"],
-                case["shear_sigma_cut"]["n"],
-                args.max_shear_sigma,
-            )
+    if args.max_final_variance is not None and calibration is None:
+        raise ValueError("max-final-variance requires --response-calibrate")
     if calibration is not None:
-        apply_response_calibration_to_case(cases[-1], calibration)
+        max_final_variance = (
+            DEFAULT_MAX_FINAL_VARIANCE
+            if args.max_final_variance is None
+            else args.max_final_variance
+        )
+        if max_final_variance <= 0.0:
+            raise ValueError("max-final-variance must be positive")
+        apply_response_calibration_to_case(
+            cases[-1],
+            calibration,
+            max_final_variance=max_final_variance,
+        )
+        LOGGER.info(
+            "%s: R(C) calibrated; kept %d / %d galaxies with σ_final < %g",
+            cases[-1]["case"],
+            cases[-1]["final_variance_cut"]["n_kept"],
+            cases[-1]["final_variance_cut"]["n"],
+            max_final_variance,
+        )
     sections = []
     cross_case_results = []
     for case in cases:
@@ -2982,13 +3314,15 @@ def main(argv=None) -> None:
             )
             map_weight_html = (
                 "<h3>Mean vs MAP with estimator-specific weights</h3>"
-                "<p>MAP is the highest-scoring identity/R90 mixture sample after "
-                "the physical Jacobian and TF ratio, not a histogram mode. "
-                "Laplace weights use the shear block of the inverse Hessian at "
-                "that sample and set invalid or wall Hessians to zero weight. "
-                "Mean shape-noise weights still use posterior sample variance; "
-                "they are not applied to MAP. This MAP is a finite-bank argmax, "
-                "not a continuous mode.</p>"
+                "<p>MAP is the TF-weighted 1D Gaussian-KDE mode of "
+                "<code>g1</code> and of <code>g2</code> on "
+                "[-0.1, 0.1]. Nuisance coordinates in the stored MAP array "
+                "are the TF-weighted Mean, not a 9D density argmax. Laplace "
+                "weights use the 1D curvature "
+                "σ² = -1 / d²log p̂/dg² at each shear mode and set wall or "
+                "non-curved densities to zero weight. Mean shape-noise weights "
+                "still use posterior sample variance; they are not applied to "
+                "MAP.</p>"
                 + mean_vs_map_weight_comparison_table(map_weight_rows)
             )
         if args.weighted:
@@ -3196,7 +3530,8 @@ def main(argv=None) -> None:
                     f"|g| &lt; {args.low_g:g}; cubic fits use the full range. "
                     f"Mean results use {operative_weight_description}. "
                     "MAP ensemble metrics use equal galaxy mass (Laplace "
-                    "reweighting is only in the Mean vs MAP table).</p>"
+                    "reweighting is only in the Mean vs MAP table). MAP shear "
+                    "is the 1D KDE mode; MAP nuisances are TF-weighted Means.</p>"
                     if case.get("map_computed")
                     else (
                         "<h3>Shear calibration — posterior Mean</h3>"
@@ -3343,8 +3678,8 @@ def main(argv=None) -> None:
         map_modes = [bool(case.get("map_computed")) for case in cases]
         if all(map_modes):
             map_description = (
-                "and the TF-target sample MAP with Laplace shear covariances. "
-                "MAP is a finite-bank argmax, not a continuous mode."
+                "and the TF-weighted 1D KDE MAP of g1 and g2 with 1D Laplace "
+                "variances."
             )
         elif any(map_modes):
             map_description = (

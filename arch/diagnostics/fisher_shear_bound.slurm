@@ -28,8 +28,8 @@ set -u
 FULL_FITS="${FULL_FITS:-/ocean/projects/phy250048p/shared/fits/fisher_full_simv3_cosi}"
 G5_FITS="${G5_FITS:-/ocean/projects/phy250048p/shared/fits/fisher_g5_simv3_cosi}"
 SAMPLE_ROOT="${SAMPLE_ROOT:-/ocean/projects/phy250048p/shared/samples}"
-OUTPUT="${OUTPUT:-/ocean/projects/phy250048p/shared/reports/fisher_shear_bound.json}"
-HTML="${HTML:-/ocean/projects/phy250048p/shared/reports/fisher_shear_bound.html}"
+OUTPUT="${OUTPUT:-/ocean/projects/phy250048p/shared/reports/fisher/fisher_shear_bound.json}"
+HTML="${HTML:-/ocean/projects/phy250048p/shared/reports/fisher/fisher_shear_bound.html}"
 
 cd "${KLNN_REPO_ROOT}"
 python arch/diagnostics/fisher_shear_bound.py \

@@ -58,7 +58,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--output",
         type=Path,
         default=Path(
-            "/ocean/projects/phy250048p/shared/reports/fisher_shear_bound.json"
+            "/ocean/projects/phy250048p/shared/reports/fisher/fisher_shear_bound.json"
         ),
     )
     parser.add_argument("--html", type=Path, default=None)

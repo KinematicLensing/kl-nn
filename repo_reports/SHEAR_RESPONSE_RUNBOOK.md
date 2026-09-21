@@ -119,7 +119,7 @@ python arch/diagnostics/shear_response_report.py \
   --estimator mean \
   --calibration-fraction 0.5 \
   --seed 31415 \
-  --output /ocean/projects/phy250048p/shared/reports/shear_response_tf_target.html
+  --output /ocean/projects/phy250048p/shared/reports/shear-response/shear_response_tf_target.html
 ```
 
 Run the same report with `--posterior-source proposal` to separate behavior of
@@ -178,7 +178,7 @@ Then compare TF-weighted Mean against the frozen cache:
 ```bash
 CASE_1=CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_valid100k_frozen_s42_45255702:test_100k_simv3_cosi_xu3_tf_testset_tfweighted_v2_10k_s42 \
 CASE_2=CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_valid100k_frozen_s42_45255702:test_100k_simv3_cosi_xu3_tf_testset_tfweighted_v2_10k_s42_pairs_45467143 \
-OUTPUT=/ocean/projects/phy250048p/shared/reports/valid100k_frozen_vs_pairs_xu3_tfweighted_s42.html \
+OUTPUT=/ocean/projects/phy250048p/shared/reports/arch-ablations/valid100k_frozen_vs_pairs_xu3_tfweighted_s42.html \
 WEIGHTED=1 \
 sbatch arch/diagnostics/shear_bias_report.slurm
 ```

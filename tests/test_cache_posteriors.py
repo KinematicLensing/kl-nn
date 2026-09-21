@@ -105,6 +105,27 @@ def test_cache_cli_rejects_unknown_options_and_has_one_sampling_surface():
         module.validate_writer_args(rejected)
 
 
+def test_identity_only_allows_odd_nsamples():
+    module = _module()
+    args = module.parse_args(
+        [
+            "-i", "0", "--nparts", "1", "--ngals", "2",
+            "--model-name", "m", "--dataset", "d", "--test-set",
+            "--identity-only", "--nsamples", "3",
+        ]
+    )
+    assert args.identity_only is True
+    module.validate_writer_args(args)
+    even_required = module.parse_args(
+        [
+            "-i", "0", "--nparts", "1", "--ngals", "2",
+            "--model-name", "m", "--dataset", "d", "--nsamples", "3",
+        ]
+    )
+    with np.testing.assert_raises_regex(ValueError, "even"):
+        module.validate_writer_args(even_required)
+
+
 def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
     module = _module()
     assert set(module.TEST_SET_CACHE_ARRAY_TYPES) == {
@@ -137,14 +158,13 @@ def test_compact_test_set_arrays_store_only_needed_tf_candidate_products():
     assert set(module.TEST_SET_MAP_CACHE_ARRAY_TYPES) == set(
         module.TEST_SET_CACHE_ARRAY_TYPES
     ) | {
-        "base_log_prob",
-        "posterior_tf_log_ratio",
         "proposal_map_estimates",
         "tf_target_map_estimates",
         "tf_map_laplace_cov",
         "tf_map_laplace_ok",
     }
     assert "sample" not in module.TEST_SET_MAP_CACHE_ARRAY_TYPES
+    assert "base_log_prob" not in module.TEST_SET_MAP_CACHE_ARRAY_TYPES
 
 
 

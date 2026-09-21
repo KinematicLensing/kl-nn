@@ -2,14 +2,12 @@
 """Cache posterior products for standard or TF-conformed test analyses.
 
 The sampling adapter in :mod:`train` constructs the canonical original/R90
-ensemble and inverse-aligns every rotated parameter row. This script adds no
-second observation, resampling, or alternate network path. ``--test-set``
-keeps a compact candidate bank (physical shear plus normalized TF log weights)
-and TF-weighted Mean summaries. It does not request density scores, compute
-MAP, or apply a second truth-population TF weight unless ``--map-density`` is
-also set. ``--map-density`` stores the normalized mixture ``base_log_prob``
-(MAP selection converts it to physical coordinates), the TF log ratio, sample
-MAP estimates, and the Laplace shear covariance at the TF-target MAP.
+ensemble by default and inverse-aligns every rotated parameter row.
+``--identity-only`` draws the full bank from the unrotated datavector instead.
+``--test-set`` keeps a compact candidate bank (physical shear plus normalized
+TF log weights) and TF-weighted Mean summaries. ``--map-density`` stores
+TF-weighted 1D KDE MAP estimates for ``g1`` and ``g2`` and the 1D Laplace
+shear variances of those same densities. It does not score the 9D mixture.
 """
 
 from __future__ import annotations
@@ -34,6 +32,10 @@ try:
         STANDARD_ANALYSIS_MODE,
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
+        EXPECTED_SYMMETRY,
+        EXPECTED_IDENTITY_SYMMETRY,
+        EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES,
+        EXPECTED_TEST_SET_DENSITY_COORDINATES,
     )
     from .model_registry import load_model_config
     from .networks import KLNPE
@@ -43,7 +45,7 @@ try:
         posterior_importance_weights,
     )
     from .train import load_model, sample_density, seed_everything
-    from .map_laplace import tf_target_laplace_covariances
+    from .map_laplace import tf_weighted_1d_shear_map_laplace
     from .utils import (
         denormalization_logabsdet,
         denormalize,
@@ -56,6 +58,10 @@ except ImportError:  # Direct execution from arch/.
         STANDARD_ANALYSIS_MODE,
         TEST_SET_ANALYSIS_MODE,
         TEST_SET_CACHE_SCHEMA,
+        EXPECTED_SYMMETRY,
+        EXPECTED_IDENTITY_SYMMETRY,
+        EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES,
+        EXPECTED_TEST_SET_DENSITY_COORDINATES,
     )
     from model_registry import load_model_config
     from networks import KLNPE
@@ -65,7 +71,7 @@ except ImportError:  # Direct execution from arch/.
         posterior_importance_weights,
     )
     from train import load_model, sample_density, seed_everything
-    from map_laplace import tf_target_laplace_covariances
+    from map_laplace import tf_weighted_1d_shear_map_laplace
     from utils import denormalization_logabsdet, denormalize, resolve_feature_index
 
 
@@ -110,8 +116,6 @@ TEST_SET_CACHE_ARRAY_TYPES = (
     "tf_target_mean_estimates",
 )
 TEST_SET_MAP_CACHE_ARRAY_TYPES = TEST_SET_CACHE_ARRAY_TYPES + (
-    "base_log_prob",
-    "posterior_tf_log_ratio",
     "proposal_map_estimates",
     "tf_target_map_estimates",
     "tf_map_laplace_cov",
@@ -126,6 +130,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--ngals", type=int, required=True)
     parser.add_argument("--nsamples", type=int, default=5000)
     parser.add_argument("--model-name", required=True)
+    parser.add_argument(
+        "--networks-name",
+        default=None,
+        help=(
+            "Network snapshot to instantiate. Defaults to --model-name. Use "
+            "when that model's snapshot was overwritten and no longer matches "
+            "the checkpoint, as with the frozen concat 45255702 weights and "
+            "the sibling 45255704 snapshot."
+        ),
+    )
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--dataset", required=True)
@@ -161,9 +175,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--map-density",
         action="store_true",
         help=(
-            "With --test-set, score the candidate bank, write sample MAP "
-            "estimates, store normalized mixture log-probabilities, and "
-            "evaluate the Laplace shear covariance at the TF-target MAP."
+            "With --test-set, write TF-weighted 1D KDE MAP estimates for "
+            "g1 and g2 and the 1D Laplace variances of those densities."
+        ),
+    )
+    parser.add_argument(
+        "--identity-only",
+        action="store_true",
+        help=(
+            "Draw every posterior sample from the unrotated datavector. "
+            "Default is the identity/R90 equal mixture."
         ),
     )
     parser.add_argument("--matched-group-size", type=int, default=1)
@@ -724,7 +745,9 @@ def validate_writer_args(args: argparse.Namespace) -> None:
 
     if args.nparts <= 0 or not 0 <= args.partition_index < args.nparts:
         raise ValueError("partition-index must lie in [0, nparts)")
-    if args.nsamples <= 0 or args.nsamples % 2:
+    if args.nsamples <= 0:
+        raise ValueError("nsamples must be positive")
+    if not args.identity_only and args.nsamples % 2:
         raise ValueError(
             "nsamples must be positive and even for the R90 ensemble"
         )
@@ -783,6 +806,7 @@ def main(argv=None) -> None:
     dataset_path = resolve_path(args.data_root, args.dataset)
     if not dataset_path.is_dir():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+    config.require_matching_dataset_par_ranges(dataset_path, config.par_ranges)
     dataset = pxt.TorchDataset(str(dataset_path))
     validate_partition_coverage(args.nparts, args.ngals, len(dataset))
     generation_manifest = None
@@ -809,6 +833,7 @@ def main(argv=None) -> None:
         KLNPE,
         path=str(checkpoint),
         model_name=args.model_name,
+        networks_name=args.networks_name,
         strict=True,
         device=str(device),
         networks_root=str(artifact_root / "networks"),
@@ -828,11 +853,12 @@ def main(argv=None) -> None:
         matched_group_size=args.matched_group_size,
         noise_seed=partition_seed,
         spectral_noise_seed=partition_seed + 101,
-        return_log_prob=(not args.test_set) or args.map_density,
+        return_log_prob=not args.test_set,
         return_observation_metadata=True,
-        return_flow_context=args.map_density,
+        return_flow_context=False,
+        identity_only=args.identity_only,
     )
-    if args.test_set and not args.map_density:
+    if args.test_set:
         samples_normalized, metadata = sampled
         base_log_prob = None
     else:
@@ -877,16 +903,6 @@ def main(argv=None) -> None:
     missing = [name for name in required_metadata if name not in metadata]
     if missing:
         raise RuntimeError(f"sample_density metadata is missing {missing}")
-    if args.map_density:
-        context_missing = [
-            name
-            for name in ("flow_context_original", "flow_context_rotated")
-            if name not in metadata
-        ]
-        if context_missing:
-            raise RuntimeError(
-                f"sample_density metadata is missing {context_missing}"
-            )
     truth_normalized = _to_numpy(metadata["truth"], name="truth")
     rmag_true = _to_numpy(
         metadata["rmag_true"], name="rmag_true"
@@ -965,37 +981,28 @@ def main(argv=None) -> None:
         population_log_ratio = None
         laplace_cov = laplace_ok = None
         if args.map_density:
-            assert base_log_prob is not None
-            # Stored base_log_prob remains the normalized mixture score; MAP
-            # selection uses the physical Jacobian conversion below.
-            physical_base_log_prob = physical_log_prob_from_normalized(
-                samples_normalized,
-                base_log_prob,
-                par_ranges=config.par_ranges,
-                feature_names=feature_names,
-                target_transforms=config.TARGET_TRANSFORMS,
-            )
-            summaries.update(
-                posterior_summaries(
+            shear_maps, laplace_cov, laplace_ok = (
+                tf_weighted_1d_shear_map_laplace(
                     samples,
-                    physical_base_log_prob,
-                    importance.log_ratio,
                     importance.weight,
-                    feature_names,
+                    feature_names=feature_names,
                 )
             )
-            laplace_cov, laplace_ok = tf_target_laplace_covariances(
-                model,
-                summaries["tf_target_map_estimates"],
-                metadata["flow_context_original"],
-                metadata["flow_context_rotated"],
-                rmag_true,
-                tf_prior,
-                par_ranges=config.par_ranges,
+            equal_maps, _, _ = tf_weighted_1d_shear_map_laplace(
+                samples,
+                np.ones_like(importance.weight),
                 feature_names=feature_names,
-                target_transforms=config.TARGET_TRANSFORMS,
-                device=device,
             )
+            g1_index = resolve_feature_index(feature_names, "g1")
+            g2_index = resolve_feature_index(feature_names, "g2")
+            proposal_map = summaries["proposal_mean_estimates"][:, 1, :].copy()
+            target_map = summaries["tf_target_mean_estimates"][:, 1, :].copy()
+            proposal_map[:, g1_index] = equal_maps[:, 0]
+            proposal_map[:, g2_index] = equal_maps[:, 1]
+            target_map[:, g1_index] = shear_maps[:, 0]
+            target_map[:, g2_index] = shear_maps[:, 1]
+            summaries["proposal_map_estimates"] = proposal_map
+            summaries["tf_target_map_estimates"] = target_map
     else:
         assert base_log_prob is not None
         physical_base_log_prob = physical_log_prob_from_normalized(
@@ -1085,15 +1092,10 @@ def main(argv=None) -> None:
         }
         array_types = TEST_SET_CACHE_ARRAY_TYPES
         if args.map_density:
-            assert base_log_prob is not None
             assert laplace_cov is not None
             assert laplace_ok is not None
             arrays.update(
                 {
-                    "base_log_prob": base_log_prob.astype(np.float32),
-                    "posterior_tf_log_ratio": importance.log_ratio.astype(
-                        np.float32
-                    ),
                     "proposal_map_estimates": summaries[
                         "proposal_map_estimates"
                     ].astype(np.float32),
@@ -1198,26 +1200,14 @@ def main(argv=None) -> None:
             name: config.TARGET_TRANSFORMS[name] for name in feature_names
         },
         "density_coordinates": (
-            {
-                "stored_shear_samples": "physical_target_coordinates",
-                "stored_base_log_prob": "normalized_target_coordinates",
-                "posterior_summary": "physical_target_coordinates",
-                "map_selection": "physical_target_coordinates",
-                "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
-            }
+            dict(EXPECTED_TEST_SET_MAP_DENSITY_COORDINATES)
             if args.test_set and args.map_density
-            else {
-                "stored_shear_samples": "physical_target_coordinates",
-                "posterior_summary": "physical_target_coordinates",
-                "map_selection": "not_computed",
-            }
+            else dict(EXPECTED_TEST_SET_DENSITY_COORDINATES)
             if args.test_set
             else {
                 "stored_base_log_prob": "normalized_target_coordinates",
                 "map_selection": "physical_target_coordinates",
-                "map_jacobian": (
-                    "subtract_logabsdet_dphysical_dnormalized"
-                ),
+                "map_jacobian": "subtract_logabsdet_dphysical_dnormalized",
             }
         ),
         "observation_model": {
@@ -1248,10 +1238,11 @@ def main(argv=None) -> None:
             ),
         },
         "sample_shape": list(samples.shape),
-        "symmetry": {
-            "policy": "original_plus_r90_equal_mixture",
-            "rotated_joint_rows_inverse_aligned": True,
-        },
+        "symmetry": dict(
+            EXPECTED_IDENTITY_SYMMETRY
+            if args.identity_only
+            else EXPECTED_SYMMETRY
+        ),
         "observation_provenance": provenance,
         "files": saved,
     }
@@ -1266,6 +1257,15 @@ def main(argv=None) -> None:
                 "mean_and_map" if args.map_density else "mean"
             ),
             "map_computed": bool(args.map_density),
+            "map_kind": (
+                "tf_weighted_1d_kde_mode" if args.map_density else "not_computed"
+            ),
+            "map_nuisance": (
+                "tf_weighted_mean" if args.map_density else "not_computed"
+            ),
+            "ensemble": (
+                "identity" if args.identity_only else "original_plus_r90_equal_mixture"
+            ),
             "tf_importance_weighting": True,
             "shape_noise_regularization": "report_time",
             "snr_source": "dataset_record",
@@ -1281,12 +1281,8 @@ def main(argv=None) -> None:
             "stored within-galaxy log-softmax of posterior_log_ratio"
         )
         posterior_log_ratio_description = (
-            "stored log[p_TF(vcirc|rmag_true)/p0(vcirc)] per candidate"
-            if args.map_density
-            else (
-                "computed log[p_TF(vcirc|rmag_true)/p0(vcirc)] "
-                "per candidate; not stored in the compact cache"
-            )
+            "computed log[p_TF(vcirc|rmag_true)/p0(vcirc)] "
+            "per candidate; not stored in the compact cache"
         )
         ess_manifest_name = "posterior_tf_ess"
         manifest.update(

@@ -100,6 +100,29 @@ def choose_indices(dataset_size, requested, seed):
     return np.sort(rng.choice(dataset_size, size=count, replace=False))
 
 
+def same_dataset_path(left, right):
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+
+
+def choose_disjoint_split(dataset_size, n_train, n_valid, seed):
+    """Train/valid indices with no shared rows, for a held-out probe on one catalog."""
+
+    if n_train <= 0 or n_valid <= 0:
+        raise ValueError("train and valid sample counts must be positive")
+    if n_train + n_valid > dataset_size:
+        raise ValueError(
+            "disjoint split requires n_train + n_valid <= dataset size; "
+            f"got {n_train} + {n_valid} > {dataset_size}"
+        )
+    rng = np.random.default_rng(seed)
+    permutation = rng.permutation(dataset_size)
+    train_indices = np.sort(permutation[:n_train].astype(np.int64, copy=False))
+    valid_indices = np.sort(
+        permutation[n_train : n_train + n_valid].astype(np.int64, copy=False)
+    )
+    return train_indices, valid_indices
+
+
 @torch.inference_mode()
 def extract_features(
     model,
@@ -213,7 +236,8 @@ class MLPProbe(nn.Module):
         super().__init__()
         if input_dim <= 0 or output_dim <= 0:
             raise ValueError("input_dim and output_dim must be positive")
-        if not hidden_dims or any(width <= 0 for width in hidden_dims):
+        hidden_dims = tuple(hidden_dims)
+        if any(width <= 0 for width in hidden_dims):
             raise ValueError("hidden_dims must contain positive widths")
 
         layers = []
@@ -424,8 +448,32 @@ def main(argv=None):
 
     train_dataset = pxt.TorchDataset(train_data)
     valid_dataset = pxt.TorchDataset(valid_data)
-    train_indices = choose_indices(len(train_dataset), args.train_samples, args.seed)
-    valid_indices = choose_indices(len(valid_dataset), args.valid_samples, args.seed + 1)
+    if same_dataset_path(train_data, valid_data):
+        if len(train_dataset) != len(valid_dataset):
+            raise RuntimeError(
+                "train and valid paths resolve to the same dataset but "
+                f"lengths differ: {len(train_dataset)} vs {len(valid_dataset)}"
+            )
+        train_indices, valid_indices = choose_disjoint_split(
+            len(train_dataset),
+            args.train_samples,
+            args.valid_samples,
+            args.seed,
+        )
+        split_kind = "disjoint_same_dataset"
+        print(
+            f"split={split_kind} train_n={len(train_indices)} "
+            f"valid_n={len(valid_indices)}",
+            flush=True,
+        )
+    else:
+        train_indices = choose_indices(
+            len(train_dataset), args.train_samples, args.seed
+        )
+        valid_indices = choose_indices(
+            len(valid_dataset), args.valid_samples, args.seed + 1
+        )
+        split_kind = "independent_datasets"
 
     extraction_kwargs = {
         "batch_size": args.batch_size,
@@ -453,7 +501,20 @@ def main(argv=None):
     train_targets, encoded_names = encode_probe_targets(
         train_labels[:, : len(feature_names)], feature_names
     )
-    predictions, training_losses = fit_mlp_probe(
+    valid_slice = valid_labels[:, : len(feature_names)]
+    linear_predictions, linear_losses = fit_mlp_probe(
+        train_features,
+        train_targets,
+        valid_features,
+        hidden_dims=(),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        device=device,
+        seed=args.seed + 303,
+    )
+    mlp_predictions, mlp_losses = fit_mlp_probe(
         train_features,
         train_targets,
         valid_features,
@@ -463,14 +524,17 @@ def main(argv=None):
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         device=device,
-        seed=args.seed + 303,
+        seed=args.seed + 404,
+    )
+    linear_metrics = evaluate_probe(
+        valid_slice, linear_predictions, feature_names, encoded_names
     )
     metrics = evaluate_probe(
-        valid_labels[:, : len(feature_names)],
-        predictions,
-        feature_names,
-        encoded_names,
+        valid_slice, mlp_predictions, feature_names, encoded_names
     )
+    print("linear probe")
+    print_metrics(linear_metrics)
+    print("mlp probe")
     print_metrics(metrics)
 
     output_path = (
@@ -491,6 +555,7 @@ def main(argv=None):
         "valid_data": valid_data,
         "train_samples": len(train_indices),
         "valid_samples": len(valid_indices),
+        "split_kind": split_kind,
         "observation_context": list(model_config.observation.context_fields),
         "noise_model": (
             "record-backed independent image_snr and central_halpha_snr "
@@ -504,11 +569,22 @@ def main(argv=None):
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
-            "initial_train_mse": training_losses[0],
-            "final_train_mse": training_losses[-1],
+            "initial_train_mse": mlp_losses[0],
+            "final_train_mse": mlp_losses[-1],
+        },
+        "linear_probe": {
+            "type": "linear",
+            "hidden_dims": [],
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+            "initial_train_mse": linear_losses[0],
+            "final_train_mse": linear_losses[-1],
         },
         "feature_dimension": int(train_features.shape[1]),
         "metrics": metrics,
+        "metrics_linear": linear_metrics,
     }
     with output_path.open("w") as handle:
         json.dump(payload, handle, indent=2)

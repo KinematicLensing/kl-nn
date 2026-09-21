@@ -132,12 +132,28 @@ parser.add_argument('--image-snr', type=float, required=True,
                     help='nominal image matched-filter S/N')
 parser.add_argument('--central-halpha-snr', type=float, required=True,
                     help='nominal central-fiber H-alpha matched-filter S/N')
+parser.add_argument(
+    '--fiber-g1',
+    type=float,
+    default=None,
+    help='shear g1 used only for fiber placement; default is the galaxy g1',
+)
+parser.add_argument(
+    '--fiber-g2',
+    type=float,
+    default=None,
+    help='shear g2 used only for fiber placement; default is the galaxy g2',
+)
 args = parser.parse_args()
 n = args.n
 d = args.d
 ID = args.ID
 g1 = args.g1
 g2 = args.g2
+if (args.fiber_g1 is None) != (args.fiber_g2 is None):
+    raise ValueError("fiber-g1 and fiber-g2 must be provided together")
+fiber_g1 = g1 if args.fiber_g1 is None else float(args.fiber_g1)
+fiber_g2 = g2 if args.fiber_g2 is None else float(args.fiber_g2)
 theta_int = args.theta_int
 sini = args.sini
 v0 = args.v0
@@ -196,8 +212,8 @@ blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask
 ### Calculate fiber offsets in the explicitly selected coordinate system.
 offsets = compute_fiber_offsets(
     fiber_offset=fiber_offset,
-    g1=g1,
-    g2=g2,
+    g1=fiber_g1,
+    g2=fiber_g2,
     theta_int=theta_int,
     sini=sini,
 )

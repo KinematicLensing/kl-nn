@@ -8,7 +8,7 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=easonw2@andrew.cmu.edu
 
-set -euo pipefail
+set -eo pipefail
 ulimit -c 0
 
 KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
@@ -21,7 +21,9 @@ module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
+set +u
 conda activate kl-nn
+set -u
 
 : "${PRETRAINED_NAME:?Set PRETRAINED_NAME to the completed CCL run}"
 PRETRAIN_FROM="${PRETRAIN_FROM:-best}"
@@ -49,6 +51,7 @@ TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_si
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
+SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_1m}"
@@ -82,6 +85,7 @@ echo "pretrained=${PRETRAINED_NAME} checkpoint=${PRETRAIN_FROM}"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
+echo "shear_bound=${SHEAR_BOUND}"
 echo "freeze_feature_extractor=${FREEZE_FEATURE_EXTRACTOR_FLAG}"
 echo "image_spectrum_fusion=${IMAGE_SPECTRUM_FUSION_FLAG}"
 
@@ -113,6 +117,7 @@ python train_model.py \
     --early-stopping-patience "${EARLY_STOPPING_PATIENCE}" \
     --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA}" \
     --gradient-clip-norm "${GRADIENT_CLIP_NORM}" \
+    --shear-bound "${SHEAR_BOUND}" \
     ${FREEZE_FEATURE_EXTRACTOR_FLAG} \
     ${IMAGE_SPECTRUM_FUSION_FLAG} \
     --seed "${SEED}" \

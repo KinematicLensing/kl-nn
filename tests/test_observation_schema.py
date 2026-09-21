@@ -263,3 +263,64 @@ def test_missing_metadata_never_falls_back():
         del header[key]
         with pytest.raises(ValueError, match="missing required"):
             schema.observation_metadata_arrays([header])
+
+
+def test_face_on_unsheared_disk_is_round():
+    ellipticity = schema.observed_ellipticity(
+        g1=0.0, g2=0.0, theta_int=0.3, sini=0.0
+    )
+    assert ellipticity == pytest.approx(0.0, abs=1e-12)
+
+
+def test_edge_on_unsheared_disk_is_highly_elliptical():
+    ellipticity = schema.observed_ellipticity(
+        g1=0.0, g2=0.0, theta_int=0.0, sini=1.0
+    )
+    assert ellipticity == pytest.approx(1.0, abs=1e-12)
+
+
+def test_hop_angle_is_zero_without_shear():
+    angle = schema.major_axis_hop_angle_deg(
+        g1=0.0, g2=0.0, theta_int=1.2, sini=0.7
+    )
+    assert angle == pytest.approx(0.0, abs=1e-5)
+    assert schema.classify_fiber_hop(
+        g1=0.0, g2=0.0, theta_int=1.2, sini=0.7
+    ) == "unhopped"
+
+
+def test_unsigned_axis_angle_treats_opposite_vectors_as_aligned():
+    assert schema.unsigned_direction_angle_deg([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(
+        0.0
+    )
+    assert schema.unsigned_direction_angle_deg([1.0, 0.0], [0.0, 1.0]) == pytest.approx(
+        90.0
+    )
+
+
+def test_perpendicular_moderate_disk_hops_at_large_camera_shear():
+    kwargs = dict(theta_int=0.5 * np.pi, sini=0.5)
+    assert schema.classify_fiber_hop(g1=0.01, g2=0.0, **kwargs) == "unhopped"
+    assert schema.classify_fiber_hop(g1=0.16, g2=0.0, **kwargs) == "hopped"
+
+
+def test_aligned_disk_does_not_hop_at_large_camera_shear():
+    label = schema.classify_fiber_hop(
+        g1=0.16, g2=0.0, theta_int=0.0, sini=0.5
+    )
+    assert label == "unhopped"
+
+
+def test_knife_edge_is_excluded_around_45_degrees(monkeypatch):
+    monkeypatch.setattr(schema, "major_axis_hop_angle_deg", lambda **kwargs: 44.0)
+    assert schema.classify_fiber_hop(g1=0.1, g2=0.0, theta_int=0.0, sini=0.5) == (
+        "knife_edge"
+    )
+    monkeypatch.setattr(schema, "major_axis_hop_angle_deg", lambda **kwargs: 41.0)
+    assert schema.classify_fiber_hop(g1=0.1, g2=0.0, theta_int=0.0, sini=0.5) == (
+        "unhopped"
+    )
+    monkeypatch.setattr(schema, "major_axis_hop_angle_deg", lambda **kwargs: 50.0)
+    assert schema.classify_fiber_hop(g1=0.1, g2=0.0, theta_int=0.0, sini=0.5) == (
+        "hopped"
+    )

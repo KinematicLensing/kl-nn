@@ -2,12 +2,14 @@ import torch
 import pytest
 
 from diagnostics.ccl_mlp_probe import (
+    choose_disjoint_split,
     choose_indices,
     encode_probe_targets,
     evaluate_probe,
     MLPProbe,
     fit_mlp_probe,
     parse_args,
+    same_dataset_path,
 )
 
 
@@ -55,6 +57,25 @@ def test_choose_indices_is_seeded_sorted_and_unique():
     assert (first[:-1] < first[1:]).all()
 
 
+def test_same_dataset_path_ignores_trailing_slash(tmp_path):
+    target = tmp_path / "catalog"
+    target.mkdir()
+    assert same_dataset_path(target, str(target) + "/")
+
+
+def test_choose_disjoint_split_is_seeded_and_nonoverlapping():
+    train_a, valid_a = choose_disjoint_split(50, 20, 10, seed=9)
+    train_b, valid_b = choose_disjoint_split(50, 20, 10, seed=9)
+
+    assert (train_a == train_b).all()
+    assert (valid_a == valid_b).all()
+    assert len(train_a) == 20
+    assert len(valid_a) == 10
+    assert len(set(train_a.tolist()) & set(valid_a.tolist())) == 0
+    with pytest.raises(ValueError, match="n_train \\+ n_valid"):
+        choose_disjoint_split(10, 6, 5, seed=1)
+
+
 def test_mlp_probe_fits_a_nonlinear_target():
     generator = torch.Generator().manual_seed(3)
     features = torch.randn((384, 4), generator=generator)
@@ -84,10 +105,11 @@ def test_mlp_probe_fits_a_nonlinear_target():
     assert losses[-1] < 0.15 * losses[0]
 
 
-def test_mlp_probe_contains_nonlinear_hidden_layers():
-    probe = MLPProbe(input_dim=8, output_dim=3, hidden_dims=(16, 12))
+def test_linear_probe_is_a_plain_affine_map():
+    probe = MLPProbe(input_dim=8, output_dim=3, hidden_dims=())
 
-    assert sum(isinstance(layer, torch.nn.ReLU) for layer in probe.network) == 2
+    assert len(list(probe.network)) == 1
+    assert isinstance(probe.network[0], torch.nn.Linear)
     assert probe(torch.zeros((5, 8))).shape == (5, 3)
 
 

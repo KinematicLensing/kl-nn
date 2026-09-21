@@ -30,7 +30,9 @@ SELECT_DIR = REPORT_ROOT / "00_select"
 STACK_DIR = REPORT_ROOT / "01_stack"
 COVERAGE_DIR = REPORT_ROOT / "02_coverage"
 NRE_DIR = REPORT_ROOT / "03_nre"
+NRE9D_DIR = REPORT_ROOT / "03_nre_9d"
 NRE_NAME = "CNN-CNN-Meta-nre2d-simv3-cosi-r90_valid100k_frozen_s42_fibrepair"
+NRE9D_NAME = "CNN-CNN-Meta-nre9d-simv3-cosi-r90_valid100k_frozen_s42_fibrepair"
 NRE_TRAIN_DATASET = "valid_100k_simv3_cosi"
 NRE_VALID_DATASET = "small_10k_simv3_cosi"
 NRE_INFER_DATASET = G01_DATASET
@@ -42,6 +44,9 @@ NRE_EPOCHS = 80
 NRE_BATCH_SIZE = 256
 NRE_LR = 1e-3
 NRE_ABS_G_EDGES = (0.0, 0.025, 0.05, 0.075, 0.1)
+NRE9D_NWALKERS = 32
+NRE9D_BURNIN = 100
+NRE9D_PRODUCTION = 200
 HTML_STYLE = """
 body { font: 17px/1.55 Palatino, "Palatino Linotype", serif; margin: 2rem auto; max-width: 980px; color: #1b1b1b; }
 h1, h2, h3 { font-weight: 600; }

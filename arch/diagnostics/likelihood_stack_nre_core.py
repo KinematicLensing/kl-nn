@@ -43,22 +43,26 @@ SLICE_LABELS = {
 
 
 class RatioHead(nn.Module):
-    """MLP on frozen context concatenated with normalized (g1, g2). One logit."""
+    """MLP on frozen context concatenated with a normalized parameter vector."""
 
     def __init__(
         self,
         context_dim: int = NRE_CONTEXT_DIM,
         hidden_dims: tuple[int, ...] = NRE_HIDDEN_DIMS,
+        parameter_dim: int = 2,
     ):
         super().__init__()
         context_dim = int(context_dim)
         hidden_dims = tuple(int(width) for width in hidden_dims)
+        parameter_dim = int(parameter_dim)
         if context_dim <= 0:
             raise ValueError("context_dim must be positive")
         if not hidden_dims or any(width <= 0 for width in hidden_dims):
             raise ValueError("hidden_dims must contain positive widths")
+        if parameter_dim <= 0:
+            raise ValueError("parameter_dim must be positive")
         layers: list[nn.Module] = []
-        width_in = context_dim + 2
+        width_in = context_dim + parameter_dim
         for width_out in hidden_dims:
             layers.extend((nn.Linear(width_in, width_out), nn.ReLU()))
             width_in = width_out
@@ -66,6 +70,7 @@ class RatioHead(nn.Module):
         self.network = nn.Sequential(*layers)
         self.context_dim = context_dim
         self.hidden_dims = hidden_dims
+        self.parameter_dim = parameter_dim
 
     def forward(self, context: torch.Tensor, shear: torch.Tensor) -> torch.Tensor:
         if context.ndim != 2 or context.shape[-1] != self.context_dim:
@@ -73,8 +78,11 @@ class RatioHead(nn.Module):
                 "context must have shape (B, "
                 f"{self.context_dim}); got {tuple(context.shape)}"
             )
-        if shear.ndim != 2 or shear.shape[-1] != 2:
-            raise ValueError(f"shear must have shape (B, 2); got {tuple(shear.shape)}")
+        if shear.ndim != 2 or shear.shape[-1] != self.parameter_dim:
+            raise ValueError(
+                "parameters must have shape (B, "
+                f"{self.parameter_dim}); got {tuple(shear.shape)}"
+            )
         if context.shape[0] != shear.shape[0]:
             raise ValueError("context and shear batch sizes must match")
         logit = self.network(torch.cat((context, shear), dim=-1))
@@ -88,19 +96,36 @@ def freeze_encoder(encoder: nn.Module) -> nn.Module:
     return encoder
 
 
-def shuffle_shear(shear: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-    """Permute g within the batch. Same x, different g is the marginal class."""
+def shuffle_parameters(
+    parameters: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Permute complete parameter rows; same x, different theta is marginal."""
+
+    if parameters.ndim != 2 or parameters.shape[-1] < 1:
+        raise ValueError(
+            "parameters must have shape (B, D); "
+            f"got {tuple(parameters.shape)}"
+        )
+    batch = int(parameters.shape[0])
+    if batch < 2:
+        raise ValueError("shuffling parameters requires batch size >= 2")
+    perm = torch.randperm(batch, device=parameters.device, generator=generator)
+    identity = torch.arange(batch, device=parameters.device)
+    if torch.equal(perm, identity):
+        perm = torch.roll(identity, shifts=1)
+    return parameters.index_select(0, perm)
+
+
+def shuffle_shear(
+    shear: torch.Tensor,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Compatibility wrapper for the original 2D shear-only NRE."""
 
     if shear.ndim != 2 or shear.shape[-1] != 2:
         raise ValueError(f"shear must have shape (B, 2); got {tuple(shear.shape)}")
-    batch = int(shear.shape[0])
-    if batch < 2:
-        raise ValueError("shuffling g requires batch size >= 2")
-    perm = torch.randperm(batch, device=shear.device, generator=generator)
-    identity = torch.arange(batch, device=shear.device)
-    if torch.equal(perm, identity):
-        perm = torch.roll(identity, shifts=1)
-    return shear.index_select(0, perm)
+    return shuffle_parameters(shear, generator=generator)
 
 
 def nre_pair_logits_and_labels(
@@ -110,9 +135,9 @@ def nre_pair_logits_and_labels(
     *,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Joint (label 1) then shuffled-g (label 0). Logits are log r at the BCE optimum."""
+    """Joint (label 1) then shuffled-theta (label 0) classifier pairs."""
 
-    shuffled = shuffle_shear(shear, generator=generator)
+    shuffled = shuffle_parameters(shear, generator=generator)
     joint = head(context, shear)
     marginal = head(context, shuffled)
     logits = torch.cat((joint, marginal), dim=0)

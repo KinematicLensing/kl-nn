@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a frozen-encoder 2D NRE head on g01 valid_100k. New nre2d dir only."""
+"""Train a frozen-encoder NRE head on normalized target vectors."""
 
 from __future__ import annotations
 
@@ -29,12 +29,12 @@ from diagnostics.likelihood_stack_core import (
     NRE_EPOCHS,
     NRE_HIDDEN_DIMS,
     NRE_LR,
+    NRE9D_NAME,
     NRE_NAME,
     NRE_TRAIN_DATASET,
     NRE_VALID_DATASET,
     json_safe,
     noise_seeds,
-    shear_columns,
     write_json,
 )
 from diagnostics.likelihood_stack_nre_core import (
@@ -57,6 +57,7 @@ def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--parent-npe", default=G01_NPE)
     parser.add_argument("--nre-name", default=NRE_NAME)
+    parser.add_argument("--nre-mode", choices=("2d", "9d"), default="2d")
     parser.add_argument("--model-root", type=Path, default=MODEL_ROOT)
     parser.add_argument("--parent-checkpoint-suffix", default="best")
     parser.add_argument(
@@ -236,10 +237,18 @@ def extract_contexts(
     channels_last: bool,
     names: tuple[str, ...],
     split_name: str,
+    target_names: tuple[str, ...] = ("g1", "g2"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if batch_size < 2:
         raise ValueError("batch_size must be at least 2 so g can be shuffled")
-    g1_idx, g2_idx = shear_columns(names)
+    target_names = tuple(target_names)
+    if not target_names:
+        raise ValueError("target_names must not be empty")
+    target_indices = []
+    for name in target_names:
+        if name not in names:
+            raise ValueError(f"target {name!r} is not present in {names!r}")
+        target_indices.append(names.index(name))
     contexts = []
     shears = []
     total = math.ceil(len(indices) / batch_size)
@@ -271,9 +280,9 @@ def extract_contexts(
                 "flow context must have shape "
                 f"({len(batch_indices)}, {NRE_CONTEXT_DIM}); got {tuple(context.shape)}"
             )
-        shear = batch["fid_pars"][:, [g1_idx, g2_idx]]
+        targets = batch["fid_pars"][:, target_indices]
         contexts.append(context.float().cpu())
-        shears.append(shear)
+        shears.append(targets)
         if batch_number == 1 or batch_number == total or batch_number % 20 == 0:
             print(
                 f"{split_name}: encoded batch {batch_number}/{total}",
@@ -306,7 +315,10 @@ def epoch_loss(
                 raise ValueError("optimizer is required when train=True")
             optimizer.zero_grad(set_to_none=True)
         loss = nre_bce_loss(
-            head, context[batch_index], shear[batch_index]
+            head,
+            context[batch_index],
+            shear[batch_index],
+            generator=generator,
         )
         if train:
             loss.backward()
@@ -334,7 +346,17 @@ def load_ratio_head(
         )
     hidden = tuple(meta.get("hidden_dims") or NRE_HIDDEN_DIMS)
     context_dim = int(meta.get("context_dim") or NRE_CONTEXT_DIM)
-    head = RatioHead(context_dim=context_dim, hidden_dims=hidden).to(device)
+    parameter_names = tuple(meta.get("target_names") or ("g1", "g2"))
+    parameter_dim = int(meta.get("parameter_dim") or len(parameter_names))
+    if parameter_dim != len(parameter_names):
+        raise ValueError(
+            f"{path} parameter_dim={parameter_dim} does not match target_names"
+        )
+    head = RatioHead(
+        context_dim=context_dim,
+        hidden_dims=hidden,
+        parameter_dim=parameter_dim,
+    ).to(device)
     head.load_state_dict(payload["head"])
     head.eval()
     return head, meta
@@ -357,9 +379,14 @@ def train_head(
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     seed_everything(seed, deterministic=True)
+    if train_shear.ndim != 2 or valid_shear.ndim != 2:
+        raise ValueError("NRE targets must have shape (N, D)")
+    if train_shear.shape[1] != valid_shear.shape[1]:
+        raise ValueError("train and valid target dimensions must match")
     head = RatioHead(
         context_dim=int(train_context.shape[1]),
         hidden_dims=hidden_dims,
+        parameter_dim=int(train_shear.shape[1]),
     ).to(device)
     optimizer = AdamW(head.parameters(), lr=learning_rate, weight_decay=weight_decay)
     train_gen = torch.Generator(device=device).manual_seed(seed + 11)
@@ -434,9 +461,15 @@ def save_nre_checkpoint(
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    if args.nre_name == args.parent_npe:
+    nre_name = args.nre_name
+    if args.nre_mode == "9d" and nre_name == NRE_NAME:
+        nre_name = NRE9D_NAME
+    target_names = (
+        tuple(config.TARGET_NAMES) if args.nre_mode == "9d" else ("g1", "g2")
+    )
+    if nre_name == args.parent_npe:
         raise ValueError("nre-name must differ from the parent NPE")
-    nre_dir = refuse_parent_overwrite(args.model_root, args.parent_npe, args.nre_name)
+    nre_dir = refuse_parent_overwrite(args.model_root, args.parent_npe, nre_name)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     device = torch.device(args.device)
@@ -477,6 +510,7 @@ def main(argv=None) -> None:
         channels_last=channels_last,
         names=names,
         split_name="train",
+        target_names=target_names,
     )
     valid_context, valid_shear = extract_contexts(
         encoder,
@@ -488,6 +522,7 @@ def main(argv=None) -> None:
         channels_last=channels_last,
         names=names,
         split_name="valid",
+        target_names=target_names,
     )
     del encoder
     if device.type == "cuda":
@@ -509,7 +544,11 @@ def main(argv=None) -> None:
     meta = {
         "parent_npe": args.parent_npe,
         "parent_checkpoint": str(parent_ckpt),
-        "nre_name": args.nre_name,
+        "nre_name": nre_name,
+        "nre_mode": args.nre_mode,
+        "target_names": list(target_names),
+        "parameter_dim": len(target_names),
+        "frozen_parent": args.parent_npe,
         "hidden_dims": list(args.hidden_dims),
         "context_dim": NRE_CONTEXT_DIM,
         "epochs": int(args.epochs),
@@ -525,7 +564,7 @@ def main(argv=None) -> None:
     }
     checkpoint = save_nre_checkpoint(
         nre_dir=nre_dir,
-        nre_name=args.nre_name,
+        nre_name=nre_name,
         head=head,
         meta=meta,
         overwrite=args.overwrite,

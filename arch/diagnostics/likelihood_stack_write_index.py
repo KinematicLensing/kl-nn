@@ -14,6 +14,7 @@ STAGES = (
     ("01_stack", "Shared-parameter stack versus inverse-variance Means"),
     ("02_coverage", "16–84% coverage inside versus outside |g| = 0.05"),
     ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean"),
+    ("03_nre_9d", "Full-9D NRE with bounded emcee and TF-prior replacement"),
     ("04_benchmark", "Fixed-shear five-estimator ensemble benchmark"),
 )
 
@@ -232,9 +233,11 @@ th, td {{ border-bottom: 1px solid #ccc; padding: .35rem .45rem; text-align: lef
 Mean is already pulled toward zero, then compare a shared-parameter
 likelihood stack to an inverse-variance mean of Means. A later page splits
 the cached 16th–84th interval at |g| = 0.05. A third page trains a shear-only
-ratio head on the frozen encoder and stacks it on xu3. This is not a catalog
-shear estimator and does not replace the multiplicative-bias tables. Frozen
-network trained out to shear 0.1; identity samples; no hopping.</p>
+ratio head on the frozen encoder and stacks it on xu3. A separate addendum
+trains a full-9D ratio head and samples its bounded ratio with emcee after
+replacing the uniform vcirc prior with the TF conditional prior. These are not
+catalog shear estimators and do not replace the multiplicative-bias tables.
+Frozen network trained out to shear 0.1; identity samples; no hopping.</p>
 <ul>{''.join(links)}</ul>
 <table><thead><tr>
 <th>Stage</th><th>N</th><th>median |g| or m of g1 or coverage of g1</th>

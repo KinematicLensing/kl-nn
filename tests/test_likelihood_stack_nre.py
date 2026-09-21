@@ -14,6 +14,8 @@ from diagnostics.likelihood_stack_core import (
     NRE_BATCH_SIZE,
     NRE_CONTEXT_DIM,
     NRE_DIR,
+    NRE9D_DIR,
+    NRE9D_NAME,
     NRE_EPOCHS,
     NRE_GRID_N,
     NRE_HIDDEN_DIMS,
@@ -72,10 +74,13 @@ def test_cli_defaults_match_the_nre_plan():
     assert infer.report_dir == NRE_DIR
     assert infer.grid_n == NRE_GRID_N == 21
     assert infer.prefixes == list(NRE_PREFIXES) == [1, 8, 32, 128]
-    assert STAGES[-2][0] == "03_nre"
     assert STAGES[-1][0] == "04_benchmark"
+    assert ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean") in STAGES
+    assert any(stage[0] == "03_nre_9d" for stage in STAGES)
     assert NRE_DIR != STACK_DIR
     assert NRE_DIR != COVERAGE_DIR
+    assert NRE9D_DIR != NRE_DIR
+    assert NRE9D_NAME != NRE_NAME
 
 
 def test_shuffle_permutes_g_not_context_and_rejects_batch_one():

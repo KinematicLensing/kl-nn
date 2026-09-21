@@ -76,6 +76,11 @@ ESTIMATORS = (
     ("nre_map", "NRE 2D grid MAP"),
     ("npe_9d_stack_map", "stacked 9D NPE q/pi MAP"),
 )
+NUISANCE_PREFIXES = (1, 2, 4, 8, 16, 32)
+NUISANCE_BOOTSTRAP_COUNT = 1000
+NUISANCE_BOOTSTRAP_LOWER_PERCENTILE = 16.0
+NUISANCE_BOOTSTRAP_UPPER_PERCENTILE = 84.0
+NUISANCE_BOOTSTRAP_SEED_OFFSET = 1_000_003
 
 
 def parse_args(argv=None):
@@ -546,6 +551,165 @@ def aggregate_results(result: dict[str, np.ndarray]) -> tuple[list[dict], list[d
     return rows, cells, takeaway
 
 
+def paired_nuisance_bootstrap_indices(
+    n_galaxies: int,
+    n_nuisance: int,
+    *,
+    n_bootstrap: int = NUISANCE_BOOTSTRAP_COUNT,
+    seed: int = NUISANCE_BOOTSTRAP_SEED_OFFSET,
+) -> np.ndarray:
+    """Return paired with-replacement nuisance IDs for one nuisance count.
+
+    Each returned row contains ``n_nuisance`` IDs drawn from all available
+    nuisance galaxies.  It is one bootstrap replicate, and callers must apply
+    that same row to every fixed-shear cell.  Seeding each nuisance count
+    independently makes the intervals reproducible without coupling one count
+    to another.
+    """
+
+    n_galaxies = int(n_galaxies)
+    n_nuisance = int(n_nuisance)
+    n_bootstrap = int(n_bootstrap)
+    if n_galaxies <= 0:
+        raise ValueError("n_galaxies must be positive")
+    if not 1 <= n_nuisance <= n_galaxies:
+        raise ValueError("n_nuisance must be between 1 and n_galaxies")
+    if n_bootstrap <= 0:
+        raise ValueError("n_bootstrap must be positive")
+    rng = np.random.default_rng(
+        np.random.SeedSequence([int(seed), n_nuisance])
+    )
+    return rng.integers(
+        0,
+        n_galaxies,
+        size=(n_bootstrap, n_nuisance),
+        dtype=np.int64,
+    )
+
+
+def _nuisance_bootstrap_fits(
+    truth_cells: np.ndarray,
+    galaxy_values: np.ndarray,
+    *,
+    n_nuisance: int,
+    n_bootstrap: int,
+    seed: int,
+) -> tuple[dict[str, float], dict[str, tuple[float, float]]]:
+    """Fit point estimates and paired-bootstrap percentile intervals."""
+
+    values = np.asarray(galaxy_values, dtype=np.float64)
+    if values.ndim != 3 or values.shape[-1] != 2:
+        raise ValueError("galaxy_values must have shape (cells, galaxies, 2)")
+    if values.shape[0] != len(truth_cells):
+        raise ValueError("galaxy_values and truth_cells must share the cell axis")
+    bootstrap_ids = paired_nuisance_bootstrap_indices(
+        values.shape[1],
+        n_nuisance,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+    )
+    point = fit_component_mc(
+        truth_cells,
+        np.mean(values[:, :n_nuisance], axis=1),
+    )
+    # Advanced indexing gives (cell, bootstrap, nuisance, component).  The
+    # bootstrap ID row is therefore shared across all 25 exact shear cells.
+    bootstrap_cell_values = np.mean(values[:, bootstrap_ids, :], axis=2)
+    bootstrap_fits = [
+        fit_component_mc(truth_cells, bootstrap_cell_values[:, index, :])
+        for index in range(n_bootstrap)
+    ]
+    interval = {
+        name: (
+            float(
+                np.percentile(
+                    [fit[name] for fit in bootstrap_fits],
+                    NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
+                )
+            ),
+            float(
+                np.percentile(
+                    [fit[name] for fit in bootstrap_fits],
+                    NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+                )
+            ),
+        )
+        for name in ("g1_m", "g2_m", "combined_m")
+    }
+    return point, interval
+
+
+def aggregate_nuisance_results(
+    result: dict[str, np.ndarray],
+    *,
+    bootstrap_count: int = NUISANCE_BOOTSTRAP_COUNT,
+    bootstrap_seed: int = NUISANCE_BOOTSTRAP_SEED_OFFSET,
+) -> list[dict]:
+    """Fit m/c after fixing R=16 and bootstrapping nuisance galaxies."""
+
+    truth_cells = np.mean(result["truth_g"], axis=1)
+    prefixes = tuple(int(value) for value in result["prefixes"])
+    try:
+        r16_index = prefixes.index(BENCHMARK_N_REALIZATIONS)
+    except ValueError as exc:
+        raise ValueError(
+            f"benchmark result does not contain R={BENCHMARK_N_REALIZATIONS}"
+        ) from exc
+
+    surface = result["surface_map"][..., [0, 1]]
+    estimates = {
+        "npe_mean": np.mean(
+            result["npe_mean"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
+        ),
+        "nre_mean": np.mean(
+            result["nre_mean"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
+        ),
+        "npe_map": np.mean(
+            result["npe_map"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
+        ),
+        "nre_map": np.mean(
+            result["nre_map"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
+        ),
+        "npe_9d_stack_map": surface[:, :, r16_index],
+    }
+    rows = []
+    for estimator, _ in ESTIMATORS:
+        galaxy_values = estimates[estimator]
+        for n_nuisance in NUISANCE_PREFIXES:
+            point, intervals = _nuisance_bootstrap_fits(
+                truth_cells,
+                galaxy_values,
+                n_nuisance=n_nuisance,
+                n_bootstrap=bootstrap_count,
+                seed=int(bootstrap_seed),
+            )
+            rows.append(
+                {
+                    "estimator": estimator,
+                    "n_nuisance": int(n_nuisance),
+                    "noise_realizations": BENCHMARK_N_REALIZATIONS,
+                    "bootstrap_count": int(bootstrap_count),
+                    "bootstrap_seed": int(bootstrap_seed),
+                    "bootstrap_lower_percentile": NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
+                    "bootstrap_upper_percentile": NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+                    **point,
+                    **{
+                        f"{name}_lower": bounds[0]
+                        for name, bounds in intervals.items()
+                    },
+                    **{
+                        f"{name}_upper": bounds[1]
+                        for name, bounds in intervals.items()
+                    },
+                    **rmse(
+                        truth_cells,
+                        np.mean(galaxy_values[:, :n_nuisance], axis=1),
+                    ),
+                }
+            )
+    return rows
+
+
 def benchmark_takeaway(metrics: list[dict]) -> str:
     """State whether increasing R actually removes the ensemble bias."""
 
@@ -581,7 +745,12 @@ def benchmark_takeaway(metrics: list[dict]) -> str:
     )
 
 
-def _plot_outputs(result, rows, report_dir: Path) -> dict[str, str]:
+def _plot_outputs(
+    result,
+    rows,
+    nuisance_rows,
+    report_dir: Path,
+) -> dict[str, str]:
     plt = _setup_matplotlib()
     report_dir.mkdir(parents=True, exist_ok=True)
     figures = {}
@@ -649,6 +818,55 @@ def _plot_outputs(result, rows, report_dir: Path) -> dict[str, str]:
 
     fig, axis = plt.subplots(figsize=(8.5, 4.8))
     for color, (name, label) in zip(colors, ESTIMATORS):
+        subset = [row for row in nuisance_rows if row["estimator"] == name]
+        x_values = np.asarray(
+            [row["n_nuisance"] for row in subset],
+            dtype=np.float64,
+        )
+        point_values = np.asarray(
+            [row["combined_m"] for row in subset],
+            dtype=np.float64,
+        )
+        lower_values = np.asarray(
+            [row["combined_m_lower"] for row in subset],
+            dtype=np.float64,
+        )
+        upper_values = np.asarray(
+            [row["combined_m_upper"] for row in subset],
+            dtype=np.float64,
+        )
+        axis.fill_between(
+            x_values,
+            lower_values,
+            upper_values,
+            color=color,
+            alpha=0.16,
+            linewidth=0,
+        )
+        axis.plot(
+            x_values,
+            point_values,
+            marker="o",
+            color=color,
+            label=label,
+        )
+    axis.axhline(0.0, color="#555", ls="--", lw=0.8)
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(list(NUISANCE_PREFIXES))
+    axis.get_xaxis().set_major_formatter(
+        plt.FuncFormatter(lambda value, _: str(int(value)))
+    )
+    axis.set_xlabel("nuisance galaxies combined (N_nuisance)")
+    axis.set_ylabel("combined multiplicative bias m")
+    axis.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    path = report_dir / "m_vs_nuisance_r16.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    figures["m_vs_nuisance_r16"] = path.name
+
+    fig, axis = plt.subplots(figsize=(8.5, 4.8))
+    for color, (name, label) in zip(colors, ESTIMATORS):
         subset = [row for row in rows if row["estimator"] == name]
         axis.plot(
             [row["prefix"] for row in subset],
@@ -697,6 +915,19 @@ def _write_html(payload: dict, figures: dict[str, str], report_dir: Path) -> Non
             f"<td>{row['g2_mean']:.5f} ± {row['g2_se']:.5f}</td>"
             "</tr>"
         )
+    nuisance_rows_html = []
+    for row in payload["nuisance_metrics"]:
+        nuisance_rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(labels[row['estimator']])}</td>"
+            f"<td>{row['n_nuisance']}</td>"
+            f"<td>{row['g1_m']:.4f}</td><td>{row['g2_m']:.4f}</td>"
+            f"<td>{row['g1_c']:.5f}</td><td>{row['g2_c']:.5f}</td>"
+            f"<td>{row['combined_m']:.4f}"
+            f" [{row['combined_m_lower']:.4f}, {row['combined_m_upper']:.4f}]</td>"
+            f"<td>{row['combined_rmse']:.5f}</td>"
+            "</tr>"
+        )
     body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Fixed-shear estimator benchmark</title>
@@ -739,6 +970,24 @@ bank.</p>
 <figure><img src="{html.escape(figures['m_vs_r'])}" alt="multiplicative bias versus R">
 <figcaption>Direct test of whether the ensemble slope moves toward m=0 as
 the number of independent noises increases.</figcaption></figure>
+<h2>Nuisance/galaxy convergence at R=16</h2>
+<table><thead><tr><th>Estimator</th><th>N_nuisance</th><th>m g1</th><th>m g2</th>
+<th>c g1</th><th>c g2</th><th>combined m [16th, 84th percentile]</th>
+<th>combined RMSE</th></tr></thead>
+<tbody>{"".join(nuisance_rows_html)}</tbody></table>
+<figure><img src="{html.escape(figures['m_vs_nuisance_r16'])}"
+alt="multiplicative bias versus nuisance galaxy count at R=16">
+<figcaption>Noise averaging is held fixed at R=16: each of the four
+per-stamp estimators first averages its 16 noise realizations per nuisance
+galaxy, while the 9D estimator uses each nuisance galaxy's R=16 stacked MAP.
+For each N_nuisance, the point estimate averages the first N nuisance IDs in
+each exact shear cell. The shaded interval is the 16th–84th percentile over
+1,000 deterministic bootstrap replicates; each replicate resamples N IDs with
+replacement from the 32 available nuisance IDs and reuses the same ID vector
+across all 25 shear cells before refitting component-wise and combined m/c.
+The interval therefore represents paired finite-nuisance-sample variation in
+this benchmark.</figcaption>
+</figure>
 <figure><img src="{html.escape(figures['rmse_vs_r'])}" alt="RMSE versus R"></figure>
 
 <h2>Fixed-shear recovery</h2>
@@ -871,10 +1120,30 @@ def write_report(args) -> None:
             meta_json=json.dumps(json_safe(meta)),
         )
     metrics, per_shear, summary = aggregate_results(result)
-    figures = _plot_outputs(result, metrics, report_dir)
+    nuisance_bootstrap_seed = int(meta.get("seed", BENCHMARK_NOISE_SEED)) + (
+        NUISANCE_BOOTSTRAP_SEED_OFFSET
+    )
+    nuisance_metrics = aggregate_nuisance_results(
+        result,
+        bootstrap_count=NUISANCE_BOOTSTRAP_COUNT,
+        bootstrap_seed=nuisance_bootstrap_seed,
+    )
+    figures = _plot_outputs(result, metrics, nuisance_metrics, report_dir)
     payload = {
         **meta,
         "metrics": metrics,
+        "nuisance_prefixes": list(NUISANCE_PREFIXES),
+        "nuisance_realizations": BENCHMARK_N_REALIZATIONS,
+        "nuisance_bootstrap": {
+            "count": NUISANCE_BOOTSTRAP_COUNT,
+            "lower_percentile": NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
+            "upper_percentile": NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+            "seed": nuisance_bootstrap_seed,
+            "paired_across_shear_cells": True,
+            "source_ids": "0 through n_galaxies_per_cell - 1",
+            "fixed_noise_realizations": BENCHMARK_N_REALIZATIONS,
+        },
+        "nuisance_metrics": nuisance_metrics,
         "per_shear": per_shear,
         "figures": figures,
         "takeaway_data": summary,

@@ -6,10 +6,15 @@ from arch.diagnostics.likelihood_stack_benchmark_core import (
     BENCHMARK_SURFACE_SAMPLES,
     benchmark_noise_seeds,
     fit_component_mc,
+    fixed_shear_grid,
     fixed_shear_group_ids,
     prefix_mean,
     prefix_surface_map,
     validate_exact_truth_groups,
+)
+from arch.diagnostics.likelihood_stack_benchmark import (
+    aggregate_nuisance_results,
+    paired_nuisance_bootstrap_indices,
 )
 
 
@@ -109,3 +114,75 @@ def test_noise_streams_are_reproducible_and_separate():
     assert first == benchmark_noise_seeds(42, 3, 7, 11)
     assert first != benchmark_noise_seeds(42, 3, 7, 12)
     assert first != benchmark_noise_seeds(42, 4, 7, 11)
+
+
+def test_nuisance_bootstrap_ids_are_paired_and_reproducible():
+    first = paired_nuisance_bootstrap_indices(
+        8, 3, n_bootstrap=12, seed=1234
+    )
+    second = paired_nuisance_bootstrap_indices(
+        8, 3, n_bootstrap=12, seed=1234
+    )
+    assert first.shape == (12, 3)
+    assert np.array_equal(first, second)
+    assert np.all((first >= 0) & (first < 8))
+
+    # One replicate's ID vector produces a fixed offset in every shear cell,
+    # demonstrating the paired application of the same nuisance IDs.
+    values = np.empty((25, 8, 2), dtype=np.float64)
+    for cell in range(25):
+        values[cell, :, 0] = cell * 100.0 + np.arange(8)
+        values[cell, :, 1] = np.arange(8)
+    sampled = values[:, first[0], :].mean(axis=1)
+    np.testing.assert_allclose(np.diff(sampled[:, 0]), 100.0)
+    np.testing.assert_allclose(sampled[:, 1], sampled[0, 1])
+
+
+def test_nuisance_results_include_deterministic_bootstrap_m_intervals():
+    truth = np.repeat(
+        fixed_shear_grid()[:, np.newaxis, :],
+        32,
+        axis=1,
+    )
+    slopes = np.linspace(-0.15, 0.2, 32, dtype=np.float64)
+    values = truth[:, :, np.newaxis, :] * (1.0 + slopes[None, :, None, None])
+    values = np.repeat(values, 16, axis=2)
+    surface = np.repeat(
+        truth[:, :, np.newaxis, :],
+        len(BENCHMARK_PREFIXES),
+        axis=2,
+    )
+    result = {
+        "truth_g": truth,
+        "npe_mean": values,
+        "nre_mean": values,
+        "npe_map": values,
+        "nre_map": values,
+        "surface_map": surface,
+        "prefixes": np.asarray(BENCHMARK_PREFIXES),
+    }
+
+    rows = aggregate_nuisance_results(
+        result,
+        bootstrap_count=64,
+        bootstrap_seed=9876,
+    )
+    row = next(
+        item
+        for item in rows
+        if item["estimator"] == "npe_mean" and item["n_nuisance"] == 4
+    )
+    assert row["bootstrap_count"] == 64
+    assert row["bootstrap_seed"] == 9876
+    assert row["bootstrap_lower_percentile"] == 16.0
+    assert row["bootstrap_upper_percentile"] == 84.0
+    for name in ("g1_m", "g2_m", "combined_m"):
+        assert row[f"{name}_lower"] <= row[f"{name}_upper"]
+    assert row["combined_m_upper"] > row["combined_m_lower"]
+
+    repeat = aggregate_nuisance_results(
+        result,
+        bootstrap_count=64,
+        bootstrap_seed=9876,
+    )
+    assert rows == repeat

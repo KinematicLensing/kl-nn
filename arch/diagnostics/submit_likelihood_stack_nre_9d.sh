@@ -11,6 +11,10 @@ VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_10k_s
 DATA_DIR="${DATA_DIR:-/ocean/projects/phy250048p/shared/datasets/test_100k_simv3_cosi_xu3_tf}"
 SEED="${SEED:-42}"
 GPU_EXCLUDE="${GPU_EXCLUDE:-v005}"
+N_WALKERS="${N_WALKERS:-20}"
+BURNIN="${BURNIN:-32}"
+PRODUCTION="${PRODUCTION:-64}"
+MAX_GALAXIES="${MAX_GALAXIES:-128}"
 
 if [[ ! -f "${KLNN_REPO_ROOT}/arch/diagnostics/likelihood_stack_nre_9d_train.slurm" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
@@ -23,7 +27,7 @@ fi
 
 mkdir -p "${REPORT_ROOT}/03_nre_9d"
 TRAIN_EXPORT="KLNN_REPO_ROOT=${KLNN_REPO_ROOT},PARENT_NPE=${PARENT_NPE},NRE_NAME=${NRE_NAME},TRAIN_DATA=${TRAIN_DATA},VALID_DATA=${VALID_DATA},SEED=${SEED},OVERWRITE=1"
-INFER_EXPORT="KLNN_REPO_ROOT=${KLNN_REPO_ROOT},PARENT_NPE=${PARENT_NPE},NRE_NAME=${NRE_NAME},DATA_DIR=${DATA_DIR},REPORT_ROOT=${REPORT_ROOT},REPORT_DIR=${REPORT_ROOT}/03_nre_9d,SEED=${SEED},OVERWRITE=1"
+INFER_EXPORT="KLNN_REPO_ROOT=${KLNN_REPO_ROOT},PARENT_NPE=${PARENT_NPE},NRE_NAME=${NRE_NAME},DATA_DIR=${DATA_DIR},REPORT_ROOT=${REPORT_ROOT},REPORT_DIR=${REPORT_ROOT}/03_nre_9d,N_WALKERS=${N_WALKERS},BURNIN=${BURNIN},PRODUCTION=${PRODUCTION},MAX_GALAXIES=${MAX_GALAXIES},SEED=${SEED},OVERWRITE=1"
 
 TRAIN_JOB=$(sbatch --parsable --exclude="${GPU_EXCLUDE}" \
     --export="${TRAIN_EXPORT}" \
@@ -42,6 +46,6 @@ STATUS="${REPORT_ROOT}/STATUS.txt"
     echo "NRE9D_TRAIN_JOB=${TRAIN_JOB}"
     echo "NRE9D_INFER_JOB=${INFER_JOB} afterok:${TRAIN_JOB}"
     echo "03_nre_9d train full normalized 9D NRE head"
-    echo "03_nre_9d infer bounded emcee with TF prior replacement"
+    echo "03_nre_9d infer bounded emcee with TF prior replacement (${MAX_GALAXIES} galaxies, ${N_WALKERS} walkers, burnin=${BURNIN}, production=${PRODUCTION})"
 } >> "${STATUS}"
 echo "Wrote ${STATUS}"

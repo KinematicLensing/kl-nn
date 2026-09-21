@@ -3,7 +3,7 @@
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/likelihood_stack_nre9d_infer_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=24:00:00
+#SBATCH --time=01:00:00
 #SBATCH --nodes=1
 #SBATCH --mail-type=FAIL,END
 #SBATCH --mail-user=easonw2@andrew.cmu.edu

@@ -28,6 +28,8 @@ from diagnostics.likelihood_stack_core import (
     NRE9D_NWALKERS,
     NRE9D_PRODUCTION,
     NRE_INFER_DATASET,
+    SELECT_DIR,
+    STACK_DIR,
     json_safe,
     write_json,
 )
@@ -42,6 +44,10 @@ from diagnostics.likelihood_stack_nre_train import (
 from tf_prior import TFPrior, tf_log_prior_ratio
 from train import seed_everything
 from utils import denormalize
+from diagnostics.likelihood_stack_benchmark_core import fit_component_mc
+
+
+NUISANCE_STACK_PREFIXES = (8, 16, 32, 64, 128)
 
 
 def parse_args(argv=None):
@@ -53,6 +59,19 @@ def parse_args(argv=None):
         "--data-dir", type=Path, default=DATA_ROOT / NRE_INFER_DATASET
     )
     parser.add_argument("--report-dir", type=Path, default=NRE9D_DIR)
+    parser.add_argument(
+        "--galaxies",
+        type=Path,
+        default=SELECT_DIR / "galaxies.npz",
+        help="galaxies.npz selection used by the shared stacking test",
+    )
+    parser.add_argument(
+        "--stack-draws",
+        type=Path,
+        default=STACK_DIR / "stack.npz",
+        help="optional shared-stack draws for NPE control curves",
+    )
+    parser.add_argument("--example-index", type=int, default=None)
     parser.add_argument("--nwalkers", type=int, default=NRE9D_NWALKERS)
     parser.add_argument("--burnin", type=int, default=NRE9D_BURNIN)
     parser.add_argument("--production", type=int, default=NRE9D_PRODUCTION)
@@ -62,6 +81,20 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
+
+
+def load_selection_indices(path: Path, dataset_size: int) -> np.ndarray:
+    data = np.load(path, allow_pickle=False)
+    if "index" not in data.files:
+        raise ValueError(f"{path} does not contain an index array")
+    indices = np.asarray(data["index"], dtype=np.int64)
+    if indices.ndim != 1 or indices.size == 0:
+        raise ValueError(f"{path} index must be a non-empty one-dimensional array")
+    if np.unique(indices).size != indices.size:
+        raise ValueError(f"{path} index contains duplicates")
+    if np.any(indices < 0) or np.any(indices >= int(dataset_size)):
+        raise ValueError(f"{path} index contains out-of-range dataset rows")
+    return indices
 
 
 def _as_parameter_matrix(theta_norm, parameter_dim: int) -> tuple[np.ndarray, bool]:
@@ -258,7 +291,187 @@ def summarize_shear_samples(
     return summary
 
 
-def _write_html(payload: dict, report_dir: Path) -> None:
+def _setup_matplotlib():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _load_control_estimates(
+    selection_path: Path,
+    stack_path: Path,
+    indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    controls: dict[str, np.ndarray] = {}
+    selection = np.load(selection_path, allow_pickle=False)
+    selected_indices = np.asarray(selection["index"], dtype=np.int64)
+    if np.array_equal(selected_indices, indices) and "mean_g" in selection.files:
+        controls["NPE posterior mean"] = np.asarray(selection["mean_g"], dtype=np.float64)
+    if stack_path.is_file():
+        stack = np.load(stack_path, allow_pickle=False)
+        stack_indices = np.asarray(stack["index"], dtype=np.int64)
+        if np.array_equal(stack_indices, indices) and "stack_map" in stack.files:
+            controls["NPE shared 16-noise MAP"] = np.asarray(
+                stack["stack_map"][:, -1], dtype=np.float64
+            )
+    return controls
+
+
+def _nuisance_stack_rows(
+    truth: np.ndarray,
+    estimates: dict[str, np.ndarray],
+    *,
+    n_bootstrap: int = 1000,
+) -> list[dict]:
+    rng = np.random.default_rng(420042)
+    rows = []
+    for count in NUISANCE_STACK_PREFIXES:
+        if count > len(truth):
+            continue
+        bootstrap_indices = rng.integers(
+            0,
+            count,
+            size=(n_bootstrap, count),
+            dtype=np.int64,
+        )
+        for name, values in estimates.items():
+            metrics = fit_component_mc(truth[:count], values[:count])
+            bootstrap_m = np.asarray(
+                [
+                    fit_component_mc(truth[:count][draw], values[:count][draw])[
+                        "combined_m"
+                    ]
+                    for draw in bootstrap_indices
+                ],
+                dtype=np.float64,
+            )
+            rows.append(
+                {
+                    "estimator": name,
+                    "nuisance_count": int(count),
+                    "combined_m_lower": float(np.quantile(bootstrap_m, 0.16)),
+                    "combined_m_upper": float(np.quantile(bootstrap_m, 0.84)),
+                    **metrics,
+                }
+            )
+    return rows
+
+
+def save_report_figures(
+    payload: dict,
+    report_dir: Path,
+    *,
+    example_chain: np.ndarray,
+    example_index: int,
+    example_log_prob: np.ndarray,
+) -> dict[str, str]:
+    plt = _setup_matplotlib()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    figures: dict[str, str] = {}
+
+    physical = np.asarray(
+        denormalize(
+            example_chain,
+            config.par_ranges,
+            feature_names=tuple(payload["parameter_names"]),
+            target_transforms=config.TARGET_TRANSFORMS,
+        ),
+        dtype=np.float64,
+    )
+    names = tuple(payload["parameter_names"])
+    g1_index, g2_index = names.index("g1"), names.index("g2")
+    finite = np.isfinite(example_log_prob)
+    map_index = int(np.nanargmax(np.where(finite, example_log_prob, -np.inf)))
+    summary = next(
+        row for row in payload["summaries"] if int(row["index"]) == int(example_index)
+    )
+    fig, axis = plt.subplots(figsize=(6.3, 5.2))
+    axis.hist2d(
+        physical[:, g1_index],
+        physical[:, g2_index],
+        bins=40,
+        cmap="Blues",
+    )
+    axis.scatter(
+        [summary["truth_g1"]],
+        [summary["truth_g2"]],
+        marker="*",
+        s=120,
+        color="#c0392b",
+        label="truth",
+        zorder=3,
+    )
+    axis.scatter(
+        [physical[map_index, g1_index]],
+        [physical[map_index, g2_index]],
+        marker="x",
+        s=70,
+        color="#1f4e79",
+        label="MAP-like retained sample",
+        zorder=3,
+    )
+    axis.set_xlabel("g1")
+    axis.set_ylabel("g2")
+    axis.set_title(f"9D NRE + TF posterior, dataset index {example_index}")
+    axis.legend(frameon=False)
+    fig.tight_layout()
+    path = report_dir / "example_posterior_g1_g2.png"
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    figures["example_posterior"] = path.name
+
+    fig, axis = plt.subplots(figsize=(8.5, 4.8))
+    colors = (
+        "#1f4e79",
+        "#8f3b76",
+        "#a05a2c",
+        "#2e7d32",
+    )
+    for color, (name, rows) in zip(
+        colors,
+        (
+            (name, [row for row in payload["nuisance_stack_table"] if row["estimator"] == name])
+            for name in payload["nuisance_estimators"]
+        ),
+    ):
+        if not rows:
+            continue
+        rows = sorted(rows, key=lambda row: row["nuisance_count"])
+        x = np.asarray([row["nuisance_count"] for row in rows], dtype=float)
+        y = np.asarray([row["combined_m"] for row in rows], dtype=float)
+        lower = np.asarray([row["combined_m_lower"] for row in rows], dtype=float)
+        upper = np.asarray([row["combined_m_upper"] for row in rows], dtype=float)
+        axis.errorbar(
+            x,
+            y,
+            yerr=np.vstack((y - lower, upper - y)),
+            marker="o",
+            capsize=3,
+            label=name,
+            color=color,
+        )
+    axis.axhline(0.0, color="#555", ls="--", lw=0.8)
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(list(NUISANCE_STACK_PREFIXES))
+    axis.get_xaxis().set_major_formatter(
+        plt.FuncFormatter(lambda value, _: str(int(value)))
+    )
+    axis.set_xlabel("number of selected galaxies in cumulative ensemble")
+    axis.set_ylabel("combined multiplicative bias m")
+    axis.set_title("9D NRE ensemble slope versus selected-galaxy count")
+    axis.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    path = report_dir / "m_vs_nuisance_stacks.png"
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    figures["m_vs_nuisance"] = path.name
+    return figures
+
+
+def _write_html(payload: dict, report_dir: Path, figures: dict[str, str]) -> None:
     rows = []
     for row in payload["summaries"]:
         diagnostics = row["diagnostics"]
@@ -290,6 +503,22 @@ denormalization. The MAP-like columns are the highest-density retained sample,
 not an optimization result.</p>
 <p class="note">Warning: the 9D NRE ratio is not the original NPE posterior.
 This report preserves the existing 2D grid report and its artifacts.</p>
+<figure>
+<img src="{html.escape(figures['example_posterior'])}" alt="Example 9D NRE posterior in g1 and g2">
+<figcaption>Example marginal posterior from the longer emcee run. The
+histogram is the g1/g2 projection of the full 9D chain; the red star is the
+simulator truth and the blue cross is the highest-density retained sample.</figcaption>
+</figure>
+<figure>
+<img src="{html.escape(figures['m_vs_nuisance'])}" alt="m versus selected galaxy count">
+<figcaption>At each cumulative count, the slope is fit over the selected
+galaxies used by the shared stacking test. This is a heterogeneous-galaxy
+ensemble diagnostic, not the fixed-shear nuisance bootstrap from report 04.
+The error bars are the 16th–84th percentiles of 1,000 deterministic
+bootstrap resamples of the cumulative selected-galaxy set. The controls are
+the cached NPE posterior mean and the original shared 16-noise NPE stack MAP
+when available.</figcaption>
+</figure>
 <table><thead><tr>
 <th>Index</th><th>g1 mean</th><th>g1 16–84%</th>
 <th>g2 mean</th><th>g2 16–84%</th><th>MAP-like (g1,g2)</th>
@@ -332,12 +561,19 @@ def write_report(args) -> None:
         raise ValueError("9D checkpoint parameter_dim is not nine")
 
     dataset = pxt.TorchDataset(str(args.data_dir))
-    count = len(dataset)
+    dataset_size = len(dataset)
+    indices = load_selection_indices(args.galaxies, dataset_size)
     if args.max_galaxies is not None:
         if args.max_galaxies <= 0:
             raise ValueError("max-galaxies must be positive")
-        count = min(count, args.max_galaxies)
-    indices = np.arange(count, dtype=np.int64)
+        indices = indices[: args.max_galaxies]
+    count = len(indices)
+    if args.example_index is None:
+        example_index = int(indices[0])
+    else:
+        example_index = int(args.example_index)
+        if example_index not in set(int(index) for index in indices):
+            raise ValueError("--example-index must be in the selected galaxy list")
     channels_last = bool(model_config.train.channels_last)
     prior = TFPrior()
     summaries = []
@@ -354,6 +590,8 @@ def write_report(args) -> None:
         "g2_map_like": [],
     }
     diagnostics_rows = []
+    example_chain = None
+    example_log_prob = None
     for start in range(0, count, args.batch_size):
         batch_indices = indices[start : start + args.batch_size]
         batch = load_observation_batch(dataset, batch_indices, device)
@@ -422,6 +660,9 @@ def write_report(args) -> None:
             summary["diagnostics"] = chain["diagnostics"]
             summaries.append(summary)
             diagnostics_rows.append(chain["diagnostics"])
+            if int(index) == example_index:
+                example_chain = np.asarray(chain["chain"], dtype=np.float64)
+                example_log_prob = np.asarray(chain["log_prob"], dtype=np.float64)
             summary_arrays["index"].append(int(index))
             summary_arrays["truth_g"].append(
                 [summary["truth_g1"], summary["truth_g2"]]
@@ -432,9 +673,31 @@ def write_report(args) -> None:
                 summary_arrays[key].append(summary[key])
         print(f"inferred galaxies {min(start + args.batch_size, count)}/{count}", flush=True)
 
+    if example_chain is None or example_log_prob is None:
+        raise RuntimeError("the requested example galaxy was not inferred")
+    nre_mean = np.column_stack(
+        (summary_arrays["g1_mean"], summary_arrays["g2_mean"])
+    )
+    nre_map = np.column_stack(
+        (summary_arrays["g1_map_like"], summary_arrays["g2_map_like"])
+    )
+    truth_g = np.asarray(summary_arrays["truth_g"], dtype=np.float64)
+    estimates = {
+        "9D NRE posterior mean": nre_mean,
+        "9D NRE MAP-like": nre_map,
+    }
+    if args.galaxies.is_file():
+        estimates.update(
+            _load_control_estimates(args.galaxies, args.stack_draws, indices)
+        )
+    nuisance_rows = _nuisance_stack_rows(truth_g, estimates)
+
     args.report_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         args.report_dir / "summaries.npz",
+        example_chain=example_chain,
+        example_log_prob=example_log_prob,
+        example_index=np.asarray(example_index, dtype=np.int64),
         **{key: np.asarray(value) for key, value in summary_arrays.items()},
     )
     payload = {
@@ -444,7 +707,11 @@ def write_report(args) -> None:
         "nre_checkpoint": str(checkpoint),
         "nre_meta": nre_meta,
         "data_dir": str(args.data_dir),
-        "dataset_size": int(count),
+        "dataset_size": int(dataset_size),
+        "n_galaxies": int(count),
+        "selection_file": str(args.galaxies),
+        "stack_draws": str(args.stack_draws),
+        "example_index": int(example_index),
         "parameter_names": list(names),
         "parameter_dim": len(names),
         "normalized_support": [[-1.0, 1.0] for _ in names],
@@ -459,6 +726,8 @@ def write_report(args) -> None:
         "nwalkers": int(args.nwalkers),
         "seed": int(args.seed),
         "summaries": summaries,
+        "nuisance_estimators": list(estimates),
+        "nuisance_stack_table": nuisance_rows,
         "warning": "The 9D NRE ratio is not the original NPE posterior.",
     }
     if diagnostics_rows:
@@ -470,7 +739,15 @@ def write_report(args) -> None:
                 np.mean([row["converged"] for row in diagnostics_rows])
             ),
         }
-    _write_html(payload, args.report_dir)
+    figures = save_report_figures(
+        payload,
+        args.report_dir,
+        example_chain=example_chain,
+        example_index=example_index,
+        example_log_prob=example_log_prob,
+    )
+    payload["figures"] = figures
+    _write_html(payload, args.report_dir, figures)
     write_json(args.report_dir / "report.json", payload)
     print(f"Wrote {args.report_dir / 'report.json'}", flush=True)
 

@@ -50,7 +50,7 @@ from diagnostics.likelihood_stack_benchmark_core import fit_component_mc
 
 
 NUISANCE_STACK_PREFIXES = (8, 16, 32, 64, 128)
-DEFAULT_RUN_NAME = "emcee_w48_b2500_p6000_s42"
+DEFAULT_RUN_NAME = "emcee_factorized_w48_b2500_p6000_s42"
 
 
 def parse_args(argv=None):

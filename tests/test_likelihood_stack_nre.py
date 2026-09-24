@@ -28,10 +28,13 @@ from diagnostics.likelihood_stack_core import (
     STACK_DIR,
 )
 from diagnostics.likelihood_stack_nre_core import (
+    FactorizedRatioHead,
     QUANTILES,
     RatioHead,
     discrete_posterior,
     freeze_encoder,
+    factorized_bce_losses,
+    factorized_pair_logits_and_labels,
     grid_map,
     grid_marginal_intervals,
     grid_posterior_moments,
@@ -157,6 +160,45 @@ def test_ratio_head_accepts_frozen_context_and_two_shear_components():
     assert logits.shape == (4,)
     with pytest.raises(ValueError, match="context"):
         head(torch.zeros(4, 8), shear)
+
+
+def test_factorized_head_composes_shear_and_nuisance_factors():
+    head = FactorizedRatioHead(context_dim=12, hidden_dims=(16, 8))
+    context = torch.randn(6, 12)
+    parameters = torch.randn(6, 9)
+    shear = parameters[:, :2]
+    nuisance = parameters[:, 2:]
+    joint = head(context, parameters)
+    composed = head.forward_shear(context, shear) + head.forward_nuisance(
+        context, shear, nuisance
+    )
+    assert joint.shape == (6,)
+    assert torch.allclose(joint, composed)
+
+
+def test_factorized_pairs_keep_shear_and_nuisance_negative_tasks_separate():
+    head = FactorizedRatioHead(context_dim=8, hidden_dims=(12, 6))
+    context = torch.randn(10, 8)
+    parameters = torch.randn(10, 9)
+    pairs = factorized_pair_logits_and_labels(
+        head,
+        context,
+        parameters,
+        generator=torch.Generator().manual_seed(7),
+    )
+    assert set(pairs) == {"shear", "nuisance"}
+    for logits, labels in pairs.values():
+        assert logits.shape == labels.shape == (20,)
+        assert labels[:10].eq(1.0).all()
+        assert labels[10:].eq(0.0).all()
+    losses = factorized_bce_losses(
+        head,
+        context,
+        parameters,
+        generator=torch.Generator().manual_seed(7),
+    )
+    assert set(losses) == {"shear", "nuisance", "total"}
+    assert torch.isfinite(losses["total"])
 
 
 def test_freeze_encoder_drops_gradients():

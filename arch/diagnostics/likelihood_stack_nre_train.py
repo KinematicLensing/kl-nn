@@ -38,7 +38,9 @@ from diagnostics.likelihood_stack_core import (
     write_json,
 )
 from diagnostics.likelihood_stack_nre_core import (
+    FactorizedRatioHead,
     RatioHead,
+    factorized_bce_losses,
     freeze_encoder,
     nre_bce_loss,
 )
@@ -70,6 +72,12 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=NRE_BATCH_SIZE)
     parser.add_argument("--learning-rate", type=float, default=NRE_LR)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--nuisance-weight",
+        type=float,
+        default=1.0,
+        help="relative BCE weight for the conditional nuisance factor in 9D mode",
+    )
     parser.add_argument(
         "--hidden-dims", type=int, nargs="+", default=list(NRE_HIDDEN_DIMS)
     )
@@ -352,11 +360,21 @@ def load_ratio_head(
         raise ValueError(
             f"{path} parameter_dim={parameter_dim} does not match target_names"
         )
-    head = RatioHead(
-        context_dim=context_dim,
-        hidden_dims=hidden,
-        parameter_dim=parameter_dim,
-    ).to(device)
+    if meta.get("head_type") == "factorized9d":
+        if parameter_dim != 9 or tuple(parameter_names[:2]) != ("g1", "g2"):
+            raise ValueError("factorized9d checkpoints must use the nine-target schema")
+        head = FactorizedRatioHead(
+            context_dim=context_dim,
+            hidden_dims=hidden,
+            shear_dim=2,
+            nuisance_dim=7,
+        ).to(device)
+    else:
+        head = RatioHead(
+            context_dim=context_dim,
+            hidden_dims=hidden,
+            parameter_dim=parameter_dim,
+        ).to(device)
     head.load_state_dict(payload["head"])
     head.eval()
     return head, meta
@@ -440,6 +458,145 @@ def train_head(
     }
 
 
+def factorized_epoch_loss(
+    head: FactorizedRatioHead,
+    context: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    batch_size: int,
+    generator: torch.Generator,
+    train: bool,
+    optimizer: AdamW | None = None,
+    nuisance_weight: float = 1.0,
+) -> dict[str, float]:
+    n = int(context.shape[0])
+    order = torch.randperm(n, device=context.device, generator=generator)
+    summed = {"shear": 0.0, "nuisance": 0.0, "total": 0.0}
+    counted = 0
+    head.train(train)
+    for start in range(0, n, batch_size):
+        batch_index = order[start : start + batch_size]
+        if int(batch_index.numel()) < 2:
+            continue
+        if train:
+            if optimizer is None:
+                raise ValueError("optimizer is required when train=True")
+            optimizer.zero_grad(set_to_none=True)
+        losses = factorized_bce_losses(
+            head,
+            context[batch_index],
+            parameters[batch_index],
+            generator=generator,
+            nuisance_weight=nuisance_weight,
+        )
+        if train:
+            losses["total"].backward()
+            optimizer.step()
+        size = int(batch_index.numel())
+        for name in summed:
+            summed[name] += float(losses[name].detach().item()) * size
+        counted += size
+    if counted == 0:
+        raise RuntimeError("no factorized NRE batches with size >= 2")
+    return {name: value / counted for name, value in summed.items()}
+
+
+def train_factorized_head(
+    train_context: torch.Tensor,
+    train_parameters: torch.Tensor,
+    valid_context: torch.Tensor,
+    valid_parameters: torch.Tensor,
+    *,
+    hidden_dims: tuple[int, ...],
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    weight_decay: float,
+    device: torch.device,
+    seed: int,
+    nuisance_weight: float,
+) -> tuple[FactorizedRatioHead, dict]:
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if train_parameters.ndim != 2 or train_parameters.shape[1] != 9:
+        raise ValueError("factorized NRE targets must have shape (N, 9)")
+    if valid_parameters.shape[1] != train_parameters.shape[1]:
+        raise ValueError("train and valid target dimensions must match")
+    seed_everything(seed, deterministic=True)
+    head = FactorizedRatioHead(
+        context_dim=int(train_context.shape[1]),
+        hidden_dims=hidden_dims,
+        shear_dim=2,
+        nuisance_dim=7,
+    ).to(device)
+    optimizer = AdamW(head.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    train_gen = torch.Generator(device=device).manual_seed(seed + 11)
+    valid_gen = torch.Generator(device=device).manual_seed(seed + 29)
+    history = []
+    best_state = None
+    best_valid = float("inf")
+    best_epoch = -1
+    report_every = max(1, epochs // 10)
+    for epoch in range(1, epochs + 1):
+        train_loss = factorized_epoch_loss(
+            head,
+            train_context,
+            train_parameters,
+            batch_size=batch_size,
+            generator=train_gen,
+            train=True,
+            optimizer=optimizer,
+            nuisance_weight=nuisance_weight,
+        )
+        with torch.inference_mode():
+            valid_loss = factorized_epoch_loss(
+                head,
+                valid_context,
+                valid_parameters,
+                batch_size=batch_size,
+                generator=valid_gen,
+                train=False,
+                nuisance_weight=nuisance_weight,
+            )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_shear_bce": train_loss["shear"],
+                "train_nuisance_bce": train_loss["nuisance"],
+                "train_total": train_loss["total"],
+                "valid_shear_bce": valid_loss["shear"],
+                "valid_nuisance_bce": valid_loss["nuisance"],
+                "valid_total": valid_loss["total"],
+            }
+        )
+        if valid_loss["total"] < best_valid:
+            best_valid = valid_loss["total"]
+            best_epoch = epoch
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in head.state_dict().items()
+            }
+        if epoch == 1 or epoch == epochs or epoch % report_every == 0:
+            print(
+                f"factorized NRE epoch {epoch:4d}/{epochs}: "
+                f"train_shear={train_loss['shear']:.6f} "
+                f"valid_shear={valid_loss['shear']:.6f} "
+                f"valid_total={valid_loss['total']:.6f} "
+                f"best={best_valid:.6f}@{best_epoch}",
+                flush=True,
+            )
+    if best_state is None:
+        raise RuntimeError("factorized NRE training produced no finite validation loss")
+    head.load_state_dict(best_state)
+    head.eval()
+    return head, {
+        "best_epoch": best_epoch,
+        "best_valid_total": best_valid,
+        "history": history,
+        "nuisance_weight": float(nuisance_weight),
+    }
+
+
 def save_nre_checkpoint(
     *,
     nre_dir: Path,
@@ -467,6 +624,8 @@ def main(argv=None) -> None:
     target_names = (
         tuple(config.TARGET_NAMES) if args.nre_mode == "9d" else ("g1", "g2")
     )
+    if args.nuisance_weight <= 0.0:
+        raise ValueError("nuisance-weight must be positive")
     if nre_name == args.parent_npe:
         raise ValueError("nre-name must differ from the parent NPE")
     nre_dir = refuse_parent_overwrite(args.model_root, args.parent_npe, nre_name)
@@ -528,24 +687,41 @@ def main(argv=None) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    head, fit = train_head(
-        train_context.to(device),
-        train_shear.to(device),
-        valid_context.to(device),
-        valid_shear.to(device),
-        hidden_dims=tuple(args.hidden_dims),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        device=device,
-        seed=args.seed,
-    )
+    if args.nre_mode == "9d":
+        head, fit = train_factorized_head(
+            train_context.to(device),
+            train_shear.to(device),
+            valid_context.to(device),
+            valid_shear.to(device),
+            hidden_dims=tuple(args.hidden_dims),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            device=device,
+            seed=args.seed,
+            nuisance_weight=args.nuisance_weight,
+        )
+    else:
+        head, fit = train_head(
+            train_context.to(device),
+            train_shear.to(device),
+            valid_context.to(device),
+            valid_shear.to(device),
+            hidden_dims=tuple(args.hidden_dims),
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            device=device,
+            seed=args.seed,
+        )
     meta = {
         "parent_npe": args.parent_npe,
         "parent_checkpoint": str(parent_ckpt),
         "nre_name": nre_name,
         "nre_mode": args.nre_mode,
+        "head_type": "factorized9d" if args.nre_mode == "9d" else "ratio",
         "target_names": list(target_names),
         "parameter_dim": len(target_names),
         "frozen_parent": args.parent_npe,

@@ -34,7 +34,14 @@ set -u
 
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 PARENT_NPE="${PARENT_NPE:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_valid100k_frozen_s42_fibrepair}"
-NRE_NAME="${NRE_NAME:-CNN-CNN-Meta-nre2d-simv3-cosi-r90_valid100k_frozen_s42_fibrepair}"
+NRE_MODE="${NRE_MODE:-2d}"
+if [[ -z "${NRE_NAME:-}" ]]; then
+    if [[ "${NRE_MODE}" == "9d" ]]; then
+        NRE_NAME="CNN-CNN-Meta-nre9d-factorized-simv3-cosi-r90_valid100k_frozen_s42_fibrepair"
+    else
+        NRE_NAME="CNN-CNN-Meta-nre2d-simv3-cosi-r90_valid100k_frozen_s42_fibrepair"
+    fi
+fi
 TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi}"
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/small_10k_simv3_cosi}"
 REPORT_ROOT="${REPORT_ROOT:-/ocean/projects/phy250048p/shared/reports/likelihood-stack}"
@@ -43,6 +50,7 @@ OVERWRITE="${OVERWRITE:-1}"
 EPOCHS="${EPOCHS:-80}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 LR="${LR:-1e-3}"
+NUISANCE_WEIGHT="${NUISANCE_WEIGHT:-1.0}"
 SEED="${SEED:-42}"
 STATUS="${REPORT_ROOT}/STATUS.txt"
 
@@ -59,7 +67,7 @@ mkdir -p "${MODEL_ROOT}/${NRE_NAME}" "${REPORT_ROOT}/03_nre" "$(dirname "${STATU
 {
     echo
     echo "NRE_TRAIN_JOB=${SLURM_JOB_ID:-unknown}  started $(date -R)"
-    echo "03_nre train  frozen-encoder 2D NRE head on valid_100k; new nre2d dir only"
+    echo "03_nre train  frozen-encoder ${NRE_MODE} NRE head on valid_100k"
 } >> "${STATUS}"
 
 export PYTHONHASHSEED="${SEED}"
@@ -68,6 +76,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 echo "parent=${PARENT_NPE}"
 echo "nre_name=${NRE_NAME}"
+echo "nre_mode=${NRE_MODE}"
 echo "train_data=${TRAIN_DATA}"
 echo "valid_data=${VALID_DATA}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} lr=${LR} seed=${SEED}"
@@ -75,6 +84,7 @@ echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} lr=${LR} seed=${SEED}"
 ARGS=(
     --parent-npe "${PARENT_NPE}"
     --nre-name "${NRE_NAME}"
+    --nre-mode "${NRE_MODE}"
     --model-root "${MODEL_ROOT}"
     --train-data "${TRAIN_DATA}"
     --valid-data "${VALID_DATA}"
@@ -82,6 +92,7 @@ ARGS=(
     --epochs "${EPOCHS}"
     --batch-size "${BATCH_SIZE}"
     --learning-rate "${LR}"
+    --nuisance-weight "${NUISANCE_WEIGHT}"
     --seed "${SEED}"
 )
 if [[ "${OVERWRITE}" == "1" ]]; then

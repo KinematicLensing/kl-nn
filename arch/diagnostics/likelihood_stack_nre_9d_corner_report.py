@@ -33,7 +33,7 @@ from model_registry import load_model_config
 from utils import denormalize
 
 
-DEFAULT_RUN_NAME = "emcee_w48_b2500_p6000_s42"
+DEFAULT_RUN_NAME = "emcee_factorized_w48_b2500_p6000_s42"
 NUISANCE_PREFIXES = (8, 16, 32, 64, 128)
 FIGURE_DPI = 140
 

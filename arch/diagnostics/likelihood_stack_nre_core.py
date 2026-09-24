@@ -89,6 +89,121 @@ class RatioHead(nn.Module):
         return logit.squeeze(-1)
 
 
+class FactorizedRatioHead(nn.Module):
+    """Joint 9D ratio represented as shear and conditional-nuisance factors."""
+
+    def __init__(
+        self,
+        context_dim: int = NRE_CONTEXT_DIM,
+        hidden_dims: tuple[int, ...] = NRE_HIDDEN_DIMS,
+        shear_dim: int = 2,
+        nuisance_dim: int = 7,
+    ):
+        super().__init__()
+        context_dim = int(context_dim)
+        hidden_dims = tuple(int(width) for width in hidden_dims)
+        shear_dim = int(shear_dim)
+        nuisance_dim = int(nuisance_dim)
+        if context_dim <= 0 or shear_dim <= 0 or nuisance_dim <= 0:
+            raise ValueError("all factorized dimensions must be positive")
+        if not hidden_dims or any(width <= 0 for width in hidden_dims):
+            raise ValueError("hidden_dims must contain positive widths")
+        self.context_dim = context_dim
+        self.hidden_dims = hidden_dims
+        self.shear_dim = shear_dim
+        self.nuisance_dim = nuisance_dim
+        self.parameter_dim = shear_dim + nuisance_dim
+
+        shared_width = hidden_dims[0]
+        self.context_projection = nn.Sequential(
+            nn.Linear(context_dim, shared_width),
+            nn.ReLU(),
+        )
+        self.shear_head = self._make_head(shared_width + shear_dim, hidden_dims)
+        self.nuisance_head = self._make_head(
+            shared_width + shear_dim + nuisance_dim,
+            hidden_dims,
+        )
+
+    @staticmethod
+    def _make_head(input_dim: int, hidden_dims: tuple[int, ...]) -> nn.Sequential:
+        layers: list[nn.Module] = []
+        width_in = int(input_dim)
+        for width_out in hidden_dims:
+            layers.extend((nn.Linear(width_in, width_out), nn.ReLU()))
+            width_in = width_out
+        layers.append(nn.Linear(width_in, 1))
+        return nn.Sequential(*layers)
+
+    def _project_context(self, context: torch.Tensor) -> torch.Tensor:
+        if context.ndim != 2 or context.shape[-1] != self.context_dim:
+            raise ValueError(
+                f"context must have shape (B, {self.context_dim}); "
+                f"got {tuple(context.shape)}"
+            )
+        return self.context_projection(context)
+
+    def _split_parameters(
+        self, parameters: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if parameters.ndim != 2 or parameters.shape[-1] != self.parameter_dim:
+            raise ValueError(
+                f"parameters must have shape (B, {self.parameter_dim}); "
+                f"got {tuple(parameters.shape)}"
+            )
+        return (
+            parameters[:, : self.shear_dim],
+            parameters[:, self.shear_dim :],
+        )
+
+    def forward_shear(
+        self, context: torch.Tensor, shear: torch.Tensor
+    ) -> torch.Tensor:
+        if shear.ndim != 2 or shear.shape[-1] != self.shear_dim:
+            raise ValueError(
+                f"shear must have shape (B, {self.shear_dim}); "
+                f"got {tuple(shear.shape)}"
+            )
+        projected = self._project_context(context)
+        if projected.shape[0] != shear.shape[0]:
+            raise ValueError("context and shear batch sizes must match")
+        return self.shear_head(torch.cat((projected, shear), dim=-1)).squeeze(-1)
+
+    def forward_nuisance(
+        self,
+        context: torch.Tensor,
+        shear: torch.Tensor,
+        nuisance: torch.Tensor,
+    ) -> torch.Tensor:
+        if shear.ndim != 2 or shear.shape[-1] != self.shear_dim:
+            raise ValueError(
+                f"shear must have shape (B, {self.shear_dim}); "
+                f"got {tuple(shear.shape)}"
+            )
+        if nuisance.ndim != 2 or nuisance.shape[-1] != self.nuisance_dim:
+            raise ValueError(
+                f"nuisance must have shape (B, {self.nuisance_dim}); "
+                f"got {tuple(nuisance.shape)}"
+            )
+        projected = self._project_context(context)
+        if projected.shape[0] != shear.shape[0] or shear.shape[0] != nuisance.shape[0]:
+            raise ValueError("factorized inputs must have matching batch sizes")
+        return self.nuisance_head(
+            torch.cat((projected, shear, nuisance), dim=-1)
+        ).squeeze(-1)
+
+    def forward_joint(
+        self, context: torch.Tensor, parameters: torch.Tensor
+    ) -> torch.Tensor:
+        shear, nuisance = self._split_parameters(parameters)
+        return self.forward_shear(context, shear) + self.forward_nuisance(
+            context, shear, nuisance
+        )
+
+    def forward(self, context: torch.Tensor, parameters: torch.Tensor) -> torch.Tensor:
+        return self.forward_joint(context, parameters)
+
+
 def freeze_encoder(encoder: nn.Module) -> nn.Module:
     encoder.eval()
     for parameter in encoder.parameters():
@@ -156,6 +271,74 @@ def nre_bce_loss(
         head, context, shear, generator=generator
     )
     return F.binary_cross_entropy_with_logits(logits, labels)
+
+
+def factorized_pair_logits_and_labels(
+    head: FactorizedRatioHead,
+    context: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Build separate shear and conditional-nuisance classification pairs."""
+
+    shear, nuisance = head._split_parameters(parameters)
+    shuffled_shear = shuffle_parameters(shear, generator=generator)
+    shuffled_nuisance = shuffle_parameters(nuisance, generator=generator)
+    shear_joint = head.forward_shear(context, shear)
+    shear_marginal = head.forward_shear(context, shuffled_shear)
+    nuisance_joint = head.forward_nuisance(context, shear, nuisance)
+    nuisance_marginal = head.forward_nuisance(
+        context, shear, shuffled_nuisance
+    )
+    return {
+        "shear": (
+            torch.cat((shear_joint, shear_marginal), dim=0),
+            torch.cat(
+                (torch.ones_like(shear_joint), torch.zeros_like(shear_marginal)),
+                dim=0,
+            ),
+        ),
+        "nuisance": (
+            torch.cat((nuisance_joint, nuisance_marginal), dim=0),
+            torch.cat(
+                (
+                    torch.ones_like(nuisance_joint),
+                    torch.zeros_like(nuisance_marginal),
+                ),
+                dim=0,
+            ),
+        ),
+    }
+
+
+def factorized_bce_losses(
+    head: FactorizedRatioHead,
+    context: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+    nuisance_weight: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Return shear, nuisance, and composed losses for the factorized head."""
+
+    pairs = factorized_pair_logits_and_labels(
+        head,
+        context,
+        parameters,
+        generator=generator,
+    )
+    shear_logits, shear_labels = pairs["shear"]
+    nuisance_logits, nuisance_labels = pairs["nuisance"]
+    shear_loss = F.binary_cross_entropy_with_logits(shear_logits, shear_labels)
+    nuisance_loss = F.binary_cross_entropy_with_logits(
+        nuisance_logits, nuisance_labels
+    )
+    return {
+        "shear": shear_loss,
+        "nuisance": nuisance_loss,
+        "total": shear_loss + float(nuisance_weight) * nuisance_loss,
+    }
 
 
 def normalized_shear_grid(n: int = NRE_GRID_N) -> tuple[np.ndarray, np.ndarray]:

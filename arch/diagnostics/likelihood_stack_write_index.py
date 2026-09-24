@@ -15,13 +15,19 @@ STAGES = (
     ("02_coverage", "16–84% coverage inside versus outside |g| = 0.05"),
     ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean"),
     ("03_nre_9d", "Full-9D NRE with bounded emcee and TF-prior replacement"),
-    ("04_benchmark", "Fixed-shear five-estimator ensemble benchmark"),
+    ("04_benchmark", "Fixed-shear seven-estimator ensemble benchmark"),
 )
 
 
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--report-root", type=Path, default=REPORT_ROOT)
+    parser.add_argument(
+        "--nre9d-report",
+        type=Path,
+        default=None,
+        help="optional run-specific 9D NRE corner-report directory",
+    )
     return parser.parse_args(argv)
 
 
@@ -47,9 +53,11 @@ def fmt(value, digits=3) -> str:
     return f"{number:.{digits}f}"
 
 
-def stage_status(folder: Path) -> str:
+def stage_status(folder: Path, *, corner_report: bool = False) -> str:
     html_path = folder / "report.html"
-    payload = load_json(folder / "report.json")
+    payload = load_json(
+        folder / ("corner_report.json" if corner_report else "report.json")
+    )
     if payload and html_path.is_file():
         return "ready"
     if html_path.is_file():
@@ -202,9 +210,16 @@ def main(argv=None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     links = []
     for folder, title in STAGES:
-        status = stage_status(root / folder)
+        report_folder = root / folder
+        corner_report = (
+            folder == "03_nre_9d" and args.nre9d_report is not None
+        )
+        if corner_report:
+            report_folder = args.nre9d_report
+        status = stage_status(report_folder, corner_report=corner_report)
+        href = report_folder.relative_to(root).as_posix()
         links.append(
-            f"<li><a href='{escape(folder)}/report.html'>{escape(title)}</a> — {status}</li>"
+            f"<li><a href='{escape(href)}/report.html'>{escape(title)}</a> — {status}</li>"
         )
     select_payload = load_json(root / "00_select" / "report.json")
     stack_payload = load_json(root / "01_stack" / "report.json")

@@ -84,4 +84,6 @@ python diagnostics/likelihood_stack_nre_9d_corner_report.py \
     --galaxies "${GALAXIES}" \
     --stack-draws "${STACK_DRAWS}" \
     --overwrite
-python diagnostics/likelihood_stack_write_index.py --report-root "${REPORT_ROOT}"
+python diagnostics/likelihood_stack_write_index.py \
+    --report-root "${REPORT_ROOT}" \
+    --nre9d-report "${REPORT_DIR}"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 import html
+import json
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ if str(ARCH_DIR) not in sys.path:
 
 import config
 from diagnostics.likelihood_stack_core import (
+    CACHE_ROOT,
     DATA_ROOT,
     G01_NPE,
     HTML_STYLE,
@@ -48,6 +50,7 @@ from diagnostics.likelihood_stack_benchmark_core import fit_component_mc
 
 
 NUISANCE_STACK_PREFIXES = (8, 16, 32, 64, 128)
+DEFAULT_RUN_NAME = "emcee_w48_b2500_p6000_s42"
 
 
 def parse_args(argv=None):
@@ -59,6 +62,18 @@ def parse_args(argv=None):
         "--data-dir", type=Path, default=DATA_ROOT / NRE_INFER_DATASET
     )
     parser.add_argument("--report-dir", type=Path, default=NRE9D_DIR)
+    parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=CACHE_ROOT,
+        help="root for model/run-specific per-galaxy chain caches",
+    )
+    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse existing per-galaxy chain artifacts in this run directory",
+    )
     parser.add_argument(
         "--galaxies",
         type=Path,
@@ -95,6 +110,72 @@ def load_selection_indices(path: Path, dataset_size: int) -> np.ndarray:
     if np.any(indices < 0) or np.any(indices >= int(dataset_size)):
         raise ValueError(f"{path} index contains out-of-range dataset rows")
     return indices
+
+
+def chain_run_dir(cache_root: Path, nre_name: str, run_name: str) -> Path:
+    return Path(cache_root) / nre_name / run_name
+
+
+def chain_path(run_dir: Path, index: int) -> Path:
+    return run_dir / f"galaxy_{int(index):06d}.npz"
+
+
+def save_chain_artifact(
+    path: Path,
+    *,
+    index: int,
+    chain: np.ndarray,
+    log_prob: np.ndarray,
+    truth_physical: np.ndarray,
+    summary: dict,
+    parameter_names: tuple[str, ...],
+) -> None:
+    """Atomically persist one galaxy's chain and reproducibility metadata."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            index=np.asarray(index, dtype=np.int64),
+            chain=np.asarray(chain, dtype=np.float64),
+            log_prob=np.asarray(log_prob, dtype=np.float64),
+            truth_physical=np.asarray(truth_physical, dtype=np.float64),
+            parameter_names=np.asarray(parameter_names),
+            summary_json=np.asarray(json.dumps(json_safe(summary))),
+        )
+    temporary.replace(path)
+
+
+def load_chain_artifact(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    data = np.load(path, allow_pickle=False)
+    required = {
+        "index",
+        "chain",
+        "log_prob",
+        "truth_physical",
+        "parameter_names",
+        "summary_json",
+    }
+    missing = required.difference(data.files)
+    if missing:
+        raise ValueError(f"{path} is missing chain fields: {sorted(missing)}")
+    summary = json.loads(str(data["summary_json"].item()))
+    return {
+        "index": int(data["index"].item()),
+        "chain": np.asarray(data["chain"], dtype=np.float64),
+        "log_prob": np.asarray(data["log_prob"], dtype=np.float64),
+        "truth_physical": np.asarray(data["truth_physical"], dtype=np.float64),
+        "parameter_names": tuple(str(name) for name in data["parameter_names"]),
+        "summary": summary,
+    }
+
+
+def write_chain_metadata(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, payload)
 
 
 def _as_parameter_matrix(theta_norm, parameter_dim: int) -> tuple[np.ndarray, bool]:
@@ -574,26 +655,46 @@ def write_report(args) -> None:
         example_index = int(args.example_index)
         if example_index not in set(int(index) for index in indices):
             raise ValueError("--example-index must be in the selected galaxy list")
+
+    run_dir = chain_run_dir(args.cache_root, args.nre_name, args.run_name)
+    existing_artifacts = sorted(run_dir.glob("galaxy_*.npz"))
+    if existing_artifacts and not args.resume:
+        raise FileExistsError(
+            f"{run_dir} already contains chain artifacts; use --resume "
+            "to reuse them or choose a new --run-name"
+        )
+    pending_indices = [
+        int(index)
+        for index in indices
+        if not (args.resume and chain_path(run_dir, int(index)).is_file())
+    ]
+    run_metadata = {
+        "status": "running",
+        "run_name": args.run_name,
+        "chain_cache": str(run_dir),
+        "parent_npe": args.parent_npe,
+        "nre_name": args.nre_name,
+        "data_dir": str(args.data_dir),
+        "selection_file": str(args.galaxies),
+        "dataset_size": int(dataset_size),
+        "indices": [int(index) for index in indices],
+        "n_expected": int(count),
+        "n_cached_before": int(count - len(pending_indices)),
+        "nwalkers": int(args.nwalkers),
+        "burnin": int(args.burnin),
+        "production": int(args.production),
+        "batch_size": int(args.batch_size),
+        "seed": int(args.seed),
+        "parameter_names": list(names),
+    }
+    write_chain_metadata(run_dir / "metadata.json", run_metadata)
+
     channels_last = bool(model_config.train.channels_last)
     prior = TFPrior()
-    summaries = []
-    summary_arrays = {
-        "index": [],
-        "truth_g": [],
-        "g1_mean": [],
-        "g2_mean": [],
-        "g1_lower": [],
-        "g1_upper": [],
-        "g2_lower": [],
-        "g2_upper": [],
-        "g1_map_like": [],
-        "g2_map_like": [],
-    }
-    diagnostics_rows = []
-    example_chain = None
-    example_log_prob = None
-    for start in range(0, count, args.batch_size):
-        batch_indices = indices[start : start + args.batch_size]
+    for start in range(0, len(pending_indices), args.batch_size):
+        batch_indices = np.asarray(
+            pending_indices[start : start + args.batch_size], dtype=np.int64
+        )
         batch = load_observation_batch(dataset, batch_indices, device)
         image, spec = apply_identity_noise(
             batch["img"],
@@ -657,24 +758,62 @@ def write_report(args) -> None:
             summary["index"] = int(index)
             summary["truth_g1"] = float(truth_physical[row, names.index("g1")])
             summary["truth_g2"] = float(truth_physical[row, names.index("g2")])
+            summary["truth_parameters"] = truth_physical[row].tolist()
+            summary["rmag_true"] = rmag_true
             summary["diagnostics"] = chain["diagnostics"]
-            summaries.append(summary)
-            diagnostics_rows.append(chain["diagnostics"])
-            if int(index) == example_index:
-                example_chain = np.asarray(chain["chain"], dtype=np.float64)
-                example_log_prob = np.asarray(chain["log_prob"], dtype=np.float64)
-            summary_arrays["index"].append(int(index))
-            summary_arrays["truth_g"].append(
-                [summary["truth_g1"], summary["truth_g2"]]
+            save_chain_artifact(
+                chain_path(run_dir, int(index)),
+                index=int(index),
+                chain=chain["chain"],
+                log_prob=chain["log_prob"],
+                truth_physical=truth_physical[row],
+                summary=summary,
+                parameter_names=names,
             )
-            for key in summary_arrays:
-                if key in ("index", "truth_g"):
-                    continue
-                summary_arrays[key].append(summary[key])
-        print(f"inferred galaxies {min(start + args.batch_size, count)}/{count}", flush=True)
+        print(
+            f"cached galaxies {min(start + args.batch_size, len(pending_indices))}/"
+            f"{len(pending_indices)}",
+            flush=True,
+        )
 
-    if example_chain is None or example_log_prob is None:
-        raise RuntimeError("the requested example galaxy was not inferred")
+    records = []
+    for index in indices:
+        artifact = load_chain_artifact(chain_path(run_dir, int(index)))
+        if artifact["parameter_names"] != names:
+            raise ValueError(
+                f"{chain_path(run_dir, int(index))} has incompatible parameter names"
+            )
+        records.append(artifact)
+    summaries = [record["summary"] for record in records]
+    diagnostics_rows = [summary["diagnostics"] for summary in summaries]
+    example_record = next(
+        record for record in records if record["index"] == example_index
+    )
+    example_chain = example_record["chain"]
+    example_log_prob = example_record["log_prob"]
+    summary_arrays = {
+        "index": np.asarray([summary["index"] for summary in summaries], dtype=np.int64),
+        "truth_g": np.asarray(
+            [[summary["truth_g1"], summary["truth_g2"]] for summary in summaries],
+            dtype=np.float64,
+        ),
+        "truth_parameters": np.asarray(
+            [summary["truth_parameters"] for summary in summaries],
+            dtype=np.float64,
+        ),
+        "g1_mean": np.asarray([summary["g1_mean"] for summary in summaries]),
+        "g2_mean": np.asarray([summary["g2_mean"] for summary in summaries]),
+        "g1_lower": np.asarray([summary["g1_lower"] for summary in summaries]),
+        "g1_upper": np.asarray([summary["g1_upper"] for summary in summaries]),
+        "g2_lower": np.asarray([summary["g2_lower"] for summary in summaries]),
+        "g2_upper": np.asarray([summary["g2_upper"] for summary in summaries]),
+        "g1_map_like": np.asarray(
+            [summary["g1_map_like"] for summary in summaries]
+        ),
+        "g2_map_like": np.asarray(
+            [summary["g2_map_like"] for summary in summaries]
+        ),
+    }
     nre_mean = np.column_stack(
         (summary_arrays["g1_mean"], summary_arrays["g2_mean"])
     )
@@ -709,6 +848,9 @@ def write_report(args) -> None:
         "data_dir": str(args.data_dir),
         "dataset_size": int(dataset_size),
         "n_galaxies": int(count),
+        "run_name": args.run_name,
+        "chain_cache": str(run_dir),
+        "cached_chain_count": int(len(records)),
         "selection_file": str(args.galaxies),
         "stack_draws": str(args.stack_draws),
         "example_index": int(example_index),
@@ -749,6 +891,15 @@ def write_report(args) -> None:
     payload["figures"] = figures
     _write_html(payload, args.report_dir, figures)
     write_json(args.report_dir / "report.json", payload)
+    run_metadata.update(
+        {
+            "status": "completed",
+            "parent_checkpoint": str(parent_checkpoint),
+            "n_cached": int(len(records)),
+            "report_dir": str(args.report_dir),
+        }
+    )
+    write_chain_metadata(run_dir / "metadata.json", run_metadata)
     print(f"Wrote {args.report_dir / 'report.json'}", flush=True)
 
 

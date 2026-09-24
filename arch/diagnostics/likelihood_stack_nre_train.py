@@ -745,11 +745,15 @@ def main(argv=None) -> None:
         meta=meta,
         overwrite=args.overwrite,
     )
-    print(json.dumps(json_safe({
+    fit_summary = {
         "checkpoint": str(checkpoint),
         "best_epoch": fit["best_epoch"],
-        "best_valid_bce": fit["best_valid_bce"],
-    }), indent=2))
+    }
+    if args.nre_mode == "9d":
+        fit_summary["best_valid_total"] = fit["best_valid_total"]
+    else:
+        fit_summary["best_valid_bce"] = fit["best_valid_bce"]
+    print(json.dumps(json_safe(fit_summary), indent=2))
 
 
 if __name__ == "__main__":

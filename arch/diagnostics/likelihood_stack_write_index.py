@@ -14,7 +14,7 @@ STAGES = (
     ("01_stack", "Shared-parameter stack versus inverse-variance Means"),
     ("02_coverage", "16–84% coverage inside versus outside |g| = 0.05"),
     ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean"),
-    ("03_nre_9d", "Full-9D NRE with bounded emcee and TF-prior replacement"),
+    ("03_nre_9d", "Full-9D NRE with Nautilus and TF-prior replacement"),
     ("04_benchmark", "Fixed-shear seven-estimator ensemble benchmark"),
 )
 

@@ -150,19 +150,16 @@ def posterior_record(
         import corner
 
         corner_dir.mkdir(parents=True, exist_ok=True)
-        points = physical
-        if len(points) > corner_max_samples:
-            rng = np.random.default_rng(420042 + int(artifact["index"]))
-            choice = rng.choice(
-                len(points),
-                size=corner_max_samples,
-                replace=False,
-                p=weights,
-            )
-            points = points[choice]
-            plot_weights = None
-        else:
-            plot_weights = weights
+        rng = np.random.default_rng(420042 + int(artifact["index"]))
+        plot_count = min(int(corner_max_samples), max(1000, len(physical)))
+        choice = rng.choice(
+            len(physical),
+            size=plot_count,
+            replace=True,
+            p=weights,
+        )
+        points = physical[choice]
+        plot_weights = None
         figure = corner.corner(
             points,
             labels=list(names),
@@ -523,6 +520,9 @@ def main(argv=None) -> None:
         "featured": [row["index"] for row in featured],
     }
     write_json(report_dir / "report.json", payload)
+    # Keep the campaign index compatible with the existing 9D corner-report
+    # convention while the report itself is Nautilus-specific.
+    write_json(report_dir / "corner_report.json", payload)
     write_html(
         output,
         metadata=payload["metadata"],

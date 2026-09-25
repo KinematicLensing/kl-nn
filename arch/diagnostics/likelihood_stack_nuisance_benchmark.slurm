@@ -21,9 +21,9 @@ NPE_SAMPLES="${NPE_SAMPLES:-1024}"
 GRID_N="${GRID_N:-21}"
 OVERWRITE="${OVERWRITE:-0}"
 
+set +u
 module load anaconda3
 module load cuda
-set +u
 source ~/.bashrc
 conda activate kl-nn
 set -u

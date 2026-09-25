@@ -77,7 +77,8 @@ def test_cli_defaults_match_the_nre_plan():
     assert infer.report_dir == NRE_DIR
     assert infer.grid_n == NRE_GRID_N == 21
     assert infer.prefixes == list(NRE_PREFIXES) == [1, 8, 32, 128]
-    assert STAGES[-1][0] == "04_benchmark"
+    assert STAGES[-1][0] == "04_benchmark_nuisance"
+    assert any(stage[0] == "04_benchmark" for stage in STAGES)
     assert ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean") in STAGES
     assert any(stage[0] == "03_nre_9d" for stage in STAGES)
     assert NRE_DIR != STACK_DIR

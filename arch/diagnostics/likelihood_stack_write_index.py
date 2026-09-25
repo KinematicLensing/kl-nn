@@ -16,6 +16,7 @@ STAGES = (
     ("03_nre", "Frozen-encoder NRE peak and posterior mean versus the Mean"),
     ("03_nre_9d", "Full-9D NRE with Nautilus and TF-prior replacement"),
     ("04_benchmark", "Fixed-shear seven-estimator ensemble benchmark"),
+    ("04_benchmark_nuisance", "Fixed-shear nuisance-only six-estimator benchmark"),
 )
 
 

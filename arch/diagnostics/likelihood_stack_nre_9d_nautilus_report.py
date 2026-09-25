@@ -34,7 +34,7 @@ from diagnostics.likelihood_stack_nre_9d_nautilus import (
     normalized_weights,
 )
 from tf_prior import TFPrior
-from utils import denormalize, normalize_targets
+from utils import denormalize
 
 
 DEFAULT_RUN_NAME = "nautilus_factorized_n100_s42"
@@ -105,21 +105,6 @@ def _weighted_quantile(
     return np.interp(np.asarray(quantiles), coordinate, values)
 
 
-def _diagnostic_normalize(values: np.ndarray, names: tuple[str, ...]) -> np.ndarray:
-    """Normalize physical values, tolerating synthetic invalid smoke-test truths."""
-
-    values = np.asarray(values, dtype=np.float64).copy()
-    for column, name in enumerate(names):
-        if config.TARGET_TRANSFORMS.get(name) == "log10":
-            values[..., column] = np.maximum(values[..., column], config.par_ranges[name][0])
-    return normalize_targets(
-        values,
-        config.par_ranges,
-        feature_names=names,
-        target_transforms=config.TARGET_TRANSFORMS,
-    )
-
-
 def posterior_record(
     artifact: dict,
     *,
@@ -138,11 +123,6 @@ def posterior_record(
         ],
         axis=0,
     )
-    normalized_mean = _diagnostic_normalize(means[None, :], names)[0]
-    normalized_lower = _diagnostic_normalize(intervals[:, 0][None, :], names)[0]
-    normalized_upper = _diagnostic_normalize(intervals[:, 1][None, :], names)[0]
-    normalized_truth = _diagnostic_normalize(artifact["truth"][None, :], names)[0]
-    normalized_half_width = 0.5 * (normalized_upper - normalized_lower)
     record = {
         "index": int(artifact["index"]),
         "truth": artifact["truth"],
@@ -158,14 +138,6 @@ def posterior_record(
         ),
         "residual": means - artifact["truth"],
         "interval_width": intervals[:, 1] - intervals[:, 0],
-        "normalized_residual": normalized_mean - normalized_truth,
-        "normalized_interval_width": normalized_upper - normalized_lower,
-        "standardized_residual": np.divide(
-            normalized_mean - normalized_truth,
-            normalized_half_width,
-            out=np.full_like(normalized_mean, np.nan),
-            where=normalized_half_width > 0.0,
-        ),
         "effective_sample_size": float(summary["effective_sample_size"]),
         "nautilus_n_eff": float(summary["nautilus_n_eff"]),
         "n_like": int(summary["n_like"]),
@@ -269,6 +241,11 @@ def save_figures(
 ) -> dict[str, str]:
     plt = _setup_matplotlib()
     figures: dict[str, str] = {}
+
+    def symmetric_limit(values: np.ndarray) -> float:
+        scale = float(np.nanmax(np.abs(values)))
+        return 1.1 * scale if scale > 0.0 else 1.0
+
     n_eff = np.asarray([row["effective_sample_size"] for row in records])
     n_like = np.asarray([row["n_like"] for row in records])
     eta = np.asarray([row["eta"] for row in records])
@@ -290,9 +267,6 @@ def save_figures(
     lower = np.stack([row["lower"] for row in records])
     upper = np.stack([row["upper"] for row in records])
     mean = np.stack([row["mean"] for row in records])
-    standardized = np.stack(
-        [row["standardized_residual"] for row in records]
-    )
     coverage = np.mean((truth >= lower) & (truth <= upper), axis=0)
     figure, axis = plt.subplots(figsize=(9, 4.8))
     axis.bar(np.arange(len(names)), coverage, color="#1f4e79")
@@ -307,22 +281,35 @@ def save_figures(
     plt.close(figure)
     figures["coverage"] = "coverage_by_parameter.png"
 
+    residual = mean - truth
     figure, axes = plt.subplots(3, 3, figsize=(11, 9), squeeze=False)
     for column, name in enumerate(names):
         axis = axes.flat[column]
-        values = standardized[:, column]
+        values = residual[:, column]
+        x_limit = symmetric_limit(truth[:, column])
+        y_limit = symmetric_limit(values)
         axis.axhline(0.0, color="#555", ls="--", lw=0.8)
-        axis.boxplot(values[np.isfinite(values)], vert=True, widths=0.45)
+        axis.scatter(
+            truth[:, column],
+            values,
+            s=10,
+            alpha=0.35,
+            linewidths=0,
+            color="#1f4e79",
+        )
+        axis.set_xlim(-x_limit, x_limit)
+        axis.set_ylim(-y_limit, y_limit)
         axis.set_title(name)
-        axis.set_ylabel("(posterior mean − truth) / posterior half-width")
-    figure.suptitle("Scale-aware posterior residuals by parameter")
+        axis.set_xlabel("truth")
+        axis.set_ylabel("posterior mean − truth")
+    figure.suptitle("Posterior-mean bias versus truth by parameter")
     figure.tight_layout()
     figure.savefig(
-        report_dir / "normalized_residuals_by_parameter.png",
+        report_dir / "bias_vs_truth_by_parameter.png",
         dpi=FIGURE_DPI,
     )
     plt.close(figure)
-    figures["normalized_residuals"] = "normalized_residuals_by_parameter.png"
+    figures["bias_vs_truth"] = "bias_vs_truth_by_parameter.png"
 
     figure, axes = plt.subplots(2, 2, figsize=(9, 8), sharex=True)
     panels = (
@@ -442,7 +429,6 @@ def write_html(
         f"<td>{row['mean_bias']:.5g}</td><td>{row['rmse']:.5g}</td>"
         f"<td>{row['coverage']:.3f}</td>"
         f"<td>{row['mean_interval_width']:.5g}</td>"
-        f"<td>{row['mean_standardized_residual']:.5g}</td>"
         "</tr>"
         for row in parameter_stats
     )
@@ -470,8 +456,7 @@ the NRE ratio is defined up to an additive log constant.</p>
 <table><thead><tr><th>Estimator</th><th>g1 m</th><th>g2 m</th><th>combined m</th>
 </tr></thead><tbody>{ensemble_rows}</tbody></table>
 <table><thead><tr><th>Parameter</th><th>mean bias</th><th>RMSE</th>
-<th>68% coverage</th><th>mean interval width</th>
-<th>mean standardized residual</th></tr></thead>
+<th>68% coverage</th><th>mean interval width</th></tr></thead>
 <tbody>{parameter_rows}</tbody></table>
 <h2>Posterior P-P coverage</h2>
 <p>The P-P curve uses each galaxy's weighted posterior CDF evaluated at
@@ -560,11 +545,6 @@ def main(argv=None) -> None:
                     )
                 ),
                 "mean_interval_width": float(np.mean(upper[:, column] - lower[:, column])),
-                "mean_standardized_residual": float(
-                    np.nanmean(
-                        [row["standardized_residual"][column] for row in report_records]
-                    )
-                ),
             }
         )
     truth_g = truth[:, :2]
@@ -604,6 +584,7 @@ def main(argv=None) -> None:
             ),
         }
     (report_dir / "m_vs_nuisance_stacks.png").unlink(missing_ok=True)
+    (report_dir / "normalized_residuals_by_parameter.png").unlink(missing_ok=True)
     figures = save_figures(
         report_dir,
         report_records,

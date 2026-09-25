@@ -198,8 +198,9 @@ def test_report_generation_with_small_campaign(tmp_path):
     assert len(list((report_dir / "corner_plots").glob("*.png"))) == 1
     payload = json.loads((report_dir / "report.json").read_text())
     assert set(payload["posterior_pp"]) == {"g1", "g2"}
-    assert "standardized_residual" in payload["per_galaxy"][0]
-    assert (report_dir / "normalized_residuals_by_parameter.png").is_file()
+    assert "residual" in payload["per_galaxy"][0]
+    assert (report_dir / "bias_vs_truth_by_parameter.png").is_file()
+    assert not (report_dir / "normalized_residuals_by_parameter.png").exists()
     assert (report_dir / "g_estimates_vs_truth.png").is_file()
     assert (report_dir / "posterior_pp.png").is_file()
     assert "m_vs_nuisance_stacks.png" not in payload["metadata"]["figures"].values()

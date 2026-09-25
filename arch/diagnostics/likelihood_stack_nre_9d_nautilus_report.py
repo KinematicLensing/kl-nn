@@ -286,7 +286,6 @@ def save_figures(
     for column, name in enumerate(names):
         axis = axes.flat[column]
         values = residual[:, column]
-        x_limit = symmetric_limit(truth[:, column])
         y_limit = symmetric_limit(values)
         axis.axhline(0.0, color="#555", ls="--", lw=0.8)
         axis.scatter(
@@ -297,7 +296,8 @@ def save_figures(
             linewidths=0,
             color="#1f4e79",
         )
-        axis.set_xlim(-x_limit, x_limit)
+        prior_lower, prior_upper = config.par_ranges[name]
+        axis.set_xlim(prior_lower, prior_upper)
         axis.set_ylim(-y_limit, y_limit)
         axis.set_title(name)
         axis.set_xlabel("truth")

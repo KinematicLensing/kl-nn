@@ -203,3 +203,6 @@ def test_report_generation_with_small_campaign(tmp_path):
     assert (report_dir / "g_estimates_vs_truth.png").is_file()
     assert (report_dir / "posterior_pp.png").is_file()
     assert "m_vs_nuisance_stacks.png" not in payload["metadata"]["figures"].values()
+    html = (report_dir / "report.html").read_text()
+    assert "<h2>Run metadata</h2>" not in html
+    assert "<h2>Per-galaxy posterior summaries</h2>" not in html

@@ -454,15 +454,6 @@ def write_html(
         "</tr>"
         for row in ensemble_metrics
     )
-    galaxy_rows = "".join(
-        "<tr>"
-        f"<td>{row['index']}</td><td>{row['effective_sample_size']:.1f}</td>"
-        f"<td>{row['n_like']}</td><td>{row['runtime_s']:.2f}</td>"
-        f"<td>{row['mean'][0]:.5g} [{row['lower'][0]:.5g}, {row['upper'][0]:.5g}]</td>"
-        f"<td>{row['mean'][1]:.5g} [{row['lower'][1]:.5g}, {row['upper'][1]:.5g}]</td>"
-        "</tr>"
-        for row in records
-    )
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Nautilus 9D NRE report</title>
 <style>{HTML_STYLE}</style></head><body>
@@ -474,7 +465,6 @@ the truncated-normal Tully–Fisher prior for <code>vcirc</code>; its exact
 parameters are recorded below.</p>
 <p>Nautilus posterior evidence is reported only as a relative diagnostic because
 the NRE ratio is defined up to an additive log constant.</p>
-<h2>Run metadata</h2><pre>{html.escape(json.dumps(metadata, indent=2))}</pre>
 <h2>Summary figures</h2>{figure_html}
 <h2>Shear calibration</h2>
 <table><thead><tr><th>Estimator</th><th>g1 m</th><th>g2 m</th><th>combined m</th>
@@ -497,10 +487,6 @@ the true shear. Uniformity is the expected calibration target.</p>
 )}
 </tbody></table>
 <h2>Representative posterior plots</h2>{featured_html}
-<h2>Per-galaxy posterior summaries</h2>
-<table><thead><tr><th>Index</th><th>ESS</th><th>likelihood calls</th>
-<th>runtime (s)</th><th>g1 mean [16,84]</th><th>g2 mean [16,84]</th>
-</tr></thead><tbody>{galaxy_rows}</tbody></table>
 </body></html>"""
     path.write_text(body, encoding="utf-8")
 

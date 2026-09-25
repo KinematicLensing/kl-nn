@@ -33,11 +33,11 @@ from diagnostics.likelihood_stack_nre_9d_nautilus import (
     load_artifact,
     normalized_weights,
 )
-from utils import denormalize
+from tf_prior import TFPrior
+from utils import denormalize, normalize_targets
 
 
 DEFAULT_RUN_NAME = "nautilus_factorized_n100_s42"
-NAUTILUS_PREFIXES = (8, 16, 32, 64, 100)
 FIGURE_DPI = 140
 
 
@@ -105,6 +105,21 @@ def _weighted_quantile(
     return np.interp(np.asarray(quantiles), coordinate, values)
 
 
+def _diagnostic_normalize(values: np.ndarray, names: tuple[str, ...]) -> np.ndarray:
+    """Normalize physical values, tolerating synthetic invalid smoke-test truths."""
+
+    values = np.asarray(values, dtype=np.float64).copy()
+    for column, name in enumerate(names):
+        if config.TARGET_TRANSFORMS.get(name) == "log10":
+            values[..., column] = np.maximum(values[..., column], config.par_ranges[name][0])
+    return normalize_targets(
+        values,
+        config.par_ranges,
+        feature_names=names,
+        target_transforms=config.TARGET_TRANSFORMS,
+    )
+
+
 def posterior_record(
     artifact: dict,
     *,
@@ -123,6 +138,11 @@ def posterior_record(
         ],
         axis=0,
     )
+    normalized_mean = _diagnostic_normalize(means[None, :], names)[0]
+    normalized_lower = _diagnostic_normalize(intervals[:, 0][None, :], names)[0]
+    normalized_upper = _diagnostic_normalize(intervals[:, 1][None, :], names)[0]
+    normalized_truth = _diagnostic_normalize(artifact["truth"][None, :], names)[0]
+    normalized_half_width = 0.5 * (normalized_upper - normalized_lower)
     record = {
         "index": int(artifact["index"]),
         "truth": artifact["truth"],
@@ -138,6 +158,14 @@ def posterior_record(
         ),
         "residual": means - artifact["truth"],
         "interval_width": intervals[:, 1] - intervals[:, 0],
+        "normalized_residual": normalized_mean - normalized_truth,
+        "normalized_interval_width": normalized_upper - normalized_lower,
+        "standardized_residual": np.divide(
+            normalized_mean - normalized_truth,
+            normalized_half_width,
+            out=np.full_like(normalized_mean, np.nan),
+            where=normalized_half_width > 0.0,
+        ),
         "effective_sample_size": float(summary["effective_sample_size"]),
         "nautilus_n_eff": float(summary["nautilus_n_eff"]),
         "n_like": int(summary["n_like"]),
@@ -182,6 +210,38 @@ def posterior_record(
     return record
 
 
+def posterior_pit(
+    artifact: dict,
+    *,
+    names: tuple[str, ...],
+) -> np.ndarray:
+    """Return each component's weighted posterior CDF evaluated at truth."""
+
+    physical, weights = physical_posterior(artifact, names=names)
+    truth = np.asarray(artifact["truth"], dtype=np.float64)
+    pits = np.empty(len(names), dtype=np.float64)
+    for column in range(len(names)):
+        below = physical[:, column] < truth[column]
+        equal = physical[:, column] == truth[column]
+        pits[column] = np.sum(weights[below]) + 0.5 * np.sum(weights[equal])
+    return pits
+
+
+def posterior_pp_curve(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return a one-dimensional posterior P-P curve and KS distance."""
+
+    values = np.sort(np.asarray(values, dtype=np.float64))
+    values = values[np.isfinite(values)]
+    if values.size == 0 or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("PIT values must be finite and lie in [0, 1]")
+    empirical = np.arange(1, len(values) + 1, dtype=np.float64) / len(values)
+    before = (np.arange(len(values), dtype=np.float64)) / len(values)
+    distance = float(
+        max(np.max(empirical - values), np.max(values - before))
+    )
+    return values, empirical, distance
+
+
 def featured_records(records: list[dict], n_featured: int) -> list[dict]:
     if n_featured <= 0:
         return []
@@ -199,43 +259,13 @@ def featured_records(records: list[dict], n_featured: int) -> list[dict]:
     return [records[i] for i in selected[:n_featured]]
 
 
-def nuisance_rows(
-    truth_g: np.ndarray,
-    estimate: np.ndarray,
-    *,
-    replicates: int,
-) -> list[dict]:
-    rng = np.random.default_rng(420042)
-    rows = []
-    for count in NAUTILUS_PREFIXES:
-        if count > len(truth_g):
-            continue
-        metrics = fit_component_mc(truth_g[:count], estimate[:count])
-        draws = rng.integers(0, count, size=(replicates, count), dtype=np.int64)
-        bootstrap = np.asarray(
-            [
-                fit_component_mc(
-                    truth_g[:count][draw], estimate[:count][draw]
-                )["combined_m"]
-                for draw in draws
-            ]
-        )
-        rows.append(
-            {
-                "nuisance_count": int(count),
-                "combined_m_lower": float(np.quantile(bootstrap, 0.16)),
-                "combined_m_upper": float(np.quantile(bootstrap, 0.84)),
-                **metrics,
-            }
-        )
-    return rows
-
-
 def save_figures(
     report_dir: Path,
     records: list[dict],
     names: tuple[str, ...],
-    nuisance: list[dict],
+    estimates: dict[str, np.ndarray],
+    ensemble_metrics: list[dict],
+    pp_plot_data: dict[str, dict],
 ) -> dict[str, str]:
     plt = _setup_matplotlib()
     figures: dict[str, str] = {}
@@ -260,6 +290,9 @@ def save_figures(
     lower = np.stack([row["lower"] for row in records])
     upper = np.stack([row["upper"] for row in records])
     mean = np.stack([row["mean"] for row in records])
+    standardized = np.stack(
+        [row["standardized_residual"] for row in records]
+    )
     coverage = np.mean((truth >= lower) & (truth <= upper), axis=0)
     figure, axis = plt.subplots(figsize=(9, 4.8))
     axis.bar(np.arange(len(names)), coverage, color="#1f4e79")
@@ -274,63 +307,107 @@ def save_figures(
     plt.close(figure)
     figures["coverage"] = "coverage_by_parameter.png"
 
-    residual = mean - truth
-    figure, axis = plt.subplots(figsize=(9, 4.8))
-    axis.axhline(0.0, color="#555", ls="--", lw=0.8)
-    axis.errorbar(
-        np.arange(len(names)),
-        residual.mean(axis=0),
-        yerr=residual.std(axis=0),
-        fmt="o",
-        capsize=3,
-        color="#8f3b76",
-    )
-    axis.set_xticks(np.arange(len(names)), names, rotation=35, ha="right")
-    axis.set_ylabel("posterior mean − truth")
-    axis.set_title("Posterior-mean residuals")
+    figure, axes = plt.subplots(3, 3, figsize=(11, 9), squeeze=False)
+    for column, name in enumerate(names):
+        axis = axes.flat[column]
+        values = standardized[:, column]
+        axis.axhline(0.0, color="#555", ls="--", lw=0.8)
+        axis.boxplot(values[np.isfinite(values)], vert=True, widths=0.45)
+        axis.set_title(name)
+        axis.set_ylabel("(posterior mean − truth) / posterior half-width")
+    figure.suptitle("Scale-aware posterior residuals by parameter")
     figure.tight_layout()
-    figure.savefig(report_dir / "residuals_by_parameter.png", dpi=FIGURE_DPI)
+    figure.savefig(
+        report_dir / "normalized_residuals_by_parameter.png",
+        dpi=FIGURE_DPI,
+    )
     plt.close(figure)
-    figures["residuals"] = "residuals_by_parameter.png"
+    figures["normalized_residuals"] = "normalized_residuals_by_parameter.png"
 
-    figure, axis = plt.subplots(figsize=(8.5, 4.8))
-    if nuisance:
-        x = np.asarray([row["nuisance_count"] for row in nuisance], dtype=float)
-        y = np.asarray([row["combined_m"] for row in nuisance], dtype=float)
-        lower_m = np.asarray([row["combined_m_lower"] for row in nuisance])
-        upper_m = np.asarray([row["combined_m_upper"] for row in nuisance])
-        axis.errorbar(
+    figure, axes = plt.subplots(2, 2, figsize=(9, 8), sharex=True)
+    panels = (
+        (axes[0, 0], estimates["Nautilus posterior mean"], "posterior mean", 0),
+        (axes[0, 1], estimates["Nautilus MAP-like"], "MAP-like", 0),
+        (axes[1, 0], estimates["Nautilus posterior mean"], "posterior mean", 1),
+        (axes[1, 1], estimates["Nautilus MAP-like"], "MAP-like", 1),
+    )
+    for axis, estimate, estimator, component in panels:
+        metric = next(
+            row
+            for row in ensemble_metrics
+            if row["estimator"] == f"Nautilus {estimator}"
+        )
+        axis.scatter(
+            truth[:, component],
+            estimate[:, component] - truth[:, component],
+            s=10,
+            alpha=0.35,
+            linewidths=0,
+            color="#1f4e79",
+        )
+        x_limit = max(
+            0.1,
+            float(np.max(np.abs(truth[:, component]))),
+        )
+        y_limit = max(
+            0.1,
+            float(np.max(np.abs(estimate[:, component] - truth[:, component]))),
+        )
+        axis.axhline(0.0, color="#555", ls="--", lw=0.8)
+        axis.set_xlim(-x_limit, x_limit)
+        axis.set_ylim(-y_limit, y_limit)
+        axis.set_title(
+            f"{estimator}, {'g1' if component == 0 else 'g2'}\n"
+            f"m={metric['g1_m' if component == 0 else 'g2_m']:.3f}, "
+            f"c={metric['g1_c' if component == 0 else 'g2_c']:.3g}"
+        )
+    axes[1, 0].set_xlabel("true shear")
+    axes[1, 1].set_xlabel("true shear")
+    axes[0, 0].set_ylabel("estimated shear − truth")
+    axes[1, 0].set_ylabel("estimated shear − truth")
+    figure.suptitle("MAP and posterior-mean shear bias versus truth")
+    figure.tight_layout()
+    figure.savefig(
+        report_dir / "g_estimates_vs_truth.png",
+        dpi=FIGURE_DPI,
+    )
+    plt.close(figure)
+    figures["g_estimates_vs_truth"] = "g_estimates_vs_truth.png"
+
+    figure, axes = plt.subplots(1, 2, figsize=(9, 4.4), sharex=True, sharey=True)
+    grid = np.linspace(0.0, 1.0, 501)
+    for axis, component in zip(axes, ("g1", "g2")):
+        diagnostic = pp_plot_data[component]
+        x = np.asarray(diagnostic["pit_sorted"])
+        y = np.asarray(diagnostic["empirical_cdf"])
+        epsilon = diagnostic["dkw_epsilon"]
+        axis.fill_between(
+            grid,
+            np.maximum(0.0, grid - epsilon),
+            np.minimum(1.0, grid + epsilon),
+            color="#1f4e79",
+            alpha=0.12,
+        )
+        axis.step(
             x,
             y,
-            yerr=np.vstack((y - lower_m, upper_m - y)),
-            marker="o",
-            capsize=3,
+            where="post",
             color="#1f4e79",
-            label="Nautilus posterior mean",
+            label=f"KS={diagnostic['ks_distance']:.3f}",
         )
-        axis.set_xscale("log", base=2)
-        axis.set_xticks(list(NAUTILUS_PREFIXES))
-        axis.get_xaxis().set_major_formatter(
-            plt.FuncFormatter(lambda value, _: str(int(value)))
-        )
+        axis.plot(grid, grid, color="#555", ls="--", label="uniform")
+        axis.set_title(component)
+        axis.set_xlabel("posterior quantile at truth")
+        axis.set_xlim(0.0, 1.0)
+        axis.set_ylim(0.0, 1.0)
+        axis.set_aspect("equal", adjustable="box")
         axis.legend(frameon=False)
-    else:
-        axis.text(
-            0.5,
-            0.5,
-            "fewer than 8 successful galaxies",
-            ha="center",
-            va="center",
-            transform=axis.transAxes,
-        )
-    axis.axhline(0.0, color="#555", ls="--", lw=0.8)
-    axis.set_xlabel("number of sampled galaxies")
-    axis.set_ylabel("combined multiplicative bias m")
-    axis.set_title("Nautilus m versus cumulative galaxy count")
+    axes[0].set_ylabel("fraction of galaxies")
+    figure.suptitle("Posterior P-P coverage diagnostic")
     figure.tight_layout()
-    figure.savefig(report_dir / "m_vs_nuisance_stacks.png", dpi=FIGURE_DPI)
+    figure.savefig(report_dir / "posterior_pp.png", dpi=FIGURE_DPI)
     plt.close(figure)
-    figures["m_vs_nuisance"] = "m_vs_nuisance_stacks.png"
+    figures["posterior_pp"] = "posterior_pp.png"
 
     return figures
 
@@ -343,6 +420,7 @@ def write_html(
     records: list[dict],
     parameter_stats: list[dict],
     ensemble_metrics: list[dict],
+    pp_summary: dict[str, dict],
     featured: list[dict],
 ) -> None:
     figure_html = "".join(
@@ -362,7 +440,9 @@ def write_html(
         "<tr>"
         f"<td>{html.escape(row['parameter'])}</td>"
         f"<td>{row['mean_bias']:.5g}</td><td>{row['rmse']:.5g}</td>"
-        f"<td>{row['coverage']:.3f}</td><td>{row['mean_interval_width']:.5g}</td>"
+        f"<td>{row['coverage']:.3f}</td>"
+        f"<td>{row['mean_interval_width']:.5g}</td>"
+        f"<td>{row['mean_standardized_residual']:.5g}</td>"
         "</tr>"
         for row in parameter_stats
     )
@@ -389,6 +469,9 @@ def write_html(
 <h1>Nautilus 9D NRE likelihood-stack report</h1>
 <p class="lead">A seeded random sample of {metadata['n_expected']} galaxies from
 <code>{html.escape(metadata['data_dir'])}</code> using the factorized joint NRE.</p>
+<p>The sampled population is the TF-conformed xu3 set. The likelihood includes
+the truncated-normal Tully–Fisher prior for <code>vcirc</code>; its exact
+parameters are recorded below.</p>
 <p>Nautilus posterior evidence is reported only as a relative diagnostic because
 the NRE ratio is defined up to an additive log constant.</p>
 <h2>Run metadata</h2><pre>{html.escape(json.dumps(metadata, indent=2))}</pre>
@@ -397,8 +480,22 @@ the NRE ratio is defined up to an additive log constant.</p>
 <table><thead><tr><th>Estimator</th><th>g1 m</th><th>g2 m</th><th>combined m</th>
 </tr></thead><tbody>{ensemble_rows}</tbody></table>
 <table><thead><tr><th>Parameter</th><th>mean bias</th><th>RMSE</th>
-<th>68% coverage</th><th>mean interval width</th></tr></thead>
+<th>68% coverage</th><th>mean interval width</th>
+<th>mean standardized residual</th></tr></thead>
 <tbody>{parameter_rows}</tbody></table>
+<h2>Posterior P-P coverage</h2>
+<p>The P-P curve uses each galaxy's weighted posterior CDF evaluated at
+the true shear. Uniformity is the expected calibration target.</p>
+<table><thead><tr><th>Component</th><th>galaxies</th><th>KS distance</th>
+<th>ESS</th><th>16–84% coverage</th></tr></thead><tbody>
+{"".join(
+    f"<tr><td>{html.escape(component)}</td><td>{diag['n']}</td>"
+    f"<td>{diag['ks_distance']:.5g}</td>"
+    f"<td>{diag['effective_sample_size']:.2f}</td>"
+    f"<td>{diag['central_coverage']:.3f}</td></tr>"
+    for component, diag in pp_summary.items()
+)}
+</tbody></table>
 <h2>Representative posterior plots</h2>{featured_html}
 <h2>Per-galaxy posterior summaries</h2>
 <table><thead><tr><th>Index</th><th>ESS</th><th>likelihood calls</th>
@@ -421,6 +518,7 @@ def main(argv=None) -> None:
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["tf_prior"] = TFPrior().to_dict()
     indices = load_selection(selection_file)
     records = []
     failed = []
@@ -476,6 +574,11 @@ def main(argv=None) -> None:
                     )
                 ),
                 "mean_interval_width": float(np.mean(upper[:, column] - lower[:, column])),
+                "mean_standardized_residual": float(
+                    np.nanmean(
+                        [row["standardized_residual"][column] for row in report_records]
+                    )
+                ),
             }
         )
     truth_g = truth[:, :2]
@@ -489,16 +592,39 @@ def main(argv=None) -> None:
         {"estimator": name, **fit_component_mc(truth_g, estimate)}
         for name, estimate in estimates.items()
     ]
-    nuisance = nuisance_rows(
-        truth_g,
-        estimates["Nautilus posterior mean"],
-        replicates=args.bootstrap_replicates,
+    pits = np.stack(
+        [posterior_pit(artifact, names=names) for artifact in records],
+        axis=0,
     )
+    pp_plot_data = {}
+    pp_summary = {}
+    mean_effective_sample_size = float(
+        np.mean([row["effective_sample_size"] for row in report_records])
+    )
+    for column, name in enumerate(names[:2]):
+        pit_sorted, empirical_cdf, ks_distance = posterior_pp_curve(pits[:, column])
+        pp_plot_data[name] = {
+            "pit_sorted": pit_sorted,
+            "empirical_cdf": empirical_cdf,
+            "ks_distance": ks_distance,
+            "dkw_epsilon": 1.36 / np.sqrt(len(pit_sorted)),
+        }
+        pp_summary[name] = {
+            "n": int(len(pit_sorted)),
+            "ks_distance": float(ks_distance),
+            "effective_sample_size": mean_effective_sample_size,
+            "central_coverage": float(
+                np.mean((pits[:, column] >= 0.16) & (pits[:, column] <= 0.84))
+            ),
+        }
+    (report_dir / "m_vs_nuisance_stacks.png").unlink(missing_ok=True)
     figures = save_figures(
         report_dir,
         report_records,
         names,
-        nuisance,
+        estimates,
+        ensemble_metrics,
+        pp_plot_data,
     )
     featured = [row for row in report_records if "corner_path" in row]
     payload = {
@@ -515,7 +641,7 @@ def main(argv=None) -> None:
         "parameter_names": list(names),
         "parameter_statistics": parameter_stats,
         "ensemble_metrics": ensemble_metrics,
-        "nuisance_stack_table": nuisance,
+        "posterior_pp": pp_summary,
         "per_galaxy": report_records,
         "featured": [row["index"] for row in featured],
     }
@@ -530,6 +656,7 @@ def main(argv=None) -> None:
         records=report_records,
         parameter_stats=parameter_stats,
         ensemble_metrics=ensemble_metrics,
+        pp_summary=pp_summary,
         featured=featured,
     )
     print(f"Wrote {output}")

@@ -17,6 +17,10 @@ from arch.diagnostics.likelihood_stack_nre_9d_nautilus import (
     summarize_posterior,
 )
 from arch.diagnostics.likelihood_stack_nre_9d_nautilus_report import main as report_main
+from arch.diagnostics.likelihood_stack_nre_9d_nautilus_report import (
+    posterior_pit,
+    posterior_pp_curve,
+)
 from arch.tf_prior import TFPrior
 from arch import config
 
@@ -71,6 +75,27 @@ def test_bounded_log_density_is_vectorized():
     )
     assert values.shape == (4,)
     assert np.all(np.isfinite(values))
+
+
+def test_posterior_pp_curve_has_uniform_reference_metrics():
+    values, empirical, distance = posterior_pp_curve(
+        np.asarray([0.1, 0.3, 0.7, 0.9])
+    )
+    assert np.allclose(values, [0.1, 0.3, 0.7, 0.9])
+    assert np.allclose(empirical, [0.25, 0.5, 0.75, 1.0])
+    assert np.isclose(distance, 0.2)
+
+
+def test_posterior_pit_evaluates_weighted_truth_cdf():
+    artifact = {
+        "points": np.vstack(
+            [np.full(len(NAMES), -0.5), np.full(len(NAMES), 0.5)]
+        ),
+        "log_weights": np.zeros(2),
+        "truth": np.zeros(len(NAMES)),
+    }
+    pits = posterior_pit(artifact, names=NAMES)
+    assert np.allclose(pits[:2], 0.5)
 
 
 def test_artifact_round_trip_and_posterior_summary(tmp_path):
@@ -171,3 +196,10 @@ def test_report_generation_with_small_campaign(tmp_path):
     assert (report_dir / "report.html").is_file()
     assert (report_dir / "report.json").is_file()
     assert len(list((report_dir / "corner_plots").glob("*.png"))) == 1
+    payload = json.loads((report_dir / "report.json").read_text())
+    assert set(payload["posterior_pp"]) == {"g1", "g2"}
+    assert "standardized_residual" in payload["per_galaxy"][0]
+    assert (report_dir / "normalized_residuals_by_parameter.png").is_file()
+    assert (report_dir / "g_estimates_vs_truth.png").is_file()
+    assert (report_dir / "posterior_pp.png").is_file()
+    assert "m_vs_nuisance_stacks.png" not in payload["metadata"]["figures"].values()

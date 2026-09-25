@@ -632,9 +632,12 @@ def main(argv=None) -> None:
         device=device,
         expected_parent=args.parent_npe,
     )
-    if int(nre2d_meta.get("parameter_dim", 0)) != 2:
+    # The original 2D NRE checkpoint predates the explicit parameter_dim
+    # metadata field; load_ratio_head derives the dimension from target_names
+    # (or the 2D default) and constructs the correct head in that case.
+    if int(getattr(nre2d_head, "parameter_dim", 0)) != 2:
         raise ValueError("the 2D NRE checkpoint must have parameter_dim=2")
-    if int(nre9d_meta.get("parameter_dim", 0)) != 9:
+    if int(getattr(nre9d_head, "parameter_dim", 0)) != 9:
         raise ValueError("the 9D NRE checkpoint must have parameter_dim=9")
     dataset = pxt.TorchDataset(str(args.data_dir))
     tf_prior = TFPrior()

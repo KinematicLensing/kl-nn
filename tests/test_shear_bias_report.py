@@ -1437,11 +1437,43 @@ def test_response_calibrate_applies_to_last_case_only(tmp_path):
     )
     document = output.read_text(encoding="utf-8")
     assert document.count("<h2>model:xu1</h2>") == 1
-    assert document.count("<h2>model:xu1 · R(σ) calibrated</h2>") == 1
+    assert document.count(
+        "<h2>model:xu1 · R(σ) calibrated · σ/R &lt; 0.2</h2>"
+    ) == 1
     assert "posterior errors inflate on purpose" in document
     assert "R<sub>min</sub>=0.25" in document
     assert str(calibration_path) in document
     assert "This is not the default Mean estimator." in document
+    assert "candidate posterior RMS" in document
+    assert "Kept 36 / 36" in document
+
+
+def test_response_calibration_uses_candidate_variance_sigma(tmp_path):
+    report = _report()
+    root = tmp_path / "cache" / "model" / "xu1"
+    arrays = _write_compact_test_cache(root)
+    case = report.load_case(tmp_path / "cache", "model:xu1", test_set=True)
+    sigma = report.combined_posterior_rms(
+        arrays["shear_sample"], arrays["posterior_tf_log_weight"]
+    )
+    a, b, r_min = 1.05, -80.0, 0.25
+    expected = report.response_from_sigma(sigma, a, b, r_min)
+    calibration_path = tmp_path / "r_sigma.json"
+    calibration_path.write_text(
+        json.dumps({"a": a, "b": b, "R_min": r_min}),
+        encoding="utf-8",
+    )
+    report.apply_response_calibration_to_case(
+        case,
+        report.load_response_calibration(calibration_path),
+    )
+    np.testing.assert_allclose(case["response_calibration"]["sigma"], sigma)
+    np.testing.assert_allclose(case["response_calibration"]["R"], expected)
+    np.testing.assert_allclose(
+        case["response_calibration"]["R"],
+        np.clip(a + b * np.square(sigma), r_min, 1.0),
+    )
+    assert "shear_sigma_cut" not in case
 
 
 def test_max_sigma_at_response_floor_matches_clip_boundary():
@@ -1455,49 +1487,64 @@ def test_max_sigma_at_response_floor_matches_clip_boundary():
     )
 
 
-def test_max_shear_sigma_cut_zeros_wide_galaxy_weights():
+def test_final_variance_cut_zeros_wide_galaxy_weights_after_r():
     report = _report()
-    n = 4
+    n = 2
     summary = np.zeros((n, 3, len(FEATURES)), dtype=np.float64)
-    summary[:2, 0, :2] = -0.02
-    summary[:2, 2, :2] = 0.02
-    summary[2:, 0, :2] = -0.08
-    summary[2:, 2, :2] = 0.08
     case = {
-        "case": "model:xu1",
+        "case": "model:xu1 · R(σ) calibrated",
         "populations": {
             "TF-conformed test set / TF posterior": {
                 "key": "test_set",
                 "summary": summary,
                 "mean": summary[:, 1],
-                "galaxy_weight": np.full(n, 0.25),
-                "population_weight": np.full(n, 0.25),
+                "galaxy_weight": np.full(n, 0.5),
+                "population_weight": np.full(n, 0.5),
             }
         },
+        "response_calibration": {
+            "sigma": np.asarray([0.05, 0.08], dtype=np.float64),
+            "R": np.asarray([1.0, 0.25], dtype=np.float64),
+        },
     }
-    report.apply_max_shear_sigma_cut(case, 0.05)
+    report.apply_final_variance_cut(case, 0.2)
     keep = case["shear_sigma_cut"]["keep"]
-    np.testing.assert_array_equal(keep, [True, True, False, False])
+    np.testing.assert_array_equal(keep, [True, False])
     weight = case["populations"]["TF-conformed test set / TF posterior"][
         "galaxy_weight"
     ]
-    np.testing.assert_allclose(weight, [0.25, 0.25, 0.0, 0.0])
-    assert case["case"].endswith(" · σ ≤ 0.05")
-    with pytest.raises(ValueError, match="before --response-calibrate"):
-        case["response_calibration"] = {"R": np.ones(n)}
-        report.apply_max_shear_sigma_cut(case, 0.05)
+    np.testing.assert_allclose(weight, [0.5, 0.0])
+    assert case["case"].endswith(" · σ/R < 0.2")
+    with pytest.raises(ValueError, match="require clipped R"):
+        bare = {
+            "case": "model:xu1",
+            "populations": case["populations"],
+        }
+        report.apply_final_variance_cut(bare, 0.2)
 
 
-def test_max_shear_sigma_report_keeps_narrow_galaxies(tmp_path):
+def test_max_final_variance_report_keeps_narrow_galaxies(tmp_path):
     report = _report()
     root = tmp_path / "cache" / "model" / "xu1"
-    _write_compact_test_cache(root)
-    summary_path = root / "tf_target_mean_estimates" / "part0of1.npy"
-    summary = np.load(summary_path)
+    arrays = _write_compact_test_cache(root)
+    shear_path = root / "shear_sample" / "part0of1.npy"
+    shear = np.load(shear_path)
     wide = slice(24, 36)
-    summary[wide, 0, :2] -= 0.07
-    summary[wide, 2, :2] += 0.07
-    np.save(summary_path, summary)
+    n_draw = shear.shape[1]
+    shear[wide, :, 0] = np.linspace(-0.45, 0.45, n_draw, dtype=np.float32)
+    shear[wide, :, 1] = np.linspace(-0.45, 0.45, n_draw, dtype=np.float32)
+    np.save(shear_path, shear)
+    arrays["shear_sample"] = shear
+    sigma = report.combined_posterior_rms(
+        shear, arrays["posterior_tf_log_weight"]
+    )
+    assert np.all(sigma[:24] < 0.2)
+    assert np.all(sigma[24:] >= 0.2)
+    calibration_path = tmp_path / "r_sigma.json"
+    calibration_path.write_text(
+        json.dumps({"a": 1.0, "b": 0.0, "R_min": 0.25}),
+        encoding="utf-8",
+    )
     output = tmp_path / "narrow.html"
     report.main(
         [
@@ -1506,13 +1553,99 @@ def test_max_shear_sigma_report_keeps_narrow_galaxies(tmp_path):
             "--output", str(output),
             "--bins", "2",
             "--test-set",
-            "--max-shear-sigma", "0.05",
+            "--response-calibrate", str(calibration_path),
+            "--max-final-variance", "0.2",
         ]
     )
     document = output.read_text(encoding="utf-8")
-    assert "<h2>model:xu1 · σ ≤ 0.05</h2>" in document
+    assert "<h2>model:xu1 · R(σ) calibrated · σ/R &lt; 0.2</h2>" in document
     assert "Kept 24 / 36" in document
-    assert "uncalibrated TF 16–84 shear width exceeds" in document
+    assert "σ<sub>final</sub> = σ/R" in document
+    assert "uncalibrated TF 16–84 shear width exceeds" not in document
+    assert "cut before calibrate" not in document
+
+
+def test_max_final_variance_ignored_without_response_calibrate(tmp_path):
+    report = _report()
+    _write_compact_test_cache(tmp_path / "cache" / "model" / "xu1")
+    output = tmp_path / "plain.html"
+    report.main(
+        [
+            "--cache-root", str(tmp_path / "cache"),
+            "--case", "model:xu1",
+            "--output", str(output),
+            "--bins", "2",
+            "--test-set",
+            "--max-final-variance", "0.2",
+        ]
+    )
+    document = output.read_text(encoding="utf-8")
+    assert "<h2>model:xu1</h2>" in document
     assert "R(σ) calibrated" not in document
+    assert "σ/R" not in document
+    assert "Kept " not in document
+
+
+def test_max_final_variance_cli_and_slurm_names():
+    report = _report()
+    args = report.parse_args(
+        ["--case", "model:xu1", "--output", "out.html"]
+    )
+    assert args.max_final_variance == 0.2
+    assert not hasattr(args, "max_shear_sigma")
+    slurm = (
+        Path(__file__).resolve().parents[1]
+        / "arch"
+        / "diagnostics"
+        / "shear_bias_report.slurm"
+    )
+    text = slurm.read_text(encoding="utf-8")
+    assert "MAX_FINAL_VARIANCE" in text
+    assert "--max-final-variance" in text
+    assert "MAX_SHEAR_SIGMA" not in text
+    assert "--max-shear-sigma" not in text
+
+
+def _fit_response():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "arch"
+        / "diagnostics"
+        / "fit_response_vs_sigma.py"
+    )
+    spec = importlib.util.spec_from_file_location("fit_response_vs_sigma_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_iterated_keep_excludes_floor_points_from_second_ols():
+    fit_mod = _fit_response()
+    n_good = 40
+    sigma_good = np.linspace(0.01, 0.04, n_good)
+    r_good = 0.95 - 40.0 * np.square(sigma_good)
+    n_wide = 20
+    sigma_wide = np.full(n_wide, 0.25)
+    r_wide = np.full(n_wide, 0.25)
+    sigma = np.concatenate([sigma_good, sigma_wide])
+    r_diag = np.concatenate([r_good, r_wide])
+    result = fit_mod.iterated_keep_fit(
+        sigma,
+        r_diag,
+        seed=31415,
+        calibration_fraction=0.5,
+        r_min=0.25,
+        r_max=1.0,
+        max_final_variance=0.2,
+    )
+    keep = result["keep"]
+    np.testing.assert_array_equal(keep[:n_good], np.ones(n_good, dtype=bool))
+    np.testing.assert_array_equal(keep[n_good:], np.zeros(n_wide, dtype=bool))
+    assert result["n_kept"] == n_good
+    assert result["n_dropped"] == n_wide
+    assert result["n_iterations"] >= 2
+    only_good = fit_mod.production_ols(sigma_good, r_good)
+    np.testing.assert_allclose(result["a"], only_good["a"], rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(result["b"], only_good["b"], rtol=1e-10, atol=1e-12)
 
 

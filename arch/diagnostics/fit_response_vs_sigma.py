@@ -3,6 +3,10 @@
 
 Writes a small JSON (the production input for report-time stretch) and a
 companion HTML scatter. This diagnostic is not METHODS-monitored.
+
+σ is posterior RMS from equal-weight candidate variance at the zero-shear
+state, not a 16–84 half-width. Production a, b are OLS on leftover bases
+after an iterated σ/R keep cut.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ for path in (str(DIAG_DIR), str(ARCH_DIR)):
         sys.path.insert(0, path)
 
 from cache_contract import load_cache_partitions, load_partitioned_array
+from shear_bias_report import combined_posterior_rms, response_from_sigma
 from shear_response_report import STATE_ORDER, build_matched_cubes
 
 
@@ -43,11 +48,13 @@ DEFAULT_MANIFEST = Path(
 )
 DEFAULT_OUTPUT = Path(
     "/ocean/projects/phy250048p/shared/reports/"
-    "r_sigma_frozen_concat_45255702.json"
+    "r_sigma_frozen_concat_45255702_variance.json"
 )
 DEFAULT_SEED = 31415
 DEFAULT_R_MIN = 0.25
 DEFAULT_R_MAX = 1.0
+DEFAULT_MAX_FINAL_VARIANCE = 0.2
+MAX_KEEP_ITERATIONS = 10
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -60,34 +67,74 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--calibration-fraction", type=float, default=0.5)
     parser.add_argument("--r-min", type=float, default=DEFAULT_R_MIN)
     parser.add_argument("--r-max", type=float, default=DEFAULT_R_MAX)
+    parser.add_argument(
+        "--max-final-variance",
+        type=float,
+        default=DEFAULT_MAX_FINAL_VARIANCE,
+        help=(
+            "Drop bases whose inflated RMS σ_final = σ/R is at least this "
+            "threshold, using the clipped R map. Default 0.2 (prior box)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def cube_rows(
-    values: np.ndarray,
+def zero_shear_sigma(draws: np.ndarray) -> np.ndarray:
+    """Combined posterior RMS of (g1, g2) at the zero-shear state.
+
+    `draws` has shape (nbase, ndraw, ≥2). Weights are equal over candidates.
+    """
+
+    sigma = combined_posterior_rms(draws, log_weight=None)
+    if not np.all(np.isfinite(sigma)) or np.any(sigma < 0.0):
+        raise ValueError("zero-shear posterior RMS must be finite and non-negative")
+    return sigma
+
+
+def load_zero_shear_candidate_draws(
+    cache_partitions,
     base_column: np.ndarray,
     state_column: np.ndarray,
     nbase: int,
 ) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim == 1:
-        values = values[:, None]
-    cube = np.empty((nbase, len(STATE_ORDER), values.shape[1]), dtype=np.float64)
-    cube[base_column, state_column] = values
-    return cube
+    """Equal-weight g1/g2 candidate draws at the zero-shear matched state."""
 
-
-def zero_shear_sigma(p16: np.ndarray, p84: np.ndarray) -> np.ndarray:
-    """Combined 16–84 half-width of (g1, g2) at the zero-shear state."""
-
-    half = 0.5 * (np.asarray(p84, dtype=np.float64) - np.asarray(p16, dtype=np.float64))
-    if half.ndim != 2 or half.shape[1] != 2:
-        raise ValueError("zero-shear 16/84 must have shape (nbase, 2)")
-    if not np.all(np.isfinite(half)):
-        raise ValueError("zero-shear 16–84 shear width must be finite")
-    if np.any(half < 0.0):
-        raise ValueError("zero-shear 84th percentile must be at least the 16th")
-    return np.sqrt(0.5 * np.sum(np.square(half), axis=1))
+    zero = STATE_ORDER.index("zero")
+    sample_files = cache_partitions.files["sample"]
+    first = np.load(sample_files[0], mmap_mode="r")
+    if first.ndim != 3 or first.shape[-1] < 2:
+        raise ValueError(
+            f"sample array must have shape (galaxy, draw, ≥2), got {first.shape}"
+        )
+    ndraw = int(first.shape[1])
+    del first
+    out = np.empty((nbase, ndraw, 2), dtype=np.float64)
+    filled = np.zeros(nbase, dtype=bool)
+    offset = 0
+    for path in sample_files:
+        samples = np.load(path, mmap_mode="r")
+        nloc = int(samples.shape[0])
+        global_index = np.arange(offset, offset + nloc)
+        if offset + nloc > len(state_column):
+            raise ValueError("sample cache is longer than the matched manifest")
+        local = np.flatnonzero(state_column[global_index] == zero)
+        if len(local):
+            bases = base_column[global_index[local]]
+            if np.any(bases < 0) or np.any(bases >= nbase):
+                raise ValueError("zero-shear base_id is outside the matched cube")
+            if np.any(filled[bases]):
+                raise ValueError("duplicate zero-shear samples for a base galaxy")
+            out[bases] = np.asarray(samples[local, :, :2], dtype=np.float64)
+            filled[bases] = True
+        offset += nloc
+        del samples
+    if offset != len(state_column):
+        raise ValueError(
+            f"sample cache has {offset} galaxies, manifest has {len(state_column)}"
+        )
+    if not np.all(filled):
+        raise ValueError("every base galaxy must have a zero-shear sample row")
+    return out
 
 
 def diagonal_response(estimate_cube: np.ndarray, truth_cube: np.ndarray) -> tuple[np.ndarray, float]:
@@ -122,51 +169,144 @@ def diagonal_response(estimate_cube: np.ndarray, truth_cube: np.ndarray) -> tupl
     return r_diag, delta
 
 
-def fit_linear_response(
+def production_ols(sigma: np.ndarray, r_diag: np.ndarray) -> dict:
+    """Ordinary least squares R = a + b σ² on every supplied point."""
+
+    sigma = np.asarray(sigma, dtype=np.float64)
+    r_diag = np.asarray(r_diag, dtype=np.float64)
+    if len(sigma) < 2 or len(r_diag) != len(sigma):
+        raise ValueError("OLS requires matching sigma and R of length >= 2")
+    sigma2 = np.square(sigma)
+    design = np.column_stack((np.ones(len(sigma), dtype=np.float64), sigma2))
+    coef, _, _, _ = np.linalg.lstsq(design, r_diag, rcond=None)
+    intercept, slope = (float(coef[0]), float(coef[1]))
+    predicted = intercept + slope * sigma2
+    residual = r_diag - predicted
+    ss_res = float(np.sum(np.square(residual)))
+    centered = r_diag - np.mean(r_diag)
+    ss_tot = float(np.sum(np.square(centered)))
+    r_squared = float("nan") if ss_tot <= 0.0 else float(1.0 - ss_res / ss_tot)
+    if len(sigma) >= 2 and float(np.std(sigma2)) > 0.0 and float(np.std(r_diag)) > 0.0:
+        correlation = float(np.corrcoef(r_diag, sigma2)[0, 1])
+    else:
+        correlation = float("nan")
+    return {
+        "a": intercept,
+        "b": slope,
+        "r_squared": r_squared,
+        "corr_R_sigma2": correlation,
+    }
+
+
+def holdout_residual_rms(
     sigma: np.ndarray,
     r_diag: np.ndarray,
+    a: float,
+    b: float,
     *,
     seed: int,
     calibration_fraction: float,
 ) -> dict:
+    """Seeded holdout RMS of production a, b on leftover points (diagnostic)."""
+
     sigma = np.asarray(sigma, dtype=np.float64)
     r_diag = np.asarray(r_diag, dtype=np.float64)
     nbase = len(sigma)
     if nbase < 4 or len(r_diag) != nbase:
-        raise ValueError("calibration requires matching sigma and R of length >= 4")
+        raise ValueError("holdout residual requires matching leftover length >= 4")
     if not 0.0 < calibration_fraction < 1.0:
         raise ValueError("calibration-fraction must lie strictly between 0 and 1")
     rng = np.random.default_rng(seed)
     order = rng.permutation(nbase)
     split = int(round(calibration_fraction * nbase))
     split = min(max(split, 2), nbase - 2)
-    calibration, holdout = order[:split], order[split:]
-    sigma2 = np.square(sigma)
-    design = np.column_stack(
-        (np.ones(len(calibration), dtype=np.float64), sigma2[calibration])
-    )
-    coef, _, _, _ = np.linalg.lstsq(design, r_diag[calibration], rcond=None)
-    intercept, slope = (float(coef[0]), float(coef[1]))
-    predicted = intercept + slope * sigma2
-    residual = r_diag - predicted
-    cal_residual = residual[calibration]
-    ss_res = float(np.sum(np.square(cal_residual)))
-    centered = r_diag[calibration] - np.mean(r_diag[calibration])
-    ss_tot = float(np.sum(np.square(centered)))
-    r_squared = float("nan") if ss_tot <= 0.0 else float(1.0 - ss_res / ss_tot)
-    holdout_residual_rms = float(np.sqrt(np.mean(np.square(residual[holdout]))))
-    correlation = float(np.corrcoef(r_diag, sigma2)[0, 1])
+    holdout = order[split:]
+    predicted = a + b * np.square(sigma[holdout])
+    residual_rms = float(np.sqrt(np.mean(np.square(r_diag[holdout] - predicted))))
     return {
-        "a": intercept,
-        "b": slope,
-        "r_squared": r_squared,
-        "holdout_residual_rms": holdout_residual_rms,
-        "n_calibration": int(len(calibration)),
+        "holdout_residual_rms": residual_rms,
+        "n_calibration": int(split),
         "n_holdout": int(len(holdout)),
-        "corr_R_sigma2": correlation,
-        "calibration_index": calibration.astype(np.int64),
-        "holdout_index": holdout.astype(np.int64),
-        "predicted": predicted,
+    }
+
+
+def keep_from_clipped_response(
+    sigma: np.ndarray,
+    response: np.ndarray,
+    max_final_variance: float,
+) -> np.ndarray:
+    sigma = np.asarray(sigma, dtype=np.float64)
+    response = np.asarray(response, dtype=np.float64)
+    ratio = sigma / response
+    return (
+        np.isfinite(sigma)
+        & (sigma >= 0.0)
+        & np.isfinite(response)
+        & (response > 0.0)
+        & np.isfinite(ratio)
+        & (ratio < max_final_variance)
+    )
+
+
+def iterated_keep_fit(
+    sigma: np.ndarray,
+    r_diag: np.ndarray,
+    *,
+    seed: int,
+    calibration_fraction: float,
+    r_min: float,
+    r_max: float,
+    max_final_variance: float,
+    max_iterations: int = MAX_KEEP_ITERATIONS,
+) -> dict:
+    """Fit a+bσ² on leftover bases, iterating the clipped σ/R keep mask."""
+
+    sigma = np.asarray(sigma, dtype=np.float64)
+    r_diag = np.asarray(r_diag, dtype=np.float64)
+    if len(sigma) < 4 or len(r_diag) != len(sigma):
+        raise ValueError("calibration requires matching sigma and R of length >= 4")
+    if not np.isfinite(max_final_variance) or max_final_variance <= 0.0:
+        raise ValueError("max-final-variance must be a positive finite value")
+    if max_iterations < 1:
+        raise ValueError("keep iteration cap must be at least 1")
+    keep = np.isfinite(sigma) & (sigma >= 0.0) & np.isfinite(r_diag)
+    if not np.any(keep):
+        raise ValueError("no finite zero-shear σ values to initialize the keep set")
+    fit = None
+    n_iterations = 0
+    response = None
+    for n_iterations in range(1, max_iterations + 1):
+        if int(np.count_nonzero(keep)) < 4:
+            raise ValueError("keep set is too small for OLS after the σ/R cut")
+        fit = production_ols(sigma[keep], r_diag[keep])
+        response = response_from_sigma(
+            sigma, fit["a"], fit["b"], r_min, r_max
+        )
+        new_keep = keep_from_clipped_response(sigma, response, max_final_variance)
+        new_keep &= np.isfinite(r_diag)
+        if np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+    holdout = holdout_residual_rms(
+        sigma[keep],
+        r_diag[keep],
+        fit["a"],
+        fit["b"],
+        seed=seed,
+        calibration_fraction=calibration_fraction,
+    )
+    n_kept = int(np.count_nonzero(keep))
+    return {
+        **fit,
+        **holdout,
+        "keep": keep,
+        "response": response,
+        "predicted": fit["a"] + fit["b"] * np.square(sigma),
+        "n_kept": n_kept,
+        "n_dropped": int(len(keep) - n_kept),
+        "n_iterations": int(n_iterations),
+        "seed": int(seed),
+        "max_final_variance": float(max_final_variance),
     }
 
 
@@ -185,28 +325,32 @@ def scatter_html(
     *,
     r_min: float,
     r_max: float,
+    max_final_variance: float,
 ) -> str:
-    calibration = fit["calibration_index"]
-    holdout = fit["holdout_index"]
+    keep = np.asarray(fit["keep"], dtype=bool)
+    dropped = ~keep
     grid = np.linspace(float(np.min(sigma)), float(np.max(sigma)), 200)
     unclipped = fit["a"] + fit["b"] * np.square(grid)
     clipped = np.clip(unclipped, r_min, r_max)
+    boundary = grid / max_final_variance
     fig, axis = plt.subplots(figsize=(7.2, 5.2))
     axis.scatter(
-        sigma[calibration],
-        r_diag[calibration],
+        sigma[keep],
+        r_diag[keep],
         s=12,
         alpha=0.75,
-        label=f"calibration (n={len(calibration)})",
+        label=rf"kept $\sigma/R < {max_final_variance:g}$ (n={int(np.count_nonzero(keep))})",
     )
-    axis.scatter(
-        sigma[holdout],
-        r_diag[holdout],
-        s=12,
-        alpha=0.75,
-        marker="s",
-        label=f"holdout (n={len(holdout)})",
-    )
+    if np.any(dropped):
+        axis.scatter(
+            sigma[dropped],
+            r_diag[dropped],
+            s=18,
+            alpha=0.8,
+            marker="x",
+            color="tab:orange",
+            label=rf"dropped $\sigma/R \geq {max_final_variance:g}$ (n={int(np.count_nonzero(dropped))})",
+        )
     axis.plot(grid, unclipped, color="black", lw=1.2, label=r"$a + b\sigma^2$")
     axis.plot(
         grid,
@@ -216,31 +360,47 @@ def scatter_html(
         ls="--",
         label=rf"clip$[{r_min:g}, {r_max:g}]$",
     )
-    axis.set_xlabel(r"zero-shear $\sigma$")
+    axis.plot(
+        grid,
+        boundary,
+        color="tab:green",
+        lw=1.2,
+        ls=":",
+        label=rf"$\sigma/R={max_final_variance:g}$",
+    )
+    axis.set_xlabel(r"zero-shear $\sigma=\sqrt{\frac{1}{2}(\mathrm{Var}\,g_1+\mathrm{Var}\,g_2)}$")
     axis.set_ylabel(r"$R_{\mathrm{diag}}=(R_{11}+R_{22})/2$")
-    axis.set_title("Proposal Mean response vs posterior width")
+    axis.set_title("Proposal Mean response vs posterior RMS")
     axis.legend()
     axis.grid(True, alpha=0.3)
     uri = fig_data_uri(fig)
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
-        "<title>R(σ) fit</title>"
+        "<title>R(σ) variance fit</title>"
         "<style>body{font-family:system-ui;max-width:800px;margin:2rem auto}"
         "table{border-collapse:collapse}th,td{border:1px solid #ccc;"
         "padding:.35rem .6rem;text-align:right}th:first-child,td:first-child"
         "{text-align:left}</style></head><body>"
-        "<h1>Scalar shear response vs posterior width</h1>"
+        "<h1>Scalar shear response vs posterior RMS</h1>"
         "<p>Proposal Mean five-point stencil. "
-        "R = a + b σ<sup>2</sup> is ordinary least squares on the calibration "
-        f"half; applied response is clipped to [{r_min:g}, {r_max:g}]. "
+        "X is posterior RMS "
+        "σ = sqrt((Var g<sub>1</sub> + Var g<sub>2</sub>)/2) from equal-weight "
+        "zero-shear candidates, not a 16–84 half-width. "
+        "R = a + b σ<sup>2</sup> is ordinary least squares on leftover "
+        f"points after iterating the keep rule σ/R &lt; {max_final_variance:g} "
+        "with clipped R; applied response is clipped to "
+        f"[{r_min:g}, {r_max:g}]. "
         "Wide-tertile floor R<sub>min</sub> never amplifies by more than "
         "&times;4 and never shrinks.</p>"
         "<table><thead><tr><th>Quantity</th><th>Value</th></tr></thead><tbody>"
         f"<tr><td>a</td><td>{fit['a']:.8g}</td></tr>"
         f"<tr><td>b</td><td>{fit['b']:.8g}</td></tr>"
-        f"<tr><td>calibration R²</td><td>{fit['r_squared']:.6g}</td></tr>"
+        f"<tr><td>leftover R²</td><td>{fit['r_squared']:.6g}</td></tr>"
         f"<tr><td>holdout residual RMS</td><td>{fit['holdout_residual_rms']:.6g}</td></tr>"
         f"<tr><td>corr(R, σ²)</td><td>{fit['corr_R_sigma2']:.6g}</td></tr>"
+        f"<tr><td>n<sub>kept</sub></td><td>{fit['n_kept']}</td></tr>"
+        f"<tr><td>n<sub>dropped</sub></td><td>{fit['n_dropped']}</td></tr>"
+        f"<tr><td>iterations</td><td>{fit['n_iterations']}</td></tr>"
         f"<tr><td>seed</td><td>{fit['seed']}</td></tr>"
         "</tbody></table>"
         f'<p><img src="{uri}" alt="R versus sigma scatter"></p>'
@@ -252,6 +412,8 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     if args.r_min <= 0.0 or args.r_min > args.r_max:
         raise ValueError("R clip bounds must satisfy 0 < R_min <= R_max")
+    if not np.isfinite(args.max_final_variance) or args.max_final_variance <= 0.0:
+        raise ValueError("max-final-variance must be a positive finite value")
     html_path = args.html if args.html is not None else args.output.with_suffix(".html")
     manifest = pd.read_csv(args.manifest)
     cache_partitions = load_cache_partitions(args.cache_root)
@@ -283,16 +445,19 @@ def main(argv=None) -> None:
     if unknown:
         raise ValueError(f"Unknown matched states: {unknown}")
     state_column = ordered["state"].map(state_code).to_numpy(dtype=np.int64)
-    p16_cube = cube_rows(summary[:, 0, :2], base_column, state_column, nbase)
-    p84_cube = cube_rows(summary[:, 2, :2], base_column, state_column, nbase)
-    zero = STATE_ORDER.index("zero")
-    sigma = zero_shear_sigma(p16_cube[:, zero], p84_cube[:, zero])
+    draws = load_zero_shear_candidate_draws(
+        cache_partitions, base_column, state_column, nbase
+    )
+    sigma = zero_shear_sigma(draws)
     r_diag, delta = diagonal_response(mean_cube, truth_cube)
-    fit = fit_linear_response(
+    fit = iterated_keep_fit(
         sigma,
         r_diag,
         seed=args.seed,
         calibration_fraction=args.calibration_fraction,
+        r_min=float(args.r_min),
+        r_max=float(args.r_max),
+        max_final_variance=float(args.max_final_variance),
     )
     payload = {
         "a": fit["a"],
@@ -308,6 +473,11 @@ def main(argv=None) -> None:
         "nbase": int(nbase),
         "n_calibration": fit["n_calibration"],
         "n_holdout": fit["n_holdout"],
+        "n_kept": fit["n_kept"],
+        "n_dropped": fit["n_dropped"],
+        "n_iterations": fit["n_iterations"],
+        "max_final_variance": float(args.max_final_variance),
+        "predictor": "posterior_variance",
         "delta_g": delta,
         "posterior_source": "proposal",
         "estimator": "mean",
@@ -317,9 +487,10 @@ def main(argv=None) -> None:
     document = scatter_html(
         sigma,
         r_diag,
-        {**fit, "seed": args.seed},
+        fit,
         r_min=float(args.r_min),
         r_max=float(args.r_max),
+        max_final_variance=float(args.max_final_variance),
     )
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(document, encoding="utf-8")
@@ -328,7 +499,9 @@ def main(argv=None) -> None:
     print(
         f"R = {payload['a']:.6g} + {payload['b']:.6g} σ², "
         f"R²={payload['r_squared']:.4f}, "
-        f"holdout RMS={payload['holdout_residual_rms']:.4f}"
+        f"holdout RMS={payload['holdout_residual_rms']:.4f}, "
+        f"kept {payload['n_kept']}/{payload['nbase']} "
+        f"after {payload['n_iterations']} iteration(s)"
     )
 
 

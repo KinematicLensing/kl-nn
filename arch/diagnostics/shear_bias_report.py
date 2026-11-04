@@ -109,13 +109,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--max-shear-sigma",
+        "--max-final-variance",
         type=float,
-        default=None,
+        default=0.2,
         help=(
-            "Zero analysis weight for galaxies whose uncalibrated TF 16–84 "
-            "shear width exceeds this cut. Applied to every --case from "
-            "uncalibrated summaries, before any R(σ) stretch."
+            "When --response-calibrate is set, zero analysis weight for "
+            "galaxies whose inflated RMS σ_final = σ/R is at least this "
+            "threshold. σ is TF / test-set candidate posterior RMS. "
+            "Ignored if --response-calibrate is omitted (no R). Default 0.2."
         ),
     )
     return parser.parse_args(argv)
@@ -190,8 +191,8 @@ def tf_or_test_population(case: dict) -> dict:
         if population["key"] in {"tf_target", "test_set"}:
             return population
     raise ValueError(
-        "TF or test-set 16–84 summaries are required for response calibration "
-        "and shear-width cuts"
+        "TF or test-set candidate variance is required for response "
+        "calibration and σ/R cuts"
     )
 
 
@@ -205,23 +206,27 @@ def max_sigma_at_response_floor(a: float, b: float, r_min: float) -> float:
     return float(np.sqrt((r_min - a) / b))
 
 
-def apply_max_shear_sigma_cut(case: dict, max_sigma: float) -> dict:
-    """Zero analysis weight for galaxies wider than `max_sigma`. Mutates `case`."""
+def apply_final_variance_cut(case: dict, max_final_variance: float) -> dict:
+    """Zero analysis weight where σ/R ≥ `max_final_variance`. Mutates `case`."""
 
-    if not np.isfinite(max_sigma) or max_sigma <= 0.0:
-        raise ValueError("max-shear-sigma must be a positive finite value")
-    source = tf_or_test_population(case)
-    if case.get("response_calibration") is not None:
+    if not np.isfinite(max_final_variance) or max_final_variance <= 0.0:
+        raise ValueError("max-final-variance must be a positive finite value")
+    info = case.get("response_calibration")
+    if info is None:
         raise ValueError(
-            "shear-width cuts must use uncalibrated 16–84 widths; "
-            "apply --max-shear-sigma before --response-calibrate"
+            "final-variance cuts require clipped R(σ); "
+            "compute --response-calibrate before --max-final-variance"
         )
-    sigma = shear_interval_sigma(source["summary"])
-    keep = sigma <= max_sigma
+    sigma = np.asarray(info["sigma"], dtype=np.float64)
+    response = np.asarray(info["R"], dtype=np.float64)
+    if sigma.shape != response.shape:
+        raise ValueError("response calibration σ and R must have the same shape")
+    ratio = sigma / response
+    keep = np.isfinite(ratio) & (ratio < max_final_variance)
     n_kept = int(np.count_nonzero(keep))
     if n_kept == 0:
         raise ValueError(
-            f"max-shear-sigma {max_sigma:g} dropped every galaxy"
+            f"max-final-variance {max_final_variance:g} dropped every galaxy"
         )
     for population in case["populations"].values():
         galaxy_weight = np.array(
@@ -235,13 +240,14 @@ def apply_max_shear_sigma_cut(case: dict, max_sigma: float) -> dict:
         population["galaxy_weight"] = galaxy_weight
         population["population_weight"] = population_mass
     case["shear_sigma_cut"] = {
-        "max_shear_sigma": float(max_sigma),
+        "max_final_variance": float(max_final_variance),
         "n": int(len(keep)),
         "n_kept": n_kept,
         "keep": keep,
         "sigma": sigma,
+        "ratio": ratio,
     }
-    suffix = f" · σ ≤ {max_sigma:g}"
+    suffix = f" · σ/R < {max_final_variance:g}"
     name = str(case["case"])
     if suffix not in name:
         case["case"] = name + suffix
@@ -254,15 +260,19 @@ def shear_sigma_cut_note(case: dict) -> str:
         return ""
     n_kept = info["n_kept"]
     n = info["n"]
-    max_sigma = info["max_shear_sigma"]
+    max_final = info["max_final_variance"]
     kept_pct = 100.0 * n_kept / n
     return (
-        "<p>This case zeros analysis weight for galaxies whose uncalibrated "
-        "TF 16–84 shear width exceeds "
-        f"<code>σ ≤ {max_sigma:g}</code>. Kept {n_kept:,} / {n:,} "
-        f"({kept_pct:.1f}%). The cut is the R(σ) floor: wider galaxies would "
-        "clip at R<sub>min</sub>. Cache rows are unchanged; posterior-candidate "
-        "diagnostics still stream every galaxy.</p>"
+        "<p>This case zeros analysis weight for galaxies whose inflated RMS "
+        "<code>σ<sub>final</sub> = σ/R</code> is at least "
+        f"<code>{max_final:g}</code> "
+        f"(keep <code>σ/R &lt; {max_final:g}</code>). "
+        "σ is TF / test-set candidate posterior RMS, and R is the clipped "
+        f"map. Kept {n_kept:,} / {n:,} ({kept_pct:.1f}%). "
+        "The cut is the prior-box width: galaxies that would land at or "
+        "beyond the box after stretch receive zero weight. Cache rows are "
+        "unchanged; posterior-candidate diagnostics still stream every "
+        "galaxy.</p>"
     )
 
 
@@ -279,11 +289,20 @@ def stretch_shear_summaries(summary: np.ndarray, response: np.ndarray) -> np.nda
     return out
 
 
-def apply_response_calibration_to_case(case: dict, calibration: dict) -> dict:
-    """Stretch the last case's shear summaries. Mutates `case` in place."""
+def apply_response_calibration_to_case(
+    case: dict,
+    calibration: dict,
+    max_final_variance: float | None = None,
+) -> dict:
+    """Stretch the last case's shear summaries. Mutates `case` in place.
 
-    source = tf_or_test_population(case)
-    sigma = shear_interval_sigma(source["summary"])
+    σ is TF / test-set candidate posterior RMS. When `max_final_variance` is
+    set, galaxies with σ/R at or above that threshold receive zero analysis
+    weight after R is computed and before Means / 16–84 / streamed candidates
+    are stretched by 1/R.
+    """
+
+    sigma = load_uncalibrated_candidate_sigma(case)
     response = response_from_sigma(
         sigma,
         calibration["a"],
@@ -291,15 +310,6 @@ def apply_response_calibration_to_case(case: dict, calibration: dict) -> dict:
         calibration["R_min"],
         calibration.get("R_max", DEFAULT_RESPONSE_R_MAX),
     )
-    for population in case["populations"].values():
-        population["summary"] = stretch_shear_summaries(
-            population["summary"], response
-        )
-        population["mean"] = population["summary"][:, 1]
-    if "base_summary" in case:
-        case["base_summary"] = stretch_shear_summaries(
-            case["base_summary"], response
-        )
     case["response_calibration"] = {
         "a": calibration["a"],
         "b": calibration["b"],
@@ -310,8 +320,19 @@ def apply_response_calibration_to_case(case: dict, calibration: dict) -> dict:
         "R": response,
     }
     name = str(case["case"])
-    if not name.endswith(RESPONSE_CALIBRATED_SUFFIX):
+    if RESPONSE_CALIBRATED_SUFFIX not in name:
         case["case"] = name + RESPONSE_CALIBRATED_SUFFIX
+    if max_final_variance is not None:
+        apply_final_variance_cut(case, max_final_variance)
+    for population in case["populations"].values():
+        population["summary"] = stretch_shear_summaries(
+            population["summary"], response
+        )
+        population["mean"] = population["summary"][:, 1]
+    if "base_summary" in case:
+        case["base_summary"] = stretch_shear_summaries(
+            case["base_summary"], response
+        )
     return case
 
 
@@ -328,6 +349,8 @@ def response_calibration_note(case: dict) -> str:
         f"<code>{path}</code> "
         f"(a={info['a']:.6g}, b={info['b']:.6g}, "
         f"R<sub>min</sub>={r_min:g}). "
+        "σ is TF / test-set candidate posterior RMS "
+        "(not a 16–84 half-width). "
         "Only g<sub>1</sub> and g<sub>2</sub> Means, 16th/84th summaries, "
         "and streamed shear candidates are divided by R, so posterior errors "
         "inflate on purpose. Nuisances and truth are unchanged. "
@@ -773,6 +796,61 @@ def posterior_component_variance(
         weight = scaled / np.sum(scaled)
     mean = float(np.sum(weight * selected))
     return float(np.sum(weight * np.square(selected - mean)))
+
+
+def combined_posterior_rms(
+    draws: np.ndarray, log_weight: np.ndarray | None = None
+) -> np.ndarray:
+    """σ = sqrt((Var g1 + Var g2) / 2) from candidate draws.
+
+    `draws` has shape (galaxy, draw, ≥2). Optional `log_weight` matches
+    (galaxy, draw) and uses the same normalization as
+    `posterior_component_variance`.
+    """
+
+    draws = np.asarray(draws, dtype=np.float64)
+    if draws.ndim != 3 or draws.shape[-1] < 2:
+        raise ValueError("candidate draws must have shape (galaxy, draw, ≥2)")
+    shear = draws[:, :, :2]
+    n_galaxy, n_draw, _ = shear.shape
+    if log_weight is None:
+        finite = np.isfinite(shear)
+        if bool(np.all(finite)):
+            variance = np.var(shear, axis=1, ddof=0)
+            return np.sqrt(0.5 * (variance[:, 0] + variance[:, 1]))
+        sigma = np.empty(n_galaxy, dtype=np.float64)
+        for row in range(n_galaxy):
+            sigma[row] = math.sqrt(
+                0.5
+                * (
+                    posterior_component_variance(shear[row, :, 0])
+                    + posterior_component_variance(shear[row, :, 1])
+                )
+            )
+        return sigma
+    log_weight = np.asarray(log_weight, dtype=np.float64)
+    if log_weight.shape != (n_galaxy, n_draw):
+        raise ValueError("log_weight must have shape (galaxy, draw)")
+    finite = np.isfinite(shear) & np.isfinite(log_weight)[:, :, None]
+    if bool(np.all(finite)):
+        maximum = np.max(log_weight, axis=1, keepdims=True)
+        scaled = np.exp(log_weight - maximum)
+        weight = scaled / np.sum(scaled, axis=1, keepdims=True)
+        mean = np.sum(weight[:, :, None] * shear, axis=1)
+        variance = np.sum(
+            weight[:, :, None] * np.square(shear - mean[:, None, :]), axis=1
+        )
+        return np.sqrt(0.5 * (variance[:, 0] + variance[:, 1]))
+    sigma = np.empty(n_galaxy, dtype=np.float64)
+    for row in range(n_galaxy):
+        sigma[row] = math.sqrt(
+            0.5
+            * (
+                posterior_component_variance(shear[row, :, 0], log_weight[row])
+                + posterior_component_variance(shear[row, :, 1], log_weight[row])
+            )
+        )
+    return sigma
 
 
 def fit_design(
@@ -1624,6 +1702,90 @@ def _conditional_candidate_mass(
     return keep, conditional, float(np.exp(log_mass))
 
 
+def load_uncalibrated_candidate_sigma(
+    case: dict, block_size: int = 64
+) -> np.ndarray:
+    """TF / test-set candidate posterior RMS from mmap samples (no PIT)."""
+
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    tf_or_test_population(case)
+    truth = np.asarray(case["truth"])
+    root = Path(case["root"])
+    cache_partitions = case.get("cache_partitions")
+    if cache_partitions is None:
+        cache_partitions = load_cache_partitions(root)
+    candidate_array = case.get("candidate_array", "sample")
+    sample_files = cache_partitions.files[candidate_array]
+    truth_files = cache_partitions.files["truth"]
+    candidate_log_weight_array = case.get(
+        "candidate_log_weight_array", "posterior_tf_log_weight"
+    )
+    try:
+        weight_files = cache_partitions.files[candidate_log_weight_array]
+    except KeyError as exc:
+        raise ValueError(
+            "TF / test-set candidate log-weights are required for R(σ) "
+            f"and the σ/R cut, missing {candidate_log_weight_array}"
+        ) from exc
+    sigma = np.full(len(truth), np.nan, dtype=np.float64)
+    offset = 0
+    for part_index, (sample_path, truth_path) in enumerate(
+        zip(sample_files, truth_files)
+    ):
+        if offset >= len(truth):
+            break
+        samples = np.load(sample_path, mmap_mode="r")
+        stored_truth = np.load(truth_path, mmap_mode="r")
+        cached_log_weight = np.load(weight_files[part_index], mmap_mode="r")
+        expected_candidate_features = (
+            2 if candidate_array == "shear_sample" else len(case["feature_names"])
+        )
+        if samples.ndim != 3 or samples.shape[-1] != expected_candidate_features:
+            raise ValueError(
+                f"Expected candidate shape (galaxy, draw, "
+                f"{expected_candidate_features}), got {samples.shape} in "
+                f"{sample_path}"
+            )
+        if stored_truth.shape != (
+            samples.shape[0], len(case["feature_names"])
+        ):
+            raise ValueError(f"Truth/sample shape mismatch in {sample_path}")
+        if cached_log_weight.shape != samples.shape[:2]:
+            raise ValueError(
+                "Candidate-weight shape mismatch in "
+                f"{weight_files[part_index]}"
+            )
+        take = min(samples.shape[0], len(truth) - offset)
+        expected_truth = truth[offset : offset + take]
+        if not np.array_equal(
+            np.asarray(stored_truth[:take]), expected_truth, equal_nan=True
+        ):
+            raise ValueError(
+                f"Truth rows in {truth_path} do not align with the report prefix"
+            )
+        for local_start in range(0, take, block_size):
+            local_end = min(take, local_start + block_size)
+            draws = np.asarray(
+                samples[local_start:local_end, :, :2], dtype=np.float64
+            )
+            log_weight = np.asarray(
+                cached_log_weight[local_start:local_end], dtype=np.float64
+            )
+            sigma[offset + local_start : offset + local_end] = (
+                combined_posterior_rms(draws, log_weight)
+            )
+        offset += take
+        del samples, stored_truth, cached_log_weight
+    if offset != len(truth):
+        raise ValueError(
+            f"Sample cache has {offset} galaxies, report uses {len(truth)}"
+        )
+    if not np.all(np.isfinite(sigma)) or np.any(sigma < 0.0):
+        raise ValueError("uncalibrated candidate posterior RMS must be finite")
+    return sigma
+
+
 def load_shear_posterior_diagnostics(
     case: dict, block_size: int = 64
 ) -> dict[str, dict[str, np.ndarray]]:
@@ -2348,8 +2510,8 @@ def test_set_provenance_table(case: dict) -> str:
     if cut is not None:
         rows.append(
             (
-                "uncalibrated TF shear-width cut",
-                f"σ ≤ {cut['max_shear_sigma']:g}; kept "
+                "inflated RMS σ/R cut",
+                f"σ/R < {cut['max_final_variance']:g}; kept "
                 f"{cut['n_kept']:,} / {cut['n']:,} analysis weight",
             )
         )
@@ -2930,20 +3092,21 @@ def main(argv=None) -> None:
         )
         for value in args.case
     ]
-    if args.max_shear_sigma is not None:
-        if args.max_shear_sigma <= 0.0:
-            raise ValueError("max-shear-sigma must be positive")
-        for case in cases:
-            apply_max_shear_sigma_cut(case, args.max_shear_sigma)
-            LOGGER.info(
-                "%s: kept %d / %d galaxies with uncalibrated σ ≤ %g",
-                case["case"],
-                case["shear_sigma_cut"]["n_kept"],
-                case["shear_sigma_cut"]["n"],
-                args.max_shear_sigma,
-            )
     if calibration is not None:
-        apply_response_calibration_to_case(cases[-1], calibration)
+        if args.max_final_variance <= 0.0:
+            raise ValueError("max-final-variance must be positive")
+        apply_response_calibration_to_case(
+            cases[-1], calibration, max_final_variance=args.max_final_variance
+        )
+        cut = cases[-1].get("shear_sigma_cut")
+        if cut is not None:
+            LOGGER.info(
+                "%s: kept %d / %d galaxies with σ/R < %g",
+                cases[-1]["case"],
+                cut["n_kept"],
+                cut["n"],
+                args.max_final_variance,
+            )
     sections = []
     cross_case_results = []
     for case in cases:

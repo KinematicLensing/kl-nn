@@ -1,0 +1,59 @@
+# Conda environment for kl-nn and kl-nn-analysis.
+#
+#   conda env create -f environment.yml        # creates the env named "kl-nn"
+#   conda activate kl-nn
+#
+# Curated from the Bridges-2 env (2026-11-04): only packages that kl-nn,
+# kl-nn-analysis or the kl-tools simulator import, plus notebook/dev tooling.
+# environment.full.yml has the exact pins of every package in that env.
+# The env name must match "conda_env" in paths.json.
+name: kl-nn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.26
+  - scipy=1.13
+  - pandas=2.3
+  - matplotlib
+  - astropy=6.1
+  - scikit-learn=1.7
+  - galsim=2.7
+  - corner=2.2
+  - emcee=3.1
+  - markdown
+  - msgpack-python
+  - nbformat
+  - pyyaml
+  - tqdm
+  - pytest=8.4
+  # imported by kl-tools when the simulator loads
+  - numba
+  - fitsio
+  - photutils=1.12
+  - dask
+  - ipython
+  - ipdb
+  - pudb
+  # notebooks and dev tooling
+  - jupyter
+  - jupyterlab
+  - mamba
+  - conda-lock
+  - snakeviz
+  - pip
+  - pip:
+      # CUDA 12.6 build of PyTorch, as on Bridges-2 (V100 GPUs)
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.9.0
+      - nflows==0.14          # pulls in tensorboard
+      - lmdb==1.7.5
+      - https://github.com/vicolab/ml-pyxis/archive/master.zip   # ml-pyxis 0.4.dev0
+      - nautilus-sampler==1.0.6
+      - getdist==1.7.6
+      - ipympl==0.10.0
+      - nodejs-bin==18.4.0a4
+      # kl-tools (simulator), fork branch with the fiber spectra used for the training data.
+      # For development, clone it next to kl-nn and use `pip install -e ../kl-tools` instead
+      # (kl-nn reads kl-tools' data/ directory from the kl_tools_root key of paths.json).
+      - git+https://github.com/wxs0703/kl-tools.git@data_generate

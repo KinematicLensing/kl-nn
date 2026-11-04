@@ -45,9 +45,12 @@ precision weighting, avoiding a second TF population correction.
 
 ## Workflow
 
-Run the commands below from the repository root. Default shared-data paths
-point at `/ocean/projects/phy250048p/shared`; each launcher documents the
-environment-variable overrides it supports for run-specific values.
+Run the commands below from the repository root. All machine-specific paths
+(shared data, models, caches, logs, the kl-tools checkout) live in
+[`paths.json`](paths.json); see [Paths and job submission](#paths-and-job-submission).
+Each launcher documents the environment-variable overrides it supports for
+run-specific values. Submit launchers with `./submit.sh` (same arguments as
+`sbatch`), e.g. `./submit.sh arch/train_npe.slurm`.
 
 1. Generate the canonical 100,000-row training sample table with
    `python data_generate/latin_hypercube.py --seed 42`.
@@ -63,21 +66,48 @@ environment-variable overrides it supports for run-specific values.
    `arch/train_npe.slurm`.
 6. Set `DATASET` to the independent final-test database, then cache base
    candidates and TF weights with `arch/cache_posteriors.slurm`.
-7. Generate diagnostics from the partitioned cache under `arch/diagnostics/`.
+7. Analyse the partitioned cache with the diagnostics in the companion
+   repository [kl-nn-analysis](https://github.com/KinematicLensing/kl-nn-analysis),
+   which also holds the paper tests, paper figures and reports.
 
-For matched finite-shear response calibration, follow
-[`repo_reports/SHEAR_RESPONSE_RUNBOOK.md`](repo_reports/SHEAR_RESPONSE_RUNBOOK.md).
-For catalog-backed, TF-conformed Xu-cut evaluation sets, follow
-[`repo_reports/DESI_TF_TEST_SET_RUNBOOK.md`](repo_reports/DESI_TF_TEST_SET_RUNBOOK.md).
-The detailed architecture contract is
-[`repo_reports/KL-NN_SIMV2_ARCH.md`](repo_reports/KL-NN_SIMV2_ARCH.md).
+Runbooks and design reports live in kl-nn-analysis under `reports/`:
+`SHEAR_RESPONSE_RUNBOOK.md` (matched finite-shear response calibration),
+`DESI_TF_TEST_SET_RUNBOOK.md` (catalog-backed, TF-conformed Xu-cut evaluation
+sets) and `KL-NN_SIMV2_ARCH.md` / `KL-NN_SIMV3_ARCH.md` (architecture contract).
+Their paths still refer to the pre-split layout, where these files lived in
+`repo_reports/` and the diagnostics in `arch/diagnostics/`. The full history of
+the analysis code is on branch `nre` of this repository.
+
+## Paths and job submission
+
+- `paths.json` maps keys (`datasets`, `samples`, `fits`, `models`, `configs`,
+  `networks`, `cache`, `reports`, `figures`, `logs`, `shared_tmp`,
+  `desi_cut_catalogs`, `kl_tools_root`, `analysis_root`, `paper_repo`,
+  `conda_env`) to paths. Values may reference other keys as `{key}`;
+  `{repo_root}` is this checkout. To move to another machine, edit
+  `shared_root` (and anything else that moved), or put per-machine overrides in
+  a gitignored `paths.local.json`. A single key can also be overridden with an
+  environment variable `KLNN_PATH_<KEY>`, e.g. `KLNN_PATH_MODELS=/scratch/models`.
+- Python reads them with `from klnn_paths import path; path("models")`.
+  `python klnn_paths.py --all` prints every resolved value.
+- Shell and slurm launchers `source klnn_paths.sh`, which exports one
+  `KLNN_<KEY>` variable per key (`KLNN_MODELS`, `KLNN_DATASETS`, ...) and
+  defines `klnn_path KEY`, `klnn_activate` and `klnn_sbatch`.
+- Launchers have no `#SBATCH --output` line. `./submit.sh [sbatch options]
+  launcher.slurm [launcher arguments]` writes the log to
+  `<logs>/<launcher name>_%j.out` (`_%A_%a.out` for array jobs) and passes
+  `KLNN_REPO_ROOT` to the job. Plain `sbatch` also works when run from the
+  repository root, but the log then goes to `slurm-<id>.out` in that directory.
 
 ## Environment and tests
 
-Install KL-tools from its simulator branch, then install this repository's
-Python dependencies and `ml-pyxis` in the `kl-nn` Conda environment. Cluster
-launchers assume the Bridges-2 module environment and should be reviewed if
-run elsewhere.
+Create the Conda environment with `conda env create -f environment.yml`. It
+installs KL-tools from the `data_generate` branch of
+[wxs0703/kl-tools](https://github.com/wxs0703/kl-tools); for development,
+clone kl-tools next to this repository and `pip install -e ../kl-tools`
+instead. `environment.full.yml` is the exact export of the Bridges-2 env.
+Cluster launchers assume the Bridges-2 module environment (`module load
+anaconda3`, `cuda`) and should be reviewed if run elsewhere.
 
 Run the maintained tests with:
 

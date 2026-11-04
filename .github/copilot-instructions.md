@@ -3,8 +3,8 @@
 ## Supported surface
 
 Work only against the current simulator-v3 pipeline described in
-`repo_reports/KL-NN_SIMV3_ARCH.md` and
-`repo_reports/METHODS_MANUSCRIPT.md`. The README and simulator-v2 report are
+`kl-nn-analysis/reports/KL-NN_SIMV3_ARCH.md` and
+`kl-nn-analysis/reports/METHODS_MANUSCRIPT.md`. The README and simulator-v2 report are
 archival and are not authoritative for the live observation or model schema.
 Do not add compatibility branches for removed architectures or inference
 modes. If an old artifact needs analysis, use its checkpointed repository
@@ -43,15 +43,15 @@ Activate the `kl-nn` environment and run `pytest -q tests`. A focused test can
 be run as `pytest -q tests/<file>.py -k <case>`. Several tests import modules
 directly from `arch/` through `tests/conftest.py`.
 
-`repo_reports/METHODS_MANUSCRIPT.md` is a required co-change for any edit to
+`kl-nn-analysis/reports/METHODS_MANUSCRIPT.md` is a required co-change for any edit to
 the monitored data-generation, architecture, training, or production-launcher
 surface. Update every affected scientific statement before acknowledging the
 new source fingerprint. Check with
-`python repo_reports/check_methods_manuscript.py --check`; after review, refresh
-it with `python repo_reports/check_methods_manuscript.py --update
+`python kl-nn-analysis/reports/check_methods_manuscript.py --check`; after review, refresh
+it with `python kl-nn-analysis/reports/check_methods_manuscript.py --update
 --acknowledge-review`. Never refresh the fingerprint merely to silence the
 test.
 
 Do not commit `__pycache__`, notebook checkpoints, generated plots, local model
 checkpoints, cache arrays, or scheduler logs. Preserve user data under
-`/ocean/projects/phy250048p/shared`; tests should use temporary directories.
+the shared root in `paths.json`; tests should use temporary directories.

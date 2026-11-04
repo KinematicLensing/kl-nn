@@ -1,0 +1,39 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools,bm}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{framed}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=MidnightBlue,urlcolor=MidnightBlue,citecolor=MidnightBlue]{hyperref}
+
+% ---- worksheet vs answer key -------------------------------------------------
+\newif\ifanswers
+% \solution{...} prints only in the answer key
+\newcommand{\solution}[1]{\ifanswers\par\medskip\noindent{\color{ForestGreen!60!black}\textbf{Solution.}}\ #1\par\fi}
+
+% ---- problem layout ------------------------------------------------------------
+\colorlet{shadecolor}{MidnightBlue!6}
+\newenvironment{given}{\begin{shaded}\noindent\textbf{Given.}\ }{\end{shaded}}
+\newcommand{\problem}[2]{\subsection*{#1\quad #2}\addcontentsline{toc}{subsection}{#1\quad #2}\label{prob:#1}}
+\newcommand{\need}[1]{\noindent\textit{You'll need from before:} #1\par\smallskip}
+\newcommand{\py}{\textsf{[Py]}}
+\newcommand{\source}[1]{\par\smallskip\noindent{\small\textit{Source:} #1}}
+\newcommand{\PENDING}[1]{{\color{red}\textbf{[CITATION PENDING: #1]}}}
+\setlist[enumerate]{label=(\alph*),itemsep=2pt,topsep=3pt}
+
+% ---- notation ------------------------------------------------------------------
+\newcommand{\vg}{\mathbf{g}}
+\newcommand{\vG}{\mathbf{G}}
+\newcommand{\vt}{\mathbf{t}}
+\newcommand{\vd}{\mathbf{d}}
+\newcommand{\vx}{\mathbf{x}}
+\newcommand{\vk}{\mathbf{k}}
+\newcommand{\T}{\mathsf{T}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\gref}{\vg_{\rm ref}}
+\newcommand{\pitrain}{\pi_{\rm train}}
+\newcommand{\Ftot}{F_{\rm tot}}
+\newcommand{\sk}{\sigma_\kappa}
+\input{citations}

@@ -129,6 +129,9 @@ def _payload_for_current_schema(payload: dict) -> dict:
         # Archived concat configs predate this flag. Missing means identity
         # fusion, matching the frozen-concat production path.
         train.setdefault("use_image_spectrum_fusion", False)
+        # Configs saved before the r90_views option always trained with random
+        # identity/R90 views.
+        train.setdefault("r90_views", True)
     return payload
 
 

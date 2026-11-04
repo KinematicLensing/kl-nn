@@ -35,6 +35,7 @@ VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
+FIBER_LAYOUT="${FIBER_LAYOUT:-galaxy_axis}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-CCL-simv3-cosi-r90_1m}"
 MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
@@ -59,6 +60,7 @@ echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
 echo "epochs=${EPOCHS} batch_size=${BATCH_SIZE} seed=${SEED}"
 echo "shear_bound=${SHEAR_BOUND}"
+echo "fiber_layout=${FIBER_LAYOUT}"
 
 cd "${KLNN_REPO_ROOT}/arch"
 python train_model.py \
@@ -74,6 +76,7 @@ python train_model.py \
     --ccl-sigma-label "${CCL_SIGMA_LABEL}" \
     --ccl-d-cutoff "${CCL_D_CUTOFF}" \
     --shear-bound "${SHEAR_BOUND}" \
+    --fiber-layout "${FIBER_LAYOUT}" \
     --seed "${SEED}" \
     --deterministic \
     --fixed-validation-streams \

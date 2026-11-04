@@ -93,6 +93,18 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--max-galaxies",
+        type=int,
+        default=None,
+        help="score only the first N xu3 rows",
+    )
+    parser.add_argument(
+        "--log-r-cache",
+        type=Path,
+        default=None,
+        help="optional output cache containing per-object NRE grid log-ratios",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
@@ -485,7 +497,10 @@ def write_report(args) -> None:
         raise ValueError(
             f"LMDB size {len(dataset)} != cache size {catalog['dataset_size']}"
         )
-    indices = np.arange(len(dataset), dtype=np.int64)
+    n_rows = len(dataset)
+    if args.max_galaxies is not None:
+        n_rows = min(int(args.max_galaxies), n_rows)
+    indices = np.arange(n_rows, dtype=np.int64)
     channels_last = bool(model_config.train.channels_last)
     print(f"encoding xu3 n={len(indices)}", flush=True)
     context, shear_norm = extract_contexts(
@@ -507,12 +522,15 @@ def write_report(args) -> None:
         denormalize(shear_norm.numpy(), config.par_ranges, feature_names=("g1", "g2")),
         dtype=np.float64,
     )
-    truth_g = catalog["truth_g"]
+    truth_g = np.asarray(catalog["truth_g"][:n_rows], dtype=np.float64)
     if truth_from_lmdb.shape != truth_g.shape or not np.allclose(
         truth_from_lmdb, truth_g, rtol=0.0, atol=1e-5
     ):
         raise ValueError("LMDB shear truth does not match the cached NPE catalog")
-    npe_mean = catalog["summaries"]["proposal"]["mean"]
+    npe_mean = np.asarray(
+        catalog["summaries"]["proposal"]["mean"][:n_rows],
+        dtype=np.float64,
+    )
     grid_norm, grid_phys, axis_phys = physical_shear_grid(args.grid_n, config.par_ranges)
     print(f"scoring {args.grid_n}x{args.grid_n} shear grid", flush=True)
     log_r = score_all_logits(
@@ -527,10 +545,22 @@ def write_report(args) -> None:
     nre_mean = nre_moments["mean"]
     nre_intervals = grid_marginal_intervals(log_r, axis_phys, n_grid=args.grid_n)
     npe_intervals = {
-        "g1_lower": catalog["summaries"]["proposal"]["lower"][:, 0],
-        "g1_upper": catalog["summaries"]["proposal"]["upper"][:, 0],
-        "g2_lower": catalog["summaries"]["proposal"]["lower"][:, 1],
-        "g2_upper": catalog["summaries"]["proposal"]["upper"][:, 1],
+        "g1_lower": np.asarray(
+            catalog["summaries"]["proposal"]["lower"][:n_rows, 0],
+            dtype=np.float64,
+        ),
+        "g1_upper": np.asarray(
+            catalog["summaries"]["proposal"]["upper"][:n_rows, 0],
+            dtype=np.float64,
+        ),
+        "g2_lower": np.asarray(
+            catalog["summaries"]["proposal"]["lower"][:n_rows, 1],
+            dtype=np.float64,
+        ),
+        "g2_upper": np.asarray(
+            catalog["summaries"]["proposal"]["upper"][:n_rows, 1],
+            dtype=np.float64,
+        ),
     }
     masks = nre_slice_masks(truth_g, split=args.abs_g_split)
     galaxy_rows = galaxy_table(
@@ -566,6 +596,15 @@ def write_report(args) -> None:
         nre_g2_lower=nre_intervals["g2_lower"],
         nre_g2_upper=nre_intervals["g2_upper"],
     )
+    if args.log_r_cache is not None:
+        args.log_r_cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            args.log_r_cache,
+            indices=indices,
+            truth_g=truth_g,
+            grid_phys=grid_phys,
+            log_r=log_r.astype(np.float64, copy=False),
+        )
     payload = {
         "parent_npe": args.parent_npe,
         "parent_checkpoint": str(parent_ckpt),
@@ -573,6 +612,10 @@ def write_report(args) -> None:
         "nre_checkpoint": str(checkpoint),
         "nre_meta": nre_meta,
         "data_dir": str(args.data_dir),
+        "row_indices": indices,
+        "log_r_cache": (
+            str(args.log_r_cache) if args.log_r_cache is not None else None
+        ),
         "cache_root": catalog["cache_root"],
         "case": args.case,
         "dataset_size": int(len(truth_g)),
@@ -604,6 +647,10 @@ def write_report(args) -> None:
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.max_galaxies is not None and args.max_galaxies <= 0:
+        raise ValueError("max-galaxies must be positive")
+    if args.log_r_cache is not None and args.log_r_cache.exists() and not args.overwrite:
+        raise FileExistsError(f"{args.log_r_cache} exists; use --overwrite")
     write_report(args)
 
 

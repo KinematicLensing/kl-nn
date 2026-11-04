@@ -73,6 +73,8 @@ RNG_STREAM_IDS = {
 }
 
 GALAXY_AXIS_FIBER_LAYOUT_CODE = 1
+# Must match data_generate/observation_schema.py FIBER_LAYOUT_CODES.
+FIBER_LAYOUT_CODES = {"galaxy_axis": 1, "measured_axis": 2}
 INSTRUMENT_METADATA = {
     "image_band_code": 0,
     "target_line_code": 0,
@@ -143,7 +145,7 @@ def validate_observation_record(record, *, location="record"):
             f"expected {observation['schema_version']}"
         )
     layout = int(_scalar(record, "fiber_layout", location).item())
-    expected_layout = GALAXY_AXIS_FIBER_LAYOUT_CODE
+    expected_layout = FIBER_LAYOUT_CODES[str(observation["fiber_layout"])]
     if layout != expected_layout:
         raise ValueError(
             f"{location} has fiber-layout code {layout}; expected {expected_layout}"
@@ -931,6 +933,7 @@ class NPETrainer(Trainer):
     def __init__(self, *args, **kwargs):
         kwargs["stage_config"] = config.train
         super().__init__(*args, **kwargs)
+        self.r90_views = bool(config.train.get("r90_views", True))
         scheduler_type = config.train["scheduler_type"]
         total = int(config.train["epoch_number"])
         warmup = int(config.train["warmup_epochs"])
@@ -981,6 +984,9 @@ class NPETrainer(Trainer):
         rotate_mask = torch.rand(
             image.shape[0], device=self.device, generator=view_generator
         ) < 0.5
+        if not self.r90_views:
+            # Draw anyway so the view RNG stream matches the default runs.
+            rotate_mask = torch.zeros_like(rotate_mask)
         image, spectra, targets, positions, context = make_npe_training_batch(
             image,
             spectra,
@@ -1176,6 +1182,13 @@ def load_train_objs(
         stage_config.get("freeze_feature_extractor", True)
     )
     if train_mode == "pretrain":
+        model = model_class()
+    elif train_mode == "train" and stage_config.get("pretrained_name") is None:
+        # From scratch: fresh encoder, every parameter trainable.
+        if freeze_feature_extractor:
+            raise ValueError(
+                "training from scratch requires an unfrozen feature extractor"
+            )
         model = model_class()
     elif train_mode == "train":
         if epoch is None:

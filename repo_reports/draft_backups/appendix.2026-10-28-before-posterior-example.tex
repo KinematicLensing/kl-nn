@@ -1,0 +1,57 @@
+\appendix
+
+\section{Further Tests of the NPE}
+\label{app:npe-tests}
+
+\subsection{Full Posterior of One Galaxy}
+\label{app:corner}
+
+\XW{Would be good to add the 9D corner plot of the galaxy in Fig.~\ref{fig:posterior-snr} here, with a short description.}
+
+\subsection{Calibration of the Other Parameters}
+\label{app:coverage}
+
+\XW{Would be good to add the P--P plots of the seven parameters other than the shear here.}
+
+\subsection{Source Redshift}
+\label{app:redshift}
+
+\XW{Would be good to write up the redshift scan here (shear robust to source redshift; velocities and H$\alpha$ flux read as if at $z = 0.3$).}
+
+\section{Posterior Means}
+\label{app:posterior-means}
+
+\subsection{Raw Posterior Means}
+\label{app:raw-bias}
+
+For each test galaxy $i$, we take the mean of its TF-weighted posterior, $\hat{g}_{k,i}$, as a point estimate of its shear. We then measure $m$ and $c$ separately for the two shear components with a linear least-squares fit of $\hat{g}_{k,i} - g_{k,i} = m_k\, g_{k,i} + c_k$, which is Eq.~(\ref{eqn:linear-bias}) with $\hat{g}$ in place of $\hat{\epsilon}$. We use all Xu3 galaxies with equal weights and no cuts, and quote the standard errors of the fit as our uncertainties. We restrict the fit to galaxies with $|g_k| < 0.02$, which we will refer to as the fit window, since this range covers the shear of the vast majority of galaxies in cosmic shear measurements.
+
+The additive bias is consistent with zero for both components, but the multiplicative bias is large, with $m_1 = -0.612 \pm 0.014$ and $m_2 = -0.588 \pm 0.014$. In other words, the posterior means respond to only about 40\% of the true shear. Multiplicative biases of tens of percent are not unusual for uncalibrated shear estimators. In DES Y1, for example, the uncalibrated bias of \textsc{im3shape} ranges from $m\approx-0.1$ for high-SNR galaxies to $m\approx-0.3$ for the lowest-SNR galaxies \citep{DESY1Shape}, with similar levels found for HSC \citep{HSCY1Sims}. These biases are then calibrated with image simulations. Finding a significant multiplicative bias in the point estimate also does not contradict the calibration results of Sec.~\ref{ssec:calibration}. As we show below, a bias of this kind is expected for posterior means when the data constrain the shear only weakly compared to the prior, even if the posteriors are correct.
+
+\subsection{Shrinkage of Posterior Means}
+\label{app:shrinkage}
+
+The bias of the posterior means can be understood as follows. Consider a single shear component $g$ of one galaxy, and suppose that its data give a Gaussian likelihood of width $\sigma_L$, centered on a noisy measurement $g_\mathrm{obs}$ whose average over noise realizations is the true shear. If the prior on $g$ is also a Gaussian centered on zero with width $\sigma_\pi$, the posterior is a Gaussian with mean and variance
+\begin{equation}
+\label{eqn:gauss-posterior}
+    \hat{g} = \frac{\sigma_\pi^2}{\sigma_\pi^2 + \sigma_L^2}\, g_\mathrm{obs}, \qquad
+    \sigma_\mathrm{post}^2 = \frac{\sigma_L^2\, \sigma_\pi^2}{\sigma_L^2 + \sigma_\pi^2}.
+\end{equation}
+The posterior mean is pulled toward the center of the prior by an amount that depends on how informative the data is compared to the prior. Averaging over noise realizations at a fixed true shear $g$ gives $\langle \hat{g} \rangle = g\,\sigma_\pi^2/(\sigma_\pi^2 + \sigma_L^2)$, so using Eq.~(\ref{eqn:gauss-posterior}) to write the result in terms of the posterior width, the multiplicative bias is
+\begin{equation}
+\label{eqn:shrinkage}
+    m = -\frac{\sigma_L^2}{\sigma_L^2 + \sigma_\pi^2} = -\frac{\sigma_\mathrm{post}^2}{\sigma_\pi^2}.
+\end{equation}
+A galaxy with $\sigma_L \ll \sigma_\pi$ has $m \approx 0$, while a galaxy whose data carry no shear information has $\sigma_\mathrm{post} \to \sigma_\pi$ and $m \to -1$. For a sample of galaxies, the fitted $m$ is approximately the average over the individual galaxies, $m \approx -\langle \sigma_\mathrm{post}^2 \rangle / \sigma_\pi^2$. Our shear prior is uniform rather than Gaussian, so we approximate it by a Gaussian with the same variance, $\sigma_\pi^2 = 0.2^2/12$.
+
+This bias is a natural result from the posterior mean, and would be present even for exact posteriors. For correct posteriors, the average true shear of galaxies with a given $\hat{g}$ is equal to $\hat{g}$, but the average $\hat{g}$ of galaxies with a given true shear, which is what $m$ measures, is shrunk toward zero.
+
+To test whether shrinkage explains the bias we measured in Appendix~\ref{app:raw-bias}, we compare Eq.~(\ref{eqn:shrinkage}) with the $m$ measured in groups of galaxies with different posterior widths. We split the test set into 15 equal-size bins of the shape noise $\sigma_{\epsilon,i}$ (Sec.~\ref{ssec:training-examples}), and in each bin fit $m_k$ as in Appendix~\ref{app:raw-bias} and compute the average posterior variance $\langle \sigma_{\mathrm{post},k}^2 \rangle$. Note that grouping galaxies by their measured posterior widths is not the most stringent version of this test. The posterior width of a galaxy depends on its measured shear, with galaxies that appear more strongly sheared tending to have narrower posteriors. Selecting galaxies with narrow posteriors therefore preferentially selects galaxies whose measured shear $|\hat{g}|$ is larger than their true shear. This selection effect is strongest in the bins with the narrowest posteriors.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/shrinkage.pdf}
+    \caption{Multiplicative bias of the raw posterior means against the average posterior variance, in 15 equal-size bins of $\sigma_{\epsilon,i}$ on the Xu3 test set (6,667 galaxies per bin), for $g_1$ (blue circles) and $g_2$ (red squares). The dashed line is the shrinkage prediction of Eq.~(\ref{eqn:shrinkage}). The dotted vertical line marks the prior variance $\sigma_\pi^2$.}
+    \label{fig:shrinkage}
+\end{figure}
+
+Fig.~\ref{fig:shrinkage} shows the result. The measured $m$ follows the prediction from the bins with intermediate posterior widths to $m \approx -1$ in the bins with the widest posteriors. Over the whole test set, the prediction gives $m_1 = -0.619$ and $m_2 = -0.615$, close to the measured $m_1 = -0.612 \pm 0.014$ and $m_2 = -0.588 \pm 0.014$. Shrinkage therefore explains almost all of the bias of the raw posterior means, which is dominated by galaxies with wide posteriors. Rather than correcting the point estimates for this bias, a more natural approach is to not reduce each posterior to a point estimate at all, and instead to combine the likelihoods of all galaxies that share the same shear, utilizing the full information in the posteriors (Sec.~\ref{ssec:stacking}).

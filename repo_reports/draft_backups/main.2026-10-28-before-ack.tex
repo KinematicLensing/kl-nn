@@ -1,0 +1,128 @@
+% ****** Start of file apssamp.tex ******
+%
+%   This file is part of the APS files in the REVTeX 4.2 distribution.
+%   Version 4.2a of REVTeX, December 2014
+%
+%   Copyright (c) 2014 The American Physical Society.
+%
+%   See the REVTeX 4 README file for restrictions and more information.
+%
+% TeX'ing this file requires that you have AMS-LaTeX 2.0 installed
+% as well as the rest of the prerequisites for REVTeX 4.2
+%
+% See the REVTeX 4 README file
+% It also requires running BibTeX. The commands are as follows:
+%
+%  1)  latex apssamp.tex
+%  2)  bibtex apssamp
+%  3)  latex apssamp.tex
+%  4)  latex apssamp.tex
+%
+\documentclass[reprint,superscriptaddress,showframe,nofootinbib,aps,prd,longbibliography,noeprint]{revtex4-2}
+
+\newcommand{\mat}[1]{\textsf{\textbf{#1}}}
+\newcommand{\bvec}[1]{\textrm{\textbf{#1}}}
+\newcommand{\farcm}{{.^\prime}}
+\newcommand{\arcsec}{{^{\prime\prime}}}
+\newcommand{\arcmin}{{^\prime}}
+\newcommand{\bigo}[1]{\mathcal{O}(#1)}
+\newcommand{\mrm}[1]{\mathrm{#1}}
+\newcommand{\CL}{\textsc{CosmoLike}\ }
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\galsim}{\textsc{GalSim} }
+\newcommand{\vcirc}{v_\mathrm{circ}}
+
+% Add command with your name/initials to comment
+\newcommand{\tim}[1]{{\textcolor{magenta}{TE: #1}}}
+\newcommand{\XW}[1]{{\textcolor{red}{XW: #1}}}
+\newcommand{\rachel}[1]{{\textcolor{cyan}{RM: #1}}}
+
+
+\usepackage{graphicx}% Include figure files
+\usepackage{dcolumn}% Align table columns on decimal point
+\usepackage{bm}% bold math
+\usepackage{hyperref}% add hypertext capabilities
+\usepackage{orcidlink}
+\usepackage{amsmath}	% Advanced maths commands
+\usepackage{amssymb}
+\usepackage{gensymb}
+%\usepackage[maxnames=10]{natbib}
+\usepackage{color}
+% \usepackage{cancel}
+\usepackage{soul}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{lmodern}
+\usepackage{subfiles}
+\usepackage{lipsum}
+\usepackage{booktabs}
+\usepackage{array}    
+\definecolor{orange}{rgb}{1.0, 0.49, 0}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+%\usepackage[showframe,%Uncomment any one of the following lines to test 
+%%scale=0.7, marginratio={1:1, 2:3}, ignoreall,% default settings
+%%text={7in,10in},centering,
+%%margin=1.5in,
+%%total={6.5in,8.75in}, top=1.2in, left=0.9in, includefoot,
+%%height=10in,a5paper,hmargin={3cm,0.8in},
+%]{geometry}
+\begin{document}
+
+\preprint{}
+
+\title{Simulation-Based Inference for Kinematic Lensing with Normalizing Flows}% Force line breaks with \\
+
+\author{Eason Wang\orcidlink{0009-0008-8544-8598}}
+\email{wxs0703@arizona.edu}
+\affiliation{McWilliams Center for Cosmology, Department of Physics, Carnegie Mellon University, Pittsburgh, PA 15213, USA}
+
+\author{Tim Eifler\orcidlink{0000-0002-1894-3301}}
+\affiliation{Department of Astronomy/Steward Observatory, University of Arizona, 933 North Cherry Avenue, Tucson, AZ 85721, USA}
+\affiliation{Department of Physics, University of Arizona, 1118 E Fourth Street, Tucson, AZ 85721, USA}
+
+\author{Friends}
+
+
+\date{\today}% It is always \today, today,
+             %  but any date may be explicitly specified
+
+\begin{abstract}
+\XW{Outdated abstract, please ignore} Cosmological surveys in the next decade will provide us with an unprecedented amount of data for Kinematic Lensing (KL) studies. KL infers the cosmic shear signal by jointly forward modeling the observed photometric image and velocity field of a disk galaxy, allowing for shear measurements with greatly reduced statistical noise. We show that there are good prospects for a future KL survey using the Dark Energy Spectroscopic Instrument (DESI), and that a pilot measurement can already be made using data from the DESI Peculiar Velocity (DESI-PV) survey. However, the process of KL inference for cosmic shear using MCMC will be time-consuming, and will become unfeasible with a large number of galaxies. In this work, we explore ways to accelerate KL inference using neural networks, in preparation for the DESI-KL pilot measurement and future KL endeavors using large survey data. Specifically, we created an algorithm to mass-generate galaxy images and spectra, which can then be used for neural network training and validation. We also develop a neural network schematic for emulating image and spectra generation, which we plan to implement and test in a future work.
+
+\end{abstract}
+
+%\keywords{Suggested keywords}%Use showkeys class option if keyword
+                              %display desired
+\maketitle
+
+\subfile{sections/introduction}
+\subfile{sections/kl-basics}
+\subfile{sections/data-generate}
+\subfile{sections/nn-arch}
+\subfile{sections/validation}
+\subfile{sections/shear}
+\subfile{sections/discussion}
+
+\section{Conclusions}
+\label{sec:conclusion}
+\lipsum[1][1]
+
+\begin{acknowledgments}
+The authors would like to acknowledge the DESI collaboration for providing us with the data used in this work. \rachel{make sure to cite the relevant DESI papers in the text as well} This work used Bridges-2 \citep{Bridges2} at Pittsburgh Supercomputing Center through allocation PHY250299 from the Advanced Cyberinfrastructure Coordination Ecosystem: Services \& Support (ACCESS) program, which is supported by National Science Foundation grants \#2138259, \#2138286, \#2138307, \#2137603, and \#2138296. The computations involved in the early stages of this work use High Performance Computing (HPC) resources supported by the University of Arizona TRIF, UITS, and RDI and maintained by the UA Research Technologies department. This material is based upon work supported by the National Science Foundation Graduate Research Fellowship Program under Grant Nos. DGE2140739 and DGE2631988. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reflect the views of the National Science Foundation.
+\end{acknowledgments}
+
+\subfile{sections/appendix}
+
+% The \nocite command causes all entries in a bibliography to be printed out
+% whether or not they are actually referenced in the text. This is appropriate
+% for the sample file to show the different styles of references, but authors
+% most likely will not want to use it.
+%\nocite{*}
+%\twocolumngrid
+%\bibliographystyle{apsrev4-2}
+\bibliography{main}% Produces the bibliography via BibTeX.
+
+\end{document}
+%
+% ****** End of file apssamp.tex ******

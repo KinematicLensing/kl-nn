@@ -1,0 +1,107 @@
+\section{Neural Network Architecture}
+\label{sec:nn-arch}
+
+Our neural network architecture consists of a feature extraction (FE) block and a posterior estimation (PE) block, as shown in Fig.~\ref{fig:nn-arch}. The FE block learns to extract key features from the image, spectra, and metadata of a galaxy, and condenses them into a 1D feature vector, which is then used as the condition for the PE block to estimate the posterior of our galaxy parameters. We describe each block in detail below.
+
+\begin{table*}
+    \centering
+    \begin{tabular}{l l l}
+    \toprule
+    \textbf{Branch} &
+    \parbox[t]{14.5cm}{\raggedright \textbf{Architecture description}} &
+    \textbf{Output} \\
+    \tableline
+    \addlinespace[5pt]
+
+    Image &
+    \parbox[t]{14.5cm}{\raggedright Two 3$\times$3 convolutions at 64 channels, each with BatchNorm and ReLU; 3$\times$3 stride-2 max pool; four 128-channel residual blocks with downsampling in the fourth; five 256-channel residual blocks with downsampling in the fifth; five 512-channel residual blocks with downsampling in the fifth; final 3$\times$3 average pool} &
+    512 \\ \addlinespace[5pt]
+
+    Spectra &
+    \parbox[t]{14.5cm}{\raggedright Pairs of 3$\times$3 convolutions at 16, 32, 64, and 128 channels, each convolution followed by BatchNorm and ReLU; 1$\times$2 max pooling along wavelength after the 16- and 32-channel pairs; two 256-channel 3$\times$3 convolutions; final 5$\times$16 convolution spanning all fibers and remaining wavelength bins} &
+    512 \\ \addlinespace[5pt]
+
+    Metadata &
+    \parbox[t]{14.5cm}{\raggedright Concatenate ten fiber coordinates with $m_r$, $\rho_I$, and $\rho_S$; linear layers $13 \to 64 \to 128$, each followed by GELU, then LayerNorm} &
+    128 \\ \addlinespace[5pt]
+
+    \tableline
+    \end{tabular}
+    \caption{Description of the architecture of each branch in the feature extraction block.}
+    \label{tab:fe-desc}
+\end{table*}
+
+\begin{figure*}
+    \includegraphics[width=\linewidth]{figs/nn_arch.eps}
+    \caption{Schematic of our neural network model during training. The image, spectra, and metadata of a galaxy are processed separately by the three branches of the feature extraction block (Table~\ref{tab:fe-desc}), whose outputs are concatenated into a 1152-dimensional feature vector. This vector is used as the condition for the normalizing flow in the posterior estimation block (Sec.~\ref{ssec:npe}), which is trained by minimizing the negative log-likelihood of the true parameters. \XW{This figure is outdated and needs to be redrawn.}}
+    \label{fig:nn-arch}
+\end{figure*}
+
+\subsection{Feature Extraction with Convolutional Networks}
+\label{ssec:feature-extract}
+Our FE block consists of a branched, convolutional neural network (CNN)-based architecture \citep{cnn}, inspired by \citep{Forklens}, where one branch processes the image, one processes the spectra, and a third small branch processes the metadata (see Table~\ref{tab:fe-desc}).
+
+The image branch first expands the data to 64 channels through two convolution layers, before applying a max pooling layer to reduce the image dimensions by half. Then, it is processed through a residual network (ResNet) \citep{resnet}, consisting of 2-layer residual blocks where the input of the block is added back to its output. This is a well-known method that works well in extracting features from high-dimensional data forms such as images. We use 14 blocks, or 28 residual layers, for the ResNet. The 14 blocks consist of 3 sections of 4-5 blocks, where we double the number of channels in the first block of every section and halve the image dimensions in the last block. In the final layer, we use an average pooling layer to reduce the image dimensions to $1\times1$, giving us a 1D feature vector of 512 channels. Batch normalization is applied after every convolution layer in this process.
+
+For the spectra, we treat the five fiber spectra of a galaxy as a single $5\times64$ image, with fibers along one axis and wavelength along the other, so that the convolutions see neighboring fibers and wavelengths together. The spectra branch consists of pairs of convolution layers at 16, 32, 64, and 128 channels, followed by two convolution layers at 256 channels. After each of the first two pairs, we apply a max pooling layer that halves the number of wavelength bins, reducing them from 64 to 16. We only pool along wavelength, since there are only five fibers. The final convolution layer has a kernel that spans all five fibers and the remaining 16 wavelength bins, which combines the information from all fibers into a 1D feature vector of 512 channels. As in the image branch, every convolution layer is followed by batch normalization.
+
+The metadata branch is a small multi-layer perceptron (MLP), which maps the ten fiber coordinates and the three normalized values of $m_r$, $\rho_I$, and $\rho_S$ (Sec.~\ref{ssec:datasets}) to a 128-dimensional feature vector. Finally, the outputs of the three branches are concatenated into a single 1152-dimensional feature vector, which is normalized with a LayerNorm layer before being passed to the PE block as its condition.
+
+\subsection{Posterior Estimation with Normalizing Flows}
+\label{ssec:npe}
+After we have extracted features from the data, we would like to estimate the posterior distributions of the KL parameters. A good architectural choice for this is a conditional normalizing flow (CNF) \citep{NormalizingFlows, CNF}. CNFs are commonly used in NPE, and have a simpler implementation than other choices like VAEs, GANs or diffusion models, while being much more flexible and expressive than a multi-layer perceptron (MLP).
+
+To explain briefly, a CNF learns a bijective mapping $f_\psi$ between a target distribution $p_x(\mathbf{x \mid c})$ and a simple base distribution $p_z(\mathbf{z})$, where $\mathbf{c}$ is a condition vector and $\psi$ are the parameters of the network:
+\begin{equation}
+\label{eqn:cnf-transform}
+    \mathbf{z} = f_\psi(\mathbf{x}; \mathbf{c}); \qquad \mathbf{x} = f_\psi^{-1}(\mathbf{z}; \mathbf{c}).
+\end{equation}
+In our case, the target distribution is the posterior of the KL parameters, and the condition is the feature vector from the FE block. By change of variables, we can express the probability density of $\mathbf{x}$ in terms of the base distribution:
+\begin{equation}
+\label{eqn:cnf-cv}
+    q_\psi(\mathbf{x \mid c}) = p_z\left(f_\psi(\mathbf{x}; \mathbf{c})\right) \cdot \left| \det\left(\frac{\partial f_\psi(\mathbf{x}; \mathbf{c})}{\partial\mathbf{x}}\right)\right| ,
+\end{equation}
+where the $ |\det(\cdot)| $ term is the Jacobian determinant of $f_\psi(\mathbf{x}; \mathbf{c})$. This formulation allows us to compute the probability of the true KL parameters of each training galaxy conditioned on its features, from which we compute our loss function, the negative log-likelihood (NLL):
+\begin{equation}
+\label{eqn:loss-unweighted}
+    \mathcal{L}(\psi) = -\frac{1}{N}\sum_{i=1}^N\log q_\psi(\mathbf{x}_i \mid \mathbf{c}_i).
+\end{equation}
+After training, we can draw posterior samples for any galaxy by drawing $\mathbf{z}$ from the base distribution and passing it through the inverse mapping $f_\psi^{-1}$.
+
+A common choice of base distribution is a standard Gaussian, which assigns some probability to every value of $\mathbf{x}$. However, all of our parameters except $\theta_\mathrm{int}$ have a finite range set by the training prior (Table~\ref{tab:kl-params}), and $\theta_\mathrm{int}$ is periodic. We design our flow to respect both of these properties. For the eight parameters other than $\theta_\mathrm{int}$, which we collectively denote as $\mathbf{x}'$, we rescale each parameter to $[0, 1]$ using its prior range, and use a uniform base distribution on the unit box $[0, 1]^8$. The mapping between them is made of rational-quadratic spline transforms \citep{NeuralSplineFlows}, which map the interval $[0,1]$ onto itself, so that the learned posterior is exactly zero outside of the prior range. For $\theta_\mathrm{int}$, we use a circular rational-quadratic spline \citep{FlowsToriSpheres}, which keeps the density continuous across $\theta_\mathrm{int}=\pm\pi$. The joint posterior is then written as
+\begin{equation}
+\label{eqn:flow-factorization}
+    q_\psi(\mathbf{x} \mid \mathbf{c}) = q_\psi(\mathbf{x}' \mid \mathbf{c})\, q_\psi(\theta_\mathrm{int} \mid \mathbf{x}', \mathbf{c}),
+\end{equation}
+where the distribution of $\theta_\mathrm{int}$ is conditioned on both the features and the other eight parameters, so that correlations between them are kept.
+
+The flow for $\mathbf{x}'$ consists of 4 masked autoregressive spline layers \citep{MAF, NeuralSplineFlows}, where the transformation of each parameter only depends on the parameters before it. This is vital as it gives us a triangular Jacobian matrix, whose determinant is simply the product of its diagonal terms, making training and inference much more computationally efficient. The spline parameters of each layer are predicted from $\mathbf{c}$ and the preceding parameters by a MADE (Masked Autoencoder for Distribution Estimation) network \citep{MADE} with 256 hidden units and 2 residual blocks, and each spline has 8 bins. We reverse the order of the parameters between layers, so that every parameter can depend on every other parameter. The flow for $\theta_\mathrm{int}$ is a single circular spline with 8 bins, whose parameters are predicted by an MLP with two hidden layers of 128 units from $\mathbf{c}$ and $\mathbf{x}'$. We implement our flow using the \texttt{nflows} package \citep{nflows}.
+
+Finally, we make our model symmetric under $90\degree$ rotations. Rotating a galaxy by $90\degree$ changes the sign of both shear components, $(g_1, g_2) \rightarrow (-g_1, -g_2)$, and shifts its position angle by $\pi/2$, while leaving its spectra unchanged, since our fibers are placed relative to the galaxy's own axes (Sec.~\ref{ssec:kl-model}). During training, we show each galaxy to the model either as simulated or rotated by $90\degree$, with equal probability, with its image, fiber positions, and parameters transformed accordingly. During inference, we draw half of the posterior samples from the original galaxy and the other half from the rotated galaxy, and transform the latter back to the original frame. Since the two halves have opposite signs of shear, any constant offset in shear that the model might learn, for example from a preferred direction on the pixel grid, cancels out between them, which keeps the additive bias of our model stable. We use the posterior mean of $(g_1, g_2)$ as our shear estimator, as described in Sec.~\ref{ssec:raw-bias}.
+
+\subsection{Incorporating the TF Prior}
+\label{ssec:tf-prior}
+As shown in Sec.~\ref{sec:kl-basics}, we need a constraint on $\vcirc$ from the TFR in order to break the degeneracy between intrinsic shape and shear. However, we sample $\vcirc$ uniformly in our training set (Table~\ref{tab:kl-params}), so the posteriors learned by our model correspond to a uniform prior on $\vcirc$. Instead of building the TFR into training, we apply it after training by reweighting the posterior samples. If our model approximates the posterior under the training prior $\pi_\mathrm{train}$, the posterior under the TF prior $\pi_\mathrm{TF}$ is
+\begin{equation}
+\label{eqn:tf-reweight}
+    p_\mathrm{TF}(\mathbf{x} \mid \mathbf{c}) \propto q_\psi(\mathbf{x} \mid \mathbf{c})\, \frac{\pi_\mathrm{TF}(\vcirc \mid m_r)}{\pi_\mathrm{train}(\vcirc)},
+\end{equation}
+while all other parameters keep their training priors. For each galaxy, we therefore give each posterior sample $\mathbf{x}_j$ a weight
+\begin{equation}
+\label{eqn:tf-weights}
+    w_j = \frac{\pi_\mathrm{TF}(v_{\mathrm{circ},j} \mid m_r)/\pi_\mathrm{train}(v_{\mathrm{circ},j})}{\sum_k \pi_\mathrm{TF}(v_{\mathrm{circ},k} \mid m_r)/\pi_\mathrm{train}(v_{\mathrm{circ},k})},
+\end{equation}
+and compute all posterior summaries, such as the mean and credible intervals, with these weights. Essentially, we are applying importance sampling to the posterior samples, weighing more heavily the samples whose $\vcirc$ is more likely according to the TF prior. Since $\pi_\mathrm{train}(\vcirc)$ is uniform, the weights are simply proportional to the TF prior. Reweighting reduces the number of samples that effectively contribute to each posterior, to $1/\sum_j w_j^2$. We checked on the Xu3 test set (Sec.~\ref{ssec:test-set}) that the median galaxy keeps 60\% of its $10^4$ samples by this measure, and 99.6\% of galaxies keep more than 1000, so the reweighted posteriors are well sampled for almost all galaxies. A benefit of this approach is that the TFR can be changed, for example when it is recalibrated on a new galaxy sample, without retraining our model.
+
+Our TF prior is a Gaussian in $\log_{10}\vcirc$, truncated to the training range of 60--540 km s$^{-1}$, with mean
+\begin{equation}
+\label{eqn:tf-mean}
+    \langle\log_{10}\vcirc\rangle = \frac{36 - m_r}{7.22}
+\end{equation}
+and a standard deviation of $\sigma_\mathrm{TF}=0.1$ dex. In terms of Eq.~(\ref{eqn:TFR}), this corresponds to $a = 36/7.22$ and $b = -1/7.22$ mag$^{-1}$, with $m_r$ in place of $M$. We assume a TFR slope of $-7.22$ mag per dex, i.e. $m_r = 36 - 7.22\log_{10}\vcirc$, which is the result of \citep{DESIPVTF2025}. Since all of our galaxies are simulated at the same redshift, we write the relation in terms of the apparent magnitude $m_r$, and assume an intercept of 36 mag, which has been empirically chosen to cover a realistic range of $\vcirc$ across a realistic range of $m_r$. Our scatter of 0.1 dex is more conservative than measured intrinsic scatters, such as 0.036 dex from \citep{Reyes11}, or 0.466 mag ($\approx$0.065 dex) from \citep{DESIPVTF2025}. Part of the reason for this is to account for the extra uncertainty from the measurement of $m_r$, since we treat $m_r$ as perfectly known in our model and do not add a separate magnitude uncertainty to the scatter. \XW{DESI/LS catalogs provide the inverse variance of the $r$-band flux, so we could eventually propagate the $m_r$ uncertainty of each galaxy into its TF scatter instead.} The same TFR is used to draw $\vcirc$ for our test sets (Sec.~\ref{ssec:test-set}), so our tests assume that the TFR of the galaxy population is known exactly.
+
+\subsection{Training Configurations}
+\label{ssec:train-conf}
+\XW{The impact of pretraining has yet to be verified, so it's not included in this section for now.}
+
+We train our model by minimizing the NLL in Eq.~(\ref{eqn:loss-unweighted}) with the AdamW optimizer \citep{AdamW}, with a weight decay of $10^{-5}$. We use an initial learning rate of $3\times10^{-4}$ for most of the model, and a lower learning rate of $10^{-4}$ for the flow of $\theta_\mathrm{int}$. The learning rate is warmed up linearly from 10\% of its initial value over the first 2 epochs, and then decreased following a cosine schedule down to $10^{-5}$ at the end of training. We also clip the norm of the gradients at 1 to stabilize training. We use a batch size of 400, split across 4 NVIDIA V100 GPUs. We train for up to 200 epochs, stopping early if the validation loss does not improve by more than $10^{-3}$ for 20 epochs, and pick the epoch with the lowest validation loss for testing. The training took about 1 hour on 4 NVIDIA V100 GPUs. \XW{These numbers are from the current model trained on 100k galaxies. Will update them for the 1M model.}

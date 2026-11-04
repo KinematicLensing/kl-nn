@@ -1,0 +1,163 @@
+% ============================== Part B ==============================
+\problem{B1}{Bias, scatter and pulls}
+
+\begin{given}
+An estimator $\hat\theta$ of a true value $\theta$ comes with a reported error bar $\hat\sigma$. The \emph{pull} is
+$(\hat\theta - \theta)/\hat\sigma$. Suppose $\hat\theta \sim \mathcal N(\theta + b, s^2)$: bias $b$, true scatter $s$.
+\emph{Derived here}; the pull is a standard diagnostic.
+\end{given}
+
+\need{nothing beyond Gaussians.}
+
+\begin{enumerate}
+  \item With $\hat\sigma$ fixed, show that the pull is $\mathcal N(b/\hat\sigma,\ s^2/\hat\sigma^2)$.
+  \item What do ``pull mean $\neq 0$'' and ``pull spread $\neq 1$'' each tell you?
+  \item Our 50-realization ensemble gives a pull spread of 0.84. By what factor do the reported error bars exceed
+    the true scatter? If you used them in an inference, what fraction of the available information
+    ($\propto 1/\sigma^2$) would you be claiming?
+  \item The polar cells give 1437 pulls. What is the statistical uncertainty on their mean? Is a pull mean of
+    $-0.02$ evidence of bias?
+\end{enumerate}
+
+\solution{
+(a) $(\hat\theta - \theta)/\hat\sigma$ is a linear function of a Gaussian, with mean $b/\hat\sigma$ and standard
+deviation $s/\hat\sigma$.
+(b) A non-zero mean means bias, in units of the error bar. A spread above 1 means the error bars are too small
+(overconfident); below 1, too large (conservative).
+(c) $\hat\sigma/s = 1/0.84 = 1.19$, so the errors are 19\% too large. You would claim
+$s^2/\hat\sigma^2 = 0.84^2 = 0.71$ of the information, as if you had thrown away 29\% of the galaxies. This loses
+precision but introduces no bias.
+(d) $0.84/\sqrt{1437} = 0.022$. A mean of $-0.02$ is $0.9\sigma$: consistent with zero.
+}
+
+% --------------------------------------------------------------------
+\problem{B2}{Multiplicative and additive bias; shrinkage of a posterior mean}
+
+\begin{given}
+Shear biases are summarised by a linear response $\hat g = (1+m)\,g + c$, with $m$ the multiplicative and $c$ the
+additive bias \source{\cBAresponse.} Model one galaxy with a Gaussian likelihood $d \sim \mathcal N(g, \sigma^2)$ and a
+Gaussian prior $g \sim \mathcal N(0, \sigma_\pi^2)$. \emph{Derived here} (it reproduces the toy model of paper
+Sec.~6.2).
+\end{given}
+
+\need{A1 (product of two Gaussians).}
+
+\begin{enumerate}
+  \item Treat the prior as a second ``measurement'' $0 \pm \sigma_\pi$. Show that the posterior mean is
+    $\hat g = d\,\sigma_\pi^2/(\sigma_\pi^2 + \sigma^2)$.
+  \item Average over the noise to find $\E[\hat g]$ and read off $m$ and $c$.
+  \item Use $\sigma = 0.07$ and the standard deviation of a uniform prior on $[-0.1, 0.1]$,
+    $\sigma_\pi = 0.2/\sqrt{12}$, to estimate $m$. Compare with A5(c).
+\end{enumerate}
+
+\solution{
+(a) By A1, with weights $1/\sigma^2$ on $d$ and $1/\sigma_\pi^2$ on $0$:
+$\hat g = (d/\sigma^2)/(1/\sigma^2 + 1/\sigma_\pi^2) = d\,\sigma_\pi^2/(\sigma_\pi^2+\sigma^2)$.
+(b) $\E[d] = g$, so $\E[\hat g] = g\,\sigma_\pi^2/(\sigma_\pi^2 + \sigma^2)$: $m = -\sigma^2/(\sigma^2 + \sigma_\pi^2)$
+and $c = 0$.
+(c) $\sigma_\pi = 0.0577$, so $m = -0.0049/(0.0049 + 0.00333) = -0.60$. The truncated box of A5 gave $-0.57$; the
+Gaussian toy captures the effect well. Shrinkage is strongest when the likelihood is wide compared with the prior.
+}
+
+% --------------------------------------------------------------------
+\problem{B3}{Stack likelihoods, not posteriors}
+
+\begin{given}
+Each galaxy's NPE posterior is $q_i(g) \propto L_i(g)\,\pitrain(g)$ (A4). $N$ galaxies share one $g$ and have
+independent data. The correct joint posterior is $p(g\mid d_1,\dots,d_N) \propto \pi(g)\prod_i L_i(g)$, and samples
+drawn under an interim prior are combined by dividing that prior out.
+\source{\cBAconst; \cInterim.}
+\end{given}
+
+\need{A4, B2.}
+
+\begin{enumerate}
+  \item Show that $\prod_i q_i(g) \propto \pitrain(g)^N\prod_i L_i(g)$. How many times is the prior counted?
+  \item Use the Gaussian model of B2 (prior $\mathcal N(0,\sigma_\pi^2)$, each likelihood width $\sigma$). Show that the
+    mean of $\prod_i q_i$ is shrunk by the same factor $\sigma_\pi^2/(\sigma_\pi^2+\sigma^2)$ for every $N$.
+  \item What is the mean of the correct posterior $\pi\prod_i L_i$, and how does its $m$ behave as $N \to \infty$?
+  \item Why does our stack use $L_i = q_i/\pitrain$ and a single flat prior on the cell shear?
+\end{enumerate}
+
+\solution{
+(a) $\prod_i q_i \propto \prod_i L_i\pitrain = \pitrain^N\prod_i L_i$: the prior is counted $N$ times.
+(b) $\pitrain^N$ has precision $N/\sigma_\pi^2$ and $\prod L_i$ has precision $N/\sigma^2$ about the mean $\bar d$, so
+the mean is $\bar d\,(N/\sigma^2)/(N/\sigma^2 + N/\sigma_\pi^2) = \bar d\,\sigma_\pi^2/(\sigma_\pi^2+\sigma^2)$: the
+$N$ cancels, and $m = -0.6$ no matter how many galaxies you multiply.
+(c) $\bar d\,(N/\sigma^2)/(N/\sigma^2 + 1/\sigma_\pi^2)$, so $m = -\sigma^2/(\sigma^2 + N\sigma_\pi^2) \to 0$ as
+$N \to \infty$.
+(d) Dividing out $\pitrain$ leaves the likelihoods, which multiply correctly. The cell then has one prior (uniform
+on $|\vG| < 0.1$), counted once, and the data dominate as $N$ grows.
+}
+
+% --------------------------------------------------------------------
+\problem{B4}{Fitting one shear to galaxies whose shears differ: the reference shear}
+
+\begin{given}
+Fitting a model that cannot be exactly right (a misspecified model) converges, as the data grow, to the parameter
+value that makes the model's distribution closest to the true one in Kullback--Leibler divergence: the
+\emph{pseudo-true} value.
+\source{\cMisspec.}
+In a cell, galaxy $i$ has true shear $\vt_i$ (in the cell frame), a Gaussian likelihood centred on $\vd_i$ with
+precision $F_i$, and $\E[\vd_i] = \vt_i$. The stack fits one common $\vG$ to all of them.
+\end{given}
+
+\need{A1, A3 (the matrix-weighted mean).}
+
+\begin{enumerate}
+  \item By A3, $\hat\vG = \Ftot^{-1}\sum_i F_i\vd_i$. Average over the noise, assuming $F_i$ doesn't depend on it.
+    Show that $\E[\hat\vG] = \Ftot^{-1}\sum_i F_i\vt_i \equiv \gref$.
+  \item Show that $\mathrm{Cov}(\hat\vG) = \Ftot^{-1}$, and that it doesn't depend on how much the $\vt_i$ differ.
+    Why is this still the right error bar \emph{about} $\gref$?
+  \item Scalar example: galaxy 1 has $t_1 = 0.02$, $\sigma_1 = 0.02$; galaxy 2 has $t_2 = 0$, $\sigma_2 = 0.06$.
+    Compute $g_{\rm ref}$ and the plain mean. Which one does the stack estimate?
+  \item Why would comparing the stack with the shear at the cell centre be the wrong test?
+\end{enumerate}
+
+\solution{
+(a) $\E[\hat\vG] = \Ftot^{-1}\sum_i F_i\,\E[\vd_i] = \Ftot^{-1}\sum_i F_i\vt_i$. This is the pseudo-true value for
+Gaussian likelihoods: the constant that best describes the varying $\vt_i$, with each galaxy weighted by its
+precision.
+(b) With independent noises of covariance $F_i^{-1}$:
+$\mathrm{Cov}(\hat\vG) = \Ftot^{-1}\big(\sum_i F_iF_i^{-1}F_i\big)\Ftot^{-1} = \Ftot^{-1}$. The $\vt_i$ don't appear.
+It is the right error about $\gref$ because $\gref$ is exactly what $\hat\vG$ estimates; so
+$\hat\vG - \gref \sim \mathcal N(0, \Ftot^{-1})$, and the pulls about $\gref$ are standard normal.
+(c) $w_1 = 2500$, $w_2 = 278$: $g_{\rm ref} = 50/2778 = 0.0180$; plain mean $0.01$. The stack estimates $0.0180$,
+with error $0.019$. Comparing it with $0.01$ would call a correct stack biased.
+(d) The cell-centre shear is not what the stack converges to. The difference is a deterministic binning effect,
+largest where the shear changes quickly. (Full derivation: \texttt{CELL\_REFERENCE\_SHEAR.md}, Secs.~3--5.)
+}
+
+% --------------------------------------------------------------------
+\problem{B5}{\py\ The tangential frame, and checking a stack with pulls}
+
+\begin{given}
+About a lens at the origin, a galaxy at position angle $\phi$ has tangential and cross shear
+$g_t = -\mathrm{Re}(g\,e^{-2i\phi})$, $g_\times = -\mathrm{Im}(g\,e^{-2i\phi})$, with $g = g_1 + i g_2$.
+\source{\cBStan.}
+As a matrix, $(g_t, g_\times)^\T = R(\phi)\,(g_1, g_2)^\T$ with
+$R(\phi) = -\begin{pmatrix}\cos2\phi & \sin2\phi\\ -\sin2\phi & \cos2\phi\end{pmatrix}$.
+\end{given}
+
+\need{A3, B1, B4.}
+
+\begin{enumerate}
+  \item Show that $R(\phi)$ is orthogonal ($RR^\T = I$), and that a likelihood with precision $F$ in the image frame has
+    precision $F' = RFR^\T$ in the tangential frame.
+  \item An axisymmetric lens produces purely tangential shear: $g_\times = 0$ and $g_t > 0$. Write $(g_1, g_2)$ at angle
+    $\phi$ in terms of $g_t$.
+  \item \py\ Simulate a cell of 5 galaxies at different $\phi$ around a lens with $g_t$ varying from 0.01 to 0.03 and
+    anisotropic, randomly oriented likelihood covariances. Draw noisy measurements, rotate each into the tangential
+    frame, stack with A3, and repeat 2000 times. Show that the pulls about $\gref$ have mean $\approx 0$ and spread
+    $\approx 1$, while the pulls about the plain mean of the $g_{t,i}$ are biased.
+\end{enumerate}
+
+\solution{
+(a) Writing $R = -Q$ with $Q$ a rotation by $2\phi$, $RR^\T = QQ^\T = I$. If
+$\ln L \propto -\tfrac12 (\vg - \hat\vg)^\T F(\vg - \hat\vg)$ and $\vg = R^\T\vg'$, then
+$(\vg - \hat\vg)^\T F(\vg - \hat\vg) = (\vg' - R\hat\vg)^\T RFR^\T(\vg' - R\hat\vg)$, so $F' = RFR^\T$.
+(b) $g\,e^{-2i\phi} = -g_t$ gives $g = -g_t e^{2i\phi}$: $g_1 = -g_t\cos2\phi$, $g_2 = -g_t\sin2\phi$.
+(c) See the solutions notebook: the pulls about $\gref$ have mean and spread close to $0$ and $1$. The pulls about
+the plain mean are offset (by about $0.05$--$0.1\sigma$ in this example; more when the precisions differ more), because
+precise galaxies at particular $g_t$ dominate the stack.
+}

@@ -16,7 +16,8 @@ set -u
 
 DATASET_NAME="${DATASET_NAME:-likelihood_stack_04_benchmark}"
 SEED="${BENCHMARK_SEED:-420042}"
+FIBER_LAYOUT="${FIBER_LAYOUT:-galaxy_axis}"
 cd "${KLNN_REPO_ROOT}"
 python data_generate/materialize_likelihood_stack_benchmark.py \
   --data-dir="/ocean/projects/phy250048p/shared/datasets/${DATASET_NAME}" \
-  --seed="${SEED}" --overwrite
+  --seed="${SEED}" --fiber-layout="${FIBER_LAYOUT}" --overwrite

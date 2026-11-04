@@ -38,6 +38,7 @@ from diagnostics.likelihood_stack_benchmark_core import (
     fit_component_mc,
     fixed_shear_grid,
     prefix_surface_map,
+    prefix_surface_mean,
     rmse,
     row_index,
 )
@@ -75,12 +76,23 @@ ESTIMATORS = (
     ("npe_map", "NPE sampled MAP"),
     ("nre_map", "NRE 2D grid MAP"),
     ("npe_9d_stack_map", "stacked 9D NPE q/pi MAP"),
+    ("npe_9d_stack_mean", "stacked 9D NPE q/pi posterior mean"),
+    ("nre_stack_mean", "stacked NRE posterior mean"),
 )
+PER_GALAXY_ESTIMATORS = ESTIMATORS[:-1]
 NUISANCE_PREFIXES = (1, 2, 4, 8, 16, 32)
 NUISANCE_BOOTSTRAP_COUNT = 1000
 NUISANCE_BOOTSTRAP_LOWER_PERCENTILE = 16.0
 NUISANCE_BOOTSTRAP_UPPER_PERCENTILE = 84.0
 NUISANCE_BOOTSTRAP_SEED_OFFSET = 1_000_003
+
+
+def available_estimators(result: dict[str, np.ndarray]) -> tuple[tuple[str, str], ...]:
+    """Return estimators supported by the saved benchmark arrays."""
+
+    if {"nre_log_r", "nre_grid_phys", "surface_mean"} <= set(result):
+        return ESTIMATORS
+    return PER_GALAXY_ESTIMATORS
 
 
 def parse_args(argv=None):
@@ -298,6 +310,7 @@ def _per_stamp_estimators(
         "npe_map": np.asarray(npe_map, dtype=np.float64),
         "nre_mean": np.asarray(nre_mean, dtype=np.float64),
         "nre_map": nre_map,
+        "nre_log_r": np.asarray(nre_log_r, dtype=np.float64),
         "surface_candidates": candidates,
         "context": context,
     }
@@ -312,7 +325,7 @@ def _surface_stack(
     candidates: np.ndarray,
     *,
     prefixes=BENCHMARK_PREFIXES,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Score every observation on its galaxy's unioned 9D candidate bank."""
 
     n_gal, n_real, n_candidates, n_features = candidates.shape
@@ -358,7 +371,8 @@ def _surface_stack(
                 .numpy()
             )
     scores_np = scores
-    output = np.empty((n_gal, len(prefixes), n_features), dtype=np.float64)
+    output_map = np.empty((n_gal, len(prefixes), n_features), dtype=np.float64)
+    output_mean = np.empty((n_gal, len(prefixes), n_features), dtype=np.float64)
     for galaxy in range(n_gal):
         mapped, _ = prefix_surface_map(
             candidates[galaxy],
@@ -367,13 +381,26 @@ def _surface_stack(
             candidates_per_realization=n_candidates,
             prior_log_density=BENCHMARK_UNIFORM_PRIOR_LOG_DENSITY,
         )
-        output[galaxy] = denormalize(
+        means = prefix_surface_mean(
+            candidates[galaxy],
+            scores_np[galaxy],
+            prefixes=prefixes,
+            candidates_per_realization=n_candidates,
+            prior_log_density=BENCHMARK_UNIFORM_PRIOR_LOG_DENSITY,
+        )
+        output_map[galaxy] = denormalize(
             mapped,
             config.par_ranges,
             feature_names=tuple(config.TARGET_NAMES),
             target_transforms=config.TARGET_TRANSFORMS,
         )
-    return output
+        output_mean[galaxy] = denormalize(
+            means,
+            config.par_ranges,
+            feature_names=tuple(config.TARGET_NAMES),
+            target_transforms=config.TARGET_TRANSFORMS,
+        )
+    return output_map, output_mean
 
 
 def run_benchmark(
@@ -407,6 +434,16 @@ def run_benchmark(
     )}
     surface_map = np.empty(
         (n_cells, BENCHMARK_N_GALAXIES, len(BENCHMARK_PREFIXES), len(names)),
+        dtype=np.float64,
+    )
+    surface_mean = np.empty_like(surface_map)
+    nre_log_r = np.empty(
+        (
+            n_cells,
+            BENCHMARK_N_GALAXIES,
+            BENCHMARK_N_REALIZATIONS,
+            grid_phys.shape[0],
+        ),
         dtype=np.float64,
     )
     truth_g = np.empty((n_cells, BENCHMARK_N_GALAXIES, 2), dtype=np.float64)
@@ -468,12 +505,13 @@ def run_benchmark(
             )
             for name in point:
                 point[name][cell_id, :, realization] = current[name]
+            nre_log_r[cell_id, :, realization] = current["nre_log_r"]
             candidates[:, realization] = current["surface_candidates"]
             noisy_images.append(image)
             noisy_spectra.append(spec)
         image_stack = torch.stack(noisy_images, dim=1)
         spec_stack = torch.stack(noisy_spectra, dim=1)
-        surface_map[cell_id] = _surface_stack(
+        surface_map[cell_id], surface_mean[cell_id] = _surface_stack(
             model,
             image_stack,
             spec_stack,
@@ -483,34 +521,118 @@ def run_benchmark(
         del image_stack, spec_stack
     return {
         **point,
+        "nre_log_r": nre_log_r,
+        "nre_grid_phys": grid_phys,
         "surface_map": surface_map,
+        "surface_mean": surface_mean,
         "truth_g": truth_g,
         "truth_full": truth_full,
         "prefixes": np.asarray(BENCHMARK_PREFIXES, dtype=np.int64),
     }
 
 
+def stacked_nre_means(
+    log_r: np.ndarray,
+    grid_phys: np.ndarray,
+    prefixes: tuple[int, ...] = BENCHMARK_PREFIXES,
+) -> np.ndarray:
+    """Posterior means after summing NRE log-ratio surfaces over nuisances."""
+
+    scores = np.asarray(log_r, dtype=np.float64)
+    grid_phys = np.asarray(grid_phys, dtype=np.float64)
+    if scores.ndim != 4:
+        raise ValueError(
+            "log_r must have shape (cells, galaxies, realizations, grid)"
+        )
+    if grid_phys.ndim != 2 or grid_phys.shape[-1] != 2:
+        raise ValueError("grid_phys must have shape (grid, 2)")
+    if scores.shape[-1] != grid_phys.shape[0]:
+        raise ValueError("log_r width must match grid_phys")
+    output = np.empty(
+        (scores.shape[0], len(prefixes), grid_phys.shape[1]),
+        dtype=np.float64,
+    )
+    for prefix_index, prefix in enumerate(prefixes):
+        prefix = int(prefix)
+        if not 1 <= prefix <= scores.shape[2]:
+            raise ValueError("prefix is outside the available realization axis")
+        stacked = np.sum(scores[:, :, :prefix, :], axis=(1, 2))
+        output[:, prefix_index] = grid_posterior_moments(
+            stacked, grid_phys
+        )["mean"]
+    return output
+
+
+def stacked_nre_nuisance_means(
+    log_r: np.ndarray,
+    grid_phys: np.ndarray,
+    nuisance_prefixes: tuple[int, ...] = NUISANCE_PREFIXES,
+    *,
+    realization_prefix: int = BENCHMARK_N_REALIZATIONS,
+) -> np.ndarray:
+    """NRE posterior means after stacking nuisance prefixes at fixed R."""
+
+    scores = np.asarray(log_r, dtype=np.float64)
+    grid_phys = np.asarray(grid_phys, dtype=np.float64)
+    if scores.ndim != 4:
+        raise ValueError(
+            "log_r must have shape (cells, galaxies, realizations, grid)"
+        )
+    if not 1 <= int(realization_prefix) <= scores.shape[2]:
+        raise ValueError("realization_prefix is outside the available axis")
+    output = np.empty(
+        (scores.shape[0], len(nuisance_prefixes), grid_phys.shape[1]),
+        dtype=np.float64,
+    )
+    for prefix_index, prefix in enumerate(nuisance_prefixes):
+        prefix = int(prefix)
+        if not 1 <= prefix <= scores.shape[1]:
+            raise ValueError("nuisance prefix is outside the available axis")
+        stacked = np.sum(
+            scores[:, :prefix, :realization_prefix, :],
+            axis=(1, 2),
+        )
+        output[:, prefix_index] = grid_posterior_moments(
+            stacked, grid_phys
+        )["mean"]
+    return output
+
+
 def aggregate_results(result: dict[str, np.ndarray]) -> tuple[list[dict], list[dict], dict]:
     truth = result["truth_g"]
     prefixes = tuple(int(value) for value in result["prefixes"])
+    estimators = available_estimators(result)
     rows = []
     cells = []
     surface = result["surface_map"][..., [0, 1]]
+    surface_mean = result["surface_mean"][..., [0, 1]]
     estimates = {
         "npe_mean": result["npe_mean"],
         "nre_mean": result["nre_mean"],
         "npe_map": result["npe_map"],
         "nre_map": result["nre_map"],
         "npe_9d_stack_map": surface,
+        "npe_9d_stack_mean": result["surface_mean"][..., [0, 1]],
     }
-    for estimator, _ in ESTIMATORS:
+    if "nre_stack_mean" in dict(estimators):
+        estimates["nre_stack_mean"] = stacked_nre_means(
+            result["nre_log_r"],
+            result["nre_grid_phys"],
+            prefixes,
+        )
+    for estimator, _ in estimators:
         values = estimates[estimator]
         for prefix_index, prefix in enumerate(prefixes):
             if estimator == "npe_9d_stack_map":
                 galaxy_values = values[:, :, prefix_index]
+            elif estimator == "nre_stack_mean":
+                galaxy_values = values[:, prefix_index]
             else:
                 galaxy_values = np.mean(values[:, :, :prefix], axis=2)
-            cell_values = np.mean(galaxy_values, axis=1)
+            if estimator == "nre_stack_mean":
+                cell_values = galaxy_values
+            else:
+                cell_values = np.mean(galaxy_values, axis=1)
             truth_cells = truth.mean(axis=1)
             fit = fit_component_mc(truth_cells, cell_values)
             metrics = rmse(truth_cells, cell_values)
@@ -523,7 +645,11 @@ def aggregate_results(result: dict[str, np.ndarray]) -> tuple[list[dict], list[d
                 }
             )
             for cell_id, shear in enumerate(fixed_shear_grid()):
-                values_cell = galaxy_values[cell_id]
+                values_cell = (
+                    galaxy_values[cell_id]
+                    if estimator != "nre_stack_mean"
+                    else galaxy_values[cell_id : cell_id + 1]
+                )
                 cells.append(
                     {
                         "estimator": estimator,
@@ -533,8 +659,22 @@ def aggregate_results(result: dict[str, np.ndarray]) -> tuple[list[dict], list[d
                         "g2_truth": float(shear[1]),
                         "g1_mean": float(np.mean(values_cell[:, 0])),
                         "g2_mean": float(np.mean(values_cell[:, 1])),
-                        "g1_se": float(np.std(values_cell[:, 0], ddof=1) / np.sqrt(len(values_cell))),
-                        "g2_se": float(np.std(values_cell[:, 1], ddof=1) / np.sqrt(len(values_cell))),
+                        "g1_se": (
+                            None
+                            if estimator == "nre_stack_mean"
+                            else float(
+                                np.std(values_cell[:, 0], ddof=1)
+                                / np.sqrt(len(values_cell))
+                            )
+                        ),
+                        "g2_se": (
+                            None
+                            if estimator == "nre_stack_mean"
+                            else float(
+                                np.std(values_cell[:, 1], ddof=1)
+                                / np.sqrt(len(values_cell))
+                            )
+                        ),
                     }
                 )
     takeaway = {
@@ -546,7 +686,7 @@ def aggregate_results(result: dict[str, np.ndarray]) -> tuple[list[dict], list[d
             for row in rows
             if row["estimator"] == estimator
         }
-        for estimator, _ in ESTIMATORS
+        for estimator, _ in estimators
     }
     return rows, cells, takeaway
 
@@ -594,8 +734,12 @@ def _nuisance_bootstrap_fits(
     n_nuisance: int,
     n_bootstrap: int,
     seed: int,
-) -> tuple[dict[str, float], dict[str, tuple[float, float]]]:
-    """Fit point estimates and paired-bootstrap percentile intervals."""
+) -> tuple[
+    dict[str, float],
+    dict[str, float],
+    dict[str, tuple[float, float]],
+]:
+    """Fit prefix provenance and paired-bootstrap summary statistics."""
 
     values = np.asarray(galaxy_values, dtype=np.float64)
     if values.ndim != 3 or values.shape[-1] != 2:
@@ -608,10 +752,14 @@ def _nuisance_bootstrap_fits(
         n_bootstrap=n_bootstrap,
         seed=seed,
     )
-    point = fit_component_mc(
+    prefix_fit = fit_component_mc(
         truth_cells,
         np.mean(values[:, :n_nuisance], axis=1),
     )
+    prefix_summary = {
+        **prefix_fit,
+        **rmse(truth_cells, np.mean(values[:, :n_nuisance], axis=1)),
+    }
     # Advanced indexing gives (cell, bootstrap, nuisance, component).  The
     # bootstrap ID row is therefore shared across all 25 exact shear cells.
     bootstrap_cell_values = np.mean(values[:, bootstrap_ids, :], axis=2)
@@ -619,6 +767,32 @@ def _nuisance_bootstrap_fits(
         fit_component_mc(truth_cells, bootstrap_cell_values[:, index, :])
         for index in range(n_bootstrap)
     ]
+    bootstrap_rmses = [
+        rmse(truth_cells, bootstrap_cell_values[:, index, :])
+        for index in range(n_bootstrap)
+    ]
+    bootstrap_names = (
+        "g1_m",
+        "g2_m",
+        "combined_m",
+        "g1_c",
+        "g2_c",
+        "combined_c",
+        "g1_rmse",
+        "g2_rmse",
+        "combined_rmse",
+    )
+    bootstrap_median = {
+        name: float(
+            np.median(
+                [
+                    fit[name] if name in fit else rmse_row[name]
+                    for fit, rmse_row in zip(bootstrap_fits, bootstrap_rmses)
+                ]
+            )
+        )
+        for name in bootstrap_names
+    }
     interval = {
         name: (
             float(
@@ -636,7 +810,105 @@ def _nuisance_bootstrap_fits(
         )
         for name in ("g1_m", "g2_m", "combined_m")
     }
-    return point, interval
+    return prefix_summary, bootstrap_median, interval
+
+
+def _nre_nuisance_bootstrap_fits(
+    truth_cells: np.ndarray,
+    log_r: np.ndarray,
+    grid_phys: np.ndarray,
+    *,
+    n_nuisance: int,
+    n_bootstrap: int,
+    seed: int,
+) -> tuple[dict[str, float], dict[str, float], dict[str, tuple[float, float]]]:
+    """Bootstrap NRE score products over paired nuisance IDs."""
+
+    scores = np.asarray(log_r, dtype=np.float64)
+    if scores.ndim != 4:
+        raise ValueError(
+            "log_r must have shape (cells, galaxies, realizations, grid)"
+        )
+    bootstrap_ids = paired_nuisance_bootstrap_indices(
+        scores.shape[1],
+        n_nuisance,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+    )
+    prefix_scores = np.sum(
+        scores[:, :n_nuisance, :BENCHMARK_N_REALIZATIONS, :],
+        axis=(1, 2),
+    )
+    prefix_values = grid_posterior_moments(prefix_scores, grid_phys)["mean"]
+    prefix_fit = fit_component_mc(truth_cells, prefix_values)
+    prefix_summary = {**prefix_fit, **rmse(truth_cells, prefix_values)}
+
+    galaxy_scores = np.sum(
+        scores[:, :, :BENCHMARK_N_REALIZATIONS, :],
+        axis=2,
+    )
+    bootstrap_fits = []
+    bootstrap_rmses = []
+    for start in range(0, n_bootstrap, 16):
+        stop = min(start + 16, n_bootstrap)
+        sampled_scores = np.take(
+            galaxy_scores,
+            bootstrap_ids[start:stop],
+            axis=1,
+        )
+        sampled_scores = np.sum(sampled_scores, axis=2)
+        sampled_values = grid_posterior_moments(
+            sampled_scores.reshape(-1, sampled_scores.shape[-1]),
+            grid_phys,
+        )["mean"].reshape(scores.shape[0], stop - start, 2)
+        bootstrap_fits.extend(
+            fit_component_mc(truth_cells, sampled_values[:, index, :])
+            for index in range(stop - start)
+        )
+        bootstrap_rmses.extend(
+            rmse(truth_cells, sampled_values[:, index, :])
+            for index in range(stop - start)
+        )
+    bootstrap_names = (
+        "g1_m",
+        "g2_m",
+        "combined_m",
+        "g1_c",
+        "g2_c",
+        "combined_c",
+        "g1_rmse",
+        "g2_rmse",
+        "combined_rmse",
+    )
+    bootstrap_median = {
+        name: float(
+            np.median(
+                [
+                    fit[name] if name in fit else rmse_row[name]
+                    for fit, rmse_row in zip(bootstrap_fits, bootstrap_rmses)
+                ]
+            )
+        )
+        for name in bootstrap_names
+    }
+    interval = {
+        name: (
+            float(
+                np.percentile(
+                    [fit[name] for fit in bootstrap_fits],
+                    NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
+                )
+            ),
+            float(
+                np.percentile(
+                    [fit[name] for fit in bootstrap_fits],
+                    NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+                )
+            ),
+        )
+        for name in ("g1_m", "g2_m", "combined_m")
+    }
+    return prefix_summary, bootstrap_median, interval
 
 
 def aggregate_nuisance_results(
@@ -657,6 +929,7 @@ def aggregate_nuisance_results(
         ) from exc
 
     surface = result["surface_map"][..., [0, 1]]
+    surface_mean = result["surface_mean"][..., [0, 1]]
     estimates = {
         "npe_mean": np.mean(
             result["npe_mean"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
@@ -671,12 +944,13 @@ def aggregate_nuisance_results(
             result["nre_map"][:, :, :BENCHMARK_N_REALIZATIONS, :], axis=2
         ),
         "npe_9d_stack_map": surface[:, :, r16_index],
+        "npe_9d_stack_mean": surface_mean[:, :, r16_index],
     }
     rows = []
-    for estimator, _ in ESTIMATORS:
+    for estimator, _ in PER_GALAXY_ESTIMATORS:
         galaxy_values = estimates[estimator]
         for n_nuisance in NUISANCE_PREFIXES:
-            point, intervals = _nuisance_bootstrap_fits(
+            prefix_summary, bootstrap_median, intervals = _nuisance_bootstrap_fits(
                 truth_cells,
                 galaxy_values,
                 n_nuisance=n_nuisance,
@@ -692,7 +966,9 @@ def aggregate_nuisance_results(
                     "bootstrap_seed": int(bootstrap_seed),
                     "bootstrap_lower_percentile": NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
                     "bootstrap_upper_percentile": NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
-                    **point,
+                    "bootstrap_center": "median",
+                    **bootstrap_median,
+                    "prefix_summary": prefix_summary,
                     **{
                         f"{name}_lower": bounds[0]
                         for name, bounds in intervals.items()
@@ -707,33 +983,87 @@ def aggregate_nuisance_results(
                     ),
                 }
             )
+    nre_scores = result["nre_log_r"]
+    for n_nuisance in NUISANCE_PREFIXES:
+        prefix_summary, bootstrap_median, intervals = _nre_nuisance_bootstrap_fits(
+            truth_cells,
+            nre_scores,
+            result["nre_grid_phys"],
+            n_nuisance=n_nuisance,
+            n_bootstrap=bootstrap_count,
+            seed=int(bootstrap_seed),
+        )
+        rows.append(
+            {
+                "estimator": "nre_stack_mean",
+                "n_nuisance": int(n_nuisance),
+                "noise_realizations": BENCHMARK_N_REALIZATIONS,
+                "bootstrap_count": int(bootstrap_count),
+                "bootstrap_seed": int(bootstrap_seed),
+                "bootstrap_lower_percentile": NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
+                "bootstrap_upper_percentile": NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+                "bootstrap_center": "median",
+                **bootstrap_median,
+                "prefix_summary": prefix_summary,
+                **{
+                    f"{name}_lower": bounds[0]
+                    for name, bounds in intervals.items()
+                },
+                **{
+                    f"{name}_upper": bounds[1]
+                    for name, bounds in intervals.items()
+                },
+            }
+        )
     return rows
 
 
 def benchmark_takeaway(metrics: list[dict]) -> str:
     """State whether increasing R actually removes the ensemble bias."""
 
+    metric_names = {row["estimator"] for row in metrics}
+    estimators = tuple(
+        (name, label)
+        for name, label in ESTIMATORS
+        if name in metric_names
+    )
     by_name = {
         estimator: {
             int(row["prefix"]): row
             for row in metrics
             if row["estimator"] == estimator
         }
-        for estimator, _ in ESTIMATORS
+        for estimator, _ in estimators
     }
     changes = []
-    for estimator, label in ESTIMATORS:
+    for estimator, label in estimators:
         first = by_name[estimator][1]["combined_m"]
         last = by_name[estimator][16]["combined_m"]
         changes.append((abs(last), estimator, label, first, last))
     _, closest_name, closest_label, first, last = min(changes)
     improving = []
-    for estimator, label in ESTIMATORS:
+    for estimator, label in estimators:
         values = by_name[estimator]
         improving.append(
             (abs(values[16]["combined_m"]) - abs(values[1]["combined_m"]), label)
         )
     _, best_improver = min(improving)
+    if "nre_stack_mean" in by_name:
+        stack_r1 = by_name["nre_stack_mean"][1]
+        stack_r16 = by_name["nre_stack_mean"][16]
+        if abs(stack_r16["combined_m"]) < 0.05:
+            return (
+                "The all-nuisance NRE likelihood product is the first estimator "
+                "close to zero in this benchmark: combined m="
+                f"{stack_r16['combined_m']:.3f} at R=16 "
+                f"(R=1: {stack_r1['combined_m']:.3f}), with component slopes "
+                f"m_g1={stack_r16['g1_m']:.3f} and "
+                f"m_g2={stack_r16['g2_m']:.3f}. This is substantially closer "
+                "to an unbiased ensemble response than the per-galaxy NRE "
+                "estimators and the 9D per-galaxy stack. The residual component "
+                "difference should be treated as remaining calibration error, "
+                "not as evidence that the likelihood is fully calibrated."
+            )
     return (
         "No estimator approaches m=0 under this exact shared-shear benchmark. "
         f"At R=16 the closest is {closest_label} with combined m="
@@ -754,8 +1084,17 @@ def _plot_outputs(
     plt = _setup_matplotlib()
     report_dir.mkdir(parents=True, exist_ok=True)
     figures = {}
-    labels = dict(ESTIMATORS)
-    colors = ("#1f4e79", "#8f3b76", "#a05a2c", "#2e7d32", "#6a4c93")
+    estimators = available_estimators(result)
+    labels = dict(estimators)
+    colors = (
+        "#1f4e79",
+        "#8f3b76",
+        "#a05a2c",
+        "#2e7d32",
+        "#6a4c93",
+        "#b56576",
+        "#4d908e",
+    )
     truth = result["truth_g"][:, 0]
     estimate_map = {
         "npe_mean": result["npe_mean"],
@@ -763,30 +1102,47 @@ def _plot_outputs(
         "npe_map": result["npe_map"],
         "nre_map": result["nre_map"],
         "npe_9d_stack_map": result["surface_map"][..., [0, 1]],
+        "npe_9d_stack_mean": result["surface_mean"][..., [0, 1]],
     }
+    if "nre_stack_mean" in dict(estimators):
+        estimate_map["nre_stack_mean"] = stacked_nre_means(
+            result["nre_log_r"],
+            result["nre_grid_phys"],
+            tuple(int(value) for value in result["prefixes"]),
+        )
     for prefix in (1, 16):
-        fig, axes = plt.subplots(2, 5, figsize=(15, 6.2), sharex=True, sharey=True)
-        for column, (name, label) in enumerate(ESTIMATORS):
-            if name == "npe_9d_stack_map":
+        fig, axes = plt.subplots(
+            2, len(estimators), figsize=(18, 6.2), sharex=True, sharey=True
+        )
+        for column, (name, label) in enumerate(estimators):
+            if name in ("npe_9d_stack_map", "npe_9d_stack_mean"):
                 prefix_index = BENCHMARK_PREFIXES.index(prefix)
                 estimate = estimate_map[name][:, :, prefix_index]
+            elif name == "nre_stack_mean":
+                prefix_index = BENCHMARK_PREFIXES.index(prefix)
+                estimate = estimate_map[name][:, prefix_index]
             else:
                 estimate = np.mean(estimate_map[name][:, :, :prefix], axis=2)
-            cell_estimate = np.mean(estimate, axis=1)
+            cell_estimate = (
+                estimate
+                if name == "nre_stack_mean"
+                else np.mean(estimate, axis=1)
+            )
             for axis, component in zip(axes[:, column], (0, 1)):
+                bias = cell_estimate[:, component] - truth[:, component]
                 axis.scatter(
                     truth[:, component],
-                    cell_estimate[:, component],
+                    bias,
                     s=22,
                     alpha=0.85,
                     color=colors[column],
                 )
-                axis.axline((0, 0), slope=1, color="#555", ls="--", lw=0.8)
+                axis.axhline(0.0, color="#555", ls="--", lw=0.8)
                 axis.set_title(label, fontsize=9)
                 axis.set_xlabel("true g" + str(component + 1))
                 if column == 0:
-                    axis.set_ylabel("estimated g" + str(component + 1))
-        fig.suptitle(f"Fixed-shear cell means, R={prefix}")
+                    axis.set_ylabel("ĝ" + str(component + 1) + " − true g" + str(component + 1))
+        fig.suptitle(f"Fixed-shear shear bias versus true shear, R={prefix}")
         fig.tight_layout()
         path = report_dir / f"scatter_r{prefix}.png"
         fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
@@ -794,7 +1150,7 @@ def _plot_outputs(
         figures[f"scatter_r{prefix}"] = path.name
 
     fig, axis = plt.subplots(figsize=(8.5, 4.8))
-    for color, (name, label) in zip(colors, ESTIMATORS):
+    for color, (name, label) in zip(colors, estimators):
         subset = [row for row in rows if row["estimator"] == name]
         axis.plot(
             [row["prefix"] for row in subset],
@@ -817,7 +1173,7 @@ def _plot_outputs(
     figures["m_vs_r"] = path.name
 
     fig, axis = plt.subplots(figsize=(8.5, 4.8))
-    for color, (name, label) in zip(colors, ESTIMATORS):
+    for color, (name, label) in zip(colors, estimators):
         subset = [row for row in nuisance_rows if row["estimator"] == name]
         x_values = np.asarray(
             [row["n_nuisance"] for row in subset],
@@ -857,7 +1213,7 @@ def _plot_outputs(
         plt.FuncFormatter(lambda value, _: str(int(value)))
     )
     axis.set_xlabel("nuisance galaxies combined (N_nuisance)")
-    axis.set_ylabel("combined multiplicative bias m")
+    axis.set_ylabel("combined multiplicative bias m (paired-bootstrap median)")
     axis.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     path = report_dir / "m_vs_nuisance_r16.png"
@@ -866,7 +1222,7 @@ def _plot_outputs(
     figures["m_vs_nuisance_r16"] = path.name
 
     fig, axis = plt.subplots(figsize=(8.5, 4.8))
-    for color, (name, label) in zip(colors, ESTIMATORS):
+    for color, (name, label) in zip(colors, estimators):
         subset = [row for row in rows if row["estimator"] == name]
         axis.plot(
             [row["prefix"] for row in subset],
@@ -892,6 +1248,34 @@ def _plot_outputs(
 def _write_html(payload: dict, figures: dict[str, str], report_dir: Path) -> None:
     rows_html = []
     labels = dict(ESTIMATORS)
+    metric_names = {row["estimator"] for row in payload["metrics"]}
+    has_nre_stack = "nre_stack_mean" in metric_names
+    estimator_count = len(metric_names)
+    nre_stack_description = (
+        "The 2D stacked NRE estimator sums the NRE log-ratio surfaces over "
+        "all 32 nuisance galaxies and the first R noise realizations, then "
+        "takes the posterior mean on that grid. "
+        if has_nre_stack
+        else ""
+    )
+    npe9d_mean_description = (
+        "The 9D surface produces both a candidate-weighted posterior mean "
+        "and a MAP for each latent galaxy. "
+        if "npe_9d_stack_mean" in metric_names
+        else ""
+    )
+    grouping_warning = (
+        "only the 9D surface stack and the 2D NRE nuisance stack combine "
+        "likelihood information. "
+        if has_nre_stack
+        else "only the 9D surface stack combines likelihood information. "
+    )
+
+    def format_se(value) -> str:
+        if value is None or not np.isfinite(float(value)):
+            return "not applicable"
+        return f"{float(value):.5f}"
+
     for row in payload["metrics"]:
         rows_html.append(
             "<tr>"
@@ -911,8 +1295,8 @@ def _write_html(payload: dict, figures: dict[str, str], report_dir: Path) -> Non
             f"<td>{html.escape(labels[row['estimator']])}</td>"
             f"<td>{row['prefix']}</td><td>{row['cell']}</td>"
             f"<td>{row['g1_truth']:.2f}</td><td>{row['g2_truth']:.2f}</td>"
-            f"<td>{row['g1_mean']:.5f} ± {row['g1_se']:.5f}</td>"
-            f"<td>{row['g2_mean']:.5f} ± {row['g2_se']:.5f}</td>"
+            f"<td>{row['g1_mean'] - row['g1_truth']:.5f} ± {format_se(row['g1_se'])}</td>"
+            f"<td>{row['g2_mean'] - row['g2_truth']:.5f} ± {format_se(row['g2_se'])}</td>"
             "</tr>"
         )
     nuisance_rows_html = []
@@ -940,7 +1324,7 @@ th, td {{ border: 1px solid #ccc; padding: .32rem .45rem; }}
 th {{ background: #f4f4f4; text-align: left; }}
 </style></head><body>
 <h1>Fixed-shear estimator benchmark</h1>
-<p class="lead">A controlled 5×5 grid of exact shears compares five ensemble
+<p class="lead">A controlled 5×5 grid of exact shears compares {estimator_count} ensemble
 estimators as independent identity-noise realizations accumulate. The 32
 latent galaxies are paired across every shear cell: nuisance parameters and
 observation-quality controls are held fixed, while only the exact g1 and g2
@@ -953,15 +1337,14 @@ streams are derived from (seed, cell, galaxy, realization), so the result is
 repeatable. Prefixes R = 1, 2, 4, 8, 16 use the first R realizations.
 Each per-stamp NPE mean and sampled MAP uses {payload["npe_samples"]:,}
 posterior candidates. The NRE mean and MAP use a {payload["grid_n"]}×{payload["grid_n"]}
-shear grid. The 9D surface uses {payload["surface_samples"]} candidates per
-noise, unions them into a common per-galaxy bank, removes the uniform
-normalized prior, sums log(q/π), and selects a 9D MAP.</p>
-<p class="note"><strong>Important grouping warning:</strong> only the 9D
-surface stack shares the complete latent truth within a group. The four
-per-stamp estimators are averaged across repeated noises and then across the
-32 galaxies; they are not products of likelihoods from different nuisance
-galaxies. Truth is a diagnostic marker and is never inserted into a candidate
-bank.</p>
+shear grid. {nre_stack_description}{npe9d_mean_description}The 9D surface uses {payload["surface_samples"]}
+candidates per noise, unions them into a common per-galaxy bank, removes the
+uniform normalized prior, sums log(q/π), and selects a 9D MAP.</p>
+<p class="note"><strong>Important grouping warning:</strong> {grouping_warning}
+The per-galaxy estimators are averaged across repeated noises and then across
+the 32 galaxies; the stacked NRE estimator instead sums its 2D score surfaces
+over nuisance galaxies. Truth is a diagnostic marker and is never inserted
+into a candidate bank.</p>
 
 <h2>m/c and RMSE versus R</h2>
 <table><thead><tr><th>Estimator</th><th>R</th><th>m g1</th><th>m g2</th>
@@ -977,30 +1360,33 @@ the number of independent noises increases.</figcaption></figure>
 <tbody>{"".join(nuisance_rows_html)}</tbody></table>
 <figure><img src="{html.escape(figures['m_vs_nuisance_r16'])}"
 alt="multiplicative bias versus nuisance galaxy count at R=16">
-<figcaption>Noise averaging is held fixed at R=16: each of the four
-per-stamp estimators first averages its 16 noise realizations per nuisance
-galaxy, while the 9D estimator uses each nuisance galaxy's R=16 stacked MAP.
-For each N_nuisance, the point estimate averages the first N nuisance IDs in
-each exact shear cell. The shaded interval is the 16th–84th percentile over
-1,000 deterministic bootstrap replicates; each replicate resamples N IDs with
-replacement from the 32 available nuisance IDs and reuses the same ID vector
-across all 25 shear cells before refitting component-wise and combined m/c.
-The interval therefore represents paired finite-nuisance-sample variation in
-this benchmark.</figcaption>
+<figcaption>Noise averaging is held fixed at R=16: each per-galaxy estimator
+first averages its 16 noise realizations per nuisance galaxy, while the two
+9D summaries use each nuisance galaxy's R=16 stacked surface. The 2D NRE
+likelihood product is recomputed over each nuisance prefix. For each
+N_nuisance, the curve is the median of 1,000 paired bootstrap
+replicates. The shaded interval is the 16th–84th percentile of those same
+replicates; each replicate resamples N IDs with replacement from the 32
+available nuisance IDs and reuses the same ID vector across all 25 shear
+cells before refitting component-wise and combined m/c. The curve and band
+therefore describe the same random-subset estimand and represent paired
+finite-nuisance-sample variation in this benchmark.</figcaption>
 </figure>
 <figure><img src="{html.escape(figures['rmse_vs_r'])}" alt="RMSE versus R"></figure>
 
 <h2>Fixed-shear recovery</h2>
-<figure><img src="{html.escape(figures['scatter_r1'])}" alt="fixed shear scatter at R=1">
-<figcaption>Cell means at R=1. Error bars are omitted here; the per-cell
-standard errors across 32 latent galaxies are tabulated below.</figcaption></figure>
-<figure><img src="{html.escape(figures['scatter_r16'])}" alt="fixed shear scatter at R=16">
-<figcaption>Cell means at R=16. These are exact fixed-shear cells, not a
-broad-|g| product diagnostic.</figcaption></figure>
+<figure><img src="{html.escape(figures['scatter_r1'])}" alt="shear bias versus true shear at R=1">
+<figcaption>Component shear bias, ĝ − g<sub>true</sub>, versus true shear
+at R=1. Error bars are omitted here; per-cell standard errors across
+latent galaxies are tabulated below.</figcaption></figure>
+<figure><img src="{html.escape(figures['scatter_r16'])}" alt="shear bias versus true shear at R=16">
+<figcaption>Component shear bias, ĝ − g<sub>true</sub>, versus true shear
+at R=16. These are exact fixed-shear cells, not a broad-|g| product
+diagnostic.</figcaption></figure>
 
 <h2>Per-shear cells at R=1 and R=16</h2>
 <table><thead><tr><th>Estimator</th><th>R</th><th>Cell</th><th>true g1</th>
-<th>true g2</th><th>g1 estimate ± SE</th><th>g2 estimate ± SE</th></tr></thead>
+<th>true g2</th><th>g1 bias ± SE</th><th>g2 bias ± SE</th></tr></thead>
 <tbody>{"".join(cell_rows)}</tbody></table>
 <p>{html.escape(payload["takeaway"])}</p>
 </body></html>"""
@@ -1129,6 +1515,17 @@ def write_report(args) -> None:
         bootstrap_seed=nuisance_bootstrap_seed,
     )
     figures = _plot_outputs(result, metrics, nuisance_metrics, report_dir)
+    nre_stack_metadata = {}
+    if "nre_stack_mean" in {row["estimator"] for row in metrics}:
+        nre_stack_metadata = {
+            "nre_nuisance_stack": {
+                "estimator": "nre_stack_mean",
+                "nuisance_galaxies": BENCHMARK_N_GALAXIES,
+                "noise_prefixes": list(BENCHMARK_PREFIXES),
+                "summary": "posterior mean of summed 2D NRE log-ratio surfaces",
+                "prior": "uniform g01 shear-box prior",
+            }
+        }
     payload = {
         **meta,
         "metrics": metrics,
@@ -1138,6 +1535,7 @@ def write_report(args) -> None:
             "count": NUISANCE_BOOTSTRAP_COUNT,
             "lower_percentile": NUISANCE_BOOTSTRAP_LOWER_PERCENTILE,
             "upper_percentile": NUISANCE_BOOTSTRAP_UPPER_PERCENTILE,
+            "center": "median",
             "seed": nuisance_bootstrap_seed,
             "paired_across_shear_cells": True,
             "source_ids": "0 through n_galaxies_per_cell - 1",
@@ -1147,6 +1545,7 @@ def write_report(args) -> None:
         "per_shear": per_shear,
         "figures": figures,
         "takeaway_data": summary,
+        **nre_stack_metadata,
         "takeaway": benchmark_takeaway(metrics),
     }
     write_json(report_dir / "report.json", payload)

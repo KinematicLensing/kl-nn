@@ -21,7 +21,10 @@ try:
         HALPHA_FLUX_TRUE_COLUMN,
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
+        REDSHIFT_COLUMN,
         RMAG_TRUE_COLUMN,
+        SIMULATION_REDSHIFT,
+        TARGETING_SEED_COLUMN,
         fiber_layout_from_header,
         halpha_flux_conversion_from_header,
         observation_instrument_metadata_from_header,
@@ -34,7 +37,10 @@ except ImportError:  # Support direct execution from data_generate/.
         HALPHA_FLUX_TRUE_COLUMN,
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
+        REDSHIFT_COLUMN,
         RMAG_TRUE_COLUMN,
+        SIMULATION_REDSHIFT,
+        TARGETING_SEED_COLUMN,
         fiber_layout_from_header,
         halpha_flux_conversion_from_header,
         observation_instrument_metadata_from_header,
@@ -85,6 +91,20 @@ def _canonical_integer(value: object, *, name: str) -> int:
     return int(numeric)
 
 
+DEFAULT_TARGETING_SEED_OFFSET = 900_000_000  # fiber_targeting.TARGETING_SEED_OFFSET
+
+
+def _optional_value(row: Mapping[str, object], name: str) -> object | None:
+    """Return ``row[name]``, or None when the column is absent or empty."""
+
+    if name not in row:
+        return None
+    value = row[name]
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    return value
+
+
 def simulator_v3_science_row_fingerprint(
     sample_id: int,
     row: Mapping[str, object],
@@ -119,6 +139,16 @@ def simulator_v3_science_row_fingerprint(
         FIBER_LAYOUT_COLUMN: fiber_layout,
         OBSERVATION_MODEL_VERSION_COLUMN: observation_model_version,
     }
+    # Redshift and targeting seed enter only when they differ from the
+    # production defaults, so existing fingerprints are unchanged.
+    redshift = _optional_value(row, REDSHIFT_COLUMN)
+    if redshift is not None and float(redshift) != SIMULATION_REDSHIFT:
+        payload[REDSHIFT_COLUMN] = float(redshift).hex()
+    seed = _optional_value(row, TARGETING_SEED_COLUMN)
+    if seed is not None:
+        seed = _canonical_integer(seed, name=TARGETING_SEED_COLUMN)
+        if seed != DEFAULT_TARGETING_SEED_OFFSET + payload["ID"]:
+            payload[TARGETING_SEED_COLUMN] = seed
     canonical_json = json.dumps(
         payload,
         ensure_ascii=True,

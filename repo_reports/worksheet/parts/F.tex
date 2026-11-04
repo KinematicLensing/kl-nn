@@ -1,0 +1,130 @@
+% ============================== Part F ==============================
+\problem{F1}{The Laplace approximation}
+
+\begin{given}
+Near its maximum $\mathbf x_0$, a log density is approximately quadratic,
+$\ln P(\mathbf x) \simeq \ln P(\mathbf x_0) - \tfrac12(\mathbf x - \mathbf x_0)^\T\mathsf A(\mathbf x - \mathbf x_0)$, with
+$\mathsf A = -\nabla\nabla\ln P|_{\mathbf x_0}$. Treating $P$ as a Gaussian with covariance $\mathsf A^{-1}$ is the
+Laplace approximation.
+\source{\cMacKayLaplace.}
+\end{given}
+
+\need{A1 (a Gaussian's log is a quadratic).}
+
+\begin{enumerate}
+  \item For $P(x) \propto x^a e^{-bx}$ ($x > 0$), find the mode, $\mathsf A$, and the Laplace standard deviation.
+  \item The exact standard deviation is $\sqrt{a+1}/b$. Compare for $a = 4$. When does Laplace work well?
+  \item For the posterior of E2, show that the Laplace approximation is exact, with $\mathsf A = \mathsf H$.
+\end{enumerate}
+
+\solution{
+(a) $\ln P = a\ln x - bx$; the mode is $x_0 = a/b$, $\mathsf A = a/x_0^2 = b^2/a$, so $\sigma_L = \sqrt a/b$.
+(b) $a = 4$: $2/b$ against $\sqrt5/b = 2.24/b$, 11\% low. It works well when the distribution is close to Gaussian,
+here for large $a$ (the ratio $\sqrt{a/(a+1)} \to 1$).
+(c) The log posterior is exactly quadratic, with $-\nabla\nabla\ln p = S^{-1} + A^\T N^{-1}A = \mathsf H$.
+}
+
+% --------------------------------------------------------------------
+\problem{F2}{Gauss--Newton: curvature from the model, not from the data grid}
+
+\begin{given}
+For a least-squares objective $F(\mathbf x) = \tfrac12\sum_i f_i(\mathbf x)^2$, the exact Hessian is
+$J^\T J + \sum_i f_i\,\nabla\nabla f_i$, with $J$ the Jacobian of the residuals $f_i$. Gauss--Newton keeps only $J^\T J$.
+\source{\cGaussNewton.}
+Our galaxies enter through $\ln L_i(\vg_i(\kappa))$, read off a grid by bilinear interpolation, and each $L_i$ has
+precision $F_i$ (A3).
+\end{given}
+
+\need{A3, F1.}
+
+\begin{enumerate}
+  \item Suppose $\ln L_i(\vg) \approx -\tfrac12(\vg - \hat\vg_i)^\T F_i(\vg - \hat\vg_i)$. Show that the Hessian of
+    $-\sum_i\ln L_i(\vg_i(\kappa))$ with respect to the pixels is
+    $\sum_i J_i^\T F_iJ_i + (\text{terms} \propto \text{residuals} \times \nabla\nabla\vg_i)$, with
+    $J_i = \partial\vg_i/\partial\kappa$.
+  \item Why are the dropped terms small for us? (Think about how $\vg_i$ depends on $\kappa$; see Part D.)
+  \item A bilinear interpolant is linear along each axis inside a grid cell. What is its second derivative along $g_1$
+    there? Why does that make the \emph{exact} Hessian of our objective useless, and why does $J^\T FJ$ not have this
+    problem?
+\end{enumerate}
+
+\solution{
+(a) The gradient is $-\sum_i J_i^\T\nabla_{\vg}\ln L_i = \sum_i J_i^\T F_i(\vg_i - \hat\vg_i)$. Differentiating again gives
+$\sum_i J_i^\T F_iJ_i$ plus terms with $\partial J_i/\partial\kappa$ multiplied by the residual $F_i(\vg_i - \hat\vg_i)$.
+This is the weighted version of MNT04's Eq.~(3.4b).
+(b) $\vg_i$ is linear in $\kappa$ except for the $1/(1-\kappa)$ factor (Part D), so $\nabla\nabla\vg_i$ is small, and it is
+multiplied by residuals that scatter around zero.
+(c) Zero. Inside each grid cell the interpolant has no curvature along $g_1$ or $g_2$; the curvature lives only in the
+kinks between cells. The exact Hessian therefore misses most of the data's information and can even have negative
+directions (in our first attempt, 12 pixels got $\sigma = 0$). $J^\T FJ$ takes the curvature from each galaxy's known
+precision $F_i$, which is positive definite by construction.
+}
+
+% --------------------------------------------------------------------
+\problem{F3}{Two different uncertainties, and the resolution matrix}
+
+\begin{given}
+In the linear-Gaussian model of E2, write $\mathsf H_d = A^\T N^{-1}A$ (data) and $\mathsf H_p = S^{-1}$ (prior), so
+$\mathsf H = \mathsf H_d + \mathsf H_p$ and $\hat{\mathbf s} = \mathsf H^{-1}A^\T N^{-1}\vd$. Let the truth be
+$\mathbf s_{\rm true}$, with $\vd = A\mathbf s_{\rm true} + \mathbf n$. \emph{Derived here}
+(\texttt{KAPPA\_FITTING\_EXPLAINED.md}, Sec.~8.3).
+\end{given}
+
+\need{E2, F1.}
+
+\begin{enumerate}
+  \item Show that $\E_{\mathbf n}[\hat{\mathbf s}] = \mathsf R\,\mathbf s_{\rm true}$ with $\mathsf R = \mathsf H^{-1}\mathsf H_d$.
+  \item Show that the covariance of $\hat{\mathbf s}$ over noise realizations is $\mathsf H^{-1}\mathsf H_d\mathsf H^{-1}$.
+  \item Scalar case ($\mathsf H_d = h$, $\mathsf H_p = p$): compare this noise variance with the posterior variance
+    $1/(h+p)$. Which is larger, and what does each one answer?
+  \item On our map, the noise covariance predicts an aperture scatter of 0.0034 and the posterior covariance 0.0067. In
+    the scalar picture, what data-to-prior ratio $h/p$ does that imply? For ``is this blob a noise fluctuation?'',
+    which one should the S/N map use?
+\end{enumerate}
+
+\solution{
+(a) $\E[\vd] = A\mathbf s_{\rm true}$, so \[\E[\hat{\mathbf s}] = \mathsf H^{-1}A^\T N^{-1}A\,\mathbf s_{\rm true} = \mathsf H^{-1}\mathsf H_d\,\mathbf s_{\rm true}.\]
+(b) $\mathrm{Cov} = \mathsf H^{-1}A^\T N^{-1}\,N\,N^{-1}A\mathsf H^{-1} = \mathsf H^{-1}\mathsf H_d\mathsf H^{-1}$.
+(c) Noise variance $h/(h+p)^2$ = posterior variance $\times\, h/(h+p)$, so it is always smaller. The posterior variance
+answers ``how unsure am I about the true value?'', including what the prior allows. The noise variance answers ``how
+much would this map change with new noise?''.
+(d) $(0.0034/0.0067)^2 = 0.26 = h/(h+p)$, so $h/p \approx 0.35$: on the subhalo's scale the prior outweighs the data
+about 3 to 1. The S/N map should use the noise covariance, which is what checks out against the scatter over
+synthetic realizations (0.0029).
+}
+
+% --------------------------------------------------------------------
+\problem{F4}{\py\ How many numbers do the data actually determine?}
+
+\begin{given}
+In the eigenbasis of the data Hessian (eigenvalues $\lambda_a$), with an isotropic prior of precision $\alpha$, the number
+of parameters well determined by the data is $\gamma = \sum_a \lambda_a/(\lambda_a + \alpha)$. Each term, between 0 and
+1, measures the data's strength relative to the prior in that direction.
+\source{\cMacKayGamma.}
+\end{given}
+
+\need{F3 (the resolution matrix $\mathsf R$), E5 (the 1D toy problem).}
+
+\begin{enumerate}
+  \item Show that $\mathrm{tr}\,\mathsf R = \gamma$ when $\mathsf H_p = \alpha I$. (Diagonalise $\mathsf H_d$.)
+  \item \py\ For the 1D problem of E5, compute $\mathrm{tr}\,\mathsf R$ as a function of the number of pixels (keeping
+    the physical $\ell$ fixed). Does it keep growing?
+  \item Our tuned map has 144 pixels and about 150 galaxies, and $\mathrm{tr}\,\mathsf R = 16.5$. With a weaker prior
+    ($\sk = 0.1$) it is 53; with 576 pixels it is 10. Answer the question ``how can 141 galaxies fit 144 pixels?''
+  \item What sets the map's effective resolution, if not the pixel size?
+\end{enumerate}
+
+\solution{
+(a) With $\mathsf H_d = U\Lambda U^\T$, $\mathsf R = (\mathsf H_d + \alpha I)^{-1}\mathsf H_d = U\,\mathrm{diag}\big(\lambda_a/(\lambda_a+\alpha)\big)U^\T$,
+whose trace is $\gamma$.
+(b) No. In the notebook $\mathrm{tr}\,\mathsf R$ rises to $\approx 19$ near 60 pixels and then \emph{falls} (7.7 at
+240). Extra pixels add only directions the data cannot see. And with $\sk$ fixed per pixel, the amplitude term
+$\sum\kappa_j^2$ runs over more pixels, so every smooth pattern is penalised more: a finer grid with the same $\sk$ is a
+stronger prior.
+(c) They don't, and they don't need to. It is a regularised fit: the galaxies pin down about 16 independent patterns,
+and the prior fixes the remaining $\sim128$. A weaker prior lets the data set more patterns, but noisily. More pixels
+add only prior-dominated directions (and, at fixed $\sk$, a stronger prior), as the drop to 10 at 576 pixels shows.
+(d) The rows of $\mathsf R$: their width is the resolution and their height the shrinkage, both set jointly by the
+galaxies (number, positions, precisions) and by the prior. The pixel size only sets the finest scale the map could
+show.
+}

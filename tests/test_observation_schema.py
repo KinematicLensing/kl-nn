@@ -78,8 +78,23 @@ def test_galaxy_axis_offsets_have_one_center_and_fixed_radius():
     np.testing.assert_allclose(
         np.linalg.norm(offsets[[0, 1, 3, 4]], axis=1), 1.5, atol=1e-12
     )
-    with pytest.raises(ValueError, match="only galaxy_axis"):
+    with pytest.raises(ValueError, match="fiber_layout must be one of"):
         schema.validate_fiber_layout("detector_axis")
+    assert schema.validate_fiber_layout("measured_axis") == "measured_axis"
+
+
+def test_measured_axis_offsets_are_right_handed_and_follow_beta():
+    from data_generate.fiber_targeting import measured_axis_fiber_offsets
+
+    for beta in (-1.2, 0.0, 0.4, np.pi / 2):
+        offsets = measured_axis_fiber_offsets(beta, fiber_offset=1.5)
+        np.testing.assert_allclose(offsets[2], 0.0, atol=1e-14)
+        np.testing.assert_allclose(
+            offsets[0], 1.5 * np.array([np.cos(beta), np.sin(beta)]), atol=1e-12
+        )
+        # minor + is major + rotated 90 degrees counter-clockwise
+        major, minor = offsets[0], offsets[3]
+        assert major[0] * minor[1] - major[1] * minor[0] > 0
 
 
 def test_observed_axes_are_right_handed_and_major_axis_is_anchored():

@@ -12,6 +12,10 @@ import json
 
 import numpy as np
 import pandas as pd
+import contextlib
+import functools
+
+import lmdb
 import pyxis as px
 from astropy.io import fits
 from argparse import ArgumentParser
@@ -330,6 +334,24 @@ def extract_fiducial_parameters(samples, row_indices, parameter_names):
         copy=True,
     )
 
+# LMDB keeps its reader table in lock.mdb as a shared writable mmap. On /ocean
+# (Lustre) page faults on that mapping intermittently raise SIGBUS. Every LMDB
+# built here is touched by one process at a time, so the lock is unnecessary.
+@contextlib.contextmanager
+def _lmdb_without_lock_file():
+    original = lmdb.open
+    lmdb.open = functools.partial(original, lock=False)
+    try:
+        yield
+    finally:
+        lmdb.open = original
+
+
+def _open_writer(dirpath, ram_gb_limit):
+    with _lmdb_without_lock_file():
+        return px.Writer(dirpath=dirpath, map_size_limit=200000, ram_gb_limit=ram_gb_limit)
+
+
 def merge_shards(
     base_save_dir,
     num_shards,
@@ -362,11 +384,11 @@ def merge_shards(
     logger.info(f"Initiating compilation of {num_shards} shards into target destination: {base_save_dir}")
     
     merged_sample_count = 0
-    with px.Writer(dirpath=base_save_dir, map_size_limit=200000, ram_gb_limit=12) as final_db:
+    with _open_writer(base_save_dir, ram_gb_limit=12) as final_db:
         for s_idx, shard_dir in enumerate(shard_dirs):
             logger.info(f"Reading and importing data from: {shard_dir}")
 
-            reader = px.Reader(dirpath=str(shard_dir))
+            reader = px.Reader(dirpath=str(shard_dir), lock=False)
             try:
                 num_samples = len(reader)
                 merged_sample_count += num_samples
@@ -479,7 +501,7 @@ def main(argv=None):
             f"{preview}{suffix}"
         )
 
-    with px.Writer(dirpath=current_save_dir, map_size_limit=200000, ram_gb_limit=2) as db:
+    with _open_writer(current_save_dir, ram_gb_limit=2) as db:
         for index in shard_indices:
             start = time.time()
             folder = index + 1

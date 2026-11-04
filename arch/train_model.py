@@ -75,6 +75,11 @@ def parse_args(argv=None):
     parser.add_argument("--flow-num-bins", type=int)
     parser.add_argument("--theta-num-layers", type=int)
     parser.add_argument("--theta-logit-limit", type=float)
+    parser.add_argument(
+        "--fiber-layout",
+        choices=("galaxy_axis", "measured_axis"),
+        help="fiber placement of the training data (must match the LMDB records)",
+    )
     parser.add_argument("--bounded-logit-limit", type=float)
     parser.add_argument("--non-theta-learning-rate", type=float)
     parser.add_argument("--theta-learning-rate", type=float)
@@ -87,6 +92,12 @@ def parse_args(argv=None):
         "--feature-norm-trainable",
         action=argparse.BooleanOptionalAction,
         default=None,
+    )
+    parser.add_argument(
+        "--r90-views",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="randomly rotate NPE training/validation galaxies by 90 degrees (default on)",
     )
     parser.add_argument(
         "--freeze-feature-extractor",
@@ -156,6 +167,7 @@ def apply_overrides(args):
         if args.stage == "pretrain"
         else config.MODEL_CONFIG.train
     )
+    _set_if_not_none(config.MODEL_CONFIG.observation, "fiber_layout", args.fiber_layout)
     _set_if_not_none(config.MODEL_CONFIG.data, "data_dir", args.train_data)
     _set_if_not_none(config.MODEL_CONFIG.test, "data_dir", args.valid_data)
     _set_if_not_none(config.MODEL_CONFIG.data, "size", args.train_size)
@@ -197,6 +209,7 @@ def apply_overrides(args):
                 args.warmup_epochs,
                 args.min_learning_rate,
                 args.feature_norm_trainable,
+                args.r90_views,
                 args.freeze_feature_extractor,
                 args.use_image_spectrum_fusion,
                 args.early_stopping_patience,
@@ -212,6 +225,8 @@ def apply_overrides(args):
         if args.ccl_sigma_label is not None or args.ccl_d_cutoff is not None:
             raise ValueError("CCL options cannot be used during NPE training")
         _set_if_not_none(stage, "pretrained_name", args.pretrained_name)
+        if isinstance(stage.pretrained_name, str) and stage.pretrained_name.lower() == "none":
+            stage.pretrained_name = None  # train from scratch
         _set_if_not_none(
             stage, "pretrain_from", _parse_checkpoint_suffix(args.pretrain_from)
         )
@@ -228,6 +243,7 @@ def apply_overrides(args):
             "warmup_epochs",
             "min_learning_rate",
             "feature_norm_trainable",
+            "r90_views",
             "freeze_feature_extractor",
             "use_image_spectrum_fusion",
             "early_stopping_patience",
@@ -264,8 +280,8 @@ def _validate_current_config(stage_name):
     observation = model.observation
     if observation.schema_version != 3:
         raise ValueError("only simulator schema version 3 is supported")
-    if observation.fiber_layout != "galaxy_axis":
-        raise ValueError("the current pipeline requires galaxy_axis fibers")
+    if observation.fiber_layout not in ("galaxy_axis", "measured_axis"):
+        raise ValueError("fiber_layout must be galaxy_axis or measured_axis")
     if tuple(observation.context_fields) != config.ORACLE_CONTEXT_FIELDS:
         raise ValueError("the current pipeline requires the three oracle contexts")
     if observation.halpha_flux_distribution != "log_uniform":
@@ -333,9 +349,12 @@ def main(argv=None):
     )
     print(f"Saved model config: {artifacts['config_path']}")
     print(f"Saved network source: {artifacts['network_path']}")
-    view_mode = (
-        "identity+r90" if args.stage == "pretrain" else "random(identity,r90)"
-    )
+    if args.stage == "pretrain":
+        view_mode = "identity+r90"
+    elif stage_config.r90_views:
+        view_mode = "random(identity,r90)"
+    else:
+        view_mode = "identity"
     print(
         "Current pipeline: "
         f"stage={args.stage}, targets={len(config.TARGET_NAMES)}, "

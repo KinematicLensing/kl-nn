@@ -1,0 +1,8 @@
+\section{KL Measurements}
+\label{sec:kl}
+
+\rachel{Make sure to say what KL paper(s) this formalism is drawn from.  Section needs references throughout for key additional concepts (e.g., intrinsic alignments, shape noise).}  
+
+given $e_\mrm{obs}$ measured from photometry images, $v_\mrm{minor}^\prime$ and $v_\mrm{major}^\prime$ measured from spectra. The intrinsic ellipticity and inclination angle can be indirectly inferred from TFR (broad-band magnitude) and the spectra. Intuitively speaking, cosmic shear impacts the galaxy photometry and LoS kinematic in different manners such that combining the two can \textit{break the degeneracy} between $\hat{\bm{\epsilon}}^\mathrm{int}$ and $\bm{g}$ in Eq.~(\ref{eqn:shear_transform}), and suppress the shape noise by an order of magnitude~\citep{HKE+13,XEH+23,PKH+23}.
+
+The above equations provide a useful intuitive explanation of the KL concept. However, the practical implementation of a KL shear estimation involves building a full forward modeling pipeline of the sheared galaxy image and velocity field as a function of shear and the specific galaxy and instrument properties. The pipeline for the potential DESI-KL project will be explained in Sec. \ref{sec:pipe}.

@@ -40,17 +40,31 @@ DEFAULT_MANIFEST = DEFAULT_DATA_DIR / "benchmark_noisy.json"
 def parse_args(argv=None):
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    # Outputs default to --data-dir, so a non-default dataset never writes into the
+    # default benchmark folder.
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=420042)
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--fiber-layout",
+        choices=("galaxy_axis", "measured_axis"),
+        default="galaxy_axis",
+        help="fiber layout the clean records were generated with",
+    )
+    args = parser.parse_args(argv)
+    if args.output is None:
+        args.output = args.data_dir / DEFAULT_OUTPUT.name
+    if args.manifest is None:
+        args.manifest = args.data_dir / DEFAULT_MANIFEST.name
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     if (args.output.exists() or args.manifest.exists()) and not args.overwrite:
         raise FileExistsError("benchmark noisy outputs exist; use --overwrite")
+    config.observation["fiber_layout"] = args.fiber_layout
     dataset = pxt.TorchDataset(str(args.data_dir))
     n_rows = len(dataset)
     expected_rows = 25 * BENCHMARK_N_GALAXIES

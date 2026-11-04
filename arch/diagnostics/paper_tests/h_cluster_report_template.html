@@ -1,0 +1,336 @@
+<title>Cluster Substructure Test</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column (~70ch) for prose, figures break out to a wider measure; a lab-notebook feel. */
+:root {
+  --bg: #f6f8fa;
+  --paper: #ffffff;
+  --ink: #17212b;
+  --muted: #566573;
+  --rule: #d6dde4;
+  --main: #2f6db5;
+  --sub: #b8502b;
+  --ok: #2f7d5b;
+  --warn: #a6670c;
+  --wash: #eaf1f8;
+  --display: "Newsreader", Georgia, "Times New Roman", serif;
+  --body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11171d; --paper: #182029; --ink: #e3e9ef; --muted: #9aa8b5; --rule: #2c3743;
+    --main: #78a9e6; --sub: #e38a64; --ok: #6cc49a; --warn: #e0a64a; --wash: #1d2a37;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11171d; --paper: #182029; --ink: #e3e9ef; --muted: #9aa8b5; --rule: #2c3743;
+  --main: #78a9e6; --sub: #e38a64; --ok: #6cc49a; --warn: #e0a64a; --wash: #1d2a37;
+  color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 16px; line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 64px;
+}
+main { max-width: 1180px; margin: 0 auto; display: grid; gap: 40px; }
+.prose { max-width: 72ch; }
+header { display: grid; gap: 10px; border-bottom: 1px solid var(--rule); padding-bottom: 24px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-family: var(--display); font-weight: 600; font-size: clamp(30px, 4vw, 42px); line-height: 1.15; margin: 0; text-wrap: balance; }
+h2 { font-family: var(--display); font-weight: 600; font-size: 26px; margin: 0 0 12px; text-wrap: balance; }
+h3 { font-size: 17px; font-weight: 600; margin: 24px 0 6px; }
+p { margin: 0 0 12px; }
+ul, ol { margin: 0 0 12px; padding-left: 22px; }
+li { margin-bottom: 6px; }
+.lede { font-size: 18px; color: var(--ink); max-width: 72ch; }
+section { display: grid; gap: 8px; }
+.status { display: flex; flex-wrap: wrap; gap: 10px; }
+.chip { font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--rule); border-radius: 999px; padding: 3px 10px; background: var(--paper); }
+.chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--rule)); }
+.chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--rule)); }
+.chip.todo { color: var(--muted); }
+code, .num { font-family: var(--mono); font-size: 0.92em; font-variant-numeric: tabular-nums; }
+.eq { font-family: var(--mono); background: var(--wash); border-radius: 6px; padding: 10px 14px; overflow-x: auto; margin: 6px 0 12px; white-space: nowrap; }
+.callout { background: var(--paper); border: 1px solid var(--rule); border-left: 4px solid var(--main); border-radius: 6px; padding: 16px 18px; max-width: 78ch; }
+.callout.finding { border-left-color: var(--warn); }
+.callout h3 { margin-top: 0; }
+figure { margin: 8px 0 0; background: #ffffff; border: 1px solid var(--rule); border-radius: 8px; padding: 12px; }
+figure img { display: block; width: 100%; height: auto; }
+figcaption { color: #3b4753; font-size: 14px; line-height: 1.5; margin-top: 8px; max-width: 95ch; }
+.table-wrap { overflow-x: auto; max-width: 100%; }
+table { border-collapse: collapse; font-size: 14.5px; min-width: 540px; }
+th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 13px; letter-spacing: 0.02em; }
+td.num { white-space: nowrap; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.two > * { min-width: 0; }
+.small { font-size: 14px; color: var(--muted); }
+a { color: var(--main); }
+:focus-visible { outline: 2px solid var(--main); outline-offset: 2px; }
+</style>
+
+<main>
+<header>
+  <div class="eyebrow">KL-NN paper · Sec. 6.4 cluster test · sample-3 density · one realization · 2026-10-23</div>
+  <h1>Cluster Substructure Test</h1>
+  <p class="lede">Can likelihood stacking of our NPE posteriors see a subhalo with 30% of the host's mass, at the
+    source density a DESI-like KL survey would have? This page covers the setup, how every step of the analysis
+    works, and the validation of the stacking estimator on synthetic data. The run on the real NPE posteriors is
+    ready but not yet analysed.</p>
+  <div class="status">
+    <span class="chip ok">Data generated (141 × 2 scenarios)</span>
+    <span class="chip ok">NPE posteriors cached</span>
+    <span class="chip ok">Stacking estimator validated</span>
+    <span class="chip warn">Subhalo sits inside the central polar cell</span>
+    <span class="chip todo">NPE analysis · halo fit · κ tuning: next</span>
+  </div>
+</header>
+
+<section>
+  <h2>Summary</h2>
+  <ul class="prose">
+    <li><b>The cell-stacking estimator is unbiased and its error bars are right, to within 7%.</b> Over 30
+      synthetic noise realizations the pulls average 0.00–0.03 in size with a spread of 0.93–0.94, in both
+      scenarios and both cell layouts.</li>
+    <li><b>Cells holding only 1–2 galaxies are slightly shrunk toward zero</b>, by about 0.005. That is the same
+      shrinkage the constant-shear benchmark shows at N = 1–2. Cells with 3 or more galaxies are unbiased to
+      better than 0.002. Sparse cells also carry the largest error bars, so they already count for less.</li>
+    <li><b>At this density the subhalo is not visible in a single synthetic realization</b>, as the S/N
+      forecast (best case ≈ 2) predicted. Both κ maps recover the main halo.</li>
+    <li><b>A design issue to fix:</b> the central polar cell needs a 0.57 Mpc radius to hold about 5 galaxies,
+      so the subhalo at 0.5 Mpc falls inside it and cannot be separated from the main halo. I propose moving
+      the subhalo to about 1 Mpc, where the forecast S/N is the same.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>How the analysis works</h2>
+
+  <h3>1. The cluster and the two scenarios</h3>
+  <div class="prose">
+    <p>One cluster at z<sub>l</sub> = 0.13, where the lensing efficiency for sources at z = 0.3 peaks. Two shear
+      fields are built from the same background galaxies:</p>
+    <ul>
+      <li><b>main</b>: one NFW halo at the origin;</li>
+      <li><b>sub</b>: the same halo plus an NFW subhalo with 30% of its mass, placed on the x axis.</li>
+    </ul>
+    <p>Both come from GalSim's <code>NFWHalo</code>. The halos are added in shear γ and convergence κ, and only
+      then converted to the reduced shear g = γ/(1 − κ) that galaxies respond to. Adding reduced shears directly
+      would be wrong.</p>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <tr><th>Quantity</th><th>Value</th><th>Source / note</th></tr>
+      <tr><td>Main halo</td><td class="num">M<sub>200c</sub> = 10<sup>15</sup> M☉, c = 3.31</td><td>Duffy+08 c(M), 200c full sample</td></tr>
+      <tr><td>Subhalo</td><td class="num">3×10<sup>14</sup> M☉, c = 3.66, at (0.5, 0) Mpc</td><td>untruncated NFW (idealized)</td></tr>
+      <tr><td>Redshifts</td><td class="num">z<sub>l</sub> = 0.13, z<sub>s</sub> = 0.3</td><td>all sources at 0.3, no tomography</td></tr>
+      <tr><td>Field</td><td class="num">R &lt; 3 Mpc = 1370 arcmin²</td><td>1′ = 144 kpc (Planck18)</td></tr>
+      <tr><td>Source density</td><td class="num">0.108 arcmin⁻² → 141 galaxies</td><td>Xu sample 3, 75.5% behind the lens</td></tr>
+      <tr><td>Shear range</td><td class="num">|g| ≤ 0.039 at the galaxies; ≤ 0.063 anywhere at R ≥ 50 kpc</td><td>inside the training box |g<sub>k</sub>| &lt; 0.1</td></tr>
+    </table>
+  </div>
+  <div class="prose">
+    <p>Galaxies are placed uniformly at random. Each takes the parameters of a random Xu3 measured-axis test
+      galaxy: R<sub>h</sub> ≥ 1″, v<sub>circ</sub> from the TF relation, catalog image and Hα S/N. Only its two
+      shear components change. Positions, parameters, fiber-targeting seeds and the NPE noise draws are shared
+      between the scenarios, so the two datasets differ only through the shear.</p>
+  </div>
+  <figure>
+    <img alt="Three panels: true shear whiskers for the main halo, subhalo shear difference whiskers, and a map of the subhalo signal magnitude with galaxy positions" src="{{img:setup}}">
+    <figcaption><b>Setup.</b> Left: the true shear of each galaxy, main halo only; each line points along the
+      stretch and its length is |g|. Middle: the subhalo's contribution Δg = g(main + sub) − g(main), drawn five
+      times longer. Right: |Δg| across the field with the 141 galaxy positions; + marks the main halo and × the
+      subhalo. Only 11 galaxies see |Δg| &gt; 0.01.</figcaption>
+  </figure>
+
+  <h3>2. One likelihood per galaxy</h3>
+  <div class="prose">
+    <p>For each galaxy the NPE gives 10<sup>4</sup> posterior samples of all nine parameters, reweighted to the
+      Tully–Fisher prior. Its shear likelihood is the shear posterior divided by the prior it was trained under:</p>
+    <div class="eq">L<sub>i</sub>(g) ∝ q(g | data<sub>i</sub>) / π<sub>train</sub>(g),  with π<sub>train</sub> uniform on |g<sub>k</sub>| &lt; 0.1</div>
+    <p>We turn the samples into a smooth density with a kernel density estimate and store log L<sub>i</sub> on a
+      401 × 401 grid in (g<sub>1</sub>, g<sub>2</sub>). The settings match the constant-shear stacking: Scott
+      bandwidth, reflection at the box edges, and a small floor so one galaxy cannot veto a shear.</p>
+    <p>Every later step reads these grids. Evaluating a galaxy's likelihood at any shear is then one bilinear
+      interpolation.</p>
+  </div>
+
+  <h3>3. Cells and stacking</h3>
+  <div class="prose">
+    <p>Galaxies are grouped into cells holding about 5 galaxies on average. Every non-empty cell is kept.</p>
+    <ul>
+      <li><b>Polar cells:</b> a central disk, then 4 log-spaced annuli out to 3 Mpc. Each annulus is cut into as
+        many sectors as keep about 5 galaxies per cell, and the subhalo direction falls at a sector centre. These
+        cells are stacked in tangential/cross components (g<sub>t</sub>, g<sub>×</sub>) about the main-halo
+        centre, so a subhalo would show as extra g<sub>t</sub> or non-zero g<sub>×</sub>.</li>
+      <li><b>Cartesian cells:</b> squares of 0.98 Mpc, stacked in (g<sub>1</sub>, g<sub>2</sub>).</li>
+    </ul>
+    <p>Within a cell we look for one common shear G and multiply the galaxies' likelihoods. For polar cells each
+      galaxy's likelihood is first rotated into the frame at its own position angle:</p>
+    <div class="eq">p(G | cell) ∝ ∏<sub>i ∈ cell</sub> L<sub>i</sub>(R<sub>i</sub><sup>T</sup> G),  uniform prior on |G| &lt; 0.1</div>
+    <p>The stacked estimate is the mean of p(G), and its error bar σ is the standard deviation.</p>
+    <p><b>What the stack should be compared with.</b> The shear varies inside a cell, so there is no single
+      "true" cell shear. For Gaussian likelihoods, the product above returns a precision-weighted mean of the
+      galaxies' true shears:</p>
+    <div class="eq">g<sub>ref</sub> = (Σ<sub>i</sub> F<sub>i</sub>)<sup>−1</sup> Σ<sub>i</sub> F<sub>i</sub> g<sub>i,true</sub>,  F<sub>i</sub> = inverse covariance of L<sub>i</sub> in the cell frame</div>
+    <p>We use that as the reference. The weights are matrices, not numbers, because KL pins one shear direction
+      much more tightly than the other. A plain average of the true shears would be the wrong target.</p>
+  </div>
+  <figure>
+    <img alt="Polar and Cartesian cell layouts with the number of galaxies in each cell, plus an occupancy histogram" src="{{img:cells}}">
+    <figcaption><b>Cells.</b> Left: the 29 polar cells, with the number of galaxies in each. Middle: the 0.98 Mpc
+      Cartesian grid (37 occupied cells). Right: how many galaxies the cells hold; the averages are 4.9 (polar)
+      and 3.8 (Cartesian, which also has partly empty edge cells). The subhalo (×) lies inside the 0.57 Mpc
+      central disk, so the polar cells cannot separate it from the main halo.</figcaption>
+  </figure>
+
+  <h3>4. Halo fit (built, not yet run on the real data)</h3>
+  <div class="prose">
+    <p>Instead of comparing cells with a reference, this step fits a shear-field model directly to the
+      galaxies. Each galaxy's likelihood is evaluated at the shear the model predicts at its own position:</p>
+    <div class="eq">L(θ) = ∏<sub>i</sub> L<sub>i</sub>( g<sub>model</sub>(x<sub>i</sub>; θ) )</div>
+    <p>This is the natural extension of constant-shear stacking to a varying shear field, in the spirit of
+      Bernstein &amp; Armstrong (2014). There is no binning and no reference shear to define.</p>
+    <ul>
+      <li>θ is log<sub>10</sub> M<sub>main</sub>, plus log<sub>10</sub> M<sub>sub</sub> in the subhalo model.</li>
+      <li>Concentrations follow Duffy+08, and both centres are fixed at their true positions.</li>
+      <li>Priors are wide and log-uniform: M<sub>main</sub> from 10<sup>13.5</sup> to 10<sup>16</sup> M☉ and
+        M<sub>sub</sub> from 10<sup>12</sup> to 10<sup>15.5</sup> M☉.</li>
+      <li>Nautilus samples both models (main-only and main + sub) for both datasets. Their evidences give a Bayes
+        factor for the subhalo, quoted as a guide, not as a detection claim.</li>
+    </ul>
+  </div>
+
+  <h3>5. κ maps: Kaiser–Squires and our likelihood-based map</h3>
+  <div class="prose">
+    <p>κ (projected mass) and γ (shear) are second derivatives of the same lensing potential, so the shear map
+      is fixed by the κ map. In Fourier space one kernel links them, D(k) = (k<sub>1</sub>² − k<sub>2</sub>² +
+      2i k<sub>1</sub>k<sub>2</sub>)/k². D only rotates each mode and never changes its size.</p>
+    <p><b>Kaiser–Squires (standard).</b> This goes from shear to κ, using κ̂ = D* γ̂:</p>
+    <ol>
+      <li>put the stacked Cartesian-cell shears on their grid, with empty cells set to zero and the grid
+        zero-padded to twice its size;</li>
+      <li>Fourier transform, multiply by the inverse kernel D*, and transform back;</li>
+      <li>smooth by 0.7 cell.</li>
+    </ol>
+    <p>It is fast, but it treats every cell the same regardless of how many galaxies it holds, assumes g ≈ γ,
+      and only ever sees cell averages.</p>
+    <p><b>Likelihood-based (ours).</b> This goes the other way, from κ to shear, and compares with the data:</p>
+    <ol>
+      <li>the unknowns are κ on a 12 × 12 grid of 0.5 Mpc pixels;</li>
+      <li>for a trial κ map, compute γ with the forward kernel, γ̂ = D κ̂, on a zero-padded grid, which means
+        assuming κ = 0 outside the field;</li>
+      <li>interpolate γ and κ to each galaxy's exact position and form g<sub>i</sub> = γ<sub>i</sub>/(1 −
+        κ<sub>i</sub>);</li>
+      <li>score the map with Σ<sub>i</sub> log L<sub>i</sub>(g<sub>i</sub>), the same per-galaxy likelihoods as
+        above, so precise galaxies pull harder, direction by direction;</li>
+      <li>add a Gaussian prior that penalises large κ (σ<sub>κ</sub> = 0.1) and differences between neighbouring
+        pixels. This replaces the smoothing step, much like a Wiener filter;</li>
+      <li>find the most probable map with a gradient optimiser (L-BFGS in PyTorch).</li>
+    </ol>
+    <p>The <b>residual map</b> is the likelihood map of the with-subhalo data minus the κ of the best-fitting
+      main-halo-only model. A subhalo should appear as a positive blob at its position.</p>
+    <p>The same scheme has a long history: Bridle+98 and Marshall+02 (maximum-entropy reconstruction from
+      per-galaxy reduced-shear likelihoods), and Schneider+17 (probabilistic mass mapping). The new ingredient
+      is the data term, each galaxy's learned KL likelihood. One caveat: the prior pulls κ toward zero, so peaks
+      come out lower than the truth. Compare maps with the truth through the same pipeline; don't read κ values
+      off at face value.</p>
+  </div>
+
+  <h3>6. How the estimator was validated</h3>
+  <div class="prose">
+    <p>Before trusting the NPE run, we replace every galaxy's likelihood with a Gaussian whose covariance is that
+      galaxy's real NPE shear covariance, taken from its Xu3 source galaxy. It is centred on a noisy copy of its
+      true shear, with the same noise in both scenarios. The truth is then known exactly, and the whole chain
+      (KDE grids, cells, stacking, reference) runs unchanged. We repeat this for 30 independent noise
+      realizations of the same 141 galaxies.</p>
+  </div>
+</section>
+
+<section>
+  <div class="callout">
+    <h3>What a "pull" is</h3>
+    <p>For each cell, the pull is how far the stacked shear lands from the reference, measured in units of the
+      cell's own error bar:</p>
+    <div class="eq">pull = (stacked − reference) / σ</div>
+    <p>If the estimator is unbiased and its error bars are honest, pulls behave like draws from a standard
+      normal distribution:</p>
+    <ul>
+      <li><b>Mean ≈ 0.</b> A clearly non-zero mean means a bias: the stack lands systematically on one side.</li>
+      <li><b>Spread (standard deviation) ≈ 1.</b> Above 1 means the error bars are too small (overconfident);
+        below 1 means they are too large (conservative).</li>
+    </ul>
+    <p>With 29 cells in one realization, the mean pull scatters by about 1/√29 ≈ 0.19 from noise alone. That is
+      why we averaged over 30 realizations.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Results on synthetic data</h2>
+  <h3>Stacking validation (30 realizations)</h3>
+  <div class="table-wrap">
+    <table>
+      <tr><th>Scenario</th><th>Cells</th><th>Pull mean (1st, 2nd component)</th><th>Pull spread</th><th>Reading</th></tr>
+      <tr><td>main</td><td>polar (g<sub>t</sub>, g<sub>×</sub>)</td><td class="num">−0.03, +0.01</td><td class="num">0.93, 0.94</td><td>unbiased; error bars ~7% conservative</td></tr>
+      <tr><td>main</td><td>Cartesian (g<sub>1</sub>, g<sub>2</sub>)</td><td class="num">+0.02, −0.01</td><td class="num">0.93, 0.94</td><td>unbiased</td></tr>
+      <tr><td>sub</td><td>polar</td><td class="num">−0.03, +0.01</td><td class="num">0.93, 0.94</td><td>unbiased</td></tr>
+      <tr><td>sub</td><td>Cartesian</td><td class="num">+0.01, −0.01</td><td class="num">0.93, 0.94</td><td>unbiased</td></tr>
+    </table>
+  </div>
+  <figure>
+    <img alt="Histograms of pulls for polar and Cartesian cells compared with a standard normal, and the mean residual against the number of galaxies in a cell" src="{{img:validation}}">
+    <figcaption><b>Validation.</b> Left and middle: pulls from all cells and all 30 realizations (solid: main,
+      dashed: sub) against the ideal standard normal (black). They match the ideal shape and centre, slightly
+      narrower. Right: the average stacked-minus-reference shear against the number of galaxies in a cell.
+      One- and two-galaxy cells are pulled toward zero by about 0.005, the shrinkage of a nearly single-galaxy
+      posterior; from three galaxies on, the stack is unbiased to within 0.002.</figcaption>
+  </figure>
+
+  <h3>One realization: cells and maps</h3>
+  <div class="prose">
+    <p>A single synthetic realization, analysed exactly as the NPE data will be. With 29 polar cells the fitted
+      slopes are noisy (m = 0.75 ± 0.35 and 0.64 ± 0.27 for polar g<sub>t</sub>). The cell χ² is 28.9 and 26.7
+      for 27 degrees of freedom, and 34.7 and 33.9 for 35 in the Cartesian cells, so the scatter matches the
+      error bars. The large slope uncertainty comes from the narrow range of cell shears (0.005–0.035), which
+      makes slope and offset degenerate. The validation above is the meaningful test of bias.</p>
+  </div>
+  <div class="two">
+    <figure>
+      <img alt="Stacked minus reference shear against reference shear for polar and Cartesian cells in both scenarios" src="{{img:cellbias}}">
+      <figcaption><b>Cell residuals, one realization.</b> Stacked minus reference shear against the reference,
+        with 1σ error bars. Top: main; bottom: sub. Left: polar (g<sub>t</sub> circles, g<sub>×</sub> squares);
+        right: Cartesian.</figcaption>
+    </figure>
+    <figure>
+      <img alt="Six kappa maps: true kappa for main and main plus sub, likelihood-based maps for both, residual map, and Kaiser-Squires map" src="{{img:kappa}}">
+      <figcaption><b>κ maps, one realization.</b> Top: true κ for main and main + sub, then the likelihood map
+        for main. Bottom: the likelihood map for main + sub, the residual (sub data minus the true-mass main
+        model, since the halo fit has not run yet), and Kaiser–Squires on the Cartesian cells. Both methods find
+        the main halo. The subhalo does not stand out from the pixel-to-pixel noise at this density.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li><b>Move the subhalo out of the central cell.</b> I'd put it at 1 Mpc, which the S/N forecast says costs
+      nothing, regenerate the 141 + 141 galaxies (about 15 minutes) and rerun the synthetic check.</li>
+    <li><b>Tune the likelihood map on synthetic data only</b>: try 0.75 Mpc pixels and a stronger smoothness
+      prior, choose one setting, then apply it once to the NPE data.</li>
+    <li><b>Run the full analysis on the NPE posteriors</b>: cells, bias fits (linear and cubic), Nautilus halo
+      fits and κ maps.</li>
+    <li><b>If the subhalo is still not visible, repeat at sample-1 density</b> (about 620 galaxies, cells of
+      about 0.43 Mpc, forecast S/N ≈ 4).</li>
+  </ol>
+  <p class="small">Simplifications to state: uniform source positions, no magnification, no line-of-sight
+    structure, one source redshift, and an untruncated NFW subhalo. Scripts:
+    <code>arch/diagnostics/paper_tests/h_cluster_{make,analysis,validate,report_figs}.py</code>. Outputs:
+    <code>$S/reports/paper-tests-1m/H_cluster/s3_r0/</code>.</p>
+</section>
+</main>

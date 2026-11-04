@@ -1,0 +1,149 @@
+% ============================== Part E ==============================
+\problem{E1}{When the data can't determine the answer}
+
+\begin{given}
+A linear model $\vd = A\mathbf{s} + \mathbf n$, with unknowns $\mathbf s$ and noise covariance $N$. Weighted least squares
+gives $\hat{\mathbf s} = [A^\T N^{-1}A]^{-1}A^\T N^{-1}\vd$, which needs $A^\T N^{-1}A$ to be invertible.
+\source{\cHBLwls.}
+\end{given}
+
+\need{A3 (the matrix least-squares solution).}
+
+\begin{enumerate}
+  \item One datum measures the sum of two unknowns: $d = s_1 + s_2 + n$, so $A = (1\ \ 1)$. Show that $A^\T A$ is
+    singular. Describe all the solutions that fit the datum perfectly.
+  \item Two data, $A = \mathrm{diag}(1, 0.01)$, $N = \sigma^2 I$. Show that $\hat s_2$ amplifies the noise 100-fold.
+  \item Our $\kappa$ map has 144 unknown pixels and about 150 galaxies, each with noise $\approx 0.05$ against a subhalo
+    signal of $\approx 0.01$. Which of (a) and (b) describes it?
+\end{enumerate}
+
+\solution{
+(a) $A^\T A = \begin{pmatrix}1&1\\1&1\end{pmatrix}$ has determinant 0. Any $(s_1, s_2)$ with $s_1 + s_2 = d$ fits; the
+data fix one combination and say nothing about $s_1 - s_2$.
+(b) $\hat s_2 = d_2/0.01 = s_2 + 100\,n_2$: a direction the data barely respond to is recovered with 100 times the noise.
+(c) Both. Small-scale patterns of $\kappa$ produce shears that nearly cancel at the galaxies (small singular values of
+$A$, as in (b)), and the noisy, nearly degenerate system has many near-equally good solutions (as in (a)). Something
+other than the data must choose between them: a prior.
+}
+
+% --------------------------------------------------------------------
+\problem{E2}{A Gaussian prior makes the problem well posed}
+
+\begin{given}
+Add a Gaussian prior $\mathbf s \sim \mathcal N(0, S)$ to the model of E1. For a Gaussian signal and Gaussian noise, the
+linear minimum-variance (Wiener) filter is $W = SA^\T(ASA^\T + N)^{-1}$, and it is also the maximum and the mean of the
+Gaussian posterior.
+\source{\cZaroubiWF; \cJeffreyWF.}
+\end{given}
+
+\need{A3 (completing the square in matrix form), E1.}
+
+\begin{enumerate}
+  \item Write $-2\ln p(\mathbf s\mid\vd) = (\vd - A\mathbf s)^\T N^{-1}(\vd - A\mathbf s) + \mathbf s^\T S^{-1}\mathbf s + \text{const}$.
+    Complete the square to show that the posterior is Gaussian with precision
+    $\mathsf H = S^{-1} + A^\T N^{-1}A$ and mean $\hat{\mathbf s} = \mathsf H^{-1}A^\T N^{-1}\vd$.
+  \item Show that $\hat{\mathbf s} = W\vd$, using the identity
+    $(S^{-1} + A^\T N^{-1}A)^{-1}A^\T N^{-1} = SA^\T(ASA^\T + N)^{-1}$. Verify the identity by multiplying both sides on
+    the left by $S^{-1} + A^\T N^{-1}A$ and on the right by $ASA^\T + N$.
+  \item Redo E1(a) with $S = \sigma_s^2 I$ and $N = \sigma_n^2$. Is $\mathsf H$ invertible now? What is $\hat{\mathbf s}$?
+\end{enumerate}
+
+\solution{
+(a) The $\mathbf s$-dependent terms are $\mathbf s^\T(A^\T N^{-1}A + S^{-1})\mathbf s - 2\mathbf s^\T A^\T N^{-1}\vd$,
+which equals $(\mathbf s - \hat{\mathbf s})^\T\mathsf H(\mathbf s - \hat{\mathbf s})$ + const with
+$\hat{\mathbf s} = \mathsf H^{-1}A^\T N^{-1}\vd$. A Gaussian's mean and maximum coincide.
+(b) Left side times the two factors: $A^\T N^{-1}(ASA^\T + N) = A^\T N^{-1}ASA^\T + A^\T$. Right side:
+$(S^{-1} + A^\T N^{-1}A)SA^\T = A^\T + A^\T N^{-1}ASA^\T$. They agree.
+(c) $\mathsf H = \sigma_s^{-2}I + \sigma_n^{-2}\begin{pmatrix}1&1\\1&1\end{pmatrix}$ has eigenvalues
+$\sigma_s^{-2} + 2\sigma_n^{-2}$ and $\sigma_s^{-2}$, both positive, so it is invertible. By symmetry
+$\hat s_1 = \hat s_2 = \frac{d\,\sigma_s^2}{2\sigma_s^2 + \sigma_n^2}$: the datum is split equally, shrunk toward zero,
+and the undetermined direction $s_1 - s_2$ is set to its prior value, 0.
+}
+
+% --------------------------------------------------------------------
+\problem{E3}{One mode at a time: what the Wiener filter keeps}
+
+\begin{given}
+If $S$ and $N$ are diagonal in the same basis, for example Fourier modes of a stationary field, the filter acts on
+each mode separately and suppresses the noise by the ratio prior/(prior + noise). It is the linear estimate with the
+smallest residual variance.
+\source{\cZaroubiMSE.}
+\end{given}
+
+\need{E2.}
+
+\begin{enumerate}
+  \item One mode, $d = s + n$, with $s \sim \mathcal N(0, S)$ and $n \sim \mathcal N(0, N)$. For an estimate
+    $\hat s = w\,d$, show that the mean squared error $\E[(\hat s - s)^2] = (1-w)^2S + w^2N$, and that it is minimised
+    at $w = S/(S+N)$.
+  \item For a \emph{fixed} true $s$, show that $\E[\hat s\mid s] = ws$. In what sense is the Wiener estimate biased?
+  \item Large scales have $S \gg N$ and small scales $S \ll N$. Describe the filtered map.
+  \item The subhalo in our likelihood map recovers about 40\% of its true peak value. What value of $w$ does that
+    suggest for the scales it occupies?
+\end{enumerate}
+
+\solution{
+(a) $\hat s - s = (w-1)s + wn$; with $s$ and $n$ independent, the variance is $(1-w)^2S + w^2N$. Setting the
+derivative to zero, $-2(1-w)S + 2wN = 0$, gives $w = S/(S+N)$.
+(b) $\E[w(s+n)\mid s] = ws$: every mode is shrunk toward zero by $w < 1$. The estimate is biased for any given field,
+but over the ensemble of fields its error is minimal. This is the trade made on purpose.
+(c) Large scales pass almost unchanged and small scales are suppressed, so the map is a smoothed, slightly shrunk
+version of the truth.
+(d) $w \approx 0.4$: at the subhalo's scale the signal and noise powers are comparable ($S/N \approx 0.7$).
+}
+
+% --------------------------------------------------------------------
+\problem{E4}{A smoothness penalty is a power spectrum}
+
+\begin{given}
+Our map prior is
+$-\ln p(\kappa) = \frac{1}{2\sk^2}\big[\sum_j\kappa_j^2 + \ell^2\sum_{\langle jj'\rangle}(\kappa_j - \kappa_{j'})^2\big]$,
+summed over pixels $j$ and neighbouring pairs $\langle jj'\rangle$. \emph{Derived here}; it is the regulariser of
+\texttt{likelihood\_kappa} in \texttt{h\_cluster\_analysis.py}.
+\end{given}
+
+\need{E2, E3 (a Gaussian prior with covariance $S$; per-mode filtering).}
+
+\begin{enumerate}
+  \item On a periodic 1D chain of $M$ pixels, insert a Fourier mode $\kappa_j = a\,e^{ikj}$. Show that
+    $\sum_j |\kappa_{j+1} - \kappa_j|^2 = 4\sin^2(k/2)\sum_j|\kappa_j|^2$.
+  \item Conclude that each mode has prior variance $P(k) = \sk^2/[1 + 4\ell^2\sin^2(k/2)] \approx \sk^2/(1+\ell^2k^2)$
+    for small $k$.
+  \item What do $\sk$ and $\ell$ each control? Which scales does the prior suppress?
+\end{enumerate}
+
+\solution{
+(a) $\kappa_{j+1} - \kappa_j = a\,e^{ikj}(e^{ik} - 1)$ and $|e^{ik} - 1|^2 = 2 - 2\cos k = 4\sin^2(k/2)$.
+(b) Modes are independent (they diagonalise the quadratic form), and mode $k$ has precision
+$[1 + 4\ell^2\sin^2(k/2)]/\sk^2$, whose inverse is the prior variance. For small $k$, $4\sin^2(k/2) \approx k^2$.
+(c) $\sk$ sets the overall amplitude the prior allows. $\ell$ sets the scale below which fluctuations are suppressed:
+the variance falls by half at $k \approx 1/\ell$. Combined with E3, the Wiener weight per mode is
+$P(k)/[P(k) + N(k)]$, which removes small scales first.
+}
+
+% --------------------------------------------------------------------
+\problem{E5}{\py\ A one-dimensional Wiener filter}
+
+\begin{given}
+A toy 1D ``$\kappa$'' made of a broad bump (the main halo) plus a narrow bump (the subhalo) is sampled by noisy point
+measurements at random positions, each with noise $\sigma = 0.05$ of a quantity linear in $\kappa$. The MAP map under
+the prior of E4 is $\hat\kappa = \mathsf H^{-1}A^\T N^{-1}\vd$ (E2). \emph{Derived here}.
+\end{given}
+
+\need{E2, E4.}
+
+\begin{enumerate}
+  \item \py\ Build $A$ (a measurement samples the pixel it falls in) and the prior precision of E4. Compute the MAP
+    map for $\sk \in \{0.03, 0.1, 0.3\}$ and $\ell \in \{0.5, 1, 2\}$ pixels.
+  \item \py\ Which settings recover the narrow bump best? What happens to it for small $\sk$, and for large $\ell$?
+  \item \py\ Repeat with 20 noise realizations. For one setting, plot the mean map against the truth. Is the mean map
+    equal to the truth?
+\end{enumerate}
+
+\solution{
+(a)--(b) See the solutions notebook. Small $\sk$ shrinks everything (low peaks); large $\ell$ blurs the narrow bump into
+the broad one. Large $\sk$ with small $\ell$ keeps the bump's height but lets the noise through. The best setting
+balances the two, just as the tuning did on the real map.
+(c) No: the mean map is a smoothed, shrunk version of the truth (E3(b)). Averaging over noise removes the noise, not
+the prior's bias. Part F makes this precise with the resolution matrix.
+}

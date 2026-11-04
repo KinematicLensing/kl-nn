@@ -22,11 +22,16 @@ try:
         CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
+        validate_fiber_layout,
         HALPHA_FLUX_TRUE_COLUMN,
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
+        REDSHIFT_COLUMN,
         RMAG_TRUE_COLUMN,
+        SIMULATION_REDSHIFT,
+        TARGETING_SEED_COLUMN,
+        validate_redshift,
         validate_halpha_flux,
         validate_central_halpha_snr,
         validate_image_snr,
@@ -43,11 +48,16 @@ except ImportError:
         CENTRAL_HALPHA_SNR_COLUMN,
         FIBER_LAYOUT_COLUMN,
         GALAXY_AXIS_FIBER_LAYOUT,
+        validate_fiber_layout,
         HALPHA_FLUX_TRUE_COLUMN,
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
+        REDSHIFT_COLUMN,
         RMAG_TRUE_COLUMN,
+        SIMULATION_REDSHIFT,
+        TARGETING_SEED_COLUMN,
+        validate_redshift,
         validate_halpha_flux,
         validate_central_halpha_snr,
         validate_image_snr,
@@ -112,9 +122,7 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
         raise ValueError(
             f"Expected observation_model_version={OBSERVATION_MODEL_VERSION}, got {version}"
         )
-    layout = str(row[FIBER_LAYOUT_COLUMN])
-    if layout != GALAXY_AXIS_FIBER_LAYOUT:
-        raise ValueError(f"Expected fiber_layout={GALAXY_AXIS_FIBER_LAYOUT!r}")
+    layout = validate_fiber_layout(row[FIBER_LAYOUT_COLUMN])
     magnitude = validate_rmag_true(row[RMAG_TRUE_COLUMN])
     halpha_flux = validate_halpha_flux(row[HALPHA_FLUX_TRUE_COLUMN])
     image_snr = validate_image_snr(row[IMAGE_SNR_COLUMN])
@@ -135,8 +143,17 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
             f"--halpha-flux-true={halpha_flux}",
             f"--image-snr={image_snr}",
             f"--central-halpha-snr={central_halpha_snr}",
+            f"--fiber-layout={layout}",
         )
     )
+    # Optional columns for the redshift-response test; omitted when absent so
+    # production commands are unchanged.
+    if REDSHIFT_COLUMN in row.index and pd.notna(row[REDSHIFT_COLUMN]):
+        redshift = validate_redshift(row[REDSHIFT_COLUMN])
+        if redshift != SIMULATION_REDSHIFT:
+            command.append(f"--redshift={redshift}")
+    if TARGETING_SEED_COLUMN in row.index and pd.notna(row[TARGETING_SEED_COLUMN]):
+        command.append(f"--targeting-seed={int(row[TARGETING_SEED_COLUMN])}")
     if "fiber_g1" in row.index and "fiber_g2" in row.index:
         fiber_g1 = row["fiber_g1"]
         fiber_g2 = row["fiber_g2"]

@@ -47,18 +47,21 @@ EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.001}"
 GRADIENT_CLIP_NORM="${GRADIENT_CLIP_NORM:-1.0}"
 FREEZE_FEATURE_EXTRACTOR="${FREEZE_FEATURE_EXTRACTOR:-1}"
 IMAGE_SPECTRUM_FUSION="${IMAGE_SPECTRUM_FUSION:-1}"
+R90_VIEWS="${R90_VIEWS:-1}"
 TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_cosi/}"
 VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
+FIBER_LAYOUT="${FIBER_LAYOUT:-galaxy_axis}"
 MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_1m}"
 MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
 PRETRAIN_CHECKPOINT="${MODEL_ROOT}/${PRETRAINED_NAME}/${PRETRAINED_NAME}${PRETRAIN_FROM}"
 
-if [[ ! -f "${PRETRAIN_CHECKPOINT}" ]]; then
+# PRETRAINED_NAME=none trains from scratch (no CCL encoder; needs FREEZE_FEATURE_EXTRACTOR=0).
+if [[ "${PRETRAINED_NAME,,}" != "none" && ! -f "${PRETRAIN_CHECKPOINT}" ]]; then
     echo "Missing pretraining checkpoint: ${PRETRAIN_CHECKPOINT}" >&2
     exit 2
 fi
@@ -80,7 +83,13 @@ else
     IMAGE_SPECTRUM_FUSION_FLAG="--image-spectrum-fusion"
 fi
 
-echo "model=${MODEL_NAME} stage=npe views=random(identity,r90) flow=bounded_hybrid_circular"
+if [[ "${R90_VIEWS}" == "0" || "${R90_VIEWS}" == "false" ]]; then
+    R90_VIEWS_FLAG="--no-r90-views"
+else
+    R90_VIEWS_FLAG="--r90-views"
+fi
+
+echo "model=${MODEL_NAME} stage=npe r90_views=${R90_VIEWS_FLAG} flow=bounded_hybrid_circular"
 echo "pretrained=${PRETRAINED_NAME} checkpoint=${PRETRAIN_FROM}"
 echo "train=${TRAIN_DATA} size=${TRAIN_SIZE}"
 echo "valid=${VALID_DATA} size=${VALID_SIZE}"
@@ -118,8 +127,10 @@ python train_model.py \
     --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA}" \
     --gradient-clip-norm "${GRADIENT_CLIP_NORM}" \
     --shear-bound "${SHEAR_BOUND}" \
+    --fiber-layout "${FIBER_LAYOUT}" \
     ${FREEZE_FEATURE_EXTRACTOR_FLAG} \
     ${IMAGE_SPECTRUM_FUSION_FLAG} \
+    ${R90_VIEWS_FLAG} \
     --seed "${SEED}" \
     --deterministic \
     --fixed-validation-streams \

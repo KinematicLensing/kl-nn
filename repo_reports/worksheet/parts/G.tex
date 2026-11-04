@@ -1,0 +1,201 @@
+% ============================== Part G ==============================
+\problem{G1}{Bernstein \& Armstrong for a constant shear}
+
+\begin{given}
+BA14 write the posterior of one shear shared by many galaxies as $P(\vg\mid D) \propto P(\vg)\prod_iP(D_i\mid\vg)$. They
+expand each galaxy's likelihood to second order about $\vg = 0$,
+$P(D_i\mid\vg) \approx P_i + \vg\cdot\mathbf Q_i + \tfrac12\vg\cdot\mathbf R_i\cdot\vg$ (here $\mathbf R_i$ is BA14's
+second-derivative matrix, not our rotation), and find a Gaussian posterior with
+$C_g^{-1} = \sum_i(\mathbf Q_i\mathbf Q_i^\T/P_i^2 - \mathbf R_i/P_i)$ and $\bar\vg = C_g\sum_i\mathbf Q_i/P_i$.
+\source{\cBAconst.}
+\end{given}
+
+\need{A3, A4, B3, B4.}
+
+\begin{enumerate}
+  \item Show that $\mathbf Q_i/P_i = \nabla\ln P(D_i\mid\vg)|_0$ and
+    $\mathbf Q_i\mathbf Q_i^\T/P_i^2 - \mathbf R_i/P_i = -\nabla\nabla\ln P(D_i\mid\vg)|_0 \equiv \mathbf A_i$.
+  \item For a Gaussian likelihood $\ln L_i = -\tfrac12(\vg - \hat\vg_i)^\T F_i(\vg - \hat\vg_i)$, show that $\mathbf A_i = F_i$
+    and $\nabla\ln L_i|_0 = F_i\hat\vg_i$, and hence that BA14's $\bar\vg$ is our stack $\Ftot^{-1}\sum_iF_i\hat\vg_i$ (A3).
+  \item Our likelihood is $L_i = q_i/\pitrain$ (A4) on a $401^2$ grid, multiplied without Taylor expansion. What do we gain
+    over the quadratic form, and what does the Gaussian form still do for us?
+\end{enumerate}
+
+\solution{
+(a) $\nabla\ln P = \nabla P/P$, which at 0 is $\mathbf Q_i/P_i$. $\nabla\nabla\ln P = \nabla\nabla P/P - \nabla P\nabla P^\T/P^2$,
+which at 0 is $\mathbf R_i/P_i - \mathbf Q_i\mathbf Q_i^\T/P_i^2$.
+(b) $\nabla\ln L_i = -F_i(\vg - \hat\vg_i)$, which at 0 is $F_i\hat\vg_i$, and $-\nabla\nabla\ln L_i = F_i$. So
+$C_g^{-1} = \sum_iF_i$ and $\bar\vg = (\sum_iF_i)^{-1}\sum_iF_i\hat\vg_i$.
+(c) The full product is exact at any $|g| < 0.1$ and includes the higher-order terms BA14 add as perturbations
+(\cBAthird). The Gaussian form still defines the reference shear: BA14's $\mathbf A_i$ is our $F_i$, so $\gref$ uses
+the same weights the stack does (B4).
+}
+
+% --------------------------------------------------------------------
+\problem{G2}{Bernstein \& Armstrong for a varying shear}
+
+\begin{given}
+For any model with parameters $\mathbf a$ that predicts a shear $\vg_i(\mathbf a)$ at each galaxy, BA14's quadratic
+expansion gives (written per galaxy)
+\[
+-\ln P(\mathbf a\mid D) \approx \text{const} - \ln P(\mathbf a) - \sum_i\vg_i(\mathbf a)\cdot\frac{\mathbf Q_i}{P_i}
++ \frac12\sum_i\vg_i(\mathbf a)\cdot\mathbf A_i\cdot\vg_i(\mathbf a).
+\]
+If $\vg_i$ is linear in $\mathbf a$ and the prior is Gaussian, the maximum has a closed form.
+\source{\cBAvarying.}
+\end{given}
+
+\need{G1, B4, E2, E4.}
+
+\begin{enumerate}
+  \item \emph{Cells.} Let $\mathbf a$ be one shear per cell, with $\vg_i(\mathbf a) = R_i^\T\vG_{c(i)}$. Show that the
+    posterior separates into independent cell stacks. Using $\E[\mathbf Q_i/P_i] \approx \mathbf A_i\vt_i$ (the linear
+    response of B4), show that the stack converges to $\gref$.
+  \item \emph{$\kappa$ map.} Let $\mathbf a$ be the $\kappa$ pixels, with $\vg_i(\kappa)$ from Part D. Neglecting the
+    $1/(1-\kappa)$ factor, $\vg_i$ is linear in $\kappa$: write $\vg = M\kappa$. With the prior of E4, which closed form
+    does BA14's statement give, and what is it called?
+  \item \emph{Halo fit.} What is $\mathbf a$, and is the model linear?
+  \item In one sentence: what does a galaxy contribute to any shear-field model?
+\end{enumerate}
+
+\solution{
+(a) Each galaxy's term depends only on its own cell's $\vG_c$, so the sum splits by cell, giving one A3/G1 stack per
+cell. Setting the gradient with respect to $\vG_c$ to zero, $\sum_{i\in c}\big(R_i\mathbf A_iR_i^\T\vG_c - R_i\mathbf Q_i/P_i\big) = 0$,
+so $\hat\vG_c = (\sum_iF_i')^{-1}\sum_iR_i\mathbf Q_i/P_i$ with $F_i' = R_i\mathbf A_iR_i^\T$. With
+$\E[\mathbf Q_i/P_i] = \mathbf A_i\vg_i = \mathbf A_iR_i^\T\vt_i$, each term becomes $F_i'\vt_i$, and
+$\E[\hat\vG_c] = (\sum_iF_i')^{-1}\sum_iF_i'\vt_i = \gref$.
+(b) Write the linear forward model as $\vg = M\kappa$ ($M$ stacks the rows $\partial\vg_i/\partial\kappa$), let
+$\mathcal A = \mathrm{blockdiag}(\mathbf A_i)$ and $\mathbf q$ stack the $\mathbf Q_i/P_i$, and take the Gaussian prior
+$S^{-1}$ of E4. The objective is quadratic, so $\hat\kappa = (S^{-1} + M^\T\mathcal AM)^{-1}M^\T\mathbf q$. This is E2's
+estimator with $\mathcal A$ in the role of $N^{-1}$ (and $\mathbf q = \mathcal A\hat\vg$ for Gaussian likelihoods): the
+Wiener filter. Our map is its non-linear, non-Gaussian generalisation, solved numerically.
+(c) $\mathbf a = (M_{\rm main}, M_{\rm sub})$; the NFW shear is non-linear in the masses, so it needs sampling or
+optimisation.
+(d) Its log-likelihood evaluated at the shear the model predicts at that galaxy's position: no per-galaxy ``shear
+estimate'' is ever needed.
+}
+
+% --------------------------------------------------------------------
+\problem{G3}{Why the difference map is clean}
+
+\begin{given}
+In each realization, the main-only and main + sub datasets have the same galaxies and the same noise draws; only the
+true shears differ. The map estimator is (nearly) the linear MAP of E2, $\hat\kappa = \mathsf H^{-1}A^\T N^{-1}\vd$. The
+difference map is $\hat\kappa_{\rm main+sub} - \hat\kappa_{\rm main}$. \emph{Derived here}
+(\texttt{KAPPA\_FITTING\_EXPLAINED.md}, Sec.~9.4).
+\end{given}
+
+\need{E2, F3, F4.}
+
+\begin{enumerate}
+  \item In the linear model, show that the difference map equals $\mathsf R\,\kappa_{\rm subhalo}$ \emph{exactly}, with
+    no noise at all.
+  \item Our real difference maps have a background rms of $\approx0.002$ against a peak of $\approx0.014$. Where can
+    noise come from, if (a) says there is none?
+  \item Why can't a real observation make a difference map, and what does it show instead?
+  \item The subhalo's true peak pixel is 0.030 and the difference map peaks at about 0.012--0.014. Explain with
+    $\mathsf R$.
+\end{enumerate}
+
+\solution{
+(a) $\vd_{\rm sub} - \vd_{\rm main} = A(\kappa_{\rm sub} - \kappa_{\rm main}) = A\kappa_{\rm subhalo}$, because the noise is
+identical and cancels. Then the difference map is $\mathsf H^{-1}A^\T N^{-1}A\kappa_{\rm subhalo} = \mathsf R\,\kappa_{\rm subhalo}$.
+(b) From the non-linearity: $g = \gamma/(1-\kappa)$ couples the subhalo to the main halo, and the NPE likelihoods are not
+exactly Gaussian, so the noise does not cancel perfectly.
+(c) A real cluster gives one map; there is no noise-matched twin without the subhalo. The difference map shows how
+visible the subhalo is \emph{through the method}: its position, size and amplitude after the prior's smoothing. The
+significance a real map could claim comes from G4.
+(d) The rows of $\mathsf R$ near the subhalo are broad and low (F4(d)): the map shrinks and spreads it to about 40\% of
+its peak.
+}
+
+% --------------------------------------------------------------------
+\problem{G4}{\py\ The significance one map can claim}
+
+\begin{given}
+For each of $K$ independent realizations of the cluster (new galaxies, positions and noise), we average the
+reconstructed $\kappa$ over a 0.5\,Mpc disk at the subhalo position: $a_{{\rm sub},r}$ for the main + sub map,
+$a_{{\rm main},r}$ for the main-only map. The single-map significance is
+$z_r = (a_{{\rm sub},r} - \overline{a_{\rm main}})/{\rm sd}(a_{\rm main})$, with the mean and sd over realizations. An
+aperture average of a mass map is a standard detection statistic (\cSchneiderMap); the empirical-null $z$ is
+\emph{derived here}.
+\end{given}
+
+\need{B1, G3.}
+
+\begin{enumerate}
+  \item Show that subtracting the same fixed map (for example the true main-halo $\kappa$) from every map leaves every
+    $z_r$ unchanged.
+  \item Why is $z_r$ computed against the other realizations' main-only maps, and not against realization $r$'s own
+    main-only map?
+  \item Our null is built from maps of the \emph{true} main halo. For a real cluster it would come from simulations of
+    a \emph{fitted} main halo. Why does that make our $z$ an upper bound?
+  \item With our numbers, $\overline{a_{\rm main}} = 0.0072$, ${\rm sd} = 0.0038$ and $\overline{a_{\rm sub}} = 0.0156$,
+    compute the $z$ of the average realization.
+  \item \py\ In the 1D toy of E5, generate 50 realizations with and without a narrow bump, compute $z_r$, and estimate
+    the fraction with $z > 2$.
+\end{enumerate}
+
+\solution{
+(a) Subtracting a fixed map subtracts the same constant $c$ (its aperture average) from every $a_{{\rm sub},r}$ and every
+$a_{{\rm main},r}$. The difference in the numerator and the sd are unchanged.
+(b) Realization $r$'s own main-only map shares its noise, which would cancel (G3), and a real observation has no such
+twin. The other realizations represent ``what that spot looks like in a cluster without a subhalo'', across noise and
+galaxy layouts.
+(c) Uncertainty in the fitted mass, concentration and centre adds scatter to the null, widening its sd and lowering $z$.
+(d) $(0.0156 - 0.0072)/0.0038 = 2.2$ (the median over realizations is 2.4).
+(e) The notebook (one seed) gives median $z \approx 1.9$, with 48\% of realizations above $z = 2$: a toy version of our 2.4 and 60\%. It also confirms (a): subtracting the truth changes no $z$.
+}
+
+% --------------------------------------------------------------------
+\problem{G5}{Reading the ensemble numbers}
+
+\begin{given}
+Our results over 50 independent NPE realizations (\texttt{repo\_reports/PAPER\_DRAFT\_HANDOFF.md}): one realization
+constrains $m$ to $\approx\pm0.3$; the pooled ensemble gives $m = +0.04 \pm 0.04$ (polar $g_t$); the pull spread is 0.84;
+the likelihood map's median $z$ is 2.4 (KS: 1.1); and the best possible matched-filter S/N (C5(d), with full precision
+matrices) has median 3.7 over realizations. Statistical errors average down as $1/\sqrt K$ (A2).
+\end{given}
+
+\need{A2, B1, C5.}
+
+\begin{enumerate}
+  \item Check $0.3/\sqrt{50}$ against the ensemble error. How many realizations would $\pm0.01$ need? Why doesn't the
+    cluster test aim for that?
+  \item What fraction of the matched-filter S/N does the likelihood map achieve, and what fraction does KS achieve?
+    Name two reasons the map falls short of the matched filter.
+  \item With 4 times the source density (Xu sample 1), roughly what median $z$ would you expect, if $z \propto \sqrt{n}$?
+\end{enumerate}
+
+\solution{
+(a) $0.3/\sqrt{50} = 0.042$, consistent. $\pm0.01$ needs $(0.3/0.01)^2 = 900$ realizations, because one cluster's cells
+span only $\approx0.04$ in shear and the slope is poorly pinned. The test asks a different question: no extra bias
+from shear gradients at the few-percent level. Percent-level $m$ comes from the constant-shear stacks.
+(b) $2.4/3.7 = 65\%$; KS $1.1/3.7 = 30\%$. The matched filter knows the subhalo's exact profile and position, while the
+map assumes neither. The map's prior also shrinks the subhalo and the null includes galaxy-layout variance.
+(c) $\approx2.4\times2 = 4.8$.
+}
+
+% --------------------------------------------------------------------
+\problem{G6}{Why the map settings were chosen on synthetic data}
+
+\begin{given}
+We tried 27 likelihood-map settings and 4 KS settings. The rule ``highest contrast with a false-peak rate $\le 0.10$''
+was fixed before the NPE maps were looked at, and applied to synthetic data only. For a standard normal, $P(z > 2) =
+0.0228$. \emph{Derived here}.
+\end{given}
+
+\need{B1, G4.}
+
+\begin{enumerate}
+  \item If instead we had tried all 31 settings on the real map and reported the best $z$, and the settings were
+    independent, what is the chance that at least one gives $z > 2$ when there is no subhalo?
+  \item Real settings are correlated. Does that make the problem better or worse than (a)?
+  \item Why does choosing on synthetic data, with the rule fixed in advance, avoid the problem?
+\end{enumerate}
+
+\solution{
+(a) $1 - (1 - 0.0228)^{31} = 0.51$: a coin flip.
+(b) Better, since correlated settings behave like fewer independent tries, but the bias stays positive.
+(c) The choice never sees the data it is judged on, so the reported $z$ is a single, pre-registered test.
+}

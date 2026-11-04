@@ -53,7 +53,9 @@ def test_wrapper_forwards_only_current_simulator_inputs():
         "sini",
         *config.TARGET_NAMES[4:8],
     )
-    assert not any("version" in item or "fiber-layout" in item or "low_psf" in item for item in command)
+    # The fiber layout is forwarded explicitly (galaxy_axis or measured_axis).
+    assert "--fiber-layout=galaxy_axis" in command
+    assert not any("version" in item or "low_psf" in item for item in command)
     assert not any("dx_" in item or "dy_" in item for item in command)
 
 

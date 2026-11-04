@@ -40,11 +40,13 @@ CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
 CASE="${CASE:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_valid100k_frozen_s42_fibrepair:test_100k_simv3_cosi_xu3_tf_testset_tfweighted_v2_10k_s42_righthanded}"
 REPORT_ROOT="${REPORT_ROOT:-/ocean/projects/phy250048p/shared/reports/likelihood-stack}"
 REPORT_DIR="${REPORT_DIR:-${REPORT_ROOT}/03_nre}"
+LOG_R_CACHE="${LOG_R_CACHE:-}"
 DEVICE="${DEVICE:-cuda}"
 OVERWRITE="${OVERWRITE:-1}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 GRID_N="${GRID_N:-21}"
 SEED="${SEED:-42}"
+MAX_GALAXIES="${MAX_GALAXIES:-}"
 STATUS="${REPORT_ROOT}/STATUS.txt"
 
 if [[ "${NRE_NAME}" == "${PARENT_NPE}" ]]; then
@@ -82,6 +84,12 @@ ARGS=(
     --grid-n "${GRID_N}"
     --seed "${SEED}"
 )
+if [[ -n "${MAX_GALAXIES}" ]]; then
+    ARGS+=(--max-galaxies "${MAX_GALAXIES}")
+fi
+if [[ -n "${LOG_R_CACHE}" ]]; then
+    ARGS+=(--log-r-cache "${LOG_R_CACHE}")
+fi
 if [[ "${OVERWRITE}" == "1" ]]; then
     ARGS+=(--overwrite)
 fi

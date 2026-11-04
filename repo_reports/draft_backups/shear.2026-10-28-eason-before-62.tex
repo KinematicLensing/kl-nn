@@ -1,0 +1,115 @@
+\section{Towards an NPE-based Shear Estimator}
+\label{sec:shear}
+
+In Sec.~\ref{sec:validation}, we showed that our NPE produces well-calibrated posteriors. However, what we ultimately need is an estimate of the shear that is unbiased over an ensemble of galaxies, i.e. one with small $m$ and $\mathbf{c}$ in Eq.~(\ref{eqn:linear-bias}). In this section, we explore how the NPE posteriors can be turned into such an estimate. The naive choice would be to use the posterior mean of every galaxy as the point estimate for its shear. However, that estimator is biased, since each posterior mean is pulled toward the center of the prior (see Appendix~\ref{app:posterior-means}). Instead, we can make use of the full posteriors provided by our model to give us an ensemble shear estimate with minimal bias. We show in (Sec.~\ref{ssec:stacking}) that stacking relatively few likelihoods of galaxies of the same shear can reduce the multiplicative bias to $\sim1\%$. We then verify this approach in a varying cluster shear field (Sec.~\ref{ssec:cluster}), and use the likelihoods of the individual galaxies to detect substructure in the cluster (Sec.~\ref{ssec:substructure}). Through these tests, we show that our NPE upholds the main advantages of KL, even if individual shear posteriors are biased.
+
+\subsection{Likelihood Stacking}
+\label{ssec:stacking}
+
+Rather than reducing the posterior of each galaxy to a point estimate, we can use the entire posterior that our NPE outputs, which contains more information than the point estimate itself. If a set of $N$ galaxies share the same shear $\mathbf{g}$, the posterior of that shear given the data of all galaxies is
+\begin{equation}
+\label{eqn:stack}
+    p(\mathbf{g} \mid \mathbf{c}_1, \dots, \mathbf{c}_N) \propto \pi(\mathbf{g}) \prod_{i=1}^{N} \mathcal{L}_i(\mathbf{g}),
+\end{equation}
+where $\mathcal{L}_i(\mathbf{g}) = p(\mathbf{c}_i \mid \mathbf{g})$ is the likelihood of the shear for galaxy $i$, marginalized over all the other parameters. The prior on the shear enters only once, instead of once per galaxy as when averaging posterior means. As $N$ grows, the product of likelihoods becomes much narrower than the prior, so the pull of the prior, and with it the shrinkage, asymptotes to having no effect on the joint posterior. For example, in a Gaussian likelihood model, a single likelihood of width $\sigma_L$ and a prior of width $\sigma_\pi$ give a posterior mean that responds to a fraction $\sigma_\pi^2/(\sigma_\pi^2 + \sigma_L^2)$ of the true shear. However, the product of $N$ likelihoods of width $\sigma_L$ has width $\sigma_L/\sqrt{N}$, so the response of the stacked posterior mean is $\sigma_\pi^2/(\sigma_\pi^2 + \sigma_L^2/N)$, which approaches 1 as $N$ grows. This is the Bayesian shear formalism of Bernstein \& Armstrong~\citep{BA14}, which we can apply directly to our NPE. We also explain this distinction more concretely in Appendix~\ref{app:shrinkage}.
+
+Our NPE gives us the likelihood of each galaxy directly. Its marginal posterior of the shear, $q(\mathbf{g} \mid \mathbf{c}_i)$, approximates the posterior under the training prior, so
+\begin{equation}
+\label{eqn:npe-likelihood}
+    \mathcal{L}_i(\mathbf{g}) \propto \frac{q(\mathbf{g} \mid \mathbf{c}_i)}{\pi_\mathrm{train}(\mathbf{g})},
+\end{equation}
+which is simply proportional to $q(\mathbf{g} \mid \mathbf{c}_i)$ inside the prior box, since our training prior on the shear is uniform. We estimate $q(\mathbf{g} \mid \mathbf{c}_i)$ from the posterior samples of each galaxy with a kernel density estimate (KDE). We use the KDE module as implemented in \textsc{SciPy}~\citep{SciPy}, specifying it with the full covariance of the posterior samples rather than the variance for each component, as we often have posteriors that are narrow along diagonal directions in the shear plane. Since the posterior is confined to the prior box, we reflect the samples across the edges of the box to avoid underestimating the density near the edges. We also add a small constant floor to each density, so that a single galaxy whose samples happen to miss the true shear cannot set the product to zero there. We then evaluate the product of Eq.~(\ref{eqn:stack}) on a fine grid of $\mathbf{g}$ and take its mean as our estimate of the shear.
+
+Testing Eq.~(\ref{eqn:stack}) requires groups of galaxies that share the same shear, which the Xu3 test set does not have. We therefore use a separate benchmark of 25 shear cells, with $g_1, g_2 \in \{-0.08, -0.04, 0, 0.04, 0.08\}$. Each cell contains the same 32 galaxies, whose other parameters are drawn from the training prior, with one noise realization per galaxy, as for real observations. Since these galaxies were drawn from the training prior, we use the posterior samples without the TF reweighting. In each cell, we stack the first $N$ galaxies, and measure $m$ and $c$ with a linear fit of the 25 cell estimates against the true shears of the cells. We estimate the uncertainties by bootstrap resampling the galaxies, using the same resampled galaxies in all cells. For a controlled comparison, we also average the posterior means of the same galaxies in each cell.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/stacking.pdf}
+    \caption{Multiplicative bias against the number of galaxies $N$ per shear cell, for 25 cells of constant shear with one noise realization per galaxy. Blue: average of the posterior means of the individual galaxies. Purple: mean of the stacked posterior of Eq.~(\ref{eqn:stack}), with the likelihood of each galaxy estimated from its NPE posterior using Eq.~(\ref{eqn:npe-likelihood}). Filled circles are $m_1$, open squares $m_2$. Markers are the medians and error bars the 16th--84th percentiles of 1000 bootstrap resamples of the galaxies.}
+    \label{fig:stacking}
+\end{figure}
+
+\begin{table}
+\centering
+\caption{Multiplicative bias of the stacked posterior of Eq.~(\ref{eqn:stack}) against the number of galaxies $N$ per shear cell, for the benchmark of Fig.~\ref{fig:stacking}. Values are the medians and errors the 16th--84th percentiles of 1000 bootstrap resamples of the galaxies.}
+\label{tab:stacking}
+\begin{tabular}{ccc}
+\toprule
+$N$ & $m_1$ & $m_2$ \\
+\midrule
+1 & $-0.409^{+0.380}_{-0.445}$ & $-0.346^{+0.337}_{-0.426}$ \\
+2 & $-0.060^{+0.054}_{-0.335}$ & $-0.030^{+0.036}_{-0.273}$ \\
+4 & $-0.013^{+0.014}_{-0.041}$ & $-0.001^{+0.014}_{-0.039}$ \\
+8 & $-0.011^{+0.009}_{-0.011}$ & $0.001^{+0.009}_{-0.009}$ \\
+16 & $-0.010^{+0.006}_{-0.007}$ & $0.001^{+0.006}_{-0.005}$ \\
+32 & $-0.010^{+0.004}_{-0.005}$ & $0.001^{+0.004}_{-0.004}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:stacking} shows the result. The averaged posterior means have $m \approx -0.4$ for all $N$, since averaging does not remove the shrinkage of the individual means (Appendix~\ref{app:shrinkage}). The stacked posterior, on the other hand, is already nearly unbiased for $N = 4$, and for all 32 galaxies gives $m_1 = -0.010 \pm 0.005$ and $m_2 = 0.001 \pm 0.004$ (Table~\ref{tab:stacking}). This shows that the shear information in our NPE posteriors is nearly unbiased, even though their means are not, and that stacking them recovers it without any calibration.
+
+These results assume a constant shear field, where every galaxy in a stacked cell is assumed to have the same shear. In real data, however, shear is not constant, so to validate, we simulated a cluster lensing scenario and stack galaxy likelihoods within spatial cells, which we will move to next. [KL can measure the shear of individual source galaxies behind a cluster \citep{KLCluster}, which in principle allows the shear to be probed locally, e.g. to reveal substructure where the shear departs from the prediction of the main cluster profile. In the next two subsections, we test both routes on a realistic population of galaxies behind a simulated cluster, including the TF prior.]
+
+\subsection{Likelihood Stacking in a Cluster Shear Field}
+\label{ssec:cluster}
+
+We now test likelihood stacking in a varying shear field. We simulate a galaxy cluster with a main halo of mass $M_\mathrm{200c} = 10^{15}\,M_\odot$, and a subhalo of $3\times10^{14}\,M_\odot$ at a projected distance of 1\,Mpc from the center of the main halo. Both halos follow NFW profiles~\citep{NFW97}, with concentrations from the mass--concentration relation of Duffy et al.~\citep{Duffy08}. We compute the shear $\boldsymbol{\gamma}$ and convergence $\kappa$ of each halo with \galsim~\citep{galsim}, add the contributions of the two halos, and then form the reduced shear $\mathbf{g} = \boldsymbol{\gamma}/(1-\kappa)$ at the position of each galaxy, assuming a Planck 2018 cosmology~\citep{Planck18}. Since our NPE is trained at a single redshift, we place all source galaxies at $z_s = 0.3$, and choose the lens redshift close to where the lensing signal of these sources peaks, at at $z_l = 0.13$. The reduced shear of all our source galaxies stays below 0.075, within the prior range of our NPE.
+
+We place the source galaxies uniformly within 3\,Mpc of the cluster center, drawing their number from a Poisson distribution with a mean density of 0.11\,arcmin$^{-2}$, which gives about 150 galaxies per cluster. This is the density of sample~3 of Xu et al.~\citep{KLDESI} over the DESI footprint, 0.14\,arcmin$^{-2}$ in our catalog of its targets, times the 75\% of these galaxies that lie behind the lens. Each galaxy takes the parameters of a randomly drawn Xu3 galaxy (Sec.~\ref{ssec:test-set}), and we simulate its image and spectra and estimate its TF-weighted posterior as for the Xu3 test set. We make two versions of each data set, one with the main halo only and one with the main halo and the subhalo. The two versions share every galaxy and noise realization, so they differ only in the shear. We repeat this for 50 independent realizations, each with new galaxies, positions, and noise.
+
+To stack the galaxies, we group them into cells and combine the likelihoods within each cell using Eq.~(\ref{eqn:stack}). We use two kinds of cells. The polar cells consist of a central disk and four logarithmically spaced annuli out to 3\,Mpc, with each annulus divided into sectors of equal area that are expected to hold about 5 galaxies. One sector of each annulus is centered on the direction of the subhalo. In these cells, we rotate the likelihood of each galaxy into tangential and cross components $(g_\mathrm{t}, g_\times)$ about the main halo before stacking. The Cartesian cells are squares of about 1\,Mpc on a side, in which we stack $(g_1, g_2)$ directly.
+
+Since the shear varies within a cell, we need to decide what the stacked shear $\hat{\mathbf{g}}$ of a cell should be compared with. The stack fits a single shear to galaxies whose true shears $\mathbf{g}_i$ differ. If the likelihood of each galaxy is approximately Gaussian with precision matrix $\mathbf{F}_i$ (the inverse of its covariance), the stacked shear converges to the reference shear
+\begin{equation}
+\label{eqn:gref}
+    \mathbf{g}_\mathrm{ref} = \Big(\sum_{i} \mathbf{F}_i\Big)^{-1} \sum_{i} \mathbf{F}_i\, \mathbf{g}_i,
+\end{equation}
+the precision-weighted average of the true shears in the cell. This is a special case of the non-constant shear formalism of \citep{BA14}, with a constant shear model in each cell. Since KL constrains one direction of the shear much better than the other, the $\mathbf{F}_i$ are strongly anisotropic, and $\mathbf{g}_\mathrm{ref}$ can differ noticeably from the plain average of the true shears or from the shear at the center of the cell. We estimate each $\mathbf{F}_i$ from the covariance of the likelihood of galaxy $i$.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/cluster_cells.pdf}
+    \caption{Stacked shears of the polar cells against their reference shears (Eq.~\ref{eqn:gref}), for the main halo + subhalo data of all 50 realizations. Top: distribution of the pulls $(\hat{g} - g_\mathrm{ref})/\sigma$, where $\sigma$ is the standard deviation of the stacked posterior, for the tangential (blue, solid) and cross (red, dashed) components of cells with at least 3 galaxies. The dotted curve is a standard normal distribution. Bottom: mean of $\hat{g} - g_\mathrm{ref}$ against the number of galaxies $n$ in a cell, with every cell counted equally. Error bars are the standard errors of the mean.}
+    \label{fig:cluster-cells}
+\end{figure}
+
+We measure the bias of the stacked shears with a fit of $\hat{g} - g_\mathrm{ref} = m\, g_\mathrm{ref} + c$ over all cells of the 50 realizations, weighting each cell by the inverse of its stacked posterior variance. For the tangential shear of the polar cells, we find $m = 0.04 \pm 0.04$ with the main halo only, and $m = 0.01 \pm 0.04$ with the subhalo. For the Cartesian cells, $m = 0.02 \pm 0.03$ and $0.06 \pm 0.03$ for $g_1$ and $g_2$. The additive biases are all consistent with zero. The pulls of the stacked shears about the reference shears (Fig.~\ref{fig:cluster-cells}, top) are centered on zero, with a standard deviation of about 0.85, so the stacked posteriors are slightly too wide. This has two causes. In cells whose stacked likelihood is not much narrower than the prior, the width of the posterior is partly set by the prior, and the pulls have a standard deviation of about 0.7. This also happens when we replace the NPE likelihoods with exact Gaussian ones, for which the pulls of all other cells have unit spread. Most of the rest comes from the KDE. The likelihoods of the most precise galaxies are narrow along a direction that is generally not aligned with $g_1$ or $g_2$, and a kernel width set separately for each component is too large along that direction.
+
+The one exception is cells with only one or two galaxies, whose stacked tangential shear is biased toward zero (Fig.~\ref{fig:cluster-cells}, bottom). This is the shrinkage of Sec.~\ref{ssec:shrinkage}: with so few galaxies, the stacked likelihood is still wide compared to the prior, as we also saw in Sec.~\ref{ssec:stacking}. With three or more galaxies per cell, the residuals are small. Likelihood stacking therefore gives nearly unbiased shear estimates in a non-constant shear field as well, as long as each stack contains a few galaxies and the stacked shear is compared with the reference shear of Eq.~(\ref{eqn:gref}).
+
+\subsection{Detecting Substructure}
+\label{ssec:substructure}
+
+The polar cells see the subhalo only through the one sector that contains it, which holds about 5 galaxies. The signal of the subhalo, however, is spread over a few Mpc, and the information is better used by fitting a mass map to the likelihoods of all galaxies at once. We describe the convergence on a grid of $12\times12$ pixels of 0.5\,Mpc. For a trial map, we compute the shear at each galaxy position from $\kappa$ with the Kaiser--Squires kernel~\citep{KS93}, and form the reduced shear $\mathbf{g}_i(\kappa)$ as above. We then maximize the log posterior
+\begin{equation}
+\label{eqn:kappa-post}
+    \ln p(\kappa \mid \text{data}) = \sum_i \ln \mathcal{L}_i\big(\mathbf{g}_i(\kappa)\big) + \ln \pi(\kappa) + \mathrm{const},
+\end{equation}
+where $\mathcal{L}_i$ is the likelihood of galaxy $i$ from Eq.~(\ref{eqn:npe-likelihood}), and
+\begin{equation}
+\label{eqn:kappa-prior}
+    \ln \pi(\kappa) = - \frac{1}{2\sigma_\kappa^2}\Big[\sum_a \kappa_a^2 + \ell^2 \sum_{\langle a,b \rangle} (\kappa_a - \kappa_b)^2\Big]
+\end{equation}
+is a Gaussian prior on the pixel values $\kappa_a$ that prefers small and smooth maps, with the second sum running over neighboring pixels. For Gaussian likelihoods and a shear that is linear in $\kappa$, the maximum of Eq.~(\ref{eqn:kappa-post}) is the Wiener filter~\citep{Zaroubi95}, which has been used for weak lensing mass maps by e.g. Jeffrey et al.~\citep{Jeffrey18}. Unlike the cells, this uses each galaxy at its own position and with its full, anisotropic likelihood. We find the maximum with the L-BFGS algorithm~\citep{LBFGS}. We choose the pixel size, $\sigma_\kappa = 0.03$, and $\ell = 1$ pixel on simulated data, in which each galaxy has a Gaussian likelihood with the same width as its NPE likelihood, picking the setting that best separates the subhalo from noise fluctuations, before applying it to the NPE likelihoods. The prior shrinks and smooths the map, so the reconstructed $\kappa$ is biased low. However, since the two versions of each data set share all galaxies and noise, the difference between the maps with and without the subhalo removes the main halo and most of the noise, and shows how visible the subhalo is at this source density.
+
+For comparison, we also reconstruct the convergence with the standard Kaiser--Squires inversion~\citep{KS93}, using the stacked shears of the Cartesian cells and smoothing the result with a Gaussian kernel whose width we choose on the same simulated data.
+
+\begin{figure*}
+    \includegraphics[width=\linewidth]{figs/cluster_maps.pdf}
+    \caption{Convergence maps of the simulated cluster. Top: (a) the true $\kappa$ of the main halo and the subhalo (cross) averaged over the pixels of our likelihood map, with the galaxy positions of one realization (white dots); (b) our likelihood map and (c) the Kaiser--Squires map reconstructed from the NPE posteriors of this realization. Bottom: the difference between the maps with and without the subhalo for (d) the likelihood map and (e) the Kaiser--Squires map of the same realization, and (f) the mean difference of the likelihood maps over all 50 realizations. The solid circle is the 0.5\,Mpc aperture used for the significance $z$, and the dashed circle marks the 3\,Mpc field. The realization shown has a significance close to the median of Fig.~\ref{fig:cluster-detection}.}
+    \label{fig:cluster-maps}
+\end{figure*}
+
+To quantify the detection in a single map, we average the map within a 0.5\,Mpc aperture centered on the subhalo, and compare it with the same quantity in the maps with the main halo only. Using the 50 main-halo-only maps as the null distribution, the significance of a map is $z = (a - \bar{a}_\mathrm{null})/\sigma_\mathrm{null}$, where $a$ is its aperture value, and $\bar{a}_\mathrm{null}$ and $\sigma_\mathrm{null}$ are the mean and standard deviation over the null maps. This assumes that the main halo is known. In real data, the null distribution would have to come from simulations of a fitted main halo, and would include its uncertainty.
+
+Fig.~\ref{fig:cluster-maps} shows the maps of one realization, and Fig.~\ref{fig:cluster-detection} the significance over all realizations. In the difference maps, the subhalo appears at the correct position in both reconstructions, but more sharply in the likelihood map. Averaged over the realizations, the difference of the likelihood maps is a clean peak at the subhalo, with a height of about a third of the true pixel value, showing the shrinkage and smoothing by the prior. For the likelihood map, the median significance is $z = 2.4$, with $z > 2$ in 60\% and $z > 3$ in 28\% of the realizations. The Kaiser--Squires map reaches a median of only $z = 1.1$, with $z > 2$ in 22\% of the realizations. The Kaiser--Squires map only uses the average shear of each cell, in which the tangential pattern of the subhalo partly cancels, and gives every cell the same weight regardless of how many galaxies it contains and how well they constrain the shear.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/cluster_detection.pdf}
+    \caption{Significance $z$ of the subhalo in single maps over the 50 realizations, for our likelihood map (purple, solid) and the Kaiser--Squires map (gray, dashed). The dotted line marks $z = 2$.}
+    \label{fig:cluster-detection}
+\end{figure}
+
+\XW{Optional paragraph, to discuss with advisors (Tae's suggestion; same approach as Weighing the Giants III, Applegate et al.~\citep{WtG3}, Sec.~5).} Instead of a map, we can also fit a parametric model directly to the likelihoods of the individual galaxies, by evaluating each $\mathcal{L}_i$ at the reduced shear predicted by NFW halos at the position of the galaxy, as in Applegate et al.~\citep{WtG3}. We fit the masses of the main halo alone, and of the main halo and a subhalo at the known position, and compare the two with the Bayesian evidence. In the data with the subhalo, the evidence favors the subhalo with $\ln B > 1$ in 92\% and $\ln B > 3$ in 64\% of the realizations, while in the data without it, $\ln B$ never exceeds 0.8. When the position of the subhalo is also left free, it is recovered within 0.5\,Mpc of the truth in 80\% of the realizations, but $\ln B > 1$ in only 38\%, because of the larger prior volume. The fitted mass of the main halo is unbiased, with a mean $\log_{10}(M_\mathrm{200c}/M_\odot) = 15.01 \pm 0.01$ over the realizations with the main halo only.
+
+Overall, the subhalo is detectable in a single cluster at the source density of a DESI-like KL sample, but at a resolution of about 1\,Mpc, set by the few galaxies that are needed for the likelihoods to overcome the prior. This is coarser than what KL can achieve with the shear of individual galaxies~\citep{KLCluster}, but it uses the NPE posteriors without any calibration.
+

@@ -1,0 +1,97 @@
+\section{Towards an NPE-based Shear Estimator}
+\label{sec:shear}
+
+In Sec.~\ref{sec:validation}, we showed that our NPE produces well-calibrated posteriors. However, what we ultimately need is an estimate of the shear that is unbiased over an ensemble of galaxies, i.e. one with small $m$ and $\mathbf{c}$ in Eq.~(\ref{eqn:linear-bias}). In this section, we explore how the NPE posteriors can be turned into such an estimate. We start from the naive choice, the posterior mean of each galaxy, and show that it is strongly biased (Sec.~\ref{ssec:raw-bias}). We explain where this bias comes from in Sec.~\ref{ssec:shrinkage}. Instead of correcting the point estimates, we then combine the full likelihoods of galaxies that share the same shear, and show that this removes the bias without any calibration (Sec.~\ref{ssec:stacking}). Finally, we apply this approach to cluster lensing, where it can also be used to probe the shear in localized regions of a cluster. We present these as explorations rather than as a final, calibrated shear estimator framework, which we leave to future work.
+
+\subsection{Raw Posterior Means}
+\label{ssec:raw-bias}
+
+For each test galaxy $i$, we take the mean of its TF-weighted posterior, $\hat{g}_{k,i}$, as a point estimate of its shear. We then measure $m$ and $c$ separately for the two shear components with a linear least-squares fit of $\hat{g}_{k,i} - g_{k,i} = m_k\, g_{k,i} + c_k$, which is Eq.~(\ref{eqn:linear-bias}) with $\hat{g}$ in place of $\hat{\epsilon}$. We use all Xu3 galaxies with equal weights and no cuts, and quote the standard errors of the fit as our uncertainties. We restrict the fit to galaxies with $|g_k| < 0.02$, which we will refer to as the fit window, since this range covers the shear of the vast majority of galaxies in cosmic shear measurements. At larger shears, the response of our estimator becomes slightly nonlinear, with a term cubic in the shear. Such third-order shear biases have also been found for other shear estimators, and become important at the large shears near galaxy clusters \citep{Anacal, AnaCalCluster}.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/raw_bias.pdf}
+    \caption{Bias of the raw posterior means on the Xu3 test set ($10^5$ galaxies, equal weights, no cuts). Points show the mean of $\hat{g}_k - g_k$ in bins of the true shear for $g_1$ (blue circles) and $g_2$ (red squares); error bars are smaller than the markers. Solid lines are the linear fits over $|g_k| < 0.02$ (shaded), and dashed lines extend them to the full prior range.}
+    \label{fig:raw-bias}
+\end{figure}
+
+Fig.~\ref{fig:raw-bias} shows the mean of $\hat{g}_k - g_k$ in bins of the true shear. The additive bias is consistent with zero for both components, but the multiplicative bias is large, with $m_1 = -0.612 \pm 0.014$ and $m_2 = -0.588 \pm 0.014$. In other words, the posterior means respond to only about 40\% of the true shear. Multiplicative biases of tens of percent are not unusual for uncalibrated shear estimators. In DES Y1, for example, the uncalibrated bias of \textsc{im3shape} ranges from $m\approx-0.1$ for high-SNR galaxies to $m\approx-0.3$ for the lowest-SNR galaxies \citep{DESY1Shape}, with similar levels found for HSC \citep{HSCY1Sims}. These biases are then calibrated with image simulations. Finding a significant multiplicative bias in the point estimate also does not contradict the calibration results of Sec.~\ref{ssec:calibration}. As we show in Sec.~\ref{ssec:shrinkage}, a bias of this kind is expected for posterior means when the data constrain the shear only weakly compared to the prior, even if the posteriors are correct.
+
+We also measure the shape noise of each galaxy following \citep{KLDESI}, as $\sigma_{\epsilon,i} = \sqrt{\sigma_{g_1,i}^2 + \sigma_{g_2,i}^2}$, where $\sigma_{g_k,i}$ is the standard deviation of the TF-weighted posterior of $g_k$. Across the Xu3 test set, the median $\sigma_{\epsilon,i}$ is 0.066, with 68\% of galaxies between 0.040 and 0.080. About a third of the galaxies have $\sigma_{\epsilon,i} > 0.075$, close to the value of $\sqrt{2}\sigma_\pi = 0.082$ that we would get if the posteriors of both components were equal to the prior. Here $\sigma_\pi = 0.2/\sqrt{12} = 0.058$ is the standard deviation of the uniform prior $\mathcal{U}(-0.1, 0.1)$ on each shear component, and the factor of $\sqrt{2}$ comes from adding the two components in quadrature. The data of these galaxies carry little information about the shear, and as we will see in the next section, they are the main source of the bias in the posterior means. We compare our shape noise with that of \citep{KLDESI} in Sec.~\ref{sec:discussion}.
+
+\subsection{Shrinkage of Posterior Means}
+\label{ssec:shrinkage}
+
+The bias of the posterior means can be understood as follows. Consider a single shear component $g$ of one galaxy, and suppose that its data give a Gaussian likelihood of width $\sigma_L$, centered on a noisy measurement $g_\mathrm{obs}$ whose average over noise realizations is the true shear. If the prior on $g$ is also a Gaussian centered on zero with width $\sigma_\pi$, the posterior is a Gaussian with mean and variance
+\begin{equation}
+\label{eqn:gauss-posterior}
+    \hat{g} = \frac{\sigma_\pi^2}{\sigma_\pi^2 + \sigma_L^2}\, g_\mathrm{obs}, \qquad
+    \sigma_\mathrm{post}^2 = \frac{\sigma_L^2\, \sigma_\pi^2}{\sigma_L^2 + \sigma_\pi^2}.
+\end{equation}
+The posterior mean is pulled toward the center of the prior by an amount that depends on how informative the data is compared to the prior. Averaging over noise realizations at a fixed true shear $g$ gives $\langle \hat{g} \rangle = g\,\sigma_\pi^2/(\sigma_\pi^2 + \sigma_L^2)$, so using Eq.~(\ref{eqn:gauss-posterior}) to write the result in terms of the posterior width, the multiplicative bias is
+\begin{equation}
+\label{eqn:shrinkage}
+    m = -\frac{\sigma_L^2}{\sigma_L^2 + \sigma_\pi^2} = -\frac{\sigma_\mathrm{post}^2}{\sigma_\pi^2}.
+\end{equation}
+A galaxy with $\sigma_L \ll \sigma_\pi$ has $m \approx 0$, while a galaxy whose data carry no shear information has $\sigma_\mathrm{post} \to \sigma_\pi$ and $m \to -1$. For a sample of galaxies, the fitted $m$ is approximately the average over the individual galaxies, $m \approx -\langle \sigma_\mathrm{post}^2 \rangle / \sigma_\pi^2$. Our shear prior is uniform rather than Gaussian, so we approximate it by a Gaussian with the same variance, $\sigma_\pi^2 = 0.2^2/12$.
+
+This bias is a natural result from the posterior mean, and would be present even for exact posteriors. For correct posteriors, the average true shear of galaxies with a given $\hat{g}$ is equal to $\hat{g}$, but the average $\hat{g}$ of galaxies with a given true shear, which is what $m$ measures, is shrunk toward zero.
+
+To test whether shrinkage explains the bias we measured in Sec.~\ref{ssec:raw-bias}, we compare Eq.~(\ref{eqn:shrinkage}) with the $m$ measured in groups of galaxies with different posterior widths. We split the test set into 15 equal-size bins of $\sigma_{\epsilon,i}$, and in each bin fit $m_k$ as in Sec.~\ref{ssec:raw-bias} and compute the average posterior variance $\langle \sigma_{\mathrm{post},k}^2 \rangle$. Note that grouping galaxies by their measured posterior widths is not the most stringent version of this test. The posterior width of a galaxy depends on its measured shear, with galaxies that appear more strongly sheared tending to have narrower posteriors. Selecting galaxies with narrow posteriors therefore preferentially selects galaxies whose measured shear $|\hat{g}|$ is larger than their true shear. This selection effect is strongest in the bins with the narrowest posteriors.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/shrinkage.pdf}
+    \caption{Multiplicative bias of the raw posterior means against the average posterior variance, in 15 equal-size bins of $\sigma_{\epsilon,i}$ on the Xu3 test set (6,667 galaxies per bin), for $g_1$ (blue circles) and $g_2$ (red squares). The dashed line is the shrinkage prediction of Eq.~(\ref{eqn:shrinkage}). The dotted vertical line marks the prior variance $\sigma_\pi^2$.}
+    \label{fig:shrinkage}
+\end{figure}
+
+Fig.~\ref{fig:shrinkage} shows the result. The measured $m$ follows the prediction from the bins with intermediate posterior widths to $m \approx -1$ in the bins with the widest posteriors. Over the whole test set, the prediction gives $m_1 = -0.619$ and $m_2 = -0.615$, close to the measured $m_1 = -0.612 \pm 0.014$ and $m_2 = -0.588 \pm 0.014$. Shrinkage therefore explains almost all of the bias of the raw posterior means, which is dominated by galaxies with wide posteriors. Rather than correcting the point estimates for this bias, a more natural approach is to not reduce each posterior to a point estimate at all, and instead to combine the likelihoods of all galaxies that share the same shear, utilizing the full information in the posteriors (Sec.~\ref{ssec:stacking}).
+
+\subsection{Likelihood Stacking}
+\label{ssec:stacking}
+
+So far, we have only used point estimates of individual galaxies to build our summary statistics. However, our NPE outputs an entire posterior, which contains more information than the point estimate itself. If a set of $N$ galaxies share the same shear $\mathbf{g}$, the posterior of that shear given the data of all galaxies is
+\begin{equation}
+\label{eqn:stack}
+    p(\mathbf{g} \mid \mathbf{c}_1, \dots, \mathbf{c}_N) \propto \pi(\mathbf{g}) \prod_{i=1}^{N} \mathcal{L}_i(\mathbf{g}),
+\end{equation}
+where $\mathcal{L}_i(\mathbf{g}) = p(\mathbf{c}_i \mid \mathbf{g})$ is the likelihood of the shear for galaxy $i$, marginalized over all the other parameters. The prior on the shear enters only once, instead of once per galaxy as when averaging posterior means. As $N$ grows, the product of likelihoods becomes much narrower than the prior, so the pull of the prior, and with it the shrinkage, disappears. In the Gaussian model of Sec.~\ref{ssec:shrinkage}, for example, the product of $N$ likelihoods of width $\sigma_L$ has width $\sigma_L/\sqrt{N}$, so the response of the stacked posterior mean is $\sigma_\pi^2/(\sigma_\pi^2 + \sigma_L^2/N)$, which approaches 1 as $N$ grows. This is the formalism of Bernstein \& Armstrong~\citep{BA14}, which we can apply directly to our NPE.
+
+Our NPE gives us the likelihood of each galaxy directly. Its marginal posterior of the shear, $q(\mathbf{g} \mid \mathbf{c}_i)$, approximates the posterior under the training prior, so
+\begin{equation}
+\label{eqn:npe-likelihood}
+    \mathcal{L}_i(\mathbf{g}) \propto \frac{q(\mathbf{g} \mid \mathbf{c}_i)}{\pi_\mathrm{train}(\mathbf{g})},
+\end{equation}
+which is simply proportional to $q(\mathbf{g} \mid \mathbf{c}_i)$ inside the prior box, since our training prior on the shear is uniform. We estimate $q(\mathbf{g} \mid \mathbf{c}_i)$ from the posterior samples of each galaxy with a kernel density estimate (KDE). We use the KDE module as implemented in \textsc{SciPy}~\citep{SciPy}, specifying it with the full covariance of the posterior samples rather than the variance for each component, as we often have posteriors that are narrow along diagonal directions in the shear plane. Since the posterior is confined to the prior box, we reflect the samples across the edges of the box to avoid underestimating the density near the edges. We also add a small constant floor to each density, so that a single galaxy whose samples happen to miss the true shear cannot set the product to zero there. We then evaluate the product of Eq.~(\ref{eqn:stack}) on a fine grid of $\mathbf{g}$ and take its mean as our estimate of the shear.
+
+Testing Eq.~(\ref{eqn:stack}) requires groups of galaxies that share the same shear, which the Xu3 test set does not have. We therefore use a separate benchmark of 25 shear cells, with $g_1, g_2 \in \{-0.08, -0.04, 0, 0.04, 0.08\}$. Each cell contains the same 32 galaxies, whose other parameters are drawn from the training prior, with one noise realization per galaxy, as for real observations. Since these galaxies were drawn from the training prior, we use the posterior samples without the TF reweighting. In each cell, we stack the first $N$ galaxies, and we measure $m$ and $c$ with a linear fit of the 25 cell estimates against the true shears of the cells. We estimate the uncertainties by bootstrap resampling the galaxies, using the same resampled galaxies in all cells. For comparison, we also average the posterior means of the same galaxies in each cell.
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/stacking.pdf}
+    \caption{Multiplicative bias against the number of galaxies $N$ per shear cell, for 25 cells of constant shear with one noise realization per galaxy. Blue: average of the posterior means of the individual galaxies. Purple: mean of the stacked posterior of Eq.~(\ref{eqn:stack}), with the likelihood of each galaxy estimated from its NPE posterior using Eq.~(\ref{eqn:npe-likelihood}). Filled circles are $m_1$, open squares $m_2$. Markers are the medians and error bars the 16th--84th percentiles of 1000 bootstrap resamples of the galaxies.}
+    \label{fig:stacking}
+\end{figure}
+
+\begin{table}
+\centering
+\caption{Multiplicative bias of the stacked posterior of Eq.~(\ref{eqn:stack}) against the number of galaxies $N$ per shear cell, for the benchmark of Fig.~\ref{fig:stacking}. Values are the medians and errors the 16th--84th percentiles of 1000 bootstrap resamples of the galaxies.}
+\label{tab:stacking}
+\begin{tabular}{ccc}
+\toprule
+$N$ & $m_1$ & $m_2$ \\
+\midrule
+1 & $-0.409^{+0.380}_{-0.445}$ & $-0.346^{+0.337}_{-0.426}$ \\
+2 & $-0.060^{+0.054}_{-0.335}$ & $-0.030^{+0.036}_{-0.273}$ \\
+4 & $-0.013^{+0.014}_{-0.041}$ & $-0.001^{+0.014}_{-0.039}$ \\
+8 & $-0.011^{+0.009}_{-0.011}$ & $0.001^{+0.009}_{-0.009}$ \\
+16 & $-0.010^{+0.006}_{-0.007}$ & $0.001^{+0.006}_{-0.005}$ \\
+32 & $-0.010^{+0.004}_{-0.005}$ & $0.001^{+0.004}_{-0.004}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Fig.~\ref{fig:stacking} shows the result. The averaged posterior means have $m \approx -0.4$ for all $N$, since averaging does not remove the shrinkage of the individual means. The stacked posterior, on the other hand, is already nearly unbiased for $N = 4$, and for all 32 galaxies gives $m_1 = -0.010 \pm 0.005$ and $m_2 = 0.001 \pm 0.004$ (Table~\ref{tab:stacking}). This shows that the shear information in our NPE posteriors is nearly unbiased, even though their means are not, and that stacking the posteriors recovers it without any calibration.
+
+These results are for an idealized case, where all galaxies share exactly the same shear, and where the galaxies are drawn from the same prior used to train the NPE. In real data, we have a non-constant shear field, so the likelihoods cannot simply be multiplied. \citep{BA14} also showed how this approach can be extended to a varying shear, by expanding the likelihood of each galaxy for small shears, which we leave to future work. However, there are settings in which galaxies do share approximately the same shear. Around a galaxy cluster, the tangential shear depends mainly on the distance from the cluster center, so galaxies within a thin annulus share nearly the same tangential shear, and their likelihoods can be stacked. KL can measure the shear of individual source galaxies behind a cluster \citep{KLCluster}, which in principle allows the shear to be probed locally, e.g. to reveal substructure where the shear departs from the prediction of the main cluster profile. Our NPE cannot do this galaxy by galaxy, since the stacked posterior needs a few galaxies to become nearly unbiased, but it can stack the few galaxies within a small region of an annulus, probing the same substructure at a lower angular resolution. In the next subsection, we test this application on a realistic population of galaxies behind a simulated cluster, including the TF prior.
+
+
+\input{sections/shear-cluster}

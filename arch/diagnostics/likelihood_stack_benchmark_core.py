@@ -159,6 +159,118 @@ def prefix_surface_map(
     return np.asarray(estimates), np.asarray(stacked_scores)
 
 
+def prefix_surface_mean(
+    candidate_bank: np.ndarray,
+    log_q: np.ndarray,
+    *,
+    prefixes=BENCHMARK_PREFIXES,
+    candidates_per_realization: int = BENCHMARK_SURFACE_SAMPLES,
+    prior_log_density: float = BENCHMARK_UNIFORM_PRIOR_LOG_DENSITY,
+) -> np.ndarray:
+    """Posterior mean of a cumulative q/pi candidate surface."""
+
+    bank = np.asarray(candidate_bank, dtype=np.float64)
+    scores = np.asarray(log_q, dtype=np.float64)
+    if bank.ndim != 3:
+        raise ValueError("candidate_bank must have shape (R, K, D)")
+    n_real, per_realization, n_features = bank.shape
+    if per_realization != int(candidates_per_realization):
+        raise ValueError("candidate bank does not have the requested K")
+    if scores.shape != (n_real, n_real * per_realization):
+        raise ValueError("log_q must have shape (R, R*K)")
+    means = []
+    for prefix in prefixes:
+        prefix = int(prefix)
+        if not 1 <= prefix <= n_real:
+            raise ValueError(f"prefix {prefix} is outside 1..{n_real}")
+        width = prefix * per_realization
+        surface = np.sum(scores[:prefix, :width], axis=0)
+        surface = surface - float(prior_log_density)
+        surface = surface - np.nanmax(surface)
+        weights = np.exp(surface)
+        total = np.sum(weights)
+        if not np.isfinite(total) or total <= 0.0:
+            raise ValueError("stacked q/pi surface has no finite posterior mass")
+        weights /= total
+        points = bank[:prefix].reshape(width, n_features)
+        means.append(weights @ points)
+    return np.asarray(means, dtype=np.float64)
+
+
+def deterministic_nuisance_bank(
+    n_samples: int,
+    *,
+    seed: int,
+    n_dimensions: int = 7,
+) -> np.ndarray:
+    """Draw a reproducible uniform normalized nuisance-prior bank."""
+
+    n_samples = int(n_samples)
+    n_dimensions = int(n_dimensions)
+    if n_samples <= 0 or n_dimensions <= 0:
+        raise ValueError("n_samples and n_dimensions must be positive")
+    rng = np.random.default_rng(int(seed))
+    return rng.uniform(
+        -1.0,
+        1.0,
+        size=(n_samples, n_dimensions),
+    ).astype(np.float64)
+
+
+def marginalize_nuisance_log_surface(
+    log_integrand: np.ndarray,
+    *,
+    return_ess: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Integrate a uniform nuisance-prior bank in log space.
+
+    ``log_integrand`` has shape ``(n_shear, n_nuisance)``.  The returned
+    surface is the log of the Monte Carlo mean over nuisance candidates.
+    """
+
+    values = np.asarray(log_integrand, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] == 0:
+        raise ValueError(
+            "log_integrand must have shape (n_shear, n_nuisance)"
+        )
+    finite = np.isfinite(values)
+    if np.any(~np.any(finite, axis=1)):
+        raise ValueError("each shear point needs finite nuisance support")
+    maxima = np.max(np.where(finite, values, -np.inf), axis=1)
+    shifted = np.where(finite, values - maxima[:, None], -np.inf)
+    weights = np.exp(shifted)
+    normalizer = np.sum(weights, axis=1)
+    log_surface = maxima + np.log(normalizer) - np.log(values.shape[1])
+    if not return_ess:
+        return log_surface
+    normalized = weights / normalizer[:, None]
+    ess = 1.0 / np.sum(np.square(normalized), axis=1)
+    return log_surface, ess
+
+
+def stack_log_surfaces(
+    log_surfaces: np.ndarray,
+    prefixes: tuple[int, ...] = BENCHMARK_PREFIXES,
+) -> np.ndarray:
+    """Sum per-galaxy log likelihood surfaces for each nuisance prefix."""
+
+    values = np.asarray(log_surfaces, dtype=np.float64)
+    if values.ndim != 3:
+        raise ValueError(
+            "log_surfaces must have shape (cell, galaxy, shear_grid)"
+        )
+    output = np.empty(
+        (values.shape[0], len(prefixes), values.shape[2]),
+        dtype=np.float64,
+    )
+    for index, prefix in enumerate(prefixes):
+        prefix = int(prefix)
+        if not 1 <= prefix <= values.shape[1]:
+            raise ValueError("prefix is outside the galaxy axis")
+        output[:, index] = np.sum(values[:, :prefix], axis=1)
+    return output
+
+
 def fit_component_mc(
     truth: np.ndarray,
     estimate: np.ndarray,

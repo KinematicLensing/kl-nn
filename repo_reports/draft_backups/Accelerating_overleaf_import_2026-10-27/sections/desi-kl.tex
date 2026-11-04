@@ -1,0 +1,60 @@
+\section{DESI-KL Pilot Measurement}
+\label{sec:pilot}
+
+Given the good science prospects of a DESI-KL project shown by simulated KL analysis, we are prepared to make pilot measurements using existing real survey data, which can further inform us about the expectations for this potential future program. The previously mentioned DESI-PV survey has already made fiber spectra measurements for many galaxies, making it an ideal data source for a DESI-KL pilot measurement. Furthermore, in preparation for DESI-KL, we need an efficient data analysis infrastructure to take data from a large number of galaxies, as indicated by our forecasted sample pool in Sec. \ref{sec:desi}. In this section, we discuss the prospects of using DESI-PV data for our pilot measurement, as well as describe the current KL analysis framework, which was used for the DESI-KL simulated analyses.
+
+\subsection{Pilot Measurement Using DESI-PV Data}
+\label{sec:pv}
+The DESI-PV sample mainly consists of early-type galaxies (ETGs) and late-type galaxies (LTGs). Both redshift and distance are needed to calculate peculiar velocities. Distances to the galaxies are estimated via the fundamental plane (FP) for the ETGs and the Tully-Fisher relation for the LTGs. To measure the rotation velocity of LTGs, two offset fibers are placed along the major axis with $\pm 0.4R_{26}$ from the galaxy center, in addition to the central fiber observation conducted as part of the BGS program~\citep[see the Fig. 8 in][for an example measurement]{DESIPV23}. Here $R_{26}$ is the semimajor axis radius measured at $\mu=26$ mag arcsec$^{-2}$ $r$-band isophote. The final DESI-PV survey is predicted to measure PV from $\sim 133,000$ FP--based and $\sim53,000$ TF--based galaxies over the $14,000$ deg$^2$ DESI 5-year footprint and expect a $4$ percent precision on $f\sigma_8(z<0.15)$. A large portion of the planned measurements have already been made and are available for us to use.
+
+The measurements of TF-based galaxies in DESI-PV should be useful for our purposes, as they contain two offset fibers on the semimajor axis to help us constrain the velocity field. Within the TF catalog, there are also larger galaxies (EXT-TF) that contain more than two offset fibers, which could give us even better shear measurements on a per-galaxy basis. Fig. \ref{fig:tf} shows an example of galaxies from the TF and EXT-TF catalogs, adapted from \citep{DESIPV23}. Although the data collection for DESI-PV is not finished, we already have spectra for more than $10,000$ galaxies with two or more fiber pointings (see Fig. \ref{fig:fiber}), which is sufficient to make a pilot measurement. The fiber arrangement for DESI-PV, while different from what we used for the simulated DESI-KL analysis (see Fig. \ref{fig:pipe} for an example), can easily be adapted into the inference pipeline we developed in \citep{xu2024KL}, which we will now describe in the next subsection.
+
+\begin{figure*}
+    \includegraphics[width=0.9\linewidth]{figs/tf_gals.png}
+    \caption{Postage stamps from the DESI Legacy Imaging Surveys DR9 showing example DESI PV galaxies and their corresponding targets. Different coloured circles represent different priority targets — red, blue and green correspond to \textsc{high}, \textsc{medium} and \textsc{low} priority respectively — and the size of the circles is equal to the DESI fibre size. Figure adapted from \citep{DESIPV23}.}
+    \label{fig:tf}
+\end{figure*}
+
+\begin{figure}
+    \includegraphics[width=\linewidth]{figs/all_fiber_point_freq.jpg}
+    \caption{Distribution of number of fiber pointings currently measured in the DESI-PV survey. For KL analysis, at least two fiber pointings are needed, one on the center and one offset. This gives us more than $10,000$ galaxy samples to use in our pilot measurement.}
+    \label{fig:fiber}
+\end{figure}
+
+\subsection{DESI-KL Inference Pipeline}
+\label{sec:pipe}
+The inference pipeline for DESI-KL is illustrated in Fig. \ref{fig:pipe}. Given input data vector $\bm{D}$, which contains all images and spectra of a single galaxy, we want to compute the maximum likelihood estimate (MLE) of the model parameters $\bm{\theta}$. By Bayes' theorem, we can compute the posterior as
+\begin{equation}
+    \label{eqn:bayes}
+    p(\bm{\theta}|\bm{D})\propto L(\bm{D}|\bm{\theta})p(\bm{\theta}),
+\end{equation}
+where $p(\bm{\theta})$ is the prior, and $L(\bm{D}|\bm{\theta})$ stands for the likelihood of $\bm{D}$ given $\bm{\theta}$. We then derive $L(\bm{D}|\bm{\theta})$ by forward modeling the images and spectra (denoted as model vector $\bm{M}$). Assuming a Gaussian likelihood for both the 2D images and 1D spectra, and ignoring noise correlation, we have
+\begin{equation}
+    \label{eqn:like}
+    L(\bm{D}|\bm{\theta}) = \prod_{i=1}^{N}\mathrm{exp}\left(-\frac{\left(\bm{D}_i-\bm{M}_i(\bm{\theta})\right)^2}{2\sigma_i^2}\right)\,,
+\end{equation}
+where $i\in[1,\,N]$ denotes each individual image/spectrum observation, and $\sigma_i$ is the standard deviation of the noise for the $i$th observation.
+
+\begin{figure*}
+    \includegraphics[width=\linewidth]{figs/PipelineFramework.eps}
+    \caption{Architecture of the KL shear inference pipeline: the orange box (top) illustrates the data simulator, which forward models images and spectra from an astrophysical model, input shear, and instrument characteristics. We show five illustrative 1D spectra which are taken by the fibers annotated by the red circular apertures on the mock $r$-band image. The diameter of the red circular apertures corresponds to the DESI fiber diameter $1.\arcsec5$. The blue box illustrates the Bayesian inference stage, which produces best-fitting models and shear posterior (black box) for a set of input data, which is also generated by the data simulator in this work with realistic SNR. Figure adapted from \citep{xu2024KL}.}
+    \label{fig:pipe}
+\end{figure*}
+
+In a real KL measurement, $\bm{D}$ comes from observed data. In forecast works such as \citep{xu2024KL}, however, we use the same model to both generate mock data at the fiducial parameter $\bm{\theta}_\mathrm{fid}$ and fit the MAP parameter to recover $\bm{\theta}_\mathrm{fid}$. 
+
+The KL measurement pipeline contains a data simulator to forward model mock images and spectra given input parameters $\bm{\theta}$, which we repurposed in this work to generate training images and spectra for neural network emulation. The data simulator first generates an intensity profile $I(\bm{x}|\bm{\theta})$ (dimensionless, above the atmosphere) and line-of-sight (LoS) rotation velocity field $v_\mathrm{LoS}(\bm{x}|\bm{\theta})$ ($\mathrm{km}\,\mathrm{s}^{-1}$) that are distorted by cosmic shear, as well as an observer-frame spectral energy distribution (SED) model $F_\lambda^\mathrm{obs}(\lambda|\bm{\theta})$ ($\mathrm{erg}\,\mathrm{s}^{-1}\,\mathrm{cm}^{-2}\,\mathrm{nm}^{-1}$). Then it constructs the 3D photon distribution
+\begin{equation}
+    f(\bm{x},\lambda|\bm{\theta})=I(\bm{x}|\bm{\theta})\, F_\lambda^\mathrm{obs}\left(\left.\frac{\lambda}{1+v_\mathrm{LoS}(\bm{x})/c}\right|\bm{\theta}\right)\frac{\lambda}{hc}\,.
+\end{equation}
+We use $f(\bm{x},\lambda|\bm{\theta})$ to further generate mock 2D photometry image
+\begin{equation}
+\label{eqn:mock_img}
+    \bm{M}_\mathrm{I}(\bm{x}|\bm{\theta})=\frac{At}{G}(\mathcal{P}\ast I)(\bm{x})\int\mathrm{d}\lambda \frac{F_\lambda^\mathrm{obs}(\lambda|\bm{\theta})}{hc/\lambda} \mathcal{T}(\lambda)\,,
+\end{equation}
+or mock 1D fiber spectrum
+\begin{equation}
+\label{eqn:mock_spec}
+    \bm{M}_\mathrm{S}(\lambda|\bm{\theta}) = \frac{At}{G}\mathcal{R}\cdot\int\mathrm{d}^2\bm{x}f(\bm{x},\lambda^\prime|\bm{\theta})(\mathcal{M}\ast\mathcal{P})(\bm{x})\mathcal{T}(\lambda^\prime)\,,
+\end{equation}
+where $A$ is the effective collecting area of the telescope, $t$ is the exposure time, $G$ is the detector gain, $\mathcal{P}$ is the point-spread function (PSF), $\mathcal{T}(\lambda)$ is the system throughput (including atmosphere transmission, optical train throughput, and detector quantum efficiency), $\mathcal{M}$ is the fiber aperture mask, $\mathcal{R}$ is the resolution matrix of DESI spectrograph \citep{BS10,GBK+23}, and $\ast$ means convolution. We then sample the model space and evaluate the cosmic shear uncertainties $\sigma_{g_1}$ and $\sigma_{g_2}$ from their 1D projected posteriors. These allow us to compute the shape noise as $\sigma_\epsilon=\sqrt{\sigma_{g_1}^2+\sigma_{g_2}^2}$. We refer the interested reader to \citep{xu2024KL} for a detailed explanation on how the 3D photon distribution $f(\bm{x},\lambda|\bm{\theta})$ is generated.

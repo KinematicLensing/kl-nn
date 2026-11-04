@@ -241,6 +241,29 @@ def test_load_model_config_defaults_missing_fusion_flag_to_identity(tmp_path):
         config.ModelConfig.from_dict(payload)
 
 
+def test_load_model_config_defaults_missing_r90_views_to_on(tmp_path):
+    configured = copy.deepcopy(config.MODEL_CONFIG)
+    configured.train.model_name = "pre-r90-option-snapshot"
+    config_root = tmp_path / "configs"
+    config_root.mkdir()
+    path = Path(
+        model_registry.get_model_config_path(
+            "pre-r90-option-snapshot", configs_root=str(config_root)
+        )
+    )
+    payload = configured.to_dict()
+    payload["train"].pop("r90_views")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = model_registry.load_model_config(
+        "pre-r90-option-snapshot", configs_root=str(config_root)
+    )
+
+    assert loaded.train.r90_views is True
+    with pytest.raises(ValueError, match="missing="):
+        config.ModelConfig.from_dict(payload)
+
+
 def test_missing_current_config_and_network_snapshots_fail_closed(tmp_path):
     with pytest.raises(FileNotFoundError, match="Current-schema model config"):
         model_registry.load_model_config(

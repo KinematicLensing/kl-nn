@@ -57,7 +57,53 @@ HALPHA_FLUX_SEMANTICS = "central_fiber_integrated_after_seeing_before_instrument
 HALPHA_FLUX_TRANSFORM = "log10"
 HALPHA_FLUX_API_VERSION = 1
 GALAXY_AXIS_FIBER_LAYOUT = "galaxy_axis"
+# Fibers along axes measured on a noisy targeting image (fiber_targeting.py).
+MEASURED_AXIS_FIBER_LAYOUT = "measured_axis"
 FIBER_LAYOUT_CODE = 1
+FIBER_LAYOUT_CODES = {GALAXY_AXIS_FIBER_LAYOUT: 1, MEASURED_AXIS_FIBER_LAYOUT: 2}
+FITS_TARGET_PA_KEY = "TGTPA"  # measured position angle [rad]
+FITS_TARGET_HSM_OK_KEY = "TGTHSMOK"  # 1 if HSM succeeded, 0 if random fallback
+FITS_TARGET_SNR_KEY = "TGTSNR"  # targeting-image matched-filter SNR
+FITS_TARGET_SEED_KEY = "TGTSEED"  # targeting noise seed
+
+# Source redshift. Production data are all rendered at z = 0.3; other values
+# are only used by the redshift-response test. The H-alpha window keeps its
+# z = 0.3 width (61 pixels of 0.08 nm) and moves with the redshifted line, and
+# the line width is fixed in the rest frame.
+REDSHIFT_COLUMN = "redshift"
+TARGETING_SEED_COLUMN = "targeting_seed"
+FITS_REDSHIFT_KEY = "ZSRC"
+SIMULATION_REDSHIFT = 0.3
+HALPHA_REST_WAVELENGTH_NM = 656.4589  # kl-tools LINE_LAMBDAS["Ha"], vacuum
+HALPHA_WINDOW_NM = (851.0, 855.81)  # at SIMULATION_REDSHIFT
+HALPHA_OBSERVED_SIGMA_NM = 0.065  # at SIMULATION_REDSHIFT
+HALPHA_REST_SIGMA_NM = 0.05
+
+
+def validate_redshift(value: object) -> float:
+    redshift = float(value)
+    if not np.isfinite(redshift) or not 0.0 < redshift < 1.0:
+        raise ValueError(f"redshift must be in (0, 1), got {value!r}")
+    return redshift
+
+
+def halpha_window(redshift: float) -> tuple[float, float]:
+    """Observed H-alpha window [nm], shifted with the line from z = 0.3."""
+
+    redshift = validate_redshift(redshift)
+    if redshift == SIMULATION_REDSHIFT:
+        return HALPHA_WINDOW_NM
+    shift = HALPHA_REST_WAVELENGTH_NM * (redshift - SIMULATION_REDSHIFT)
+    return (HALPHA_WINDOW_NM[0] + shift, HALPHA_WINDOW_NM[1] + shift)
+
+
+def halpha_observed_sigma(redshift: float) -> float:
+    """Observed-frame H-alpha Gaussian width [nm] for a fixed rest-frame width."""
+
+    redshift = validate_redshift(redshift)
+    if redshift == SIMULATION_REDSHIFT:
+        return HALPHA_OBSERVED_SIGMA_NM
+    return HALPHA_REST_SIGMA_NM * (1.0 + redshift)
 
 IMAGE_BAND_CODE_COLUMN = "image_band_code"
 TARGET_LINE_CODE_COLUMN = "target_line_code"
@@ -167,9 +213,9 @@ def configure_sed(
 
 def validate_fiber_layout(value: str) -> str:
     value = str(value)
-    if value != GALAXY_AXIS_FIBER_LAYOUT:
+    if value not in FIBER_LAYOUT_CODES:
         raise ValueError(
-            "The current simulator supports only galaxy_axis fiber placement"
+            "fiber_layout must be one of " + ", ".join(sorted(FIBER_LAYOUT_CODES))
         )
     return value
 
@@ -508,7 +554,7 @@ def halpha_flux_conversion_from_header(
 
 def fiber_layout_from_header(header: Mapping[str, Any]) -> tuple[str, int]:
     layout = validate_fiber_layout(_required(header, FITS_FIBER_LAYOUT_KEY))
-    return layout, FIBER_LAYOUT_CODE
+    return layout, FIBER_LAYOUT_CODES[layout]
 
 
 def observation_instrument_metadata_from_header(
@@ -634,7 +680,7 @@ def observation_metadata_arrays(
         result[HALPHA_FLUX_TRUE_COLUMN][index] = central
         result[HALPHA_TOTAL_FLUX_COLUMN][index] = total
         result[CENTRAL_HALPHA_APERTURE_FRACTION_COLUMN][index] = fraction
-        fiber_layout_from_header(header)
+        result[FIBER_LAYOUT_COLUMN][index] = fiber_layout_from_header(header)[1]
         instrument = observation_instrument_metadata_from_header(header)
         for name, value in instrument.items():
             result[name][index] = value

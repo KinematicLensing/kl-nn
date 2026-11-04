@@ -13,6 +13,13 @@ from kl_tools.parameters import Pars
 from kl_tools.likelihood import get_GlobalDataVector, FiberLikelihood
 
 try:
+    from .fiber_targeting import (
+        measure_position_angle,
+        measured_axis_fiber_offsets,
+        targeting_noisy_image,
+        targeting_seed,
+        targeting_snr,
+    )
     from .generation_integrity import (
         FITS_SCIENCE_ROW_FINGERPRINT_KEY,
         FITS_SCIENCE_ROW_FINGERPRINT_VERSION_KEY,
@@ -43,6 +50,17 @@ try:
         FITS_SPECTRAL_UNITS_KEY,
         FITS_TARGET_LINE_KEY,
         GALAXY_AXIS_FIBER_LAYOUT,
+        MEASURED_AXIS_FIBER_LAYOUT,
+        FITS_TARGET_PA_KEY,
+        FITS_TARGET_HSM_OK_KEY,
+        FITS_TARGET_SNR_KEY,
+        FITS_TARGET_SEED_KEY,
+        validate_fiber_layout,
+        FITS_REDSHIFT_KEY,
+        SIMULATION_REDSHIFT,
+        halpha_observed_sigma,
+        halpha_window,
+        validate_redshift,
         HALPHA_FLUX_SEMANTICS,
         HALPHA_FLUX_API_VERSION,
         HALPHA_FLUX_TRANSFORM,
@@ -60,6 +78,13 @@ try:
         validate_rmag_true,
     )
 except ImportError:  # Support direct execution from data_generate/.
+    from fiber_targeting import (
+        measure_position_angle,
+        measured_axis_fiber_offsets,
+        targeting_noisy_image,
+        targeting_seed,
+        targeting_snr,
+    )
     from generation_integrity import (
         FITS_SCIENCE_ROW_FINGERPRINT_KEY,
         FITS_SCIENCE_ROW_FINGERPRINT_VERSION_KEY,
@@ -90,6 +115,17 @@ except ImportError:  # Support direct execution from data_generate/.
         FITS_SPECTRAL_UNITS_KEY,
         FITS_TARGET_LINE_KEY,
         GALAXY_AXIS_FIBER_LAYOUT,
+        MEASURED_AXIS_FIBER_LAYOUT,
+        FITS_TARGET_PA_KEY,
+        FITS_TARGET_HSM_OK_KEY,
+        FITS_TARGET_SNR_KEY,
+        FITS_TARGET_SEED_KEY,
+        validate_fiber_layout,
+        FITS_REDSHIFT_KEY,
+        SIMULATION_REDSHIFT,
+        halpha_observed_sigma,
+        halpha_window,
+        validate_redshift,
         HALPHA_FLUX_SEMANTICS,
         HALPHA_FLUX_API_VERSION,
         HALPHA_FLUX_TRANSFORM,
@@ -144,7 +180,28 @@ parser.add_argument(
     default=None,
     help='shear g2 used only for fiber placement; default is the galaxy g2',
 )
+parser.add_argument(
+    '--fiber-layout',
+    type=str,
+    default=GALAXY_AXIS_FIBER_LAYOUT,
+    help='galaxy_axis: fibers on the true observed axes; measured_axis: fibers '
+         'on axes measured from a noisy targeting image (fiber_targeting.py)',
+)
+parser.add_argument(
+    '--redshift',
+    type=float,
+    default=SIMULATION_REDSHIFT,
+    help='source redshift; production data use 0.3 (redshift-response test only)',
+)
+parser.add_argument(
+    '--targeting-seed',
+    type=int,
+    default=None,
+    help='targeting-noise seed for measured_axis; default 900000000 + ID',
+)
 args = parser.parse_args()
+fiber_layout = validate_fiber_layout(args.fiber_layout)
+redshift = validate_redshift(args.redshift)
 n = args.n
 d = args.d
 ID = args.ID
@@ -190,8 +247,6 @@ default_fiber_conf = {'INSTNAME': "DESI", 'OBSTYPE': 1,
     'NOISETYP': 'ccd', 'ADDNOISE': ADD_NOISE, 'FIBERRAD': fiber_rad, 'FIBRBLUR': fiber_blur
 }
 
-default_obs_conf, _index_ = [], 0
-
 ### Fiber observations
 emlines = ['O2', 'Hb', 'O3_1', 'O3_2', 'Ha']
 channels = ['b', 'r', 'r', 'r', 'z']
@@ -203,45 +258,24 @@ wavelength_range = np.array([
                         [648.7, 653.51],
                         [851, 855.81],
                     ])
+if redshift != SIMULATION_REDSHIFT:
+    # Move the H-alpha window with the line and observe it on whichever DESI
+    # camera (r or z) transmits more over the window (r for z < ~0.16).
+    wavelength_range[4] = halpha_window(redshift)
+    _grid = np.linspace(*wavelength_range[4], 50)
+    _throughput = {}
+    for _cam in ('r', 'z'):
+        _tab = np.loadtxt(join(KL_TOOLS_DATA_DIR, "Bandpass", "DESI", f"{_cam}.dat"))
+        _throughput[_cam] = np.interp(_grid, _tab[:, 0], _tab[:, 1], left=0.0, right=0.0).mean()
+    channels[4] = max(_throughput, key=_throughput.get)
+    if len(np.arange(*wavelength_range[4], 0.08)) != 61:
+        raise RuntimeError("H-alpha window must keep 61 pixels")
 SPEC_MASK = 1
 spec_mask_str = ("{0:0%db}"%len(emlines)).format(SPEC_MASK)
 spec_mask = np.array([int(bit) for bit in spec_mask_str])
 Nspec_used = np.sum(spec_mask)
 blockids = [int(np.sum(spec_mask[:i])*spec_mask[i]) for i in range(len(spec_mask))]
     
-### Calculate fiber offsets in the explicitly selected coordinate system.
-offsets = compute_fiber_offsets(
-    fiber_offset=fiber_offset,
-    g1=fiber_g1,
-    g2=fiber_g2,
-    theta_int=theta_int,
-    sini=sini,
-)
-center_fiber_indices = np.flatnonzero(
-    np.all(np.isclose(offsets, 0.0, atol=1e-12), axis=1)
-)
-if center_fiber_indices.size != 1:
-    raise RuntimeError(
-        "Expected exactly one on-axis fiber after applying the permutation"
-    )
-center_fiber_index = int(center_fiber_indices[0])
-OFFSETX = 1
-
-### Choose fiber configurations
-for i in range(len(emlines)):
-    if spec_mask[i]==1:
-        eml, bid, chn, rdn = emlines[i], blockids[i], channels[i], rdnoise[i]
-        _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "DESI", "%s.dat"%(chn))
-        for (dx, dy) in offsets:
-            _conf = copy.deepcopy(default_fiber_conf)
-            _conf.update({'OBSINDEX': _index_, 'SEDBLKID': bid, 'BANDPASS': _bp,
-                'RDNOISE': rdn, 'FIBERDX': dx, 'FIBERDY': dy})
-            if np.abs(dx)>1e-3 or np.abs(dy)>1e-3:
-                _conf.update({'EXPTIME': exptime_offset*OFFSETX})
-            default_obs_conf.append(_conf)
-            _index_+=1
-            
-
 ### Photometry observations
 photometry_band = ['r', 'g', 'z']
 R_BANDPASS = join(KL_TOOLS_DATA_DIR, "Bandpass", "CTIO", "DECam.r.dat")
@@ -251,18 +285,48 @@ PHOT_MASK = 4
 phot_mask = np.array([int(bit) for bit in ("{0:0%db}"%len(photometry_band)).format(PHOT_MASK)])
 Nphot_used = np.sum(phot_mask)
 
-for i in range(len(photometry_band)):
-    if phot_mask[i]==1:
-        _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "CTIO", "DECam.%s.dat"%photometry_band[i])
-        _conf = copy.deepcopy(default_photo_conf)
-        _conf.update({"OBSINDEX": _index_, 'BANDPASS': _bp, "SKYLEVEL": sky_levels[i],
-            "EXPTIME": exptime_photo if exptime_photo>0 else LS_DR9_exptime[i]})
-        default_obs_conf.append(_conf)
-        _index_+=1
+
+
+def build_obs_conf(offsets):
+    """Fiber and photometry observation configs for the given fiber offsets.
+
+    Returns the config list and the index of the on-axis (central) fiber.
+    """
+    offsets = np.asarray(offsets, dtype=float)
+    center_fiber_indices = np.flatnonzero(
+        np.all(np.isclose(offsets, 0.0, atol=1e-12), axis=1)
+    )
+    if center_fiber_indices.size != 1:
+        raise RuntimeError(
+            "Expected exactly one on-axis fiber after applying the permutation"
+        )
+    obs_conf, index = [], 0
+    for i in range(len(emlines)):
+        if spec_mask[i]==1:
+            eml, bid, chn, rdn = emlines[i], blockids[i], channels[i], rdnoise[i]
+            _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "DESI", "%s.dat"%(chn))
+            for (dx, dy) in offsets:
+                _conf = copy.deepcopy(default_fiber_conf)
+                _conf.update({'OBSINDEX': index, 'SEDBLKID': bid, 'BANDPASS': _bp,
+                    'RDNOISE': rdn, 'FIBERDX': float(dx), 'FIBERDY': float(dy)})
+                if np.abs(dx)>1e-3 or np.abs(dy)>1e-3:
+                    _conf.update({'EXPTIME': exptime_offset*OFFSETX})
+                obs_conf.append(_conf)
+                index+=1
+    for i in range(len(photometry_band)):
+        if phot_mask[i]==1:
+            _bp = join(KL_TOOLS_DATA_DIR, "Bandpass", "CTIO", "DECam.%s.dat"%photometry_band[i])
+            _conf = copy.deepcopy(default_photo_conf)
+            _conf.update({"OBSINDEX": index, 'BANDPASS': _bp, "SKYLEVEL": sky_levels[i],
+                "EXPTIME": exptime_photo if exptime_photo>0 else LS_DR9_exptime[i]})
+            obs_conf.append(_conf)
+            index+=1
+    return obs_conf, int(center_fiber_indices[0])
+
+OFFSETX = 1
 
 def main():
     ########################### Initialization #################################
-    redshift = 0.3
     ################## Params Sampled & Fiducial Values ########################
     sampled_pars = [
         "g1",
@@ -316,158 +380,207 @@ def main():
     sampled_pars_std=np.array([sampled_pars_std_dict[k] for k in sampled_pars])
     sampled_pars_std /= 1000
 
-    base_sed = {
-        'z': redshift,
-        'continuum_type': 'temp',
-        'restframe_temp': join(KL_TOOLS_DATA_DIR, "Simulation", "GSB2.spec"),
-        'temp_wave_type': 'Ang',
-        'temp_flux_type': 'flambda',
-        'cont_norm_method': 'flux',
-        'obs_cont_norm_wave': 850,
-        'obs_cont_norm_flam': 3.0e-17,
-        # Integrated observed-frame line flux [erg s^-1 cm^-2]. The current
-        # simulator replaces this template default with each sampled value.
-        'em_Ha_flux': 1.2e-16,
-        'em_Ha_sigma': 0.065,
-        'em_O2_flux': 8.8e-17,
-        'em_O2_sigma': [0.065, 0.065],
-        'em_O2_share': [0.45, 0.55],
-        'em_O3_1_flux': 2.4e-17,
-        'em_O3_1_sigma': 0.065,
-        'em_O3_2_flux': 2.8e-17,
-        'em_O3_2_sigma': 0.065,
-        'em_Hb_flux': 1.2e-17,
-        'em_Hb_sigma': 0.065,
-    }
-    sed_config = configure_sed(
-        base_sed,
-        rmag_true=rmag_true,
-        halpha_flux_true=halpha_flux_true,
-        r_bandpass=R_BANDPASS,
-        center_fiber_obsindex=center_fiber_index,
-    )
+    def _simulate(obs_conf, center_fiber_index):
+        """Render the noiseless image and fiber spectra for one fiber layout."""
+        base_sed = {
+            'z': redshift,
+            'continuum_type': 'temp',
+            'restframe_temp': join(KL_TOOLS_DATA_DIR, "Simulation", "GSB2.spec"),
+            'temp_wave_type': 'Ang',
+            'temp_flux_type': 'flambda',
+            'cont_norm_method': 'flux',
+            'obs_cont_norm_wave': 850,
+            'obs_cont_norm_flam': 3.0e-17,
+            # Integrated observed-frame line flux [erg s^-1 cm^-2]. The current
+            # simulator replaces this template default with each sampled value.
+            'em_Ha_flux': 1.2e-16,
+            'em_Ha_sigma': halpha_observed_sigma(redshift),
+            'em_O2_flux': 8.8e-17,
+            'em_O2_sigma': [0.065, 0.065],
+            'em_O2_share': [0.45, 0.55],
+            'em_O3_1_flux': 2.4e-17,
+            'em_O3_1_sigma': 0.065,
+            'em_O3_2_flux': 2.8e-17,
+            'em_O3_2_sigma': 0.065,
+            'em_Hb_flux': 1.2e-17,
+            'em_Hb_sigma': 0.065,
+        }
+        sed_config = configure_sed(
+            base_sed,
+            rmag_true=rmag_true,
+            halpha_flux_true=halpha_flux_true,
+            r_bandpass=R_BANDPASS,
+            center_fiber_obsindex=center_fiber_index,
+        )
 
-    meta_pars = {
-        ### priors
-        'priors': {
-            'g1': priors.UniformPrior(-0.99, 0.99,),
-            'g2': priors.UniformPrior(-0.99, 0.99),
-            'theta_int': priors.UniformPrior(-np.pi/2., np.pi/2.),
-            'sini': priors.UniformPrior(-1., 1.),
-            'v0': priors.GaussPrior(0, 10),
-            'vcirc': priors.LognormalPrior(300, 0.06, clip_sigmas=3),
-            'rscale': priors.UniformPrior(0.1, 5),
-            'hlr': priors.UniformPrior(0.1, 5),
-            'dx_disk': priors.UniformPrior(-1, 1),
-            'dy_disk': priors.UniformPrior(-1, 1),
-            'dx_spec': priors.UniformPrior(-1, 1),
-            'dy_spec': priors.UniformPrior(-1, 1),
-        },
-        ### velocity model
-        'velocity': {
-            'model': 'default',
-            'v0': 'param',
-            'vcirc': 'param',
-            'rscale': 'param',
-        },
-        ### intensity model
-        'intensity': {
-            ### Inclined Exp profile
-            'type': 'inclined_exp',
-            # 'sersic_n': n_s,
-            'flux': 1.0, # counts
-            'hlr': hlr,
-            'dx_disk': 0.0,
-            'dy_disk': 0.0,
-            'dx_spec': 0.0,
-            'dy_spec': 0.0,
-        },
-        ### misc
-        'units': {
-            'v_unit': Unit('km/s'),
-            'r_unit': Unit('arcsec')
-        },
-        'run_options': {
-            'run_mode': 'ETC',
-            #'remove_continuum': True,
-            'use_numba': False,
-            'alignment_params': 'sini_pa', # eint | inc_pa | sini_pa | eint_eigen
-        },
-        ### 3D underlying model dimension
-        'model_dimension':{
-            'Nx': 64,
-            'Ny': 64,
-            'lblue': 300,
-            'lred': 1200,
-            'resolution': 500000,
-            'scale': 0.11, # arcsec
-            'lambda_range': wavelength_range[np.where(spec_mask==1)[0]],
-            'lambda_res': 0.08, # nm
-            'super_sampling': 4,
-            'lambda_unit': 'nm',
-        },
-        ### SED model
-        # V3 normalizes the continuum by rmag_true, zeroes non-Ha lines, and
-        # asks kl-tools to interpret em_Ha_flux as clean central-fiber flux.
-        'sed': sed_config,
-        ### observation configurations
-        'obs_conf': default_obs_conf,
-    }
-    pars = Pars(sampled_pars, meta_pars)
+        meta_pars = {
+            ### priors
+            'priors': {
+                'g1': priors.UniformPrior(-0.99, 0.99,),
+                'g2': priors.UniformPrior(-0.99, 0.99),
+                'theta_int': priors.UniformPrior(-np.pi/2., np.pi/2.),
+                'sini': priors.UniformPrior(-1., 1.),
+                'v0': priors.GaussPrior(0, 10),
+                'vcirc': priors.LognormalPrior(300, 0.06, clip_sigmas=3),
+                'rscale': priors.UniformPrior(0.1, 5),
+                'hlr': priors.UniformPrior(0.1, 5),
+                'dx_disk': priors.UniformPrior(-1, 1),
+                'dy_disk': priors.UniformPrior(-1, 1),
+                'dx_spec': priors.UniformPrior(-1, 1),
+                'dy_spec': priors.UniformPrior(-1, 1),
+            },
+            ### velocity model
+            'velocity': {
+                'model': 'default',
+                'v0': 'param',
+                'vcirc': 'param',
+                'rscale': 'param',
+            },
+            ### intensity model
+            'intensity': {
+                ### Inclined Exp profile
+                'type': 'inclined_exp',
+                # 'sersic_n': n_s,
+                'flux': 1.0, # counts
+                'hlr': hlr,
+                'dx_disk': 0.0,
+                'dy_disk': 0.0,
+                'dx_spec': 0.0,
+                'dy_spec': 0.0,
+            },
+            ### misc
+            'units': {
+                'v_unit': Unit('km/s'),
+                'r_unit': Unit('arcsec')
+            },
+            'run_options': {
+                'run_mode': 'ETC',
+                #'remove_continuum': True,
+                'use_numba': False,
+                'alignment_params': 'sini_pa', # eint | inc_pa | sini_pa | eint_eigen
+            },
+            ### 3D underlying model dimension
+            'model_dimension':{
+                'Nx': 64,
+                'Ny': 64,
+                'lblue': 300,
+                'lred': 1200,
+                'resolution': 500000,
+                'scale': 0.11, # arcsec
+                'lambda_range': wavelength_range[np.where(spec_mask==1)[0]],
+                'lambda_res': 0.08, # nm
+                'super_sampling': 4,
+                'lambda_unit': 'nm',
+            },
+            ### SED model
+            # V3 normalizes the continuum by rmag_true, zeroes non-Ha lines, and
+            # asks kl-tools to interpret em_Ha_flux as clean central-fiber flux.
+            'sed': sed_config,
+            ### observation configurations
+            'obs_conf': obs_conf,
+        }
+        pars = Pars(sampled_pars, meta_pars)
      
-    likelihood = FiberLikelihood(
-        pars,
-        None,
-        sampled_theta_fid=sampled_pars_value,
-        pickle_cubes=False,
-    )
-    calibration_getter = getattr(
-        likelihood, "get_central_fiber_flux_calibration", None
-    )
-    if not callable(calibration_getter):
-        raise RuntimeError(
-            "Simulator v3 requires a kl-tools version with central-fiber "
-            "H-alpha flux calibration support"
+        likelihood = FiberLikelihood(
+            pars,
+            None,
+            sampled_theta_fid=sampled_pars_value,
+            pickle_cubes=False,
         )
-    calibration = calibration_getter()
-    if not isinstance(calibration, dict):
-        raise RuntimeError(
-            "kl-tools did not apply the requested central-fiber H-alpha "
-            "flux semantics"
+        calibration_getter = getattr(
+            likelihood, "get_central_fiber_flux_calibration", None
         )
-    if calibration.get("semantics") != "central_fiber" or int(
-        calibration.get("reference_obsindex", -1)
-    ) != center_fiber_index:
-        raise RuntimeError(
-            "kl-tools central-fiber calibration provenance does not match "
-            "the configured central fiber"
+        if not callable(calibration_getter):
+            raise RuntimeError(
+                "Simulator v3 requires a kl-tools version with central-fiber "
+                "H-alpha flux calibration support"
+            )
+        calibration = calibration_getter()
+        if not isinstance(calibration, dict):
+            raise RuntimeError(
+                "kl-tools did not apply the requested central-fiber H-alpha "
+                "flux semantics"
+            )
+        if calibration.get("semantics") != "central_fiber" or int(
+            calibration.get("reference_obsindex", -1)
+        ) != center_fiber_index:
+            raise RuntimeError(
+                "kl-tools central-fiber calibration provenance does not match "
+                "the configured central fiber"
+            )
+        if int(calibration.get("api_version", -1)) != HALPHA_FLUX_API_VERSION:
+            raise RuntimeError(
+                "kl-tools central-fiber calibration API version does not match "
+                f"simulator schema v3: {calibration.get('api_version')!r}"
+            )
+        _, halpha_total_flux, central_halpha_aperture_fraction = (
+            validate_central_halpha_flux_conversion(
+                central_flux=calibration.get("requested_central_flux"),
+                total_flux=calibration.get("derived_total_flux"),
+                aperture_fraction=calibration.get("central_aperture_fraction"),
+            )
         )
-    if int(calibration.get("api_version", -1)) != HALPHA_FLUX_API_VERSION:
-        raise RuntimeError(
-            "kl-tools central-fiber calibration API version does not match "
-            f"simulator schema v3: {calibration.get('api_version')!r}"
+        if not np.isclose(
+            calibration["requested_central_flux"],
+            halpha_flux_true,
+            rtol=1e-12,
+            atol=0.0,
+        ):
+            raise RuntimeError(
+                "kl-tools central-fiber calibration changed the requested H-alpha flux"
+            )
+        return (
+            get_GlobalDataVector(0),
+            halpha_total_flux,
+            central_halpha_aperture_fraction,
         )
-    _, halpha_total_flux, central_halpha_aperture_fraction = (
-        validate_central_halpha_flux_conversion(
-            central_flux=calibration.get("requested_central_flux"),
-            total_flux=calibration.get("derived_total_flux"),
-            aperture_fraction=calibration.get("central_aperture_fraction"),
+
+    target_header = {}
+    if fiber_layout == GALAXY_AXIS_FIBER_LAYOUT:
+        offsets = compute_fiber_offsets(
+            fiber_offset=fiber_offset,
+            g1=fiber_g1,
+            g2=fiber_g2,
+            theta_int=theta_int,
+            sini=sini,
         )
-    )
-    if not np.isclose(
-        calibration["requested_central_flux"],
-        halpha_flux_true,
-        rtol=1e-12,
-        atol=0.0,
-    ):
-        raise RuntimeError(
-            "kl-tools central-fiber calibration changed the requested H-alpha flux"
+        obs_conf, center_fiber_index = build_obs_conf(offsets)
+        datavector, halpha_total_flux, central_halpha_aperture_fraction = (
+            _simulate(obs_conf, center_fiber_index)
         )
-    datavector = get_GlobalDataVector(0)
+    else:
+        # Pass 1: render the image with only the central fiber (the image does
+        # not depend on fiber positions), add the fixed targeting noise, and
+        # measure the position angle as a survey would.
+        probe_conf, probe_center = build_obs_conf(np.zeros((1, 2)))
+        probe_dv, _, _ = _simulate(probe_conf, probe_center)
+        clean_image = np.asarray(probe_dv.get_data(len(probe_conf) - 1), dtype=float)
+        seed = targeting_seed(ID) if args.targeting_seed is None else int(args.targeting_seed)
+        noisy = targeting_noisy_image(clean_image, seed=seed)
+        beta, hsm_ok = measure_position_angle(noisy, fallback_seed=seed + 1)
+        # Pass 2: place the fibers along the measured axes and render again.
+        offsets = measured_axis_fiber_offsets(beta, fiber_offset=fiber_offset)
+        obs_conf, center_fiber_index = build_obs_conf(offsets)
+        datavector, halpha_total_flux, central_halpha_aperture_fraction = (
+            _simulate(obs_conf, center_fiber_index)
+        )
+        final_image = np.asarray(datavector.get_data(len(obs_conf) - 1), dtype=float)
+        if not np.allclose(final_image, clean_image, rtol=1e-6, atol=1e-8 * np.abs(clean_image).max()):
+            raise RuntimeError("targeting image differs from the final image")
+        target_header = {
+            FITS_TARGET_PA_KEY: float(beta),
+            FITS_TARGET_HSM_OK_KEY: int(hsm_ok),
+            FITS_TARGET_SNR_KEY: targeting_snr(clean_image),
+            FITS_TARGET_SEED_KEY: int(seed),
+        }
     datavector.header[FITS_OBSERVATION_MODEL_VERSION_KEY] = OBSERVATION_MODEL_VERSION
     datavector.header[FITS_PHOTOMETRY_BAND_KEY] = PHOTOMETRY_BAND
     datavector.header[FITS_TARGET_LINE_KEY] = TARGET_EMISSION_LINE
-    datavector.header[FITS_FIBER_LAYOUT_KEY] = GALAXY_AXIS_FIBER_LAYOUT
+    datavector.header[FITS_FIBER_LAYOUT_KEY] = fiber_layout
+    if redshift != SIMULATION_REDSHIFT:
+        datavector.header[FITS_REDSHIFT_KEY] = redshift
+    for key, value in target_header.items():
+        datavector.header[key] = value
     datavector.header[FITS_SPECTRAL_UNITS_KEY] = SPECTRAL_UNITS
     datavector.header[FITS_CENTER_FIBER_INDEX_KEY] = center_fiber_index
     datavector.header[FITS_CENTER_EXPOSURE_KEY] = float(
@@ -507,8 +620,10 @@ def main():
         "halpha_flux_true": halpha_flux_true,
         "image_snr": image_snr,
         "central_halpha_snr": central_halpha_snr,
-        "fiber_layout": GALAXY_AXIS_FIBER_LAYOUT,
+        "fiber_layout": fiber_layout,
         "observation_model_version": OBSERVATION_MODEL_VERSION,
+        "redshift": redshift,
+        "targeting_seed": args.targeting_seed,
     }
     row_fingerprint = simulator_v3_science_row_fingerprint(ID, science_row)
     datavector.header[FITS_SCIENCE_ROW_ID_KEY] = ID

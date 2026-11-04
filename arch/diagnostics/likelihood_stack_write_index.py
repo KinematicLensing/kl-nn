@@ -17,6 +17,7 @@ STAGES = (
     ("03_nre_9d", "Full-9D NRE with Nautilus and TF-prior replacement"),
     ("04_benchmark", "Fixed-shear seven-estimator ensemble benchmark"),
     ("04_benchmark_nuisance", "Fixed-shear nuisance-only six-estimator benchmark"),
+    ("05_pp_comparison", "Three-way 9D NPE, 2D NRE, and 9D NRE P–P comparison"),
 )
 
 

@@ -2,7 +2,7 @@
 #SBATCH --job-name=kl_nuisance_bench
 #SBATCH --output=/ocean/projects/phy250048p/shared/logs/kl_nuisance_bench_%j.out
 #SBATCH --partition=GPU-shared
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -17,9 +17,11 @@ PARENT_NPE="${PARENT_NPE:-CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90_valid100k_f
 NRE_2D_NAME="${NRE_2D_NAME:-CNN-CNN-Meta-nre2d-simv3-cosi-r90_valid100k_frozen_s42_fibrepair}"
 NRE_9D_NAME="${NRE_9D_NAME:-CNN-CNN-Meta-nre9d-factorized-simv3-cosi-r90_valid100k_frozen_s42_fibrepair}"
 SEED="${BENCHMARK_SEED:-420042}"
-NPE_SAMPLES="${NPE_SAMPLES:-1024}"
+NUISANCE_SAMPLES="${NUISANCE_SAMPLES:-4096}"
+NUISANCE_SEED="${NUISANCE_SEED:-420043}"
+CANDIDATE_CHUNK_SIZE="${CANDIDATE_CHUNK_SIZE:-2048}"
 GRID_N="${GRID_N:-21}"
-OVERWRITE="${OVERWRITE:-0}"
+OVERWRITE="${OVERWRITE:-1}"
 
 set +u
 module load anaconda3
@@ -36,7 +38,9 @@ ARGS=(
   --report-dir "${REPORT_DIR}"
   --device cuda
   --seed "${SEED}"
-  --npe-samples "${NPE_SAMPLES}"
+  --nuisance-samples "${NUISANCE_SAMPLES}"
+  --nuisance-seed "${NUISANCE_SEED}"
+  --candidate-chunk-size "${CANDIDATE_CHUNK_SIZE}"
   --grid-n "${GRID_N}"
 )
 if [[ "${OVERWRITE}" == "1" ]]; then

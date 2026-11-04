@@ -183,7 +183,8 @@ class TrainConfig:
     feature_names: list[str] = field(default_factory=lambda: list(TARGET_NAMES))
     model_path: str = "/ocean/projects/phy250048p/shared/models/"
     model_name: str = "CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90"
-    pretrained_name: str = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
+    # None trains the whole network from scratch, without a CCL-pretrained encoder.
+    pretrained_name: str | None = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
     pretrain_from: int | str = "best"
     use_amp: bool = False
     amp_dtype: str = "float16"
@@ -205,6 +206,9 @@ class TrainConfig:
     feature_norm_trainable: bool = True
     freeze_feature_extractor: bool = True
     use_image_spectrum_fusion: bool = True
+    # Show each NPE training/validation galaxy as simulated or rotated by 90 deg
+    # with equal probability. False trains on the simulated view only.
+    r90_views: bool = True
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
     gradient_clip_norm: float = 1.0
@@ -292,8 +296,11 @@ class ModelConfig:
         observation = self.observation
         if observation.schema_version != 3:
             raise ValueError("only simulator schema version 3 is supported")
-        if observation.fiber_layout != "galaxy_axis":
-            raise ValueError("the current pipeline requires galaxy_axis fibers")
+        if observation.fiber_layout not in ("galaxy_axis", "measured_axis"):
+            raise ValueError(
+                "fiber_layout must be galaxy_axis (true observed axes) or "
+                "measured_axis (axes measured on a noisy targeting image)"
+            )
         if observation.image_band != "r" or observation.target_line != "Ha":
             raise ValueError("the current observation schema requires r band and H-alpha")
         if observation.spectral_units != "counts":

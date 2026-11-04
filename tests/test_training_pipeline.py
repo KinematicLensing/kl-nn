@@ -96,6 +96,7 @@ def _bare_batch_trainer(trainer_type, model):
     trainer.central_halpha_snr_valid = trainer.central_halpha_snr_train.clone()
     trainer.train_npe_view_generator = torch.Generator().manual_seed(11)
     trainer.valid_npe_view_generator = torch.Generator().manual_seed(12)
+    trainer.r90_views = True
 
     image = torch.arange(8, dtype=torch.float32).reshape(2, 1, 2, 2)
     spectra = torch.zeros(2, 1, 5, 8)
@@ -476,6 +477,24 @@ def test_ccl_invalid_global_gradient_skips_optimizer_step(monkeypatch):
     assert not trainer._last_batch_valid
     torch.testing.assert_close(model.weight, before)
     assert not steps
+
+
+def test_npe_r90_views_off_keeps_every_row_unrotated(monkeypatch):
+    model = _TinyNPE()
+    trainer = _bare_batch_trainer(train.NPETrainer, model)
+    trainer.r90_views = False
+    seen = []
+    original = train.make_npe_training_batch
+
+    def spy(*args, rotate_mask, **kwargs):
+        seen.append(rotate_mask.clone())
+        return original(*args, rotate_mask=rotate_mask, **kwargs)
+
+    monkeypatch.setattr(train, "make_npe_training_batch", spy)
+    for split in ("train", "valid"):
+        trainer._batch_loss(torch.tensor([0, 1]), split, train=split == "train")
+    assert len(seen) == 2
+    assert not any(mask.any() for mask in seen)
 
 
 def test_npe_random_view_is_one_step_and_invalid_global_gradient_skips(monkeypatch):

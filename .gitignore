@@ -29,3 +29,5 @@ tests/plots/
 model_report/*.html
 repo_reports/*.html
 Accelerating_Kinematic_Lensing_Inference_with_Neural_Networks/
+# Per-machine path overrides (see paths.json)
+paths.local.json

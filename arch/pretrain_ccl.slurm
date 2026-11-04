@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=klnn_ccl
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/pretrain_ccl_%j.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:4
 #SBATCH --time=12:00:00
@@ -11,7 +10,12 @@
 set -eo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 if [[ ! -f "${KLNN_REPO_ROOT}/arch/train_model.py" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
     exit 2
@@ -22,7 +26,7 @@ module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
 set +u
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 SEED="${SEED:-42}"
@@ -30,8 +34,8 @@ EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-100}"
 CCL_SIGMA_LABEL="${CCL_SIGMA_LABEL:-0.15}"
 CCL_D_CUTOFF="${CCL_D_CUTOFF:-0.40}"
-TRAIN_DATA="${TRAIN_DATA:-/ocean/projects/phy250048p/shared/datasets/train_1m_simv3_cosi/}"
-VALID_DATA="${VALID_DATA:-/ocean/projects/phy250048p/shared/datasets/valid_100k_simv3_cosi/}"
+TRAIN_DATA="${TRAIN_DATA:-${KLNN_DATASETS}/train_1m_simv3_cosi/}"
+VALID_DATA="${VALID_DATA:-${KLNN_DATASETS}/valid_100k_simv3_cosi/}"
 TRAIN_SIZE="${TRAIN_SIZE:-1000000}"
 VALID_SIZE="${VALID_SIZE:-100000}"
 SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
@@ -39,7 +43,7 @@ FIBER_LAYOUT="${FIBER_LAYOUT:-galaxy_axis}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 MODEL_STEM="${MODEL_STEM:-CNN-CNN-Meta-CCL-simv3-cosi-r90_1m}"
 MODEL_NAME="${MODEL_NAME:-${MODEL_STEM}_s${SEED}_${JOB_TAG}}"
-MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
+MODEL_ROOT="${MODEL_ROOT:-${KLNN_MODELS}}"
 
 for DATA_DIR in "${TRAIN_DATA}" "${VALID_DATA}"; do
     if [[ ! -d "${DATA_DIR}" ]]; then

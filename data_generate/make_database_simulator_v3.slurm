@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=kl_simv3_db
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/make_database_simulator_v3_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=0:30:00
 #SBATCH --nodes=1
@@ -12,7 +11,12 @@
 set -eo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
     exit 2
@@ -22,7 +26,7 @@ setup_shared_job_scratch simulator-v3-db
 
 module load anaconda3
 source ~/.bashrc
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_cosi}"

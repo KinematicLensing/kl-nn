@@ -3,9 +3,13 @@ import copy, os
 from os.path import join
 from argparse import ArgumentParser
 from astropy.units import Unit
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 SCR_DIR = os.path.dirname(os.path.abspath(__file__))
-HOME_DIR = os.path.dirname(os.path.dirname(SCR_DIR))
-KL_TOOLS_DATA_DIR = join(HOME_DIR, "kl-tools", "data")
+KL_TOOLS_DATA_DIR = str(klnn_path("kl_tools_root") / "data")
 
 # From KL-tools
 import kl_tools.priors as priors
@@ -231,7 +235,7 @@ exptime_offset = 600 # seconds
 exptime_photo = -1
 ADD_NOISE = False
 
-FITS_DIR = f'/ocean/projects/phy250048p/shared/fits/{d}/part_{n}/'
+FITS_DIR = str(klnn_path('fits') / d / f'part_{n}') + '/'
 
 ##################### Setting up observation configurations ####################
 

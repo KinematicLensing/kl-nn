@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import (
 
 import config
 import train
-from diagnostics.plot_losses import load_losses
+from plot_losses import load_losses
 
 
 class _ModuleWrapper(nn.Module):

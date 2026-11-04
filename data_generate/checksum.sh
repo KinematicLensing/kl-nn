@@ -7,10 +7,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../klnn_paths.sh"
 SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3}"
 DATASET_NAME="${DATASET_NAME:-${SAMPLE_NAME}}"
-SAMPLE_PATH="${SAMPLE_PATH:-/ocean/projects/phy250048p/shared/samples/${SAMPLE_NAME}.csv}"
-FITS_ROOT="${FITS_ROOT:-/ocean/projects/phy250048p/shared/fits}"
+SAMPLE_PATH="${SAMPLE_PATH:-${KLNN_SAMPLES}/${SAMPLE_NAME}.csv}"
+FITS_ROOT="${FITS_ROOT:-${KLNN_FITS}}"
 FITS_PATH="${FITS_PATH:-${FITS_ROOT}/${DATASET_NAME}}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 REPORT_PATH="${REPORT_PATH:-${PWD}/checksum_${DATASET_NAME}.tsv}"

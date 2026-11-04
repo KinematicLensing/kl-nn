@@ -27,7 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_fits_launcher_has_recovery_safe_runtime_and_log_contract():
     launcher = (ROOT / "data_generate/generate_simulator_v3.slurm").read_text()
     assert "#SBATCH --time=12:00:00" in launcher
-    assert "generate_simulator_v3_%A_%a.out" in launcher
+    # The log path is set by submit.sh as <logs>/<launcher stem>_%A_%a.out for array jobs.
+    assert "#SBATCH --array=" in launcher
+    submit = (ROOT / "submit.sh").read_text()
+    assert 'pattern="%A_%a"' in submit and '${stem}_${pattern}.out' in submit
+    assert "${KLNN_LOGS}/generate_simulator_v3_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out" in launcher
     assert "--skip-existing" in launcher
     assert "SLURM_ARRAY_JOB_ID" in launcher
 

@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=klnn_cache
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/cache_posteriors_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=3:00:00
@@ -12,7 +11,12 @@
 set -eo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 source "${KLNN_REPO_ROOT}/shared_job_scratch.sh"
 setup_shared_job_scratch cache-posteriors
 
@@ -20,7 +24,7 @@ module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
@@ -37,9 +41,9 @@ TEST_SET="${TEST_SET:-0}"
 MAP_DENSITY="${MAP_DENSITY:-0}"
 IDENTITY_ONLY="${IDENTITY_ONLY:-0}"
 DATASET_MANIFEST="${DATASET_MANIFEST:-}"
-MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
-DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
-CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
+MODEL_ROOT="${MODEL_ROOT:-${KLNN_MODELS}}"
+DATA_ROOT="${DATA_ROOT:-${KLNN_DATASETS}}"
+CACHE_ROOT="${CACHE_ROOT:-${KLNN_CACHE}}"
 PART_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-10}"
 ALLOW_PARTIAL_ARRAY="${ALLOW_PARTIAL_ARRAY:-0}"

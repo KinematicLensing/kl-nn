@@ -10,6 +10,11 @@ import subprocess
 import sys
 
 import pandas as pd
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
 try:
     from .generation_integrity import (
@@ -66,8 +71,8 @@ except ImportError:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_ROOT = "/ocean/projects/phy250048p/shared/samples"
-FITS_ROOT = "/ocean/projects/phy250048p/shared/fits"
+SAMPLE_ROOT = str(klnn_path("samples"))
+FITS_ROOT = str(klnn_path("fits"))
 SIMULATION_PARAMETERS = (
     "g1",
     "g2",

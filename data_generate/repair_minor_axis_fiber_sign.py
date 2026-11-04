@@ -51,7 +51,12 @@ except ImportError:
 
 
 FITS_FIBER_HDUS = tuple(index + 1 for index in MINOR_FIBER_INDICES)
-SHARED_ROOT = Path("/ocean/projects/phy250048p/shared")
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
+SHARED_ROOT = klnn_path("shared_root")
 GENERATION_PART_SIZE = 2000
 LMDB_WRITE_BATCH = 256
 SIMV3_CATALOGS = (

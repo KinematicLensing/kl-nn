@@ -5,6 +5,11 @@ from os.path import join
 
 import numpy as np
 import pandas as pd
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 from scipy.stats.qmc import LatinHypercube
 
 try:
@@ -37,7 +42,7 @@ except ImportError:
     )
 
 
-SAMPLE_ROOT = "/ocean/projects/phy250048p/shared/samples"
+SAMPLE_ROOT = str(klnn_path("samples"))
 DEFAULT_OUTPUT = join(
     SAMPLE_ROOT,
     "train_1m_simv3_cosi.csv",

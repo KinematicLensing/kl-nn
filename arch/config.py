@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
 
 TARGET_NAMES = (
@@ -151,7 +156,7 @@ class PretrainConfig:
     weight_decay: float = 1e-4
     eps: float = 1e-8
     batch_size: int = 100
-    model_path: str = "/ocean/projects/phy250048p/shared/models/"
+    model_path: str = str(klnn_path("models")) + "/"
     model_name: str = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
     use_amp: bool = False
     amp_dtype: str = "float16"
@@ -181,7 +186,7 @@ class TrainConfig:
     weight_decay: float = 1e-5
     batch_size: int = 50
     feature_names: list[str] = field(default_factory=lambda: list(TARGET_NAMES))
-    model_path: str = "/ocean/projects/phy250048p/shared/models/"
+    model_path: str = str(klnn_path("models")) + "/"
     model_name: str = "CNN-CNN-Meta-bounded-hybrid-simv3-cosi-r90"
     # None trains the whole network from scratch, without a CCL-pretrained encoder.
     pretrained_name: str | None = "CNN-CNN-Meta-CCL-simv3-cosi-r90"
@@ -454,16 +459,14 @@ def _default_model_config() -> ModelConfig:
             size=1_000_000,
             nspec=5,
             data_dir=(
-                "/ocean/projects/phy250048p/shared/datasets/"
-                "train_1m_simv3_cosi/"
+                str(klnn_path("datasets") / "train_1m_simv3_cosi") + "/"
             ),
         ),
         test=DatasetConfig(
             size=100_000,
             nspec=5,
             data_dir=(
-                "/ocean/projects/phy250048p/shared/datasets/"
-                "valid_100k_simv3_cosi/"
+                str(klnn_path("datasets") / "valid_100k_simv3_cosi") + "/"
             ),
         ),
         par_ranges={

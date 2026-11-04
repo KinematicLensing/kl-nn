@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=kl_simv2_merge
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/merge_database_simulator_v2_%j.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=1:00:00
 #SBATCH --nodes=1
@@ -13,9 +12,16 @@
 set -eo pipefail
 ulimit -c 0
 
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
+
 module load anaconda3
 source ~/.bashrc
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv2_galaxyaxis_halpha}"
@@ -29,7 +35,7 @@ if (( TOTAL <= 0 || CHUNK_SIZE <= 0 || TOTAL % CHUNK_SIZE != 0 )); then
 fi
 PART_COUNT="$((TOTAL / CHUNK_SIZE))"
 
-cd /jet/home/xwang30/kl-nn/data_generate
+cd "${KLNN_REPO_ROOT}/data_generate"
 python make_database.py \
     -s="${SAMPLE_NAME}" \
     -d="${DATASET_NAME}" \

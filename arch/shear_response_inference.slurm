@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=klnn_response_cache
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/shear_response_inference_%A_%a.out
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=2:00:00
@@ -11,7 +10,12 @@
 set -euo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 if [[ ! -f "${KLNN_REPO_ROOT}/arch/cache_posteriors.py" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
     exit 2
@@ -21,8 +25,7 @@ module load anaconda3
 module load cuda
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate kl-nn
-
+conda activate "${KLNN_CONDA_ENV}"
 : "${MODEL_NAME:?Set MODEL_NAME to the completed NPE run}"
 EPOCH="${EPOCH:-}"
 DATASET="${DATASET:-shear_response_simv3_cosi_5k}"
@@ -31,9 +34,9 @@ NPARTS="${NPARTS:-10}"
 NSAMPLES="${NSAMPLES:-5000}"
 SEED="${SEED:-42}"
 CACHE_TAG="${CACHE_TAG:-${MODEL_NAME}_shear_response_candidates}"
-MODEL_ROOT="${MODEL_ROOT:-/ocean/projects/phy250048p/shared/models}"
-DATA_ROOT="${DATA_ROOT:-/ocean/projects/phy250048p/shared/datasets}"
-CACHE_ROOT="${CACHE_ROOT:-/ocean/projects/phy250048p/shared/cache}"
+MODEL_ROOT="${MODEL_ROOT:-${KLNN_MODELS}}"
+DATA_ROOT="${DATA_ROOT:-${KLNN_DATASETS}}"
+CACHE_ROOT="${CACHE_ROOT:-${KLNN_CACHE}}"
 TOTAL="$((5 * NBASE))"
 PART_INDEX="$((SLURM_ARRAY_TASK_ID - 1))"
 ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-10}"

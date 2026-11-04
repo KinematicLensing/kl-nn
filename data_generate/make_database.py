@@ -19,6 +19,11 @@ import lmdb
 import pyxis as px
 from astropy.io import fits
 from argparse import ArgumentParser
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
 try:
     from .observation_schema import (
@@ -433,9 +438,9 @@ def main(argv=None):
     dataset_name = args.d
     shard_idx = args.shard_idx
     num_shards = args.num_shards
-    data_dir = f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
-    samp_dir = f'/ocean/projects/phy250048p/shared/samples/{sample_name}.csv'
-    save_dir = f'/ocean/projects/phy250048p/shared/datasets/{dataset_name}'
+    data_dir = str(klnn_path('fits') / dataset_name) + '/'
+    samp_dir = str(klnn_path('samples') / f'{sample_name}.csv')
+    save_dir = str(klnn_path('datasets') / dataset_name)
     expected_sample_count = n * N
     generation_manifest_path = validate_generation_manifest(
         samp_dir,
@@ -463,7 +468,7 @@ def main(argv=None):
     
     # Prevent disk write collisions across array tasks on the shared filesystems
     if shard_idx == 0:
-        normalized_dir = '/ocean/projects/phy250048p/shared/samples/normalized'
+        normalized_dir = str(klnn_path('samples') / 'normalized')
         os.makedirs(normalized_dir, exist_ok=True)
         samples.to_csv(
             join(normalized_dir, f'samples_{dataset_name}_normalized.csv'),

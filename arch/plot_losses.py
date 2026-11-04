@@ -16,12 +16,17 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
 import config
 
 
-DEFAULT_FIGURE_ROOT = "/ocean/projects/phy250048p/shared/figures"
-DEFAULT_CONFIGS_ROOT = "/ocean/projects/phy250048p/shared/configs"
+DEFAULT_FIGURE_ROOT = str(klnn_path("figures"))
+DEFAULT_CONFIGS_ROOT = str(klnn_path("configs"))
 
 
 def parse_args() -> argparse.Namespace:

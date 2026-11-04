@@ -5,7 +5,9 @@
 # per-task directory is exported through TMPDIR, TMP, and TEMP and is removed
 # on normal exit, failure, or a catchable termination signal.
 
-readonly KLNN_SHARED_TMP_ROOT="/ocean/projects/phy250048p/shared/tmp"
+# The scratch root is the "shared_tmp" key of paths.json.
+source "$(dirname "${BASH_SOURCE[0]}")/klnn_paths.sh"
+readonly KLNN_SHARED_TMP_ROOT="${KLNN_SHARED_TMP}"
 
 _cleanup_shared_job_scratch() {
     local status=$?

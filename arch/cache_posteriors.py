@@ -74,8 +74,13 @@ except ImportError:  # Direct execution from arch/.
     from map_laplace import tf_weighted_1d_shear_map_laplace
     from utils import denormalization_logabsdet, denormalize, resolve_feature_index
 
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
-DEFAULT_SHARED_ROOT = Path("/ocean/projects/phy250048p/shared")
+DEFAULT_SHARED_ROOT = klnn_path("shared_root")
 
 STANDARD_CACHE_ARRAY_TYPES = (
     "sample",

@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=kl_desi_test_samples
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_desi_test_sets_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=1:00:00
 #SBATCH --nodes=1
@@ -13,7 +12,12 @@
 set -eo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
     exit 2
@@ -23,11 +27,11 @@ setup_shared_job_scratch desi-test-samples
 
 module load anaconda3
 source ~/.bashrc
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
-CATALOG_ROOT="${CATALOG_ROOT:-/ocean/projects/phy250048p/shared/desi_cut_catalogs}"
-SAMPLE_ROOT="${SAMPLE_ROOT:-/ocean/projects/phy250048p/shared/samples}"
+CATALOG_ROOT="${CATALOG_ROOT:-${KLNN_DESI_CUT_CATALOGS}}"
+SAMPLE_ROOT="${SAMPLE_ROOT:-${KLNN_SAMPLES}}"
 PRODUCTION_TOTAL="100000"
 REQUESTED_TOTAL="${TOTAL:-${PRODUCTION_TOTAL}}"
 BASE_SEED="${BASE_SEED:-42000}"

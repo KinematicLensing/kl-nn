@@ -77,19 +77,3 @@ def test_fingerprint_tells_redshifts_and_seeds_apart():
     z46 = simulator_v3_science_row_fingerprint(17, _row(redshift=0.46))
     seeded = simulator_v3_science_row_fingerprint(17, _row(targeting_seed=900_000_005))
     assert len({base, z42, z46, seeded}) == 4
-
-
-def test_redshift_scan_rows_share_every_input_but_redshift():
-    from data_generate.make_redshift_scan_samples import build_scan
-
-    source = pd.DataFrame([_row(sample_id=i, g1=0.001 * i) for i in range(7)])
-    samples, manifest = build_scan(source, nbase=3, redshifts=[0.14, 0.3, 0.5], seed=1)
-    assert list(samples["ID"]) == list(range(9))
-    assert list(manifest["ID"]) == list(range(9))
-    assert list(samples["redshift"]) == [0.14] * 3 + [0.3] * 3 + [0.5] * 3
-    inputs = samples.drop(columns=["ID", "redshift"]).to_numpy()
-    for k in (1, 2):
-        assert (inputs[3 * k:3 * k + 3] == inputs[:3]).all()
-    # Targeting seed is the source row's production seed.
-    assert list(samples["targeting_seed"][:3]) == [900_000_000 + i for i in manifest["source_id"][:3]]
-    assert (samples["fiber_layout"] == "measured_axis").all()

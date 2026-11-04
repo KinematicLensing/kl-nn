@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=kl_fisher_fits
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_fisher_stencil_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=2:00:00
 #SBATCH --nodes=1
@@ -12,7 +11,12 @@
 set -eo pipefail
 ulimit -c 0
 
-KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-/jet/home/xwang30/kl-nn}}"
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
 if [[ ! -f "${KLNN_REPO_ROOT}/shared_job_scratch.sh" ]]; then
     echo "KLNN_REPO_ROOT does not identify a KL-NN checkout: ${KLNN_REPO_ROOT}" >&2
     exit 2
@@ -23,14 +27,14 @@ setup_shared_job_scratch fisher-stencil-fits
 module load anaconda3
 KLNN_CONDA_BASE="$(conda info --base)"
 source "${KLNN_CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 SAMPFILE="${SAMPFILE:?set SAMPFILE to the sample CSV filename}"
 DATASET="${DATASET:?set DATASET to the FITS dataset name}"
 NROWS="${NROWS:?set NROWS to the sample table length}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
-SAMPLE_PATH="/ocean/projects/phy250048p/shared/samples/${SAMPFILE}"
+SAMPLE_PATH="${KLNN_SAMPLES}/${SAMPFILE}"
 
 if (( NROWS <= 0 || CHUNK_SIZE <= 0 )); then
     echo "NROWS and CHUNK_SIZE must be positive" >&2
@@ -69,7 +73,7 @@ if (( START >= NROWS )); then
     exit 0
 fi
 
-mkdir -p "/ocean/projects/phy250048p/shared/fits/${DATASET}"
+mkdir -p "${KLNN_FITS}/${DATASET}"
 cd "${KLNN_REPO_ROOT}/data_generate"
 python generate_fits_wrapper.py \
     -i="${START}" \

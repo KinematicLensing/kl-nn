@@ -1,0 +1,20 @@
+{
+  "_comment": "Machine-specific paths for kl-nn and kl-nn-analysis. Values may reference other keys as {key}; {repo_root} is the kl-nn checkout. Override per machine in paths.local.json (gitignored) or per key with KLNN_PATH_<KEY> environment variables.",
+  "shared_root": "/ocean/projects/phy250048p/shared",
+  "datasets": "{shared_root}/datasets",
+  "samples": "{shared_root}/samples",
+  "fits": "{shared_root}/fits",
+  "models": "{shared_root}/models",
+  "configs": "{shared_root}/configs",
+  "networks": "{shared_root}/networks",
+  "cache": "{shared_root}/cache",
+  "reports": "{shared_root}/reports",
+  "figures": "{shared_root}/figures",
+  "logs": "{shared_root}/logs",
+  "shared_tmp": "{shared_root}/tmp",
+  "desi_cut_catalogs": "{shared_root}/desi_cut_catalogs",
+  "kl_tools_root": "{repo_root}/../kl-tools",
+  "analysis_root": "{repo_root}/../kl-nn-analysis",
+  "paper_repo": "{repo_root}/../Accelerating_Kinematic_Lensing_Inference_with_Neural_Networks",
+  "conda_env": "kl-nn"
+}

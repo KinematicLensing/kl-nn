@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=kl_simv2_fits
-#SBATCH --output=/ocean/projects/phy250048p/shared/logs/generate_simulator_v2_%A_%a.out
 #SBATCH --partition=RM-shared
 #SBATCH --time=4:00:00
 #SBATCH --nodes=1
@@ -12,9 +11,16 @@
 set -eo pipefail
 ulimit -c 0
 
+KLNN_REPO_ROOT="${KLNN_REPO_ROOT:-${SLURM_SUBMIT_DIR:-}}"
+if [[ ! -f "${KLNN_REPO_ROOT}/klnn_paths.sh" ]]; then
+    echo "KLNN_REPO_ROOT does not identify a kl-nn checkout: ${KLNN_REPO_ROOT} (submit with submit.sh)" >&2
+    exit 2
+fi
+source "${KLNN_REPO_ROOT}/klnn_paths.sh"
+
 module load anaconda3
 source ~/.bashrc
-conda activate kl-nn
+conda activate "${KLNN_CONDA_ENV}"
 set -u
 
 SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv2_galaxyaxis_halpha}"
@@ -22,7 +28,7 @@ DATASET_NAME="${DATASET_NAME:-train_1m_simv2_galaxyaxis_halpha}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
 SAMPLE_FILE="samples_${SAMPLE_NAME}.csv"
-SAMPLE_PATH="/ocean/projects/phy250048p/shared/samples/${SAMPLE_FILE}"
+SAMPLE_PATH="${KLNN_SAMPLES}/${SAMPLE_FILE}"
 
 if (( TOTAL <= 0 || CHUNK_SIZE <= 0 )); then
     echo "TOTAL and CHUNK_SIZE must be positive" >&2
@@ -51,7 +57,7 @@ if (( STOP > TOTAL )); then
     STOP="${TOTAL}"
 fi
 
-cd /jet/home/xwang30/kl-nn/data_generate
+cd "${KLNN_REPO_ROOT}/data_generate"
 python generate_fits_wrapper.py \
     -i="${START}" \
     -j="${STOP}" \

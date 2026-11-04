@@ -16,9 +16,14 @@ try:
     from . import config
 except ImportError:  # Direct execution with arch/ on sys.path.
     import config
+import sys as _klnn_sys
+from pathlib import Path as _KlnnPath
+if str(_KlnnPath(__file__).resolve().parents[1]) not in _klnn_sys.path:
+    _klnn_sys.path.append(str(_KlnnPath(__file__).resolve().parents[1]))
+from klnn_paths import path as klnn_path  # noqa: E402  (machine paths: kl-nn/paths.json)
 
-DEFAULT_SHARED_ROOT = "/ocean/projects/phy250048p/shared"
-DEFAULT_CONFIGS_ROOT = join(DEFAULT_SHARED_ROOT, "configs")
+DEFAULT_SHARED_ROOT = str(klnn_path("shared_root"))
+DEFAULT_CONFIGS_ROOT = str(klnn_path("configs"))
 # Leftover pair-NPE train keys still present on some shared snapshots. They are
 # unused by the current frozen-concat TrainConfig; drop them on load so
 # inference can read production configs without relaxing from_dict.
@@ -30,7 +35,7 @@ IGNORED_TRAIN_SNAPSHOT_KEYS = frozenset(
         "pair_size",
     }
 )
-DEFAULT_NETWORKS_ROOT = join(DEFAULT_SHARED_ROOT, "networks")
+DEFAULT_NETWORKS_ROOT = str(klnn_path("networks"))
 
 _CIRCULAR_SPLINE_IMPORT_RE = re.compile(
     r"(?m)^\s*(?:from\s+circular_spline\s+import\b|import\s+circular_spline\b)"

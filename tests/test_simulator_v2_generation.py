@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from data_generate.latin_hypercube import (
+    DEFAULT_G_LIMIT,
     DEFAULT_RMAG_RANGE,
     PARAMETER_LIMITS,
     generate_samples,
@@ -105,6 +106,7 @@ def test_generation_is_seed_reproducible_and_cli_has_no_schema_switches():
     assert not hasattr(args, "rmag_min")
     assert not hasattr(args, "halpha_flux_min")
     assert args.nsamples == 100_000
+    assert args.g_limit == DEFAULT_G_LIMIT
     assert args.output.endswith(
         "train_1m_simv3_cosi.csv"
     )
@@ -143,3 +145,44 @@ def test_generator_supplies_fixed_zero_centering_to_renderer_theta():
 def test_nonpositive_sample_count_is_rejected():
     with pytest.raises(ValueError):
         generate_samples(0)
+
+
+@pytest.mark.parametrize("g_limit", (0.02, 0.2))
+def test_training_proposal_g_limit_is_allowlisted(g_limit):
+    samples = generate_samples(256, seed=20260910, g_limit=g_limit)
+    assert samples["g1"].between(-g_limit, g_limit, inclusive="neither").all()
+    assert samples["g2"].between(-g_limit, g_limit, inclusive="neither").all()
+    assert samples["g1"].min() < -0.5 * g_limit
+    assert samples["g1"].max() > 0.5 * g_limit
+    args = parse_args(["--g-limit", str(g_limit), "--output", "out.csv"])
+    assert args.g_limit == pytest.approx(g_limit)
+
+
+def test_g_limit_does_not_change_test_set_cli_sampling():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--test-set",
+                "--catalog",
+                "catalog.fits",
+                "--output",
+                "test.csv",
+                "--g-limit",
+                "0.02",
+            ]
+        )
+    args = parse_args(
+        [
+            "--test-set",
+            "--catalog",
+            "catalog.fits",
+            "--output",
+            "test.csv",
+        ]
+    )
+    assert args.g_limit == DEFAULT_G_LIMIT
+
+
+def test_unlistlisted_g_limit_is_rejected():
+    with pytest.raises(ValueError, match="g-limit must be one of"):
+        generate_samples(4, seed=1, g_limit=0.03)

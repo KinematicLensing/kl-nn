@@ -52,7 +52,29 @@ PARAMETER_LIMITS = {
     "rscale": (0.1, 5.0),
     "hlr": (0.1, 5.0),
 }
+ALLOWED_G_LIMITS = (0.02, 0.1, 0.2)
+DEFAULT_G_LIMIT = 0.1
 DEFAULT_RMAG_RANGE = (15.0, 23.4)
+
+
+def resolve_g_limit(g_limit=DEFAULT_G_LIMIT) -> float:
+    candidate = float(g_limit)
+    if not np.isfinite(candidate) or candidate <= 0.0:
+        raise ValueError("g-limit must be a positive finite value")
+    for allowed in ALLOWED_G_LIMITS:
+        if np.isclose(candidate, allowed, rtol=0.0, atol=1e-12):
+            return float(allowed)
+    raise ValueError(
+        f"g-limit must be one of {ALLOWED_G_LIMITS!r}; got {candidate!r}"
+    )
+
+
+def parameter_limits_with_g_limit(g_limit=DEFAULT_G_LIMIT) -> dict[str, tuple[float, float]]:
+    half_width = resolve_g_limit(g_limit)
+    limits = dict(PARAMETER_LIMITS)
+    limits["g1"] = (-half_width, half_width)
+    limits["g2"] = (-half_width, half_width)
+    return limits
 
 
 def _lhs_column(nsamples, seed_sequence, lower, upper):
@@ -68,6 +90,7 @@ def generate_samples(
     nsamples: int,
     *,
     seed: int | None = None,
+    g_limit: float = DEFAULT_G_LIMIT,
 ) -> pd.DataFrame:
     """Draw targets and observation-quality controls independently.
 
@@ -75,11 +98,12 @@ def generate_samples(
     simulator's ``sin(i)`` parameterization. H-alpha flux is uniform in log10
     physical flux. Image and central-line S/N are uniform in linear S/N and
     are stored once per galaxy for reuse across noise realizations and matched
-    shears.
+    shears. ``g_limit`` is the allowlisted half-width for ``g1`` and ``g2``.
     """
 
     if nsamples <= 0:
         raise ValueError("nsamples must be positive")
+    limits = parameter_limits_with_g_limit(g_limit)
     (
         parameter_seed,
         magnitude_seed,
@@ -87,14 +111,14 @@ def generate_samples(
         image_snr_seed,
         central_halpha_snr_seed,
     ) = np.random.SeedSequence(seed).spawn(5)
-    names = tuple(PARAMETER_LIMITS)
+    names = tuple(limits)
     unit = LatinHypercube(
         len(names),
         scramble=True,
         seed=np.random.default_rng(parameter_seed),
     ).random(nsamples)
     result = pd.DataFrame(unit, columns=names)
-    for name, (lower, upper) in PARAMETER_LIMITS.items():
+    for name, (lower, upper) in limits.items():
         if name == "sini":
             cosi = lower + result[name].to_numpy() * (upper - lower)
             result[name] = np.sqrt(np.maximum(0.0, 1.0 - np.square(cosi)))
@@ -188,12 +212,23 @@ def parse_args(argv=None):
             "overwrite the default training proposal"
         ),
     )
+    parser.add_argument(
+        "--g-limit",
+        type=float,
+        default=DEFAULT_G_LIMIT,
+        help=(
+            "Half-width a for training-proposal g1,g2 ~ U[-a, a]; "
+            f"must be one of {ALLOWED_G_LIMITS}. Ignored for --test-set."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.test_set:
         if args.catalog is None:
             parser.error("--catalog is required with --test-set")
         if args.output is None:
             parser.error("--output is required with --test-set")
+        if not np.isclose(args.g_limit, DEFAULT_G_LIMIT, rtol=0.0, atol=1e-12):
+            parser.error("--g-limit applies only to generate_samples, not --test-set")
     else:
         if args.catalog is not None:
             parser.error("--catalog requires --test-set")
@@ -220,6 +255,7 @@ def main(argv=None):
         samples = generate_samples(
             args.nsamples,
             seed=args.seed,
+            g_limit=args.g_limit,
         )
     samples.to_csv(args.output, index_label="ID")
     if manifest is not None:

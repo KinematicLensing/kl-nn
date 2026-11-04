@@ -783,6 +783,7 @@ def main(argv=None) -> None:
     dataset_path = resolve_path(args.data_root, args.dataset)
     if not dataset_path.is_dir():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+    config.assert_dataset_par_ranges_match(dataset_path, config.par_ranges)
     dataset = pxt.TorchDataset(str(dataset_path))
     validate_partition_coverage(args.nparts, args.ngals, len(dataset))
     generation_manifest = None

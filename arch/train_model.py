@@ -111,6 +111,16 @@ def parse_args(argv=None):
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--gradient-clip-norm", type=float)
+    parser.add_argument(
+        "--shear-bound",
+        type=float,
+        default=None,
+        help=(
+            "Half-width a for g1,g2 ~ U[-a, a]; must be one of "
+            f"{config.ALLOWED_SHEAR_BOUNDS}. Applied before ModelConfig "
+            "validation. Default keeps the loaded/canonical ±0.1 box."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -133,9 +143,19 @@ def _parse_checkpoint_suffix(value):
     return epoch
 
 
+def _apply_shear_bound(shear_bound):
+    """Rebuild ModelConfig so shear bounds are validated in __post_init__."""
+
+    payload = config.MODEL_CONFIG.to_dict()
+    payload["par_ranges"] = config.par_ranges_with_shear_bound(shear_bound)
+    config.set_model_config(config.ModelConfig.from_dict(payload))
+
+
 def apply_overrides(args):
     if args.config:
         config.load_model_config_from_json(args.config)
+    if args.shear_bound is not None:
+        _apply_shear_bound(args.shear_bound)
 
     stage = (
         config.MODEL_CONFIG.pretrain
@@ -304,6 +324,12 @@ def _validate_current_config(stage_name):
 def main(argv=None):
     args = parse_args(argv)
     stage_config = apply_overrides(args)
+    config.assert_dataset_par_ranges_match(
+        config.MODEL_CONFIG.data.data_dir, config.MODEL_CONFIG.par_ranges
+    )
+    config.assert_dataset_par_ranges_match(
+        config.MODEL_CONFIG.test.data_dir, config.MODEL_CONFIG.par_ranges
+    )
     seed = int(stage_config.seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     if stage_config.deterministic:

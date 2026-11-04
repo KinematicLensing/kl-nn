@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,6 +31,85 @@ CANONICAL_PARAMETER_RANGES = {
     "hlr": [0.1, 5.0],
     "halpha_flux_true": [1.0e-17, 1.0e-14],
 }
+ALLOWED_SHEAR_BOUNDS = (0.02, 0.1, 0.2)
+DEFAULT_SHEAR_BOUND = 0.1
+PAR_RANGES_FILENAME = "par_ranges.json"
+
+
+def resolve_allowed_shear_bound(value: float) -> float:
+    """Return the allowlisted half-width ``a`` for ``g ~ U[-a, a]``."""
+
+    candidate = float(value)
+    if not np.isfinite(candidate) or candidate <= 0.0:
+        raise ValueError("shear bound must be a positive finite value")
+    for allowed in ALLOWED_SHEAR_BOUNDS:
+        if np.isclose(candidate, allowed, rtol=0.0, atol=1e-12):
+            return float(allowed)
+    raise ValueError(
+        "shear bound must be one of "
+        f"{ALLOWED_SHEAR_BOUNDS!r}; got {candidate!r}"
+    )
+
+
+def par_ranges_with_shear_bound(shear_bound: float = DEFAULT_SHEAR_BOUND) -> dict[str, list[float]]:
+    """Canonical target bounds with an allowlisted symmetric shear box."""
+
+    half_width = resolve_allowed_shear_bound(shear_bound)
+    ranges = {
+        name: [float(bound) for bound in bounds]
+        for name, bounds in CANONICAL_PARAMETER_RANGES.items()
+    }
+    ranges["g1"] = [-half_width, half_width]
+    ranges["g2"] = [-half_width, half_width]
+    return ranges
+
+
+def par_ranges_equal(left, right) -> bool:
+    if tuple(left) != tuple(right):
+        return False
+    for name in left:
+        observed = [float(value) for value in left[name]]
+        expected = [float(value) for value in right[name]]
+        if len(observed) != 2 or len(expected) != 2:
+            return False
+        if not np.allclose(observed, expected, rtol=0.0, atol=1e-12):
+            return False
+    return True
+
+
+def load_dataset_par_ranges(data_dir) -> dict[str, list[float]] | None:
+    path = Path(data_dir) / PAR_RANGES_FILENAME
+    if not path.is_file():
+        return None
+    with path.open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict) or tuple(payload) != TARGET_NAMES:
+        raise ValueError(
+            f"{path} must contain par_ranges keys in order {TARGET_NAMES!r}"
+        )
+    return {
+        name: [float(bounds[0]), float(bounds[1])]
+        for name, bounds in payload.items()
+    }
+
+
+def assert_dataset_par_ranges_match(data_dir, par_ranges) -> None:
+    """If an LMDB wrote par_ranges.json, it must match the live cfg."""
+
+    stored = load_dataset_par_ranges(data_dir)
+    if stored is None:
+        return
+    live = {
+        name: [float(bound) for bound in par_ranges[name]]
+        for name in TARGET_NAMES
+    }
+    if not par_ranges_equal(stored, live):
+        path = Path(data_dir) / PAR_RANGES_FILENAME
+        raise ValueError(
+            "LMDB par_ranges do not match the live ModelConfig "
+            f"(g01-LMDB vs g02-cfg gate): {path} has {stored!r}, "
+            f"cfg has {live!r}"
+        )
 
 TARGET_TRANSFORMS = {
     name: "log10" if name == "halpha_flux_true" else "identity"
@@ -188,11 +268,34 @@ class ModelConfig:
             name: [float(value) for value in bounds]
             for name, bounds in CANONICAL_PARAMETER_RANGES.items()
         }
-        if self.par_ranges != canonical_ranges:
+        observed_ranges = {
+            name: [float(value) for value in bounds]
+            for name, bounds in self.par_ranges.items()
+        }
+        for name, expected in canonical_ranges.items():
+            if name in ("g1", "g2"):
+                continue
+            if observed_ranges[name] != expected:
+                raise ValueError(
+                    "par_ranges are immutable for the current normalized LMDB "
+                    f"schema; expected {name}={expected!r}"
+                )
+        g1_bounds = observed_ranges["g1"]
+        g2_bounds = observed_ranges["g2"]
+        if g1_bounds != g2_bounds:
             raise ValueError(
-                "par_ranges are immutable for the current normalized LMDB schema; "
-                f"expected {canonical_ranges!r}"
+                "par_ranges g1 and g2 must use the same allowlisted shear bound; "
+                f"got g1={g1_bounds!r}, g2={g2_bounds!r}"
             )
+        if (
+            len(g1_bounds) != 2
+            or g1_bounds[0] != -g1_bounds[1]
+            or g1_bounds[1] <= 0.0
+        ):
+            raise ValueError(
+                "par_ranges g1/g2 must be a symmetric interval [-a, a]"
+            )
+        resolve_allowed_shear_bound(g1_bounds[1])
         if tuple(self.observation.context_fields) != ORACLE_CONTEXT_FIELDS:
             raise ValueError(
                 "context_fields must contain only the independent oracle fields: "

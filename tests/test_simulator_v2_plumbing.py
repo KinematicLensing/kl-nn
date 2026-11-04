@@ -8,7 +8,14 @@ import pytest
 
 import config
 from data_generate.generate_fits_wrapper import SIMULATION_PARAMETERS, build_generate_command
-from data_generate.make_database import extract_fiducial_parameters, merge_shards, normalize_sample_table
+from data_generate.make_database import (
+    extract_fiducial_parameters,
+    merge_shards,
+    normalize_sample_table,
+    read_par_ranges_json,
+    resolve_fits_path,
+    write_par_ranges_json,
+)
 from data_generate import make_shear_response_samples
 
 
@@ -109,6 +116,31 @@ def test_merge_refuses_missing_or_existing_outputs_before_writer(tmp_path, monke
         merge_shards(str(base), num_shards=2, chunk_size=8)
 
 
+def test_fits_id_paths_use_original_part_layout(tmp_path):
+    root = tmp_path / "xu3"
+    path = resolve_fits_path(root, 4123, chunk_size=2000)
+    assert path == root / "part_3" / "gal_4123.fits"
+    path = resolve_fits_path(root, 0, chunk_size=2000)
+    assert path == root / "part_1" / "gal_0.fits"
+
+
+def test_merge_refuses_disagreeing_par_ranges(tmp_path, monkeypatch):
+    base = tmp_path / "merged"
+    shard0 = tmp_path / "merged_shard_0_of_2"
+    shard1 = tmp_path / "merged_shard_1_of_2"
+    shard0.mkdir()
+    shard1.mkdir()
+    write_par_ranges_json(shard0, config.par_ranges_with_shear_bound(0.02))
+    write_par_ranges_json(shard1, config.par_ranges_with_shear_bound(0.1))
+    monkeypatch.setattr(
+        "data_generate.make_database.px.Writer",
+        lambda **kwargs: pytest.fail(f"writer opened: {kwargs}"),
+    )
+    with pytest.raises(ValueError, match="disagreeing par_ranges"):
+        merge_shards(str(base), num_shards=2, chunk_size=8)
+    assert read_par_ranges_json(shard0)["g1"] == [-0.02, 0.02]
+
+
 def test_matched_shear_samples_preserve_observation_metadata(tmp_path, monkeypatch):
     source = pd.DataFrame([
         _row(0),
@@ -175,6 +207,8 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert 'IMAGE_SPECTRUM_FUSION="${IMAGE_SPECTRUM_FUSION:-1}"' in npe
     assert "--image-spectrum-fusion" in npe
     assert "--no-image-spectrum-fusion" in npe
+    assert 'SHEAR_BOUND="${SHEAR_BOUND:-0.1}"' in npe
+    assert '--shear-bound "${SHEAR_BOUND}"' in npe
     pretrain = (ROOT / "arch/pretrain_ccl.slurm").read_text()
     assert '--model-root "${MODEL_ROOT}"' in pretrain
     assert "train_1m_simv3_cosi/" in pretrain
@@ -197,6 +231,11 @@ def test_all_canonical_launchers_are_current_and_syntax_valid():
     assert "--skip-existing" in generate
     assert 'ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-500}"' in package
     assert "PART_COUNT != ARRAY_TASK_COUNT" in package
+    assert 'SHEAR_BOUND="${SHEAR_BOUND:-0.1}"' in package
+    assert '--shear-bound="${SHEAR_BOUND}"' in package
+    merge = (ROOT / "data_generate/merge_database_simulator_v3.slurm").read_text()
+    assert 'SHEAR_BOUND="${SHEAR_BOUND:-0.1}"' in merge
+    assert '--shear-bound="${SHEAR_BOUND}"' in merge
     assert "simv2" not in generate
     assert "simv2" not in package
     response_generate = (ROOT / "data_generate/generate_shear_response.slurm").read_text()

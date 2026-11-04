@@ -30,6 +30,7 @@ SAMPLE_NAME="${SAMPLE_NAME:-train_1m_simv3_cosi}"
 DATASET_NAME="${DATASET_NAME:-train_1m_simv3_cosi}"
 TOTAL="${TOTAL:-1000000}"
 CHUNK_SIZE="${CHUNK_SIZE:-2000}"
+SHEAR_BOUND="${SHEAR_BOUND:-0.1}"
 
 if (( TOTAL <= 0 || CHUNK_SIZE <= 0 || TOTAL % CHUNK_SIZE != 0 )); then
     echo "TOTAL must be positive and exactly divisible by CHUNK_SIZE" >&2
@@ -45,4 +46,5 @@ python make_database.py \
     -n="${CHUNK_SIZE}" \
     --nspec=5 \
     --num_shards="${PART_COUNT}" \
+    --shear-bound="${SHEAR_BOUND}" \
     --merge

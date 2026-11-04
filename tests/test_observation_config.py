@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -302,3 +303,62 @@ def test_best_pretraining_checkpoint_is_the_current_default_and_cli_value():
         module.parse_args(["--stage", "npe", "--pretrain-from", "best"])
     )
     assert stage.pretrain_from == "best"
+
+
+def test_default_cfg_remains_canonical_g01():
+    assert config.MODEL_CONFIG.par_ranges["g1"] == [-0.1, 0.1]
+    assert config.MODEL_CONFIG.par_ranges["g2"] == [-0.1, 0.1]
+    assert config.MODEL_CONFIG.par_ranges["vcirc"] == [60.0, 540.0]
+    assert config.par_ranges_with_shear_bound()["g1"] == [-0.1, 0.1]
+
+
+@pytest.mark.parametrize("half_width", [0.02, 0.2])
+def test_allowlisted_shear_bounds_are_accepted(half_width):
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"]["g1"] = [-half_width, half_width]
+    payload["par_ranges"]["g2"] = [-half_width, half_width]
+    restored = config.ModelConfig.from_dict(payload)
+    assert restored.par_ranges["g1"] == [-half_width, half_width]
+    assert restored.par_ranges["g2"] == [-half_width, half_width]
+    assert restored.par_ranges["vcirc"] == [60.0, 540.0]
+
+
+def test_mixed_and_unlistlisted_shear_bounds_are_rejected():
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"]["g1"] = [-0.02, 0.02]
+    with pytest.raises(ValueError, match="same allowlisted shear bound"):
+        config.ModelConfig.from_dict(payload)
+
+    payload = copy.deepcopy(config.MODEL_CONFIG.to_dict())
+    payload["par_ranges"]["g1"] = [-0.03, 0.03]
+    payload["par_ranges"]["g2"] = [-0.03, 0.03]
+    with pytest.raises(ValueError, match="shear bound must be one of"):
+        config.ModelConfig.from_dict(payload)
+
+
+def test_npe_cli_applies_shear_bound_before_post_init():
+    module = _training_entrypoint()
+    stage = module.apply_overrides(
+        module.parse_args(["--stage", "npe", "--shear-bound", "0.02"])
+    )
+    assert stage is config.MODEL_CONFIG.train
+    assert config.MODEL_CONFIG.par_ranges["g1"] == [-0.02, 0.02]
+    assert config.MODEL_CONFIG.par_ranges["g2"] == [-0.02, 0.02]
+    assert config.MODEL_CONFIG.par_ranges["vcirc"] == [60.0, 540.0]
+    spawned = config.ModelConfig.from_dict(config.MODEL_CONFIG.to_dict())
+    assert spawned.par_ranges["g1"] == [-0.02, 0.02]
+
+
+def test_lmdb_par_ranges_mismatch_raises(tmp_path):
+    stored = config.par_ranges_with_shear_bound(0.02)
+    (tmp_path / config.PAR_RANGES_FILENAME).write_text(
+        json.dumps(stored, indent=2),
+        encoding="utf-8",
+    )
+    live = config.par_ranges_with_shear_bound(0.1)
+    with pytest.raises(ValueError, match="g01-LMDB vs g02-cfg"):
+        config.assert_dataset_par_ranges_match(tmp_path, live)
+    config.assert_dataset_par_ranges_match(tmp_path, stored)
+    empty = tmp_path / "legacy"
+    empty.mkdir()
+    config.assert_dataset_par_ranges_match(empty, live)

@@ -40,6 +40,33 @@ def parse_args(argv=None):
     parser.add_argument('--shard_idx', type=int, default=0, help='Index of the current shard (0-indexed)')
     parser.add_argument('--num_shards', type=int, default=1, help='Total number of shards to split workflow')
     parser.add_argument('--merge', action='store_true', help='Combine existing shards into one master dataset')
+    parser.add_argument(
+        '--shear-bound',
+        type=float,
+        default=0.1,
+        help='Half-width a for g1,g2 normalization; allowlisted 0.02, 0.1, 0.2',
+    )
+    parser.add_argument(
+        '--fits-root',
+        type=str,
+        default=None,
+        help='FITS tree root; default is shared/fits/{dataset_name}',
+    )
+    parser.add_argument(
+        '--fits-id-column',
+        type=str,
+        default=None,
+        help=(
+            'Sample-table column of original FITS ids. Pack those files from '
+            '--fits-root without requiring remapped gal_0..N in a new folder.'
+        ),
+    )
+    parser.add_argument(
+        '--fits-chunk-size',
+        type=int,
+        default=2000,
+        help='FITS part size used as part_{id//chunk+1}/gal_{id}.fits',
+    )
     return parser.parse_args(argv)
 
 
@@ -75,13 +102,16 @@ def load_default_target_schema():
     return (
         arch_config.MODEL_CONFIG.par_ranges.copy(),
         dict(arch_config.TARGET_TRANSFORMS),
+        arch_config,
     )
 
-par_ranges, target_transforms = load_default_target_schema()
+
+par_ranges, target_transforms, arch_config = load_default_target_schema()
 arch_utils = load_arch_module('utils.py', 'arch_utils')
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+PAR_RANGES_FILENAME = 'par_ranges.json'
 DATASET_MANIFEST_FILENAME = 'manifest.json'
 GENERATION_MANIFEST_SCHEMA = 'klnn-generation-manifest-v1'
 TEST_SET_ANALYSIS_MODE = 'test_set'
@@ -330,6 +360,51 @@ def extract_fiducial_parameters(samples, row_indices, parameter_names):
         copy=True,
     )
 
+
+def resolve_fits_path(fits_root, fits_id, chunk_size=2000):
+    """Locate ``part_{id//chunk+1}/gal_{id}.fits`` in an existing FITS tree."""
+
+    galaxy_id = int(fits_id)
+    chunk = int(chunk_size)
+    if galaxy_id < 0:
+        raise ValueError(f"fits_id must be non-negative, got {fits_id!r}")
+    if chunk <= 0:
+        raise ValueError("fits chunk size must be positive")
+    part = galaxy_id // chunk + 1
+    return Path(fits_root) / f"part_{part}" / f"gal_{galaxy_id}.fits"
+
+
+def write_par_ranges_json(directory, ranges):
+    destination = Path(directory) / PAR_RANGES_FILENAME
+    payload = {
+        name: [float(bounds[0]), float(bounds[1])]
+        for name, bounds in ranges.items()
+    }
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    logger.info(f"Wrote parameter ranges: {destination}")
+    return destination
+
+
+def read_par_ranges_json(directory):
+    path = Path(directory) / PAR_RANGES_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {PAR_RANGES_FILENAME}: {path}")
+    with path.open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must be a JSON object")
+    return {
+        name: [float(bounds[0]), float(bounds[1])]
+        for name, bounds in payload.items()
+    }
+
 def merge_shards(
     base_save_dir,
     num_shards,
@@ -358,6 +433,15 @@ def merge_shards(
             "Refusing to merge into an existing dataset; choose a new dataset "
             f"name or explicitly remove the stale output: {base_save_dir}"
         )
+
+    shard_ranges = [read_par_ranges_json(shard_dir) for shard_dir in shard_dirs]
+    merged_ranges = shard_ranges[0]
+    for shard_dir, ranges in zip(shard_dirs[1:], shard_ranges[1:]):
+        if not arch_config.par_ranges_equal(ranges, merged_ranges):
+            raise ValueError(
+                "Refusing to merge shards with disagreeing par_ranges.json: "
+                f"{shard_dirs[0]} has {merged_ranges!r}, {shard_dir} has {ranges!r}"
+            )
 
     logger.info(f"Initiating compilation of {num_shards} shards into target destination: {base_save_dir}")
     
@@ -395,6 +479,7 @@ def merge_shards(
             f'{merged_sample_count} != {expected_sample_count}'
         )
     propagate_generation_manifest(generation_manifest_path, base_save_dir)
+    write_par_ranges_json(base_save_dir, merged_ranges)
 
     # Automated Shard Post-Cleanup Sequence
     logger.info("Master database finalized. Starting cleanup of shard files...")
@@ -411,7 +496,8 @@ def main(argv=None):
     dataset_name = args.d
     shard_idx = args.shard_idx
     num_shards = args.num_shards
-    data_dir = f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
+    active_par_ranges = arch_config.par_ranges_with_shear_bound(args.shear_bound)
+    data_dir = args.fits_root or f'/ocean/projects/phy250048p/shared/fits/{dataset_name}/'
     samp_dir = f'/ocean/projects/phy250048p/shared/samples/{sample_name}.csv'
     save_dir = f'/ocean/projects/phy250048p/shared/datasets/{dataset_name}'
     expected_sample_count = n * N
@@ -437,7 +523,13 @@ def main(argv=None):
     else:
         current_save_dir = save_dir
 
-    samples = normalize_sample_table(pd.read_csv(samp_dir), par_ranges)
+    samples = pd.read_csv(samp_dir)
+    if args.fits_id_column is not None:
+        if args.fits_id_column not in samples.columns:
+            raise ValueError(
+                f"Sample table is missing fits-id column {args.fits_id_column!r}"
+            )
+    samples = normalize_sample_table(samples, active_par_ranges)
     
     # Prevent disk write collisions across array tasks on the shared filesystems
     if shard_idx == 0:
@@ -465,11 +557,19 @@ def main(argv=None):
             "Refusing to append to an existing shard; explicitly remove or "
             f"rename it before regenerating: {current_save_dir}"
         )
-    expected_files = [
-        Path(data_dir) / f"part_{index + 1}" / f"gal_{sample_id}.fits"
-        for index in shard_indices
-        for sample_id in range(index * n, (index + 1) * n)
-    ]
+    expected_files = []
+    for index in shard_indices:
+        start_id = index * n
+        for sample_id in range(start_id, start_id + n):
+            if args.fits_id_column is None:
+                expected_files.append(
+                    Path(data_dir) / f"part_{index + 1}" / f"gal_{sample_id}.fits"
+                )
+            else:
+                fits_id = samples.iloc[sample_id][args.fits_id_column]
+                expected_files.append(
+                    resolve_fits_path(data_dir, fits_id, args.fits_chunk_size)
+                )
     missing_files = [str(path) for path in expected_files if not path.is_file()]
     if missing_files:
         preview = missing_files[:20]
@@ -487,14 +587,27 @@ def main(argv=None):
             spec_stack = np.full((n, 1, nspec, 64), 0.)
             fib_pos_stack = np.full((n, nspec, 2), 0.)
             start_id = index * n
-            file_id = index * n
-            ids = np.arange(start_id, start_id + n, dtype=np.uint64)
-            fids = extract_fiducial_parameters(samples, ids, par_ranges)
+            row_ids = np.arange(start_id, start_id + n, dtype=np.int64)
+            fids = extract_fiducial_parameters(samples, row_ids, active_par_ranges)
+            if args.fits_id_column is None:
+                stored_ids = np.arange(start_id, start_id + n, dtype=np.uint64)
+                fits_ids = stored_ids
+            else:
+                fits_ids = np.asarray(
+                    samples.iloc[row_ids][args.fits_id_column],
+                    dtype=np.int64,
+                )
+                stored_ids = fits_ids.astype(np.uint64)
             primary_headers = []
 
             for i in range(n):
-                ID = file_id + i
-                with fits.open(join(data_dir, f'part_{folder}/gal_{ID}.fits')) as hdu:
+                if args.fits_id_column is None:
+                    fits_path = join(data_dir, f'part_{folder}/gal_{int(fits_ids[i])}.fits')
+                else:
+                    fits_path = resolve_fits_path(
+                        data_dir, fits_ids[i], args.fits_chunk_size
+                    )
+                with fits.open(fits_path) as hdu:
                     primary_headers.append(hdu[0].header.copy())
                     img_stack[i, 0] = hdu[nspec+1].data
                     
@@ -508,13 +621,14 @@ def main(argv=None):
                 'spec': spec_stack,
                 'fib_pos': fib_pos_stack,
                 'fid_pars': fids,
-                'id': ids,
+                'id': stored_ids,
             }
             batch.update(observation_metadata_arrays(primary_headers))
             db.put_samples(batch)
             t = round(time.time() - start, 2)
             logger.info(f'Shard {shard_idx + 1}/{num_shards}: Entry {index+1}/{N} completed in {t}s.')
 
+    write_par_ranges_json(current_save_dir, active_par_ranges)
     if num_shards == 1:
         propagate_generation_manifest(generation_manifest_path, current_save_dir)
 

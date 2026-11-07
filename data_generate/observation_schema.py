@@ -80,6 +80,23 @@ HALPHA_OBSERVED_SIGMA_NM = 0.065  # at SIMULATION_REDSHIFT
 HALPHA_REST_SIGMA_NM = 0.05
 
 
+# Sersic index of the light profile that the image and the H-alpha emission share.
+# Production data are exponential (n = 1, kl-tools InclinedExponential); other
+# values are only used by the Sersic-profile test, which renders kl-tools
+# InclinedSersic with the same half-light radius.
+SERSIC_N_COLUMN = "sersic_n"
+FITS_SERSIC_N_KEY = "SERSICN"
+SIMULATION_SERSIC_N = 1.0
+SERSIC_N_RANGE = (0.3, 6.2)  # GalSim InclinedSersic limits
+
+
+def validate_sersic_n(value: object) -> float:
+    sersic_n = float(value)
+    if not np.isfinite(sersic_n) or not SERSIC_N_RANGE[0] <= sersic_n <= SERSIC_N_RANGE[1]:
+        raise ValueError(f"sersic_n must be in {list(SERSIC_N_RANGE)}, got {value!r}")
+    return sersic_n
+
+
 def validate_redshift(value: object) -> float:
     redshift = float(value)
     if not np.isfinite(redshift) or not 0.0 < redshift < 1.0:

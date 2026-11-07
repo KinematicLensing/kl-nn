@@ -33,10 +33,13 @@ try:
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         REDSHIFT_COLUMN,
+        SERSIC_N_COLUMN,
         RMAG_TRUE_COLUMN,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         TARGETING_SEED_COLUMN,
         validate_redshift,
+        validate_sersic_n,
         validate_halpha_flux,
         validate_central_halpha_snr,
         validate_image_snr,
@@ -59,10 +62,13 @@ except ImportError:
         OBSERVATION_MODEL_VERSION,
         OBSERVATION_MODEL_VERSION_COLUMN,
         REDSHIFT_COLUMN,
+        SERSIC_N_COLUMN,
         RMAG_TRUE_COLUMN,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         TARGETING_SEED_COLUMN,
         validate_redshift,
+        validate_sersic_n,
         validate_halpha_flux,
         validate_central_halpha_snr,
         validate_image_snr,
@@ -157,6 +163,10 @@ def build_generate_command(row: pd.Series, *, part: int, dataset: str) -> list[s
         redshift = validate_redshift(row[REDSHIFT_COLUMN])
         if redshift != SIMULATION_REDSHIFT:
             command.append(f"--redshift={redshift}")
+    if SERSIC_N_COLUMN in row.index and pd.notna(row[SERSIC_N_COLUMN]):
+        sersic_n = validate_sersic_n(row[SERSIC_N_COLUMN])
+        if sersic_n != SIMULATION_SERSIC_N:
+            command.append(f"--sersic-n={sersic_n}")
     if TARGETING_SEED_COLUMN in row.index and pd.notna(row[TARGETING_SEED_COLUMN]):
         command.append(f"--targeting-seed={int(row[TARGETING_SEED_COLUMN])}")
     if "fiber_g1" in row.index and "fiber_g2" in row.index:

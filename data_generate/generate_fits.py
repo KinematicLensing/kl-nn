@@ -61,10 +61,13 @@ try:
         FITS_TARGET_SEED_KEY,
         validate_fiber_layout,
         FITS_REDSHIFT_KEY,
+        FITS_SERSIC_N_KEY,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         halpha_observed_sigma,
         halpha_window,
         validate_redshift,
+        validate_sersic_n,
         HALPHA_FLUX_SEMANTICS,
         HALPHA_FLUX_API_VERSION,
         HALPHA_FLUX_TRANSFORM,
@@ -126,10 +129,13 @@ except ImportError:  # Support direct execution from data_generate/.
         FITS_TARGET_SEED_KEY,
         validate_fiber_layout,
         FITS_REDSHIFT_KEY,
+        FITS_SERSIC_N_KEY,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         halpha_observed_sigma,
         halpha_window,
         validate_redshift,
+        validate_sersic_n,
         HALPHA_FLUX_SEMANTICS,
         HALPHA_FLUX_API_VERSION,
         HALPHA_FLUX_TRANSFORM,
@@ -198,6 +204,13 @@ parser.add_argument(
     help='source redshift; production data use 0.3 (redshift-response test only)',
 )
 parser.add_argument(
+    '--sersic-n',
+    type=float,
+    default=SIMULATION_SERSIC_N,
+    help='Sersic index of the image and H-alpha profile; production data use 1 '
+         '(exponential) (Sersic-profile test only)',
+)
+parser.add_argument(
     '--targeting-seed',
     type=int,
     default=None,
@@ -206,6 +219,7 @@ parser.add_argument(
 args = parser.parse_args()
 fiber_layout = validate_fiber_layout(args.fiber_layout)
 redshift = validate_redshift(args.redshift)
+sersic_n = validate_sersic_n(args.sersic_n)
 n = args.n
 d = args.d
 ID = args.ID
@@ -442,9 +456,10 @@ def main():
             },
             ### intensity model
             'intensity': {
-                ### Inclined Exp profile
-                'type': 'inclined_exp',
-                # 'sersic_n': n_s,
+                ### Inclined Exp profile (production); inclined Sersic only for
+                ### the Sersic-profile test
+                **({'type': 'inclined_exp'} if sersic_n == SIMULATION_SERSIC_N
+                   else {'type': 'inclined_sersic', 'sersic_n': sersic_n}),
                 'flux': 1.0, # counts
                 'hlr': hlr,
                 'dx_disk': 0.0,
@@ -583,6 +598,8 @@ def main():
     datavector.header[FITS_FIBER_LAYOUT_KEY] = fiber_layout
     if redshift != SIMULATION_REDSHIFT:
         datavector.header[FITS_REDSHIFT_KEY] = redshift
+    if sersic_n != SIMULATION_SERSIC_N:
+        datavector.header[FITS_SERSIC_N_KEY] = sersic_n
     for key, value in target_header.items():
         datavector.header[key] = value
     datavector.header[FITS_SPECTRAL_UNITS_KEY] = SPECTRAL_UNITS
@@ -627,6 +644,7 @@ def main():
         "fiber_layout": fiber_layout,
         "observation_model_version": OBSERVATION_MODEL_VERSION,
         "redshift": redshift,
+        "sersic_n": sersic_n,
         "targeting_seed": args.targeting_seed,
     }
     row_fingerprint = simulator_v3_science_row_fingerprint(ID, science_row)

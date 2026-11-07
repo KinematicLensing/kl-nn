@@ -22,8 +22,10 @@ try:
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
         REDSHIFT_COLUMN,
+        SERSIC_N_COLUMN,
         RMAG_TRUE_COLUMN,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         TARGETING_SEED_COLUMN,
         fiber_layout_from_header,
         halpha_flux_conversion_from_header,
@@ -38,8 +40,10 @@ except ImportError:  # Support direct execution from data_generate/.
         IMAGE_SNR_COLUMN,
         OBSERVATION_MODEL_VERSION_COLUMN,
         REDSHIFT_COLUMN,
+        SERSIC_N_COLUMN,
         RMAG_TRUE_COLUMN,
         SIMULATION_REDSHIFT,
+        SIMULATION_SERSIC_N,
         TARGETING_SEED_COLUMN,
         fiber_layout_from_header,
         halpha_flux_conversion_from_header,
@@ -144,6 +148,9 @@ def simulator_v3_science_row_fingerprint(
     redshift = _optional_value(row, REDSHIFT_COLUMN)
     if redshift is not None and float(redshift) != SIMULATION_REDSHIFT:
         payload[REDSHIFT_COLUMN] = float(redshift).hex()
+    sersic_n = _optional_value(row, SERSIC_N_COLUMN)
+    if sersic_n is not None and float(sersic_n) != SIMULATION_SERSIC_N:
+        payload[SERSIC_N_COLUMN] = float(sersic_n).hex()
     seed = _optional_value(row, TARGETING_SEED_COLUMN)
     if seed is not None:
         seed = _canonical_integer(seed, name=TARGETING_SEED_COLUMN)
